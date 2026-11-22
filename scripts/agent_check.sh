@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
+TOTAL_CHECKS=5
 FAILURES=0
 
 pass() {
@@ -33,11 +34,11 @@ check_governance_files() {
   done
 
   if [[ ${#missing[@]} -gt 0 ]]; then
-    fail "[1/4] Governance files: missing ${missing[*]}"
+    fail "[1/${TOTAL_CHECKS}] Governance files: missing ${missing[*]}"
   elif [[ -f "${REPO_ROOT}/GEMINI.md" ]]; then
-    fail "[1/4] Governance files: redundant GEMINI.md present (use AGENTS.md + .agents/rules/)"
+    fail "[1/${TOTAL_CHECKS}] Governance files: redundant GEMINI.md present (use AGENTS.md + .agents/rules/)"
   else
-    pass "[1/4] Governance files: all ${#required[@]} required files present (Antigravity-native layout)"
+    pass "[1/${TOTAL_CHECKS}] Governance files: all ${#required[@]} required files present (Antigravity-native layout)"
   fi
 }
 
@@ -46,12 +47,12 @@ check_governance_files() {
 # ---------------------------------------------------------------------------
 check_no_forbidden_tracked_files() {
   local tracked=""
-  tracked="$(git ls-files | grep -E '(^|/)\.DS_Store$|(^|/)\.env($|\.)|(^|/)\.antigravitycli/|(^|/)\.remember/|\.(pem|key)$' | grep -vE '(^|/)\.env\.example$' || true)"
+  tracked="$(git ls-files | grep -E '(^|/)\.DS_Store$|(^|/)\.env($|\.)|(^|/)\.antigravitycli/|(^|/)\.remember/|^target/|\.(pem|key)$' | grep -vE '(^|/)\.env\.example$' || true)"
   if [[ -n "${tracked}" ]]; then
-    fail "[2/4] Tracked file hygiene: forbidden files tracked in git"
+    fail "[2/${TOTAL_CHECKS}] Tracked file hygiene: forbidden files tracked in git"
     printf '%s\n' "${tracked}" | sed 's/^/  - /'
   else
-    pass "[2/4] Tracked file hygiene: 0 forbidden or secret files tracked"
+    pass "[2/${TOTAL_CHECKS}] Tracked file hygiene: 0 forbidden or secret files tracked"
   fi
 }
 
@@ -71,10 +72,10 @@ check_zero_ai_attribution() {
   local hits=""
   hits="$(git log "${range}" --format='%h %B' 2>/dev/null | grep -iE 'co-authored-by:.*(claude|gemini|copilot|openai|chatgpt|anthropic|antigravity|cursor|ai|bot)|generated with (claude|gemini|ai|copilot)' || true)"
   if [[ -n "${hits}" ]]; then
-    fail "[3/4] Commit hygiene: AI attribution detected in commit messages"
+    fail "[3/${TOTAL_CHECKS}] Commit hygiene: AI attribution detected in commit messages"
     printf '%s\n' "${hits}" | sed 's/^/  - /'
   else
-    pass "[3/4] Commit hygiene: 0 AI attribution lines found"
+    pass "[3/${TOTAL_CHECKS}] Commit hygiene: 0 AI attribution lines found"
   fi
 }
 
@@ -90,9 +91,42 @@ check_shell_scripts() {
   done < <(find "${REPO_ROOT}/scripts" -type f -name '*.sh' | sort)
 
   if [[ ${#bad[@]} -gt 0 ]]; then
-    fail "[4/4] Shell syntax: failed bash -n on ${bad[*]}"
+    fail "[4/${TOTAL_CHECKS}] Shell syntax: failed bash -n on ${bad[*]}"
   else
-    pass "[4/4] Shell syntax: all scripts/*.sh valid"
+    pass "[4/${TOTAL_CHECKS}] Shell syntax: all scripts/*.sh valid"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 5: Rust workspace format, clippy, and unit/integration tests
+# ---------------------------------------------------------------------------
+check_rust_workspace() {
+  if [[ ! -f "${REPO_ROOT}/Cargo.toml" ]]; then
+    pass "[5/${TOTAL_CHECKS}] Rust workspace: skipped (no Cargo.toml)"
+    return
+  fi
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    fail "[5/${TOTAL_CHECKS}] Rust workspace: Cargo.toml present but cargo not found on PATH"
+    return
+  fi
+
+  local rust_failed=0
+  if ! cargo fmt --all -- --check; then
+    fail "[5/${TOTAL_CHECKS}] Rust workspace: cargo fmt --all -- --check failed"
+    rust_failed=1
+  fi
+  if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    fail "[5/${TOTAL_CHECKS}] Rust workspace: cargo clippy --workspace --all-targets -- -D warnings failed"
+    rust_failed=1
+  fi
+  if ! cargo test --workspace; then
+    fail "[5/${TOTAL_CHECKS}] Rust workspace: cargo test --workspace failed"
+    rust_failed=1
+  fi
+
+  if [[ ${rust_failed} -eq 0 ]]; then
+    pass "[5/${TOTAL_CHECKS}] Rust workspace: fmt, clippy (-D warnings), and cargo test passed"
   fi
 }
 
@@ -100,6 +134,7 @@ check_governance_files
 check_no_forbidden_tracked_files
 check_zero_ai_attribution
 check_shell_scripts
+check_rust_workspace
 
 if [[ ${FAILURES} -gt 0 ]]; then
   printf '\nagent_check failed (%d failure(s))\n' "${FAILURES}"
