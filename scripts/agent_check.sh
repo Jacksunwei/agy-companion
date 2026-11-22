@@ -16,14 +16,12 @@ fail() {
 }
 
 # ---------------------------------------------------------------------------
-# Check 1: Required agent-driven governance files exist
+# Check 1: Required Antigravity-native governance files exist (and no GEMINI.md)
 # ---------------------------------------------------------------------------
 check_governance_files() {
   local required=(
     "LICENSE"
     "AGENTS.md"
-    "CLAUDE.md"
-    "GEMINI.md"
     ".agents/rules/workflow.md"
     ".github/PULL_REQUEST_TEMPLATE.md"
   )
@@ -36,8 +34,10 @@ check_governance_files() {
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     fail "[1/4] Governance files: missing ${missing[*]}"
+  elif [[ -f "${REPO_ROOT}/GEMINI.md" ]]; then
+    fail "[1/4] Governance files: redundant GEMINI.md present (use AGENTS.md + .agents/rules/)"
   else
-    pass "[1/4] Governance files: all ${#required[@]} required files present"
+    pass "[1/4] Governance files: all ${#required[@]} required files present (Antigravity-native layout)"
   fi
 }
 

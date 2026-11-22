@@ -1,29 +1,30 @@
 # AGENTS.md: How Coding Agents Work in This Repo
 
-This file is the canonical engineering contract for coding agents working in `agy-byom`. Read it before editing code, opening a PR, or modifying workflows.
+This repository uses **Antigravity customization conventions** as the default agent-driven setup (`AGENTS.md` + `.agents/rules/` + `.agents/skills/`). Do not create redundant tool-specific root files such as `GEMINI.md`.
 
 ## Repo Layout
 
 | Path | Role | Rule |
 | --- | --- | --- |
-| `AGENTS.md` | Canonical agent engineering contract | Single source of truth; keep `CLAUDE.md` and `GEMINI.md` aligned as thin entrypoints. |
-| `.agents/rules/` | Always-on workspace rules | Loaded automatically by Antigravity / compatible coding agents. |
-| `.github/` | PR template & CI workflows | Every PR uses `PULL_REQUEST_TEMPLATE.md` and passes CI. |
-| `scripts/agent_check.sh` | Fast local verification gate | Run before every commit and PR; CI runs the exact same script. |
+| `AGENTS.md` | Canonical engineering contract | Single root entrypoint for coding agents. |
+| `.agents/rules/` | Always-on & contextual workspace rules | Antigravity-native rules (`trigger: always_on` or `model_decision`). |
+| `.agents/skills/` | On-demand project skills | Add `<name>/SKILL.md` runbooks here as recurring workflows emerge. |
+| `.github/PULL_REQUEST_TEMPLATE.md` | PR template | Every PR includes summary + pasted local verification evidence. |
+| `scripts/agent_check.sh` | Fast local verification gate | Run before every commit and PR. |
 | `docs/` | Design docs (`docs/design/`) and ADRs (`docs/decisions/`) | Update docs alongside behavior or architecture changes. |
 
 ## Verification Gates
 
-Run checks from fastest to heaviest before committing or opening a PR:
+> **Local-only verification policy:** GitHub Actions is intentionally not enabled on this private repo (keep `.github/workflows/` empty). Run all verification gates locally before opening or merging a PR.
 
 ```bash
 # Gate 1: Fast static & repo invariant check (< 2s)
 ./scripts/agent_check.sh
 ```
 
-As the codebase grows, register lint, typecheck, and unit/integration test commands in `scripts/agent_check.sh` and `.github/workflows/ci.yml` so local checks and CI stay identical.
+As the codebase grows, register lint, typecheck, and unit/integration test commands in `scripts/agent_check.sh` (or dedicated test scripts) and climb gates from fastest to heaviest.
 
-**Verification discipline:** Before running a check, state the positive success signal you expect, then verify it in real output before declaring success or merging.
+**Verification discipline:** State the expected positive success signal before running a check, then verify it in real output before declaring success or merging.
 
 ## Git, PR & Auto-Merge Rule
 
@@ -36,9 +37,9 @@ This repository uses a standing **branch → PR → auto-merge** workflow for al
    - **Never** include `Co-Authored-By:` lines naming an assistant, "Generated with ...", or any AI branding.
 3. **Verify locally before pushing.** Run `./scripts/agent_check.sh` and all relevant tests; fix failures before opening the PR.
 4. **Open a PR using `.github/PULL_REQUEST_TEMPLATE.md`.** Include concrete summary bullets and pasted verification evidence.
-5. **Auto-merge once green.**
-   - Wait for CI checks to pass (`gh pr checks --watch`, if checks are configured).
-   - Enable auto-merge (`gh pr merge --auto --squash --delete-branch`). If server-side auto-merge is not enabled on the repository (e.g., private repo without GitHub Pro auto-merge or required branch protection) and all checks are green, merge immediately via `gh pr merge --squash --delete-branch`.
+5. **Auto-merge once verified.**
+   - If CI checks are configured on the repo, wait for them (`gh pr checks --watch`).
+   - Enable auto-merge (`gh pr merge --auto --squash --delete-branch`), or when server-side auto-merge / required branch protection is unavailable on a private repo and all checks are green, merge immediately via `gh pr merge --squash --delete-branch`.
 6. **Keep local `main` clean.** After merge, switch back and fast-forward:
    ```bash
    git checkout main && git pull --ff-only
