@@ -10,12 +10,13 @@ This repository uses **Antigravity customization conventions** as the default ag
 | `.agents/rules/` | Always-on & contextual workspace rules | Antigravity-native rules (`trigger: always_on` or `model_decision`). |
 | `.agents/skills/` | On-demand project skills | Add `<name>/SKILL.md` runbooks here as recurring workflows emerge. |
 | `.github/PULL_REQUEST_TEMPLATE.md` | PR template | Every PR includes summary + pasted local verification evidence. |
+| `.github/workflows/ci.yml` | CI workflow (currently disabled at repo level) | Kept in sync with `scripts/agent_check.sh` so CI works immediately when enabled. |
 | `scripts/agent_check.sh` | Fast local verification gate | Run before every commit and PR. |
 | `docs/` | Design docs (`docs/design/`) and ADRs (`docs/decisions/`) | Update docs alongside behavior or architecture changes. |
 
 ## Verification Gates
 
-> **Local-only verification policy:** GitHub Actions is intentionally not enabled on this private repo (keep `.github/workflows/` empty). Run all verification gates locally before opening or merging a PR.
+> **Local-only verification policy (for now):** `.github/workflows/ci.yml` is checked in and ready, but GitHub Actions is disabled at the repository level while this repo is private without Actions quota. Run all verification gates locally before opening or merging a PR.
 
 ```bash
 # Gate 1: Fast static & repo invariant check (< 2s)
