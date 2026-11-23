@@ -446,6 +446,22 @@ pub fn validate_path(path: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn reject_symlink_config_file(path: &Path) -> Result<(), CoreError> {
+    // Strip trailing separators/dot components so POSIX lstat(2) inspects the symlink itself.
+    let check_path: PathBuf = path.components().collect();
+    match fs::symlink_metadata(&check_path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::InvalidPath {
+            reason: "symbolic links are not allowed for config files".to_string(),
+        }),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum TargetPlatform {
@@ -796,6 +812,7 @@ impl Config {
 
     pub fn load_or_default(path: &Path) -> Result<Config, CoreError> {
         validate_path(path)?;
+        reject_symlink_config_file(path)?;
 
         let raw = match fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -820,6 +837,7 @@ impl Config {
     pub fn save_secure(&self, path: &Path) -> Result<(), CoreError> {
         validate_path(path)?;
         self.validate()?;
+        reject_symlink_config_file(path)?;
 
         let file_name = path
             .file_name()
@@ -2551,6 +2569,112 @@ mod tests {
         assert!(
             leftover_temps.is_empty(),
             "temp files left behind after failed rename: {leftover_temps:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_and_save_reject_symlink_config_files_without_mutating_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("temp dir");
+
+        // (i) Symlink to a valid config file.
+        let target = tmp.path().join("victim.json");
+        let mut target_cfg = Config::default();
+        target_cfg.gemini.default_model = "victim-sentinel".to_string();
+        target_cfg
+            .save_secure(&target)
+            .expect("write target config");
+        let original_target_bytes = fs::read(&target).expect("read original target");
+
+        let sym_to_file = tmp.path().join("sym_config.json");
+        symlink(&target, &sym_to_file).expect("create symlink to target file");
+
+        // (ii) Dangling symlink.
+        let dangling_target = tmp.path().join("does_not_exist.json");
+        let sym_dangling = tmp.path().join("dangling_config.json");
+        symlink(&dangling_target, &sym_dangling).expect("create dangling symlink");
+
+        // (iii) Trailing-slash symlink to file (and trailing-slash symlink to dir).
+        let sym_trailing_slash = PathBuf::from(format!("{}/", sym_to_file.display()));
+        let real_dir = tmp.path().join("real_dir");
+        fs::create_dir(&real_dir).expect("create real dir");
+        let sym_to_dir = tmp.path().join("sym_dir");
+        symlink(&real_dir, &sym_to_dir).expect("create symlink to dir");
+        let sym_dir_trailing_slash = PathBuf::from(format!("{}/", sym_to_dir.display()));
+
+        let mut updated_cfg = Config::default();
+        updated_cfg.gemini.default_model = "gemini-2.5-flash".to_string();
+
+        for (label, path) in [
+            ("symlink to valid config", &sym_to_file),
+            ("dangling symlink", &sym_dangling),
+            ("trailing-slash symlink to file", &sym_trailing_slash),
+            ("trailing-slash symlink to dir", &sym_dir_trailing_slash),
+        ] {
+            let load_err = Config::load_or_default(path)
+                .expect_err(&format!("load_or_default must reject {label}"));
+            assert!(
+                matches!(
+                    &load_err,
+                    CoreError::InvalidPath { reason } if reason.contains("symbolic link")
+                ),
+                "load_or_default({label}) returned unexpected error: {load_err:?}"
+            );
+
+            let save_err = updated_cfg
+                .save_secure(path)
+                .expect_err(&format!("save_secure must reject {label}"));
+            assert!(
+                matches!(
+                    &save_err,
+                    CoreError::InvalidPath { reason } if reason.contains("symbolic link")
+                ),
+                "save_secure({label}) returned unexpected error: {save_err:?}"
+            );
+        }
+
+        // Target file must remain byte-for-byte untouched, symlinks untouched, zero .tmp. files created.
+        assert_eq!(
+            fs::read(&target).expect("re-read target"),
+            original_target_bytes,
+            "target file must remain byte-for-byte untouched"
+        );
+        assert!(
+            fs::symlink_metadata(&sym_to_file)
+                .expect("lstat sym_to_file")
+                .file_type()
+                .is_symlink(),
+            "sym_to_file must remain a symlink"
+        );
+        assert!(
+            fs::symlink_metadata(&sym_dangling)
+                .expect("lstat sym_dangling")
+                .file_type()
+                .is_symlink(),
+            "sym_dangling must remain a symlink"
+        );
+        assert!(
+            !dangling_target.exists(),
+            "dangling target must not be created"
+        );
+        assert!(
+            fs::symlink_metadata(&sym_to_dir)
+                .expect("lstat sym_to_dir")
+                .file_type()
+                .is_symlink(),
+            "sym_to_dir must remain a symlink"
+        );
+
+        let leftover_temps: Vec<_> = fs::read_dir(tmp.path())
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover_temps.is_empty(),
+            "no .tmp. files may be created when rejecting symlinks: {leftover_temps:?}"
         );
     }
 }
