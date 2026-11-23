@@ -18,6 +18,8 @@ pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-pro";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const CONFIG_PATH_ENV_VAR: &str = "AGY_COMPANION_CONFIG";
+pub const XDG_CONFIG_HOME_ENV_VAR: &str = "XDG_CONFIG_HOME";
+pub const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -444,28 +446,220 @@ pub fn validate_path(path: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
-pub fn resolve_config_path(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum TargetPlatform {
+    Unix,
+    Windows,
+}
+
+impl TargetPlatform {
+    const fn current() -> Self {
+        #[cfg(windows)]
+        {
+            Self::Windows
+        }
+        #[cfg(not(windows))]
+        {
+            Self::Unix
+        }
+    }
+}
+
+fn is_windows_drive_rooted(raw: &str, allow_forward_slash: bool) -> bool {
+    let bytes = raw.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || (allow_forward_slash && bytes[2] == b'/'))
+}
+
+fn is_windows_absolute(raw: &str) -> bool {
+    if is_windows_drive_rooted(raw, true) {
+        return true;
+    }
+
+    if let Some(verbatim_rest) = raw.strip_prefix(r"\\?\") {
+        if verbatim_rest
+            .as_bytes()
+            .get(..4)
+            .is_some_and(|prefix| prefix[..3].eq_ignore_ascii_case(b"UNC") && prefix[3] == b'\\')
+        {
+            let mut parts = verbatim_rest[4..].split('\\');
+            let server = parts.next().unwrap_or("").trim();
+            let share = parts.next().unwrap_or("").trim();
+            return !server.is_empty()
+                && !matches!(server, "." | "?")
+                && !share.is_empty()
+                && !matches!(share, "." | "?");
+        }
+        return is_windows_drive_rooted(verbatim_rest, false);
+    }
+
+    if let Some(unc_rest) = raw.strip_prefix(r"\\").or_else(|| raw.strip_prefix("//")) {
+        let mut parts = unc_rest.split(['\\', '/']);
+        let server = parts.next().unwrap_or("").trim();
+        let share = parts.next().unwrap_or("").trim();
+        return !server.is_empty()
+            && !matches!(server, "." | "?")
+            && !share.is_empty()
+            && !matches!(share, "." | "?");
+    }
+
+    false
+}
+
+fn is_absolute_for_platform(raw: &str, platform: TargetPlatform) -> bool {
+    match platform {
+        TargetPlatform::Unix => raw.starts_with('/'),
+        TargetPlatform::Windows => is_windows_absolute(raw),
+    }
+}
+
+fn strip_optional_drive_prefix(segment: &str) -> &str {
+    let bytes = segment.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        &segment[2..]
+    } else {
+        segment
+    }
+}
+
+fn has_parent_dir_traversal(raw: &str, platform: TargetPlatform) -> bool {
+    match platform {
+        TargetPlatform::Unix => raw.split('/').any(|seg| seg == ".."),
+        TargetPlatform::Windows => raw
+            .split(['/', '\\'])
+            .any(|seg| strip_optional_drive_prefix(seg) == ".."),
+    }
+}
+
+fn is_non_empty_dir(dir: &Path) -> bool {
+    !dir.as_os_str().is_empty() && !dir.to_str().is_some_and(|s| s.trim().is_empty())
+}
+
+fn validate_platform_dir(dir: &Path, platform: TargetPlatform) -> Result<(), CoreError> {
+    validate_path(dir)?;
+    if dir
+        .to_str()
+        .is_some_and(|raw| has_parent_dir_traversal(raw, platform))
+    {
+        return Err(CoreError::InvalidPath {
+            reason: "path must not contain parent directory ('..') traversal".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_xdg_base(
+    xdg_env: Option<&str>,
+    platform: TargetPlatform,
+) -> Result<Option<PathBuf>, CoreError> {
+    let Some(raw) = xdg_env else {
+        return Ok(None);
+    };
+
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+
+    if raw.contains('\0') {
+        return Err(CoreError::InvalidPath {
+            reason: "path must not contain NUL bytes".to_string(),
+        });
+    }
+
+    if has_parent_dir_traversal(raw, platform) {
+        return Err(CoreError::InvalidPath {
+            reason: "path must not contain parent directory ('..') traversal".to_string(),
+        });
+    }
+
+    if !is_absolute_for_platform(raw, platform) {
+        return Ok(None);
+    }
+
+    let candidate = PathBuf::from(raw);
+    validate_path(&candidate)?;
+    Ok(Some(candidate))
+}
+
+fn resolve_config_path_for_platform(
     env_override: Option<&str>,
+    xdg_config_home: Option<&str>,
+    platform_config_dir: Option<PathBuf>,
     home: Option<PathBuf>,
+    platform: TargetPlatform,
 ) -> Result<PathBuf, CoreError> {
     if let Some(raw_override) = env_override {
         let trimmed = raw_override.trim();
         if !trimmed.is_empty() {
+            if trimmed.contains('\0') {
+                return Err(CoreError::InvalidPath {
+                    reason: "path must not contain NUL bytes".to_string(),
+                });
+            }
+            if has_parent_dir_traversal(trimmed, platform) {
+                return Err(CoreError::InvalidPath {
+                    reason: "path must not contain parent directory ('..') traversal".to_string(),
+                });
+            }
             let path = PathBuf::from(trimmed);
             validate_path(&path)?;
             return Ok(path);
         }
     }
 
-    let home_dir = home.ok_or(CoreError::HomeDirUnavailable)?;
+    if let Some(xdg_base) = resolve_xdg_base(xdg_config_home, platform)? {
+        return Ok(xdg_base.join("agy-companion").join("config.json"));
+    }
+
+    match platform {
+        TargetPlatform::Windows => {
+            if let Some(config_dir) = platform_config_dir.filter(|dir| is_non_empty_dir(dir)) {
+                validate_platform_dir(&config_dir, platform)?;
+                return Ok(config_dir.join("agy-companion").join("config.json"));
+            }
+        }
+        TargetPlatform::Unix => {}
+    }
+
+    let home_dir = home
+        .filter(|dir| is_non_empty_dir(dir))
+        .ok_or(CoreError::HomeDirUnavailable)?;
+    validate_platform_dir(&home_dir, platform)?;
     Ok(home_dir
         .join(".config")
         .join("agy-companion")
         .join("config.json"))
 }
 
-pub fn resolve_usage_dir(home: Option<PathBuf>) -> Result<PathBuf, CoreError> {
-    let home_dir = home.ok_or(CoreError::HomeDirUnavailable)?;
+fn resolve_usage_dir_for_platform(
+    xdg_data_home: Option<&str>,
+    platform_data_local_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+    platform: TargetPlatform,
+) -> Result<PathBuf, CoreError> {
+    if let Some(xdg_base) = resolve_xdg_base(xdg_data_home, platform)? {
+        return Ok(xdg_base.join("agy-companion").join("usage"));
+    }
+
+    match platform {
+        TargetPlatform::Windows => {
+            if let Some(data_local_dir) =
+                platform_data_local_dir.filter(|dir| is_non_empty_dir(dir))
+            {
+                validate_platform_dir(&data_local_dir, platform)?;
+                return Ok(data_local_dir.join("agy-companion").join("usage"));
+            }
+        }
+        TargetPlatform::Unix => {}
+    }
+
+    let home_dir = home
+        .filter(|dir| is_non_empty_dir(dir))
+        .ok_or(CoreError::HomeDirUnavailable)?;
+    validate_platform_dir(&home_dir, platform)?;
     Ok(home_dir
         .join(".local")
         .join("share")
@@ -473,18 +667,65 @@ pub fn resolve_usage_dir(home: Option<PathBuf>) -> Result<PathBuf, CoreError> {
         .join("usage"))
 }
 
-pub fn default_config_path() -> Result<PathBuf, CoreError> {
-    match std::env::var(CONFIG_PATH_ENV_VAR) {
-        Ok(value) => resolve_config_path(Some(&value), dirs::home_dir()),
-        Err(std::env::VarError::NotPresent) => resolve_config_path(None, dirs::home_dir()),
+fn read_optional_env(var_name: &str) -> Result<Option<String>, CoreError> {
+    match std::env::var(var_name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(CoreError::InvalidPath {
-            reason: format!("{CONFIG_PATH_ENV_VAR} contains invalid UTF-8"),
+            reason: format!("{var_name} contains invalid UTF-8"),
         }),
     }
 }
 
+pub fn resolve_config_path(
+    env_override: Option<&str>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, CoreError> {
+    resolve_config_path_for_platform(env_override, None, None, home, TargetPlatform::current())
+}
+
+pub fn resolve_usage_dir(home: Option<PathBuf>) -> Result<PathBuf, CoreError> {
+    resolve_usage_dir_for_platform(None, None, home, TargetPlatform::current())
+}
+
+pub fn default_config_path() -> Result<PathBuf, CoreError> {
+    let platform = TargetPlatform::current();
+    let env_override = read_optional_env(CONFIG_PATH_ENV_VAR)?;
+    if let Some(ref raw) = env_override
+        && !raw.trim().is_empty()
+    {
+        return resolve_config_path_for_platform(Some(raw), None, None, None, platform);
+    }
+
+    let xdg_config_home = read_optional_env(XDG_CONFIG_HOME_ENV_VAR)?;
+    #[cfg(windows)]
+    let platform_config_dir = dirs::config_dir();
+    #[cfg(not(windows))]
+    let platform_config_dir = None;
+
+    resolve_config_path_for_platform(
+        None,
+        xdg_config_home.as_deref(),
+        platform_config_dir,
+        dirs::home_dir(),
+        platform,
+    )
+}
+
 pub fn default_usage_dir() -> Result<PathBuf, CoreError> {
-    resolve_usage_dir(dirs::home_dir())
+    let platform = TargetPlatform::current();
+    let xdg_data_home = read_optional_env(XDG_DATA_HOME_ENV_VAR)?;
+    #[cfg(windows)]
+    let platform_data_local_dir = dirs::data_local_dir();
+    #[cfg(not(windows))]
+    let platform_data_local_dir = None;
+
+    resolve_usage_dir_for_platform(
+        xdg_data_home.as_deref(),
+        platform_data_local_dir,
+        dirs::home_dir(),
+        platform,
+    )
 }
 
 impl Config {
@@ -647,7 +888,12 @@ impl Config {
             });
         }
 
-        if let Err(source) = fs::rename(&tmp_path, path) {
+        #[cfg(windows)]
+        let rename_result = retry_rename_on_permission_denied(&tmp_path, path);
+        #[cfg(not(windows))]
+        let rename_result = fs::rename(&tmp_path, path);
+
+        if let Err(source) = rename_result {
             let _ = fs::remove_file(&tmp_path);
             return Err(CoreError::Io {
                 path: path.to_path_buf(),
@@ -657,6 +903,47 @@ impl Config {
 
         Ok(())
     }
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_RENAME_MAX_ATTEMPTS: usize = 3;
+
+#[cfg(any(windows, test))]
+const WINDOWS_RENAME_BACKOFFS: [std::time::Duration; WINDOWS_RENAME_MAX_ATTEMPTS - 1] = [
+    std::time::Duration::from_millis(25),
+    std::time::Duration::from_millis(50),
+];
+
+#[cfg(any(windows, test))]
+fn retry_rename_with_backoff<F, S>(
+    backoffs: &[std::time::Duration],
+    mut rename_op: F,
+    mut sleep_op: S,
+) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+    S: FnMut(std::time::Duration),
+{
+    let mut attempt = 0;
+    loop {
+        match rename_op() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::PermissionDenied && attempt < backoffs.len() => {
+                sleep_op(backoffs[attempt]);
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn retry_rename_on_permission_denied(from: &Path, to: &Path) -> std::io::Result<()> {
+    retry_rename_with_backoff(
+        &WINDOWS_RENAME_BACKOFFS,
+        || fs::rename(from, to),
+        std::thread::sleep,
+    )
 }
 
 #[cfg(test)]
@@ -1473,5 +1760,797 @@ mod tests {
                 "false positive rejection for valid default_model '{good_model}'"
             );
         }
+    }
+
+    #[test]
+    fn resolves_unix_xdg_config_and_usage_precedence() {
+        assert_eq!(XDG_CONFIG_HOME_ENV_VAR, "XDG_CONFIG_HOME");
+        assert_eq!(XDG_DATA_HOME_ENV_VAR, "XDG_DATA_HOME");
+
+        let home = PathBuf::from("/Users/test");
+        let macos_app_support = PathBuf::from("/Users/test/Library/Application Support");
+
+        // AGY_COMPANION_CONFIG overrides XDG_CONFIG_HOME and short-circuits invalid XDG.
+        let env_wins = resolve_config_path_for_platform(
+            Some("/custom/cfg.json"),
+            Some("/tmp/../bad"),
+            Some(macos_app_support.clone()),
+            None,
+            TargetPlatform::Unix,
+        )
+        .expect("env override short-circuits XDG");
+        assert_eq!(env_wins, PathBuf::from("/custom/cfg.json"));
+
+        // Invalid AGY_COMPANION_CONFIG fails closed and never falls through to XDG.
+        let invalid_env = resolve_config_path_for_platform(
+            Some("../escape.json"),
+            Some("/xdg/config"),
+            None,
+            Some(home.clone()),
+            TargetPlatform::Unix,
+        )
+        .expect_err("invalid env override must fail closed");
+        assert!(matches!(invalid_env, CoreError::InvalidPath { .. }));
+
+        // Blank/whitespace AGY_COMPANION_CONFIG falls through to valid XDG_CONFIG_HOME.
+        for blank in ["", "   ", "\t\n"] {
+            let from_xdg = resolve_config_path_for_platform(
+                Some(blank),
+                Some("/xdg/config"),
+                Some(macos_app_support.clone()),
+                None,
+                TargetPlatform::Unix,
+            )
+            .expect("blank env override falls through to XDG");
+            assert_eq!(
+                from_xdg,
+                PathBuf::from("/xdg/config")
+                    .join("agy-companion")
+                    .join("config.json")
+            );
+        }
+
+        // Valid XDG_CONFIG_HOME with trailing slash, spaces, and benign dotted names.
+        for xdg in [
+            "/xdg/cfg/",
+            "/Users/Jane Doe/xdg config",
+            "/tmp/my..dir",
+            "/tmp/...",
+        ] {
+            let resolved = resolve_config_path_for_platform(
+                None,
+                Some(xdg),
+                Some(macos_app_support.clone()),
+                None,
+                TargetPlatform::Unix,
+            )
+            .expect("valid XDG_CONFIG_HOME resolves without home");
+            assert_eq!(
+                resolved,
+                PathBuf::from(xdg).join("agy-companion").join("config.json")
+            );
+        }
+
+        // Unset XDG on Unix ignores platform_config_dir (no macOS Library/Application Support drift).
+        let unix_default_cfg = resolve_config_path_for_platform(
+            None,
+            None,
+            Some(macos_app_support.clone()),
+            Some(home.clone()),
+            TargetPlatform::Unix,
+        )
+        .expect("unix default config path");
+        assert_eq!(
+            unix_default_cfg,
+            home.join(".config")
+                .join("agy-companion")
+                .join("config.json")
+        );
+        assert!(
+            !unix_default_cfg
+                .to_string_lossy()
+                .contains("Library/Application Support")
+        );
+
+        // XDG_DATA_HOME resolves without home; unset XDG ignores platform_data_local_dir.
+        let xdg_usage = resolve_usage_dir_for_platform(
+            Some("/xdg/data"),
+            Some(macos_app_support.clone()),
+            None,
+            TargetPlatform::Unix,
+        )
+        .expect("valid XDG_DATA_HOME resolves without home");
+        assert_eq!(
+            xdg_usage,
+            PathBuf::from("/xdg/data")
+                .join("agy-companion")
+                .join("usage")
+        );
+
+        let unix_default_usage = resolve_usage_dir_for_platform(
+            None,
+            Some(macos_app_support),
+            Some(home.clone()),
+            TargetPlatform::Unix,
+        )
+        .expect("unix default usage dir");
+        assert_eq!(
+            unix_default_usage,
+            home.join(".local")
+                .join("share")
+                .join("agy-companion")
+                .join("usage")
+        );
+        assert!(
+            !unix_default_usage
+                .to_string_lossy()
+                .contains("Library/Application Support")
+        );
+    }
+
+    #[test]
+    fn ignores_empty_and_relative_xdg_paths_and_rejects_traversal() {
+        let home = PathBuf::from("/Users/test");
+        let expected_cfg = home
+            .join(".config")
+            .join("agy-companion")
+            .join("config.json");
+        let expected_usage = home
+            .join(".local")
+            .join("share")
+            .join("agy-companion")
+            .join("usage");
+
+        // Unset, empty, whitespace, benign relative, leading-space, or Windows paths on Unix
+        // are ignored per XDG spec and fall back to ~/.config & ~/.local/share.
+        for ignored in [
+            "",
+            "   ",
+            "\t\n",
+            "relative/dir",
+            "./xdg",
+            " /tmp/xdg",
+            r"C:\Users\alice\cfg",
+        ] {
+            let cfg = resolve_config_path_for_platform(
+                None,
+                Some(ignored),
+                None,
+                Some(home.clone()),
+                TargetPlatform::Unix,
+            )
+            .unwrap_or_else(|err| {
+                panic!("expected fallback for XDG_CONFIG_HOME='{ignored}': {err:?}")
+            });
+            assert_eq!(
+                cfg, expected_cfg,
+                "config fallback mismatch for '{ignored}'"
+            );
+
+            let usage = resolve_usage_dir_for_platform(
+                Some(ignored),
+                None,
+                Some(home.clone()),
+                TargetPlatform::Unix,
+            )
+            .unwrap_or_else(|err| {
+                panic!("expected fallback for XDG_DATA_HOME='{ignored}': {err:?}")
+            });
+            assert_eq!(
+                usage, expected_usage,
+                "usage fallback mismatch for '{ignored}'"
+            );
+        }
+
+        // NUL bytes and '..' traversal fail closed on both absolute and relative XDG inputs.
+        for bad in [
+            "/tmp/xdg/../evil",
+            "/var/..",
+            "/../etc",
+            "../escape",
+            "..",
+            "foo/../bar",
+            "/tmp/xdg\0evil",
+            "rel\0evil",
+        ] {
+            let cfg_err = resolve_config_path_for_platform(
+                None,
+                Some(bad),
+                None,
+                Some(home.clone()),
+                TargetPlatform::Unix,
+            )
+            .expect_err(&format!("expected InvalidPath for XDG_CONFIG_HOME='{bad}'"));
+            assert!(
+                matches!(cfg_err, CoreError::InvalidPath { .. }),
+                "unexpected error for XDG_CONFIG_HOME='{bad}': {cfg_err:?}"
+            );
+
+            let usage_err = resolve_usage_dir_for_platform(
+                Some(bad),
+                None,
+                Some(home.clone()),
+                TargetPlatform::Unix,
+            )
+            .expect_err(&format!("expected InvalidPath for XDG_DATA_HOME='{bad}'"));
+            assert!(
+                matches!(usage_err, CoreError::InvalidPath { .. }),
+                "unexpected error for XDG_DATA_HOME='{bad}': {usage_err:?}"
+            );
+        }
+
+        // HomeDirUnavailable when XDG is unset/ignored and home is None.
+        assert!(matches!(
+            resolve_config_path_for_platform(None, None, None, None, TargetPlatform::Unix),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+        assert!(matches!(
+            resolve_config_path_for_platform(
+                None,
+                Some("relative/cfg"),
+                None,
+                None,
+                TargetPlatform::Unix
+            ),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+        assert!(matches!(
+            resolve_usage_dir_for_platform(None, None, None, TargetPlatform::Unix),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+        assert!(matches!(
+            resolve_usage_dir_for_platform(Some("./rel"), None, None, TargetPlatform::Unix),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+    }
+
+    #[test]
+    fn resolves_windows_known_folders_xdg_and_userprofile_fallback() {
+        let appdata = PathBuf::from(r"C:\Users\alice\AppData\Roaming");
+        let localappdata = PathBuf::from(r"C:\Users\alice\AppData\Local");
+        let userprofile = PathBuf::from(r"C:\Users\alice");
+
+        // Known folders (%APPDATA% and %LOCALAPPDATA%) resolve even when home is None.
+        let win_cfg = resolve_config_path_for_platform(
+            None,
+            None,
+            Some(appdata.clone()),
+            None,
+            TargetPlatform::Windows,
+        )
+        .expect("Windows APPDATA config path");
+        assert_eq!(win_cfg, appdata.join("agy-companion").join("config.json"));
+
+        let win_usage = resolve_usage_dir_for_platform(
+            None,
+            Some(localappdata.clone()),
+            None,
+            TargetPlatform::Windows,
+        )
+        .expect("Windows LOCALAPPDATA usage dir");
+        assert_eq!(win_usage, localappdata.join("agy-companion").join("usage"));
+
+        // Fallback to %USERPROFILE% when platform Known Folder is None or empty/blank.
+        for missing_dir in [None, Some(PathBuf::from("")), Some(PathBuf::from("   "))] {
+            let fallback_cfg = resolve_config_path_for_platform(
+                None,
+                None,
+                missing_dir.clone(),
+                Some(userprofile.clone()),
+                TargetPlatform::Windows,
+            )
+            .expect("Windows USERPROFILE config fallback");
+            assert_eq!(
+                fallback_cfg,
+                userprofile
+                    .join(".config")
+                    .join("agy-companion")
+                    .join("config.json")
+            );
+
+            let fallback_usage = resolve_usage_dir_for_platform(
+                None,
+                missing_dir,
+                Some(userprofile.clone()),
+                TargetPlatform::Windows,
+            )
+            .expect("Windows USERPROFILE usage fallback");
+            assert_eq!(
+                fallback_usage,
+                userprofile
+                    .join(".local")
+                    .join("share")
+                    .join("agy-companion")
+                    .join("usage")
+            );
+        }
+
+        // HomeDirUnavailable when both Known Folder and home are None.
+        assert!(matches!(
+            resolve_config_path_for_platform(None, None, None, None, TargetPlatform::Windows),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+        assert!(matches!(
+            resolve_usage_dir_for_platform(None, None, None, TargetPlatform::Windows),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+
+        // AGY_COMPANION_CONFIG overrides Windows XDG & %APPDATA% (and short-circuits bad XDG).
+        let env_cfg = resolve_config_path_for_platform(
+            Some(r"D:\work\agy-config.json"),
+            Some(r"C:\Users\..\Admin"),
+            Some(appdata.clone()),
+            Some(userprofile.clone()),
+            TargetPlatform::Windows,
+        )
+        .expect("AGY_COMPANION_CONFIG overrides Windows XDG and APPDATA");
+        assert_eq!(env_cfg, PathBuf::from(r"D:\work\agy-config.json"));
+
+        // Invalid backslash traversal in AGY_COMPANION_CONFIG fails closed on Windows.
+        let bad_env_cfg = resolve_config_path_for_platform(
+            Some(r"C:\Users\alice\..\evil.json"),
+            Some(r"C:\Users\alice\xdg"),
+            Some(appdata.clone()),
+            Some(userprofile.clone()),
+            TargetPlatform::Windows,
+        )
+        .expect_err("Windows backslash traversal in env override rejected");
+        assert!(matches!(bad_env_cfg, CoreError::InvalidPath { .. }));
+
+        // Valid absolute Windows XDG values (drive-rooted, lowercase drive, forward-slash drive,
+        // UNC including UTF-8, verbatim, benign dotted segments) override %APPDATA% / %LOCALAPPDATA%.
+        for valid_xdg in [
+            r"C:\Users\alice\xdg",
+            r"c:\foo",
+            "D:/Users/alice/xdg",
+            r"\\server\share\xdg",
+            "//server/share/xdg",
+            r"\\é\ø",
+            r"\\?\C:\Users\alice\xdg",
+            r"\\?\c:\",
+            r"\\?\UNC\server\share\xdg",
+            r"\\?\UNC\é\ø",
+            r"C:\Users\my..dir",
+            r"C:\Users\...",
+        ] {
+            let xdg_cfg = resolve_config_path_for_platform(
+                None,
+                Some(valid_xdg),
+                Some(appdata.clone()),
+                None,
+                TargetPlatform::Windows,
+            )
+            .unwrap_or_else(|err| {
+                panic!("valid Windows XDG_CONFIG_HOME '{valid_xdg}' failed: {err:?}")
+            });
+            assert_eq!(
+                xdg_cfg,
+                PathBuf::from(valid_xdg)
+                    .join("agy-companion")
+                    .join("config.json")
+            );
+
+            let xdg_usage = resolve_usage_dir_for_platform(
+                Some(valid_xdg),
+                Some(localappdata.clone()),
+                None,
+                TargetPlatform::Windows,
+            )
+            .unwrap_or_else(|err| {
+                panic!("valid Windows XDG_DATA_HOME '{valid_xdg}' failed: {err:?}")
+            });
+            assert_eq!(
+                xdg_usage,
+                PathBuf::from(valid_xdg).join("agy-companion").join("usage")
+            );
+        }
+
+        // Non-absolute Windows XDG values fall back to %APPDATA% / %LOCALAPPDATA%.
+        for ignored_win_xdg in [
+            "",
+            "   ",
+            r"relative\dir",
+            r".\cfg",
+            "C:relative",
+            r"\rooted",
+            "/unix/path",
+            r"\\",
+            r"\\server",
+            r"\\server\",
+            r"\\server\.",
+            r"\\server\?",
+            r"\\ . \share",
+            r"\\ ? \share",
+            r"\\.\COM1",
+            r"\\.\pipe\foo",
+            "//./COM1",
+            r"\\?\COM1",
+            r"\\?\C:/foo",
+            r"\\?\UNC\server\",
+            r"\\?\UNC\server\.",
+            r"\\?\UNC\server\?",
+            r"\\?\UNC\ . \share",
+            "\\\\?\\é\\foo",
+            "é:\\foo",
+            "C:é",
+            "é:",
+            "🔥:\\foo",
+            r" C:\Users\alice\xdg",
+        ] {
+            let cfg = resolve_config_path_for_platform(
+                None,
+                Some(ignored_win_xdg),
+                Some(appdata.clone()),
+                Some(userprofile.clone()),
+                TargetPlatform::Windows,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected APPDATA fallback for Windows XDG_CONFIG_HOME='{ignored_win_xdg}': {err:?}"
+                )
+            });
+            assert_eq!(
+                cfg,
+                appdata.join("agy-companion").join("config.json"),
+                "Windows config fallback mismatch for '{ignored_win_xdg}'"
+            );
+
+            let usage = resolve_usage_dir_for_platform(
+                Some(ignored_win_xdg),
+                Some(localappdata.clone()),
+                Some(userprofile.clone()),
+                TargetPlatform::Windows,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "expected LOCALAPPDATA fallback for Windows XDG_DATA_HOME='{ignored_win_xdg}': {err:?}"
+                )
+            });
+            assert_eq!(
+                usage,
+                localappdata.join("agy-companion").join("usage"),
+                "Windows usage fallback mismatch for '{ignored_win_xdg}'"
+            );
+        }
+
+        // Windows traversal & NUL payloads fail closed even when tests run on macOS/Linux.
+        for bad_win_xdg in [
+            r"C:\Users\alice\..\evil",
+            "C:/Users/alice/../evil",
+            r"C:\a\b\..",
+            r"C:..\evil",
+            "C:..",
+            r"..\escape",
+            r"\\server\share\..\evil",
+            r"\\?\C:\Users\..\Admin",
+            "C:\\Users\\alice\\xdg\0bad",
+        ] {
+            let cfg_err = resolve_config_path_for_platform(
+                None,
+                Some(bad_win_xdg),
+                Some(appdata.clone()),
+                Some(userprofile.clone()),
+                TargetPlatform::Windows,
+            )
+            .expect_err(&format!(
+                "expected InvalidPath for Windows XDG_CONFIG_HOME='{bad_win_xdg}'"
+            ));
+            assert!(
+                matches!(cfg_err, CoreError::InvalidPath { .. }),
+                "unexpected error for '{bad_win_xdg}': {cfg_err:?}"
+            );
+
+            let usage_err = resolve_usage_dir_for_platform(
+                Some(bad_win_xdg),
+                Some(localappdata.clone()),
+                Some(userprofile.clone()),
+                TargetPlatform::Windows,
+            )
+            .expect_err(&format!(
+                "expected InvalidPath for Windows XDG_DATA_HOME='{bad_win_xdg}'"
+            ));
+            assert!(
+                matches!(usage_err, CoreError::InvalidPath { .. }),
+                "unexpected error for '{bad_win_xdg}': {usage_err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_whitespace_traversal_and_nul_in_home_and_known_folders() {
+        let valid_win_home = PathBuf::from(r"C:\Users\alice");
+
+        // 1. Empty and whitespace-only home -> HomeDirUnavailable on both Unix & Windows
+        //    and via public resolve_config_path / resolve_usage_dir wrappers.
+        for blank in ["", "   ", "\t\n"] {
+            let blank_home = Some(PathBuf::from(blank));
+
+            for platform in [TargetPlatform::Unix, TargetPlatform::Windows] {
+                let cfg_err = resolve_config_path_for_platform(
+                    None,
+                    None,
+                    None,
+                    blank_home.clone(),
+                    platform,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(cfg_err, CoreError::HomeDirUnavailable),
+                    "expected HomeDirUnavailable for {platform:?} config home='{blank}', got {cfg_err:?}"
+                );
+
+                let usage_err =
+                    resolve_usage_dir_for_platform(None, None, blank_home.clone(), platform)
+                        .unwrap_err();
+                assert!(
+                    matches!(usage_err, CoreError::HomeDirUnavailable),
+                    "expected HomeDirUnavailable for {platform:?} usage home='{blank}', got {usage_err:?}"
+                );
+            }
+
+            let pub_cfg_err = resolve_config_path(None, blank_home.clone()).unwrap_err();
+            assert!(
+                matches!(pub_cfg_err, CoreError::HomeDirUnavailable),
+                "expected HomeDirUnavailable for public resolve_config_path home='{blank}', got {pub_cfg_err:?}"
+            );
+
+            let pub_usage_err = resolve_usage_dir(blank_home).unwrap_err();
+            assert!(
+                matches!(pub_usage_err, CoreError::HomeDirUnavailable),
+                "expected HomeDirUnavailable for public resolve_usage_dir home='{blank}', got {pub_usage_err:?}"
+            );
+        }
+
+        // 2. Traversal and NUL in home fail closed with InvalidPath on Unix (and public wrappers).
+        for bad_unix_home in ["/Users/alice/../evil", "/Users/alice\0evil"] {
+            let bad_home = Some(PathBuf::from(bad_unix_home));
+
+            let cfg_err = resolve_config_path_for_platform(
+                None,
+                None,
+                None,
+                bad_home.clone(),
+                TargetPlatform::Unix,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(cfg_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for Unix config home='{bad_unix_home}', got {cfg_err:?}"
+            );
+
+            let usage_err =
+                resolve_usage_dir_for_platform(None, None, bad_home.clone(), TargetPlatform::Unix)
+                    .unwrap_err();
+            assert!(
+                matches!(usage_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for Unix usage home='{bad_unix_home}', got {usage_err:?}"
+            );
+
+            let pub_cfg_err = resolve_config_path(None, bad_home.clone()).unwrap_err();
+            assert!(
+                matches!(pub_cfg_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for public resolve_config_path home='{bad_unix_home}', got {pub_cfg_err:?}"
+            );
+
+            let pub_usage_err = resolve_usage_dir(bad_home).unwrap_err();
+            assert!(
+                matches!(pub_usage_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for public resolve_usage_dir home='{bad_unix_home}', got {pub_usage_err:?}"
+            );
+        }
+
+        // 3. Traversal and NUL in Windows home fail closed with InvalidPath.
+        for bad_win_home in [r"C:\Users\..\evil", "C:\\Users\\alice\0evil"] {
+            let bad_home = Some(PathBuf::from(bad_win_home));
+
+            let cfg_err = resolve_config_path_for_platform(
+                None,
+                None,
+                None,
+                bad_home.clone(),
+                TargetPlatform::Windows,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(cfg_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for Windows config home='{bad_win_home}', got {cfg_err:?}"
+            );
+
+            let usage_err =
+                resolve_usage_dir_for_platform(None, None, bad_home, TargetPlatform::Windows)
+                    .unwrap_err();
+            assert!(
+                matches!(usage_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for Windows usage home='{bad_win_home}', got {usage_err:?}"
+            );
+        }
+
+        // 4. Traversal and NUL in Windows platform_config_dir / platform_data_local_dir fail closed
+        //    even when a valid home fallback is present.
+        for bad_known_folder in [r"C:\Users\..\evil", "C:\\Users\\alice\0evil"] {
+            let bad_dir = Some(PathBuf::from(bad_known_folder));
+
+            let cfg_err = resolve_config_path_for_platform(
+                None,
+                None,
+                bad_dir.clone(),
+                Some(valid_win_home.clone()),
+                TargetPlatform::Windows,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(cfg_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for Windows platform_config_dir='{bad_known_folder}', got {cfg_err:?}"
+            );
+
+            let usage_err = resolve_usage_dir_for_platform(
+                None,
+                bad_dir,
+                Some(valid_win_home.clone()),
+                TargetPlatform::Windows,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(usage_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for Windows platform_data_local_dir='{bad_known_folder}', got {usage_err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_rename_with_backoff_retries_only_permission_denied() {
+        use std::time::Duration;
+
+        // 1. Succeeds on attempt 1 -> 1 call, 0 sleeps.
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let res = retry_rename_with_backoff(
+            &WINDOWS_RENAME_BACKOFFS,
+            || {
+                attempts += 1;
+                Ok(())
+            },
+            |d| sleeps.push(d),
+        );
+        assert!(res.is_ok());
+        assert_eq!(attempts, 1);
+        assert!(sleeps.is_empty());
+
+        // 2. PermissionDenied on attempt 1, succeeds on attempt 2 -> 2 calls, [25ms].
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let res = retry_rename_with_backoff(
+            &WINDOWS_RENAME_BACKOFFS,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::new(ErrorKind::PermissionDenied, "locked"))
+                } else {
+                    Ok(())
+                }
+            },
+            |d| sleeps.push(d),
+        );
+        assert!(res.is_ok());
+        assert_eq!(attempts, 2);
+        assert_eq!(sleeps, vec![Duration::from_millis(25)]);
+
+        // 3. PermissionDenied on attempts 1 & 2, succeeds on attempt 3 -> 3 calls, [25ms, 50ms].
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let res = retry_rename_with_backoff(
+            &WINDOWS_RENAME_BACKOFFS,
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::new(ErrorKind::PermissionDenied, "locked"))
+                } else {
+                    Ok(())
+                }
+            },
+            |d| sleeps.push(d),
+        );
+        assert!(res.is_ok());
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_millis(25), Duration::from_millis(50)]
+        );
+
+        // 4. Exhausted (all 3 PermissionDenied) -> Err(PermissionDenied), 3 calls, NO 3rd sleep.
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let err = retry_rename_with_backoff(
+            &WINDOWS_RENAME_BACKOFFS,
+            || {
+                attempts += 1;
+                Err(std::io::Error::new(ErrorKind::PermissionDenied, "locked"))
+            },
+            |d| sleeps.push(d),
+        )
+        .expect_err("exhausted retries must fail");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(attempts, WINDOWS_RENAME_MAX_ATTEMPTS);
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_millis(25), Duration::from_millis(50)]
+        );
+
+        // 5. Non-PermissionDenied on attempt 1 aborts immediately -> 1 call, 0 sleeps.
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::AlreadyExists,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            let mut attempts = 0;
+            let mut sleeps = Vec::new();
+            let err = retry_rename_with_backoff(
+                &WINDOWS_RENAME_BACKOFFS,
+                || {
+                    attempts += 1;
+                    Err(std::io::Error::new(kind, "non-retryable"))
+                },
+                |d| sleeps.push(d),
+            )
+            .expect_err("non-PermissionDenied must fail immediately");
+            assert_eq!(err.kind(), kind);
+            assert_eq!(attempts, 1);
+            assert!(sleeps.is_empty());
+        }
+
+        // 6. PermissionDenied on attempt 1, then NotFound on attempt 2 -> immediate abort.
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let err = retry_rename_with_backoff(
+            &WINDOWS_RENAME_BACKOFFS,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::new(ErrorKind::PermissionDenied, "locked"))
+                } else {
+                    Err(std::io::Error::new(ErrorKind::NotFound, "gone"))
+                }
+            },
+            |d| sleeps.push(d),
+        )
+        .expect_err("mid-sequence non-PermissionDenied must abort");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(attempts, 2);
+        assert_eq!(sleeps, vec![Duration::from_millis(25)]);
+
+        // 7. Real filesystem smoke test of retry_rename_on_permission_denied replacing a file.
+        let tmp = TempDir::new().expect("temp dir");
+        let src = tmp.path().join("config.json.tmp");
+        let dst = tmp.path().join("config.json");
+        fs::write(&dst, "old").expect("write old dst");
+        fs::write(&src, "new").expect("write new src");
+
+        retry_rename_on_permission_denied(&src, &dst).expect("rename smoke test succeeds");
+        assert!(!src.exists());
+        assert_eq!(fs::read_to_string(&dst).expect("read dst"), "new");
+    }
+
+    #[test]
+    fn save_secure_cleans_up_temp_file_when_rename_fails() {
+        let tmp = TempDir::new().expect("temp dir");
+        let target_is_dir = tmp.path().join("config.json");
+        fs::create_dir(&target_is_dir).expect("create directory at target path");
+
+        let cfg = Config::default();
+        let err = cfg
+            .save_secure(&target_is_dir)
+            .expect_err("renaming file over directory must fail");
+        assert!(matches!(err, CoreError::Io { .. }));
+
+        let leftover_temps: Vec<_> = fs::read_dir(tmp.path())
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover_temps.is_empty(),
+            "temp files left behind after failed rename: {leftover_temps:?}"
+        );
     }
 }
