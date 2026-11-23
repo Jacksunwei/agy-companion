@@ -32,3 +32,5 @@ ui/dist/*
 build/
 coverage/
 target/
+packages/npm/platforms/
+*.egg-info/

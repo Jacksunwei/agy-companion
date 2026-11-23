@@ -1,0 +1,48 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "agy-companion"
+version = "0.1.0"
+description = "Bring your own models (BYOM) and track token usage and costs in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and embedded MCP App Settings UI."
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+keywords = [
+  "antigravity",
+  "agy",
+  "byom",
+  "proxy",
+  "sidecar",
+  "gemini",
+  "cache",
+  "ollama",
+  "usage",
+  "cost",
+  "mcp",
+  "companion",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.urls]
+Homepage = "https://github.com/Jacksunwei/agy-companion"
+Repository = "https://github.com/Jacksunwei/agy-companion"
+Issues = "https://github.com/Jacksunwei/agy-companion/issues"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "../../crates/companion-cli/Cargo.toml"
+python-source = "python"
+strip = true
