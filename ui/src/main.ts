@@ -80,6 +80,7 @@ const QUICK_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"] as const;
 interface AppState {
   connected: boolean;
   hydratedFromInitialResult: boolean;
+  snapshotEpoch: number;
   snapshot: SettingsSnapshot | null;
   savedPort: number;
   portChangedSinceSave: boolean;
@@ -94,6 +95,7 @@ interface AppState {
 const state: AppState = {
   connected: false,
   hydratedFromInitialResult: false,
+  snapshotEpoch: 0,
   snapshot: null,
   savedPort: DEFAULT_CONFIG.listen_port,
   portChangedSinceSave: false,
@@ -744,7 +746,7 @@ function updateBusyControls(refs: UiRefs): void {
   const anyWrite = state.saving || state.clearing;
   const canCall = state.connected && state.activeCalls < 4;
 
-  refs.refreshBtn.disabled = !canCall || state.refreshing;
+  refs.refreshBtn.disabled = !canCall || state.refreshing || anyWrite;
   refs.refreshBtn.textContent = state.refreshing ? "Refreshing..." : "Refresh";
 
   refs.saveBtn.disabled = !canCall || anyWrite;
@@ -759,6 +761,7 @@ function updateBusyControls(refs: UiRefs): void {
 }
 
 function renderStats(refs: UiRefs, snapshot: SettingsSnapshot | null): void {
+  const host = snapshot?.config.listen_host ?? DEFAULT_CONFIG.listen_host;
   const port = snapshot?.config.listen_port ?? DEFAULT_CONFIG.listen_port;
   if (!snapshot || !snapshot.proxy.reachable || snapshot.stats === null) {
     refs.statsBadge.className = "badge";
@@ -767,7 +770,7 @@ function renderStats(refs: UiRefs, snapshot: SettingsSnapshot | null): void {
     const detail = snapshot?.proxy.error ? ` (${snapshot.proxy.error})` : "";
     const emptyPanel = el("div", {
       className: "empty-state",
-      text: `Proxy is currently unreachable at 127.0.0.1:${port}${detail}. Start agy-companion serve or enable the proxy sidecar to see live session token and implicit-cache metrics.`,
+      text: `Proxy is currently unreachable at ${host}:${port}${detail}. Start agy-companion serve or enable the proxy sidecar to see live session token and implicit-cache metrics.`,
     });
     refs.statsBody.replaceChildren(emptyPanel);
     return;
@@ -826,7 +829,7 @@ function renderSnapshot(refs: UiRefs, snapshot: SettingsSnapshot, syncFormInputs
   state.savedPort = snapshot.config.listen_port;
 
   // Section 1: Proxy Status & Version Skew Bar
-  refs.endpointTag.textContent = `127.0.0.1:${snapshot.config.listen_port}`;
+  refs.endpointTag.textContent = `${snapshot.config.listen_host}:${snapshot.config.listen_port}`;
   refs.binaryVersionVal.textContent = `v${snapshot.binary_version}`;
 
   if (snapshot.proxy.reachable) {
@@ -992,16 +995,23 @@ async function main(): Promise<void> {
   }
 
   async function refreshSettings(syncFormInputs: boolean): Promise<void> {
-    if (!state.connected || state.refreshing) return;
+    if (!state.connected || state.refreshing || state.saving || state.clearing) return;
+    const epoch = state.snapshotEpoch;
     state.refreshing = true;
     updateBusyControls(refs);
     try {
       const outcome = await callTool("get_settings", {}, parseSettingsSnapshot);
+      if (state.snapshotEpoch !== epoch || state.saving || state.clearing) {
+        return;
+      }
       if (!outcome.ok) {
         showGlobalBanner(refs, "danger", "Failed to load settings", outcome.error);
         return;
       }
       hideGlobalBanner(refs);
+      if (outcome.data.proxy.reachable) {
+        state.portChangedSinceSave = false;
+      }
       renderSnapshot(refs, outcome.data, syncFormInputs);
     } finally {
       state.refreshing = false;
@@ -1027,6 +1037,10 @@ async function main(): Promise<void> {
     const parsed = parseSettingsSnapshot(payload);
     if (parsed) {
       state.hydratedFromInitialResult = true;
+      state.snapshotEpoch += 1;
+      if (parsed.proxy.reachable) {
+        state.portChangedSinceSave = false;
+      }
       hideGlobalBanner(refs);
       renderSnapshot(refs, parsed, true);
     }
@@ -1071,6 +1085,7 @@ async function main(): Promise<void> {
 
   refs.confirmClearBtn.addEventListener("click", async () => {
     if (!state.connected || state.clearing || state.saving) return;
+    state.snapshotEpoch += 1;
     state.clearing = true;
     clearFormFeedback(refs);
     updateBusyControls(refs);
@@ -1129,6 +1144,7 @@ async function main(): Promise<void> {
     }
 
     const previousPort = state.savedPort;
+    state.snapshotEpoch += 1;
     state.saving = true;
     clearFormFeedback(refs);
     updateBusyControls(refs);

@@ -1,7 +1,7 @@
-"""Tier 1: Core Feature Coverage (76 isolated happy-path opaque-box E2E tests).
+"""Tier 1: Core Feature Coverage (82 isolated happy-path opaque-box E2E tests).
 
-Covers all 12 core features (6–7 tests per feature F1–F12 = 73 tests) plus 3
-additive feature tests for F14 & F15.
+Covers all 12 core features (6–7 tests per feature F1–F12 = 74 tests) plus 8
+additive feature tests for F14, F15 & F16 (XDG paths).
 """
 
 from __future__ import annotations
@@ -1045,6 +1045,33 @@ class TestTier1F7UiBundle(E2ETestCase):
         self.assertIsNone(re.search(r'<script[^>]+src=["\']\./assets/', html, re.IGNORECASE))
         self.assertIsNone(re.search(r'<link[^>]+href=["\']\./assets/', html, re.IGNORECASE))
 
+    def test_t1_f7_ui_src_guards_stale_refresh_and_disables_refresh_during_writes(self) -> None:
+        """ui/src/main.ts tracks monotonic snapshotEpoch, guards stale get_settings, and disables refresh during writes."""
+        main_ts = self.repo_root / "ui" / "src" / "main.ts"
+        self.assertTrue(main_ts.is_file(), f"Missing {main_ts}")
+        src = _strip_ts_comments(main_ts.read_text(encoding="utf-8"))
+        self.assertIn("snapshotEpoch", src, "Expected monotonic snapshotEpoch in ui/src/main.ts")
+        self.assertRegex(
+            src,
+            r"refs\.refreshBtn\.disabled\s*=\s*!canCall\s*\|\|\s*state\.refreshing\s*\|\|\s*anyWrite",
+            "refreshBtn must be disabled while save_settings or clear_api_key is in flight",
+        )
+        self.assertRegex(
+            src,
+            r"state\.snapshotEpoch\s*!==\s*epoch",
+            "refreshSettings must drop stale get_settings responses when snapshotEpoch advanced",
+        )
+        self.assertRegex(
+            src,
+            r"refs\.endpointTag\.textContent\s*=\s*`\$\{snapshot\.config\.listen_host\}:\$\{snapshot\.config\.listen_port\}`",
+            "endpointTag should render snapshot.config.listen_host dynamically instead of hardcoded 127.0.0.1",
+        )
+        self.assertRegex(
+            src,
+            r"if\s*\(\s*outcome\.data\.proxy\.reachable\s*\)\s*\{\s*state\.portChangedSinceSave\s*=\s*false;",
+            "refreshSettings should reset portChangedSinceSave once proxy is reachable again",
+        )
+
 
 class TestTier1F8McpServer(E2ETestCase):
     TIER = 1
@@ -1332,12 +1359,16 @@ class TestTier1F11PackagingShims(E2ETestCase):
     FEATURE = "F11"
 
     def test_t1_f11_npm_package_json_bin_and_optional_deps(self) -> None:
-        """packages/npm/agy-companion/package.json defines agy-companion/agyc bins and 5 optionalDeps."""
+        """packages/npm/agy-companion/package.json defines agy-companion/agyc bins, public publishConfig, and 5 optionalDeps."""
         pkg_path = self.repo_root / "packages" / "npm" / "agy-companion" / "package.json"
         self.assertTrue(pkg_path.is_file(), f"Missing {pkg_path}")
         pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
         self.assertEqual(pkg.get("name"), "agy-companion")
         self.assertEqual(pkg.get("version"), "0.1.0")
+        self.assertEqual(
+            pkg.get("publishConfig"),
+            {"registry": "https://registry.npmjs.org/", "access": "public"},
+        )
         bins = pkg.get("bin") or {}
         self.assertEqual(bins.get("agy-companion"), "bin/agy-companion.js")
         self.assertEqual(bins.get("agyc"), "bin/agy-companion.js")
@@ -1392,6 +1423,11 @@ class TestTier1F11PackagingShims(E2ETestCase):
                 if str(name).startswith("@agy-companion/"):
                     found_names.add(str(name))
                     self.assertEqual(data.get("version"), "0.1.0")
+                    self.assertEqual(
+                        data.get("publishConfig"),
+                        {"registry": "https://registry.npmjs.org/", "access": "public"},
+                        f"{name} missing expected public publishConfig: {data.get('publishConfig')!r}",
+                    )
                     self.assertTrue(isinstance(data.get("os"), list) and len(data["os"]) >= 1)
                     self.assertTrue(isinstance(data.get("cpu"), list) and len(data["cpu"]) >= 1)
             self.assertEqual(
@@ -1556,3 +1592,315 @@ class TestTier1F15LocalDevWorkflow(E2ETestCase):
         self.assertTrue(mode & 0o111, f"scripts/dev-install.sh is not executable: {oct(mode)}")
         res = run_cli(["bash", "-n", str(script)])
         self.assertEqual(res.returncode, 0, f"bash -n failed for dev-install.sh: {res.stderr}")
+
+    def test_t1_f15_dev_install_dry_run_install_and_uninstall_lifecycle(self) -> None:
+        """scripts/dev-install.sh handles --dry-run, --no-build link creation, and idempotent --uninstall."""
+        script = self.repo_root / "scripts" / "dev-install.sh"
+        self.assertTrue(script.is_file(), f"Missing {script}")
+        env = self.make_env()
+        plugins_dir = env.root / "dev_plugins"
+        link_path = plugins_dir / "agy-companion"
+        expected_target = (self.repo_root / "plugin").resolve()
+        proc_env = env.build_env()
+
+        # 1. --dry-run --no-build reports planned actions without creating directories or symlinks.
+        r_dry = run_cli(
+            [str(script), "--no-build", "--dry-run", "--plugins-dir", str(plugins_dir)],
+            env=proc_env,
+        )
+        self.assertEqual(r_dry.returncode, 0, f"dry-run failed:\n{r_dry.stdout}\n{r_dry.stderr}")
+        self.assertIn("[dry-run]", r_dry.stdout)
+        self.assertFalse(link_path.exists() or link_path.is_symlink())
+        self.assertFalse(plugins_dir.exists())
+
+        # 2. --no-build creates plugins dir and symlink pointing to ./plugin.
+        r_inst = run_cli(
+            [str(script), "--no-build", "--plugins-dir", str(plugins_dir)],
+            env=proc_env,
+        )
+        self.assertEqual(r_inst.returncode, 0, f"install failed:\n{r_inst.stdout}\n{r_inst.stderr}")
+        self.assertTrue(link_path.is_symlink(), f"Expected symlink at {link_path}")
+        self.assertEqual(link_path.resolve(), expected_target)
+
+        # 3. --uninstall --dry-run preserves the symlink.
+        r_udry = run_cli(
+            [str(script), "--uninstall", "--dry-run", "--plugins-dir", str(plugins_dir)],
+            env=proc_env,
+        )
+        self.assertEqual(r_udry.returncode, 0, f"uninstall dry-run failed:\n{r_udry.stdout}\n{r_udry.stderr}")
+        self.assertIn("[dry-run] rm --", r_udry.stdout)
+        self.assertTrue(link_path.is_symlink())
+
+        # 4. --uninstall removes the symlink cleanly.
+        r_uninst = run_cli(
+            [str(script), "--uninstall", "--plugins-dir", str(plugins_dir)],
+            env=proc_env,
+        )
+        self.assertEqual(r_uninst.returncode, 0, f"uninstall failed:\n{r_uninst.stdout}\n{r_uninst.stderr}")
+        self.assertFalse(link_path.exists() or link_path.is_symlink())
+
+        # 5. Repeated --uninstall is idempotent and exits 0.
+        r_idem = run_cli(
+            [str(script), "--uninstall", "--plugins-dir", str(plugins_dir)],
+            env=proc_env,
+        )
+        self.assertEqual(r_idem.returncode, 0, f"idempotent uninstall failed:\n{r_idem.stdout}\n{r_idem.stderr}")
+        self.assertIn("Nothing to uninstall", r_idem.stdout)
+
+
+class TestTier1F16XdgPaths(E2ETestCase):
+    TIER = 1
+    FEATURE = "F16"
+
+    def test_t1_f16_xdg_config_home_honored_across_cli_and_mcp(self) -> None:
+        """XDG_CONFIG_HOME is honored by models, serve, and ui-mcp when --config and AGY_COMPANION_CONFIG are unset."""
+        binary = self.require_binary()
+        env = self.make_env()
+        mock = self.start_mock_gemini(expected_api_key="AIzaSyXdgConfigTest12")
+        custom_xdg_cfg = env.root / "custom_xdg_cfg"
+        xdg_cfg_file = custom_xdg_cfg / "agy-companion" / "config.json"
+        port = find_free_port()
+        env.write_config(
+            env.make_config_dict(
+                listen_port=port,
+                base_url=mock.base_url,
+                api_key="AIzaSyXdgConfigTest12",
+                default_model="gemini-2.5-flash",
+            ),
+            path=xdg_cfg_file,
+        )
+
+        xdg_env = env.build_env(
+            extra={"XDG_CONFIG_HOME": str(custom_xdg_cfg)},
+            set_config_env=False,
+        )
+
+        # CLI `models --json` loads listen_port & default_model from XDG_CONFIG_HOME.
+        r_models = run_cli([str(binary), "models", "--json"], env=xdg_env)
+        self.assertEqual(r_models.returncode, 0, r_models.stderr)
+        models = extract_models_list(r_models.json_stdout())
+        self.assertTrue(
+            any(f"127.0.0.1:{port}/models/gemini-2.5-flash" in str(m.get("modelName", "")) for m in models),
+            f"Expected XDG port {port} and model in models output: {models!r}",
+        )
+
+        # `serve` without --config or --port binds XDG config port and forwards to mock.
+        proxy = self.start_proxy(
+            env,
+            port=port,
+            extra_env={"XDG_CONFIG_HOME": str(custom_xdg_cfg)},
+            pass_port_flag=False,
+            pass_config_flag=False,
+            set_config_env=False,
+        )
+        resp = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+            body=b'{"contents":[]}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(resp.status, 200, resp.text)
+        req = mock.last_request()
+        self.assertIsNotNone(req)
+        assert req is not None
+        self.assertEqual(req.header("x-goog-api-key"), "AIzaSyXdgConfigTest12")
+
+        # `ui-mcp` without --config loads the same XDG config (redacted).
+        mcp = self.start_mcp(
+            env,
+            extra_env={"XDG_CONFIG_HOME": str(custom_xdg_cfg)},
+            pass_config_flag=False,
+            set_config_env=False,
+        )
+        get_res = mcp.call_tool("get_settings", {})
+        mcp.assert_clean_stdout()
+        sc = get_res.get("structuredContent", {})
+        found_p, listen_port = find_key_recursive(sc, "listen_port")
+        found_m, model = _find_any_key(sc, ("gemini_default_model", "default_model"))
+        found_h, hint = find_key_recursive(sc, "api_key_hint")
+        self.assertTrue(found_p and listen_port == port, f"Bad listen_port in {sc!r}")
+        self.assertTrue(found_m and model == "gemini-2.5-flash", f"Bad model in {sc!r}")
+        self.assertTrue(found_h and hint == "AIza...st12", f"Bad hint in {sc!r}")
+
+    def test_t1_f16_xdg_data_home_honored_when_usage_dir_omitted(self) -> None:
+        """XDG_DATA_HOME/agy-companion/usage receives JSONL usage logs when config.usage_dir is omitted."""
+        env = self.make_env()
+        mock = self.start_mock_gemini(
+            default_usage={
+                "promptTokenCount": 420,
+                "cachedContentTokenCount": 120,
+                "candidatesTokenCount": 60,
+                "thoughtsTokenCount": 10,
+            }
+        )
+        custom_xdg_data = env.root / "custom_xdg_data"
+        expected_usage_dir = custom_xdg_data / "agy-companion" / "usage"
+        cfg = env.write_config(
+            env.make_config_dict(
+                base_url=mock.base_url,
+                api_key="AIzaSyXdgDataHome1234",
+                include_usage_dir=False,
+            )
+        )
+        self.assertNotIn("usage_dir", json.loads(cfg.read_text(encoding="utf-8")))
+
+        proxy = self.start_proxy(
+            env,
+            config_path=cfg,
+            extra_env={"XDG_DATA_HOME": str(custom_xdg_data)},
+        )
+        resp = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            body=b'{"contents":[]}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(resp.status, 200, resp.text)
+
+        files, events = poll_usage_events(expected_usage_dir, min_count=1, timeout=3.0)
+        self.assertGreaterEqual(len(files), 1, f"Expected JSONL under {expected_usage_dir}")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["input_tokens"], 420)
+        self.assertEqual(events[0]["cached_tokens"], 120)
+        self.assertEqual(stat.S_IMODE(os.stat(files[0]).st_mode), 0o600)
+        # Default IsolatedEnv usage_dir and $HOME/.local/share must remain untouched.
+        self.assertEqual(env.usage_files(), [])
+        self.assertEqual(env.usage_files(env.home_dir / ".local" / "share" / "agy-companion" / "usage"), [])
+
+    def test_t1_f16_config_precedence_cli_env_xdg_home(self) -> None:
+        """Config path precedence strictly follows: --config > AGY_COMPANION_CONFIG > XDG_CONFIG_HOME > $HOME/.config."""
+        env = self.make_env()
+        cli_cfg = env.root / "prec_cli" / "config.json"
+        env_cfg = env.root / "prec_env" / "config.json"
+        xdg_root = env.root / "prec_xdg"
+        xdg_cfg = xdg_root / "agy-companion" / "config.json"
+        home_cfg = env.home_dir / ".config" / "agy-companion" / "config.json"
+
+        env.write_config(env.make_config_dict(default_model="gemini-cli-win"), path=cli_cfg)
+        env.write_config(env.make_config_dict(default_model="gemini-env-win"), path=env_cfg)
+        env.write_config(env.make_config_dict(default_model="gemini-xdg-win"), path=xdg_cfg)
+        env.write_config(env.make_config_dict(default_model="gemini-home-win"), path=home_cfg)
+
+        def _query_model(
+            *,
+            pass_config_flag: bool,
+            config_path: Path | None,
+            extra_env: dict[str, str | None],
+        ) -> str:
+            mcp = self.start_mcp(
+                env,
+                config_path=config_path,
+                extra_env=extra_env,
+                pass_config_flag=pass_config_flag,
+                set_config_env=False,
+            )
+            sc = mcp.call_tool("get_settings", {}).get("structuredContent", {})
+            mcp.assert_clean_stdout()
+            found, model = _find_any_key(sc, ("gemini_default_model", "default_model"))
+            self.assertTrue(found, f"Missing default_model in {sc!r}")
+            return str(model)
+
+        # 1. --config beats AGY_COMPANION_CONFIG, XDG_CONFIG_HOME, and $HOME/.config
+        self.assertEqual(
+            _query_model(
+                pass_config_flag=True,
+                config_path=cli_cfg,
+                extra_env={"AGY_COMPANION_CONFIG": str(env_cfg), "XDG_CONFIG_HOME": str(xdg_root)},
+            ),
+            "gemini-cli-win",
+        )
+        # 2. AGY_COMPANION_CONFIG beats XDG_CONFIG_HOME and $HOME/.config
+        self.assertEqual(
+            _query_model(
+                pass_config_flag=False,
+                config_path=None,
+                extra_env={"AGY_COMPANION_CONFIG": str(env_cfg), "XDG_CONFIG_HOME": str(xdg_root)},
+            ),
+            "gemini-env-win",
+        )
+        # 3. XDG_CONFIG_HOME beats $HOME/.config
+        self.assertEqual(
+            _query_model(
+                pass_config_flag=False,
+                config_path=None,
+                extra_env={"AGY_COMPANION_CONFIG": None, "XDG_CONFIG_HOME": str(xdg_root)},
+            ),
+            "gemini-xdg-win",
+        )
+        # 4. Unset XDG_CONFIG_HOME falls back to $HOME/.config
+        self.assertEqual(
+            _query_model(
+                pass_config_flag=False,
+                config_path=None,
+                extra_env={"AGY_COMPANION_CONFIG": None, "XDG_CONFIG_HOME": None},
+            ),
+            "gemini-home-win",
+        )
+
+    def test_t1_f16_usage_dir_precedence_config_xdg_home(self) -> None:
+        """Usage dir precedence strictly follows: config.usage_dir > XDG_DATA_HOME > $HOME/.local/share."""
+        env = self.make_env()
+        mock = self.start_mock_gemini()
+        explicit_usage = env.root / "explicit_usage"
+        xdg_data = env.root / "prec_xdg_data"
+        xdg_usage = xdg_data / "agy-companion" / "usage"
+        home_usage = env.home_dir / ".local" / "share" / "agy-companion" / "usage"
+
+        # Tier 1: config.usage_dir beats XDG_DATA_HOME and $HOME/.local/share.
+        cfg1 = env.write_config(
+            env.make_config_dict(
+                base_url=mock.base_url,
+                api_key="AIzaSyUsagePrecOne123",
+                usage_dir=explicit_usage,
+            ),
+            path=env.root / "cfg1.json",
+        )
+        p1 = self.start_proxy(env, config_path=cfg1, extra_env={"XDG_DATA_HOME": str(xdg_data)})
+        self.assertEqual(
+            http_raw_request(
+                "127.0.0.1", p1.port, "POST", "/v1beta/models/gemini-2.5-pro:generateContent", body=b"{}"
+            ).status,
+            200,
+        )
+        _, ev1 = poll_usage_events(explicit_usage, min_count=1, timeout=3.0)
+        self.assertEqual(len(ev1), 1)
+        self.assertEqual(env.usage_files(xdg_usage), [])
+        self.assertEqual(env.usage_files(home_usage), [])
+        p1.stop()
+
+        # Tier 2: omitted config.usage_dir uses XDG_DATA_HOME/agy-companion/usage.
+        cfg2 = env.write_config(
+            env.make_config_dict(
+                base_url=mock.base_url,
+                api_key="AIzaSyUsagePrecTwo123",
+                include_usage_dir=False,
+            ),
+            path=env.root / "cfg2.json",
+        )
+        p2 = self.start_proxy(env, config_path=cfg2, extra_env={"XDG_DATA_HOME": str(xdg_data)})
+        self.assertEqual(
+            http_raw_request(
+                "127.0.0.1", p2.port, "POST", "/v1beta/models/gemini-2.5-pro:generateContent", body=b"{}"
+            ).status,
+            200,
+        )
+        _, ev2 = poll_usage_events(xdg_usage, min_count=1, timeout=3.0)
+        self.assertEqual(len(ev2), 1)
+        self.assertEqual(env.usage_files(home_usage), [])
+        p2.stop()
+
+        # Tier 3: omitted config.usage_dir and unset XDG_DATA_HOME falls back to $HOME/.local/share.
+        p3 = self.start_proxy(env, config_path=cfg2, extra_env={"XDG_DATA_HOME": None})
+        self.assertEqual(
+            http_raw_request(
+                "127.0.0.1", p3.port, "POST", "/v1beta/models/gemini-2.5-pro:generateContent", body=b"{}"
+            ).status,
+            200,
+        )
+        _, ev3 = poll_usage_events(home_usage, min_count=1, timeout=3.0)
+        self.assertEqual(len(ev3), 1)
+        p3.stop()

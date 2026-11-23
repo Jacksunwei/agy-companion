@@ -2,7 +2,7 @@
 set -euo pipefail
 unset CDPATH
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+REPO_ROOT="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
 cd -- "${REPO_ROOT}" >/dev/null
 
 TOTAL_CHECKS=7
@@ -176,7 +176,7 @@ check_zero_ai_attribution() {
 
   local hits=""
   local grep_rc=0
-  hits="$(printf '%s\n' "${log_output}" | LC_ALL=C grep -iE -- 'co-authored-by:.*(claude|gemini|copilot|openai|chatgpt|anthropic|antigravity|cursor|ai|bot)|generated with (claude|gemini|ai|copilot)')" || grep_rc=$?
+  hits="$(printf '%s\n' "${log_output}" | LC_ALL=C grep -iE -- 'co-authored-by:.*((claude|gemini|copilot|openai|chatgpt|anthropic|antigravity|cursor)|(^|[^[:alnum:]])(ai|bot)([^[:alnum:]]|$))|generated with[[:space:]]+((claude|gemini|copilot)|ai([^[:alnum:]]|$))')" || grep_rc=$?
   if [[ ${grep_rc} -gt 1 ]]; then
     fail "[3/${TOTAL_CHECKS}] Commit hygiene: grep failed scanning commit messages (exit ${grep_rc})"
   elif [[ ${grep_rc} -eq 0 && -n "${hits}" ]]; then
@@ -399,6 +399,9 @@ if not py_init.is_file():
     errors.append("missing packages/python/python/agy_companion/__init__.py")
 else:
     py_files = sorted(py_src_root.rglob("*.py"))
+    e2e_runner = root / "e2e" / "run_e2e.py"
+    if e2e_runner.is_file():
+        py_files.extend(sorted((root / "e2e").glob("*.py")))
     with tempfile.TemporaryDirectory() as td:
         for idx, py_file in enumerate(py_files):
             py_compile.compile(
@@ -528,8 +531,17 @@ PYEOF
     fi
   fi
 
+  # 5d. Run pure-stdlib E2E harness self-test when e2e/run_e2e.py is present (gracefully skipped in minimal repos)
+  local e2e_runner="${REPO_ROOT}/e2e/run_e2e.py"
+  if [[ -f "${e2e_runner}" ]]; then
+    if ! python3 -B "${e2e_runner}" --self-test >/dev/null 2>&1; then
+      fail "[5/${TOTAL_CHECKS}] Version sync & packaging: python3 -B e2e/run_e2e.py --self-test failed"
+      pkg_failed=1
+    fi
+  fi
+
   if [[ ${pkg_failed} -eq 0 ]]; then
-    pass "[5/${TOTAL_CHECKS}] Version sync & packaging: 4-way version ${py_out}, publishConfig, 5 platform manifests, node --check, execFileSync hygiene & py_compile passed"
+    pass "[5/${TOTAL_CHECKS}] Version sync & packaging: 4-way version ${py_out}, publishConfig, 5 platform manifests, node --check, execFileSync hygiene, py_compile & e2e self-test passed"
   fi
 }
 
@@ -593,7 +605,7 @@ check_rust_and_ui() {
         check6_failed=1
       fi
 
-      local ext_tag_pattern='<script[^>]+src=|<link[^>]+href=|<img[^>]+src=|<iframe|@import'
+      local ext_tag_pattern='<script[^>]*[[:space:]]src[[:space:]]*=|<link[^>]*[[:space:]]href[[:space:]]*=|<img[^>]*[[:space:]]src[[:space:]]*=|<iframe|@import'
       local ext_hits=""
       local ext_rc=0
       ext_hits="$(LC_ALL=C grep -inE -- "${ext_tag_pattern}" "${ui_bundle}")" || ext_rc=$?
@@ -606,7 +618,7 @@ check_rust_and_ui() {
         check6_failed=1
       fi
 
-      local bundle_sink_pattern='innerHTML|outerHTML|document\.write|localStorage|sessionStorage|XMLHttpRequest|(^|[^[:alnum:]_$])(eval|fetch)[[:space:]]*\('
+      local bundle_sink_pattern="${src_sink_pattern}"
       local bundle_hits=""
       local bundle_rc=0
       bundle_hits="$(LC_ALL=C grep -nE -- "${bundle_sink_pattern}" "${ui_bundle}")" || bundle_rc=$?

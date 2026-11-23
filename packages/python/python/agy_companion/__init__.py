@@ -80,7 +80,8 @@ def find_binary() -> Path | None:
 
     Resolution order:
     1. ``AGY_COMPANION_BIN`` environment variable (if set, non-empty, an
-       absolute path, and an executable regular file; relative values are
+       absolute path without ``..`` traversal components, and an executable
+       regular file; relative, non-executable, or traversal values are
        ignored and fall through).
     2. Bundled binary adjacent to this package directory.
     3. Installed wheel scripts directories (``sysconfig.get_path("scripts")``,
@@ -96,8 +97,10 @@ def find_binary() -> Path | None:
         stripped = env_override.strip()
         if stripped and "\x00" not in env_override:
             candidate = Path(stripped)
-            if candidate.is_absolute() and _is_executable_file(candidate):
-                return candidate
+            if candidate.is_absolute() and ".." not in candidate.parts:
+                resolved = _resolve_executable(candidate)
+                if resolved is not None:
+                    return resolved
 
     exe_name = _executable_name()
 

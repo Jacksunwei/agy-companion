@@ -1,4 +1,4 @@
-"""Pure-Python harness self-tests (`SELF-01` .. `SELF-19`).
+"""Pure-Python harness self-tests (`SELF-01` .. `SELF-21`).
 
 Runs via `python3 e2e/run_e2e.py --self-test` with zero external dependencies
 and without requiring the compiled `agy-companion` binary.
@@ -7,6 +7,7 @@ and without requiring the compiled `agy-companion` binary.
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import hashlib
 import http.client
 import json
@@ -19,6 +20,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock as unittest_mock
 
 from harness import (
     CompanionProcess,
@@ -536,7 +538,7 @@ class TestHarnessSelfTests(E2ETestCase):
 
         self.assertGreaterEqual(by_tier.get("T1", 0), 72, f"Tier 1 below target: {by_tier}")
         self.assertGreaterEqual(by_tier.get("T2", 0), 80, f"Tier 2 below target: {by_tier}")
-        self.assertGreaterEqual(by_tier.get("T3", 0), 14, f"Tier 3 below target: {by_tier}")
+        self.assertGreaterEqual(by_tier.get("T3", 0), 16, f"Tier 3 below target: {by_tier}")
         self.assertGreaterEqual(by_tier.get("T4", 0), 7, f"Tier 4 below target: {by_tier}")
         self.assertEqual(len(tests), len({t.name for t in tests}), "Duplicate test names detected")
 
@@ -547,11 +549,13 @@ class TestHarnessSelfTests(E2ETestCase):
             self.assertGreaterEqual(t1_count, 6, f"{feat} Tier 1 count < 6: {t1_count}")
             self.assertGreaterEqual(t2_count, 6, f"{feat} Tier 2 count < 6: {t2_count}")
 
-        # Additive F14 & F15 coverage check.
+        # Additive F14, F15 & F16 coverage check.
         self.assertGreaterEqual(by_feature.get("T1", {}).get("F14", 0), 2)
         self.assertGreaterEqual(by_feature.get("T1", {}).get("F15", 0), 1)
+        self.assertGreaterEqual(by_feature.get("T1", {}).get("F16", 0), 4)
         self.assertGreaterEqual(by_feature.get("T2", {}).get("F14", 0), 1)
         self.assertGreaterEqual(by_feature.get("T2", {}).get("F15", 0), 1)
+        self.assertGreaterEqual(by_feature.get("T2", {}).get("F16", 0), 2)
 
         # Execute runner CLI with --list and --list --json without requiring any binary.
         runner = Path(__file__).resolve().parent / "run_e2e.py"
@@ -750,3 +754,191 @@ class TestHarnessSelfTests(E2ETestCase):
         self.assertEqual(len(res_ff.records), 1)
         self.assertEqual(res_ff.records[0]["status"], "fail")
         self.assertIn("idx=0", res_ff.records[0]["test"])
+
+    def test_self_20_http_raw_request_retries_transient_enobufs_and_eagain(self) -> None:
+        """SELF-20: http_raw_request retries transient ENOBUFS/EAGAIN/EINTR and partial socket writes."""
+        mock_srv = self.start_mock_gemini()
+        mock_srv.enqueue(EchoChecksumAction())
+        payload = bytes((i % 251 for i in range(256 * 1024)))
+        expected_sha = hashlib.sha256(payload).hexdigest()
+
+        orig_connect = http.client.HTTPConnection.connect
+        faults = [
+            OSError(errno.ENOBUFS, "No buffer space available"),
+            OSError(errno.EAGAIN, "Resource temporarily unavailable"),
+            OSError(errno.EINTR, "Interrupted system call"),
+        ]
+        state = {"send_calls": 0, "fault_idx": 0}
+
+        class _FlakySocketProxy:
+            def __init__(self, real_sock: socket.socket) -> None:
+                self._real = real_sock
+
+            def send(self, data: Any, *args: Any, **kwargs: Any) -> int:
+                state["send_calls"] += 1
+                # Inject transient errors on early body writes (after headers are sent via sendall).
+                if state["send_calls"] in (2, 4, 6) and state["fault_idx"] < len(faults):
+                    exc = faults[state["fault_idx"]]
+                    state["fault_idx"] += 1
+                    raise exc
+                # Exercise partial-write offset advancement on every 3rd call.
+                mv = memoryview(data)
+                if state["send_calls"] == 3 and len(mv) > 4096:
+                    return self._real.send(mv[:4096], *args, **kwargs)
+                return self._real.send(data, *args, **kwargs)
+
+            def sendall(self, data: Any, *args: Any, **kwargs: Any) -> None:
+                # Headers use sendall(); body writes should use send(), but if legacy conn.send()
+                # calls sendall() for body chunks, inject ENOBUFS there too so the test fails on unfixed code.
+                mv = memoryview(data)
+                if len(mv) >= 32768 and state["fault_idx"] < len(faults):
+                    exc = faults[state["fault_idx"]]
+                    state["fault_idx"] += 1
+                    raise exc
+                self._real.sendall(data, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real, name)
+
+        def _wrapped_connect(conn: http.client.HTTPConnection) -> None:
+            orig_connect(conn)
+            assert conn.sock is not None
+            conn.sock = _FlakySocketProxy(conn.sock)  # type: ignore[assignment]
+
+        with unittest_mock.patch.object(http.client.HTTPConnection, "connect", _wrapped_connect):
+            resp = http_raw_request(
+                mock_srv.host,
+                mock_srv.port,
+                "POST",
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                body=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=5.0,
+                chunk_size=32768,
+            )
+
+        self.assertEqual(resp.status, 200)
+        echo = resp.json()["echo"]
+        self.assertEqual(echo["length"], len(payload))
+        self.assertEqual(echo["sha256"], expected_sha)
+        self.assertEqual(state["fault_idx"], len(faults), "Expected all 3 transient socket faults to be injected")
+
+    def test_self_21_dev_install_heredoc_scanner_edge_cases(self) -> None:
+        """SELF-21: dev-install.sh config.json mutation scanner handles all 10 heredoc/here-string/quote cases."""
+        from test_tier2_boundaries import scan_shell_script_for_config_json_mutations
+
+        cases: list[tuple[str, list[str], bool]] = [
+            # 1. Here-string <<<EOF must NOT enter heredoc skip mode -> catches mutation on next line.
+            (
+                "herestring_unquoted",
+                [
+                    "read -r x <<<EOF",
+                    'cp /tmp/evil "$HOME/.gemini/config/config.json"',
+                ],
+                True,
+            ),
+            # 2. Here-string <<< 'EOF' must NOT enter heredoc skip mode -> catches mutation.
+            (
+                "herestring_quoted",
+                [
+                    "read -r x <<< 'EOF'",
+                    'cp /tmp/evil "$HOME/.gemini/config/config.json"',
+                ],
+                True,
+            ),
+            # 3. Quoted <<EOF inside echo must NOT enter heredoc skip mode -> catches mutation.
+            (
+                "quoted_heredoc_in_echo",
+                [
+                    'echo "use cat <<EOF for help"',
+                    'cp /tmp/evil "$HOME/.gemini/config/config.json"',
+                ],
+                True,
+            ),
+            # 4. Backslash-escaped <<\EOF IS a real heredoc -> prose inside body is safe (no false positive).
+            (
+                "escaped_heredoc_body_safe",
+                [
+                    r"cat <<\EOF",
+                    "cp /tmp/example ~/.gemini/config/config.json",
+                    "EOF",
+                ],
+                False,
+            ),
+            # 5. Tab-stripped <<-\EOF IS a real heredoc -> tab-indented EOF terminates it, mutation after caught.
+            (
+                "escaped_tab_heredoc_then_mutation",
+                [
+                    r"cat <<-\EOF",
+                    "\tdo not mutate config.json",
+                    "\tEOF",
+                    'rm -f "$HOME/.gemini/config/config.json"',
+                ],
+                True,
+            ),
+            # 6. Partially backslash-escaped <<E\OF IS a real heredoc terminated by EOF.
+            (
+                "partial_escaped_heredoc_safe",
+                [
+                    r"cat <<E\OF",
+                    "echo '{}' > ~/.gemini/config/config.json",
+                    "EOF",
+                ],
+                False,
+            ),
+            # 7. Single-quoted <<'EOF' (used in scripts/dev-install.sh:16) IS a real heredoc.
+            (
+                "single_quoted_heredoc_safe",
+                [
+                    "cat <<'EOF'",
+                    "Never write > ~/.gemini/config/config.json",
+                    "EOF",
+                ],
+                False,
+            ),
+            # 8. Double-quoted <<"EOF" IS a real heredoc.
+            (
+                "double_quoted_heredoc_safe",
+                [
+                    'cat <<"EOF"',
+                    "cp /tmp/a ~/.gemini/config/config.json",
+                    "EOF",
+                ],
+                False,
+            ),
+            # 9. Tab-stripped <<-EOF IS a real heredoc terminated by tab-indented EOF.
+            (
+                "tab_stripped_heredoc_safe",
+                [
+                    "cat <<-EOF",
+                    "\techo '{}' > ~/.gemini/config/config.json",
+                    "\tEOF",
+                ],
+                False,
+            ),
+            # 10. Heredoc header redirecting to config.json MUST be caught on the header line.
+            (
+                "heredoc_header_redirect_caught",
+                [
+                    "cat <<EOF > ~/.gemini/config/config.json",
+                    '{"bad": true}',
+                    "EOF",
+                ],
+                True,
+            ),
+        ]
+
+        for name, script_lines, expect_offender in cases:
+            with self.subTest(case=name):
+                offenders = scan_shell_script_for_config_json_mutations(script_lines)
+                if expect_offender:
+                    self.assertTrue(
+                        len(offenders) > 0,
+                        f"Case {name}: expected mutation offender to be detected, got []",
+                    )
+                else:
+                    self.assertEqual(
+                        offenders,
+                        [],
+                        f"Case {name}: unexpected false-positive offenders: {offenders!r}",
+                    )
