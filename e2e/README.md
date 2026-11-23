@@ -1,6 +1,6 @@
 # `e2e/` — Opaque-Box 4-Tier E2E Test Suite for `agy-companion`
 
-Pure Python 3 standard-library opaque-box E2E test suite verifying all Milestone 1 user-facing features (**F1–F12**, plus additive **F14–F15** local-dev workflow checks) and all 8 Security Invariants (**S1–S8**).
+Pure Python 3 standard-library opaque-box E2E test suite verifying all Milestone 1 user-facing features (**F1–F12**, plus additive **F14–F16** docs, local-dev workflow & XDG path checks) and all 8 Security Invariants (**S1–S8**).
 
 - **Zero external dependencies**: Uses only Python 3 stdlib (`unittest`, `http.server`, `http.client`, `subprocess`, `socket`, `threading`, `tempfile`, `tomllib`, etc.).
 - **Strict test isolation**: Every test runs in a fresh `IsolatedEnv` (`tempfile.TemporaryDirectory`) with ambient secrets and proxy variables stripped (`GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `AGY_COMPANION_CONFIG`, `AGY_COMPANION_UI_HTML`, `AGY_COMPANION_BIN`, `ANTIGRAVITY_EXECUTABLE_DATA_DIR`). All child processes and mock servers are torn down via `ExitStack` + process-group `SIGTERM`→`SIGKILL` + `atexit` PID guards.
@@ -13,11 +13,11 @@ Pure Python 3 standard-library opaque-box E2E test suite verifying all Milestone
 | `harness.py` | `E2ETestCase`, `TestRuntimeConfig`, `IsolatedEnv`, `CompanionProcess`, `run_cli`, `http_raw_request`, `http_stream_request`, `poll_usage_events`, `poll_stats`, `find_key_recursive`, `resolve_binary` |
 | `mock_gemini.py` | Ephemeral HTTP/1.1 `MockGeminiServer` (exact request capture, chunked SSE, split UTF-8/CRLF, FIFO fault queues, `SO_LINGER` TCP RST, `EchoChecksumAction`) & `MockHealthServer` |
 | `mcp_client.py` | Strict newline-delimited JSON-RPC 2.0 `McpStdioClient` (stdout purity auditing, fast EOF detection, thread-safe stdin writes, `save_settings_smart` schema introspection) |
-| `test_tier1_features.py` | **Tier 1** — Core happy-path feature coverage (76 tests: 6–7 per F1–F12 + 3 for F14/F15) |
-| `test_tier2_boundaries.py` | **Tier 2** — Boundaries, corner cases, negative inputs & S1–S8 security tests (83 tests: 6–9 per F1–F12 + 2 for F14/F15) |
-| `test_tier3_combinations.py` | **Tier 3** — Pairwise cross-feature combinations (15 tests, including F15 live UI reload & symlink-aware launcher) |
+| `test_tier1_features.py` | **Tier 1** — Core happy-path feature coverage (82 tests: 6–7 per F1–F12 + 8 for F14/F15/F16) |
+| `test_tier2_boundaries.py` | **Tier 2** — Boundaries, corner cases, negative inputs & S1–S8 security tests (92 tests: 6–9 per F1–F12 + 5 for F14/F15/F16) |
+| `test_tier3_combinations.py` | **Tier 3** — Pairwise cross-feature combinations (16 tests, including F15 live UI reload, symlink-aware launcher & F16 XDG coordination) |
 | `test_tier4_scenarios.py` | **Tier 4** — Multi-step real-world end-to-end application workloads (7 tests) |
-| `test_self.py` | **Self-Tests** — 19 pure-Python harness self-tests (`SELF-01`..`SELF-19`), runnable without the Rust binary |
+| `test_self.py` | **Self-Tests** — 21 pure-Python harness self-tests (`SELF-01`..`SELF-21`), runnable without the Rust binary |
 
 ## Quick Usage
 

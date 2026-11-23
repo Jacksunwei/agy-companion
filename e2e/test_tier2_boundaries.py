@@ -1,18 +1,24 @@
-"""Tier 2: Boundary, Corner-Case, Negative & Security Tests (83 tests).
+"""Tier 2: Boundary, Corner-Case, Negative & Security Tests (92 tests).
 
-Covers all 12 core features (6–9 tests per feature F1–F12 = 81 tests) plus 2
-additive boundary tests for F14 & F15, enforcing Security Invariants S1–S8 and
-Ambiguity Guards A1–A15.
+Covers all 12 core features (6–9 tests per feature F1–F12 = 87 tests) plus 5
+additive boundary tests for F14, F15 & F16 (XDG boundaries), enforcing
+Security Invariants S1–S8 and Ambiguity Guards A1–A15.
 """
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
+import io
 import json
 import math
 import os
 import re
 import shutil
 import stat
+import sys
+import tarfile
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -1176,10 +1182,14 @@ class TestTier2F7UiBoundaries(E2ETestCase):
         self.assertLess(size, 500 * 1024, f"UI bundle too large: {size} bytes")
 
     def test_t2_f7_zero_forbidden_xss_dom_sinks_in_ui_src(self) -> None:
-        """ui/src/ has strictly 0 hits for forbidden XSS/DOM execution sinks (S4)."""
+        """ui/src/ has strictly 0 hits for all S5 forbidden XSS/DOM/network sinks."""
         src_dir = self.repo_root / "ui" / "src"
         self.assertTrue(src_dir.is_dir(), f"Missing {src_dir}")
-        pattern = re.compile(r"innerHTML|outerHTML|document\.write|dangerouslySetInnerHTML|\beval\(")
+        pattern = re.compile(
+            r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|dangerouslySetInnerHTML"
+            r"|new\s+Function|document\.cookie|XMLHttpRequest"
+            r"|(?<![A-Za-z0-9_$])(?:eval|fetch)\s*\("
+        )
         hits: list[str] = []
         for path in sorted(src_dir.rglob("*")):
             if not path.is_file():
@@ -1187,13 +1197,16 @@ class TestTier2F7UiBoundaries(E2ETestCase):
             for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if pattern.search(line):
                     hits.append(f"{path.relative_to(self.repo_root)}:{lineno}: {line.strip()}")
-        self.assertEqual(hits, [], f"Forbidden XSS/DOM sinks found:\n" + "\n".join(hits))
+        self.assertEqual(hits, [], "Forbidden XSS/DOM/network sinks found:\n" + "\n".join(hits))
 
     def test_t2_f7_zero_storage_and_blocking_dialogs_in_ui_src(self) -> None:
-        """ui/src/ has strictly 0 hits for localStorage/sessionStorage/alert/confirm/prompt (S4)."""
+        """ui/src/ has strictly 0 hits for localStorage/sessionStorage/document.cookie/alert/confirm/prompt (S5)."""
         src_dir = self.repo_root / "ui" / "src"
         self.assertTrue(src_dir.is_dir(), f"Missing {src_dir}")
-        pattern = re.compile(r"localStorage|sessionStorage|\balert\(|\bconfirm\(|\bprompt\(")
+        pattern = re.compile(
+            r"localStorage|sessionStorage|document\.cookie"
+            r"|(?<![A-Za-z0-9_$])(?:alert|confirm|prompt)\s*\("
+        )
         hits: list[str] = []
         for path in sorted(src_dir.rglob("*")):
             if not path.is_file():
@@ -1201,15 +1214,31 @@ class TestTier2F7UiBoundaries(E2ETestCase):
             for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if pattern.search(line):
                     hits.append(f"{path.relative_to(self.repo_root)}:{lineno}: {line.strip()}")
-        self.assertEqual(hits, [], f"Forbidden storage/dialog APIs found:\n" + "\n".join(hits))
+        self.assertEqual(hits, [], "Forbidden storage/dialog APIs found:\n" + "\n".join(hits))
 
     def test_t2_f7_no_external_cdn_scripts_or_stylesheets_in_bundle(self) -> None:
-        """ui/dist/index.html has zero external http(s) script or stylesheet links (S4)."""
+        """ui/dist/index.html has zero external tags (incl. whitespace around '=', img, iframe, @import) and zero S5 sinks."""
         dist = self.repo_root / "ui" / "dist" / "index.html"
         self.assertTrue(dist.is_file(), f"Missing {dist}")
         html = dist.read_text(encoding="utf-8")
-        self.assertIsNone(re.search(r'<script[^>]+src=["\']https?://', html, re.IGNORECASE))
-        self.assertIsNone(re.search(r'<link[^>]+href=["\']https?://', html, re.IGNORECASE))
+        ext_tag_pattern = re.compile(
+            r"<script[^>]*\ssrc\s*=|<link[^>]*\shref\s*=|<img[^>]*\ssrc\s*=|<iframe|@import",
+            re.IGNORECASE,
+        )
+        self.assertIsNone(
+            ext_tag_pattern.search(html),
+            f"Forbidden external resource tag found in ui/dist/index.html: {ext_tag_pattern.search(html)!r}",
+        )
+        bundle_sink_pattern = re.compile(
+            r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|dangerouslySetInnerHTML"
+            r"|localStorage|sessionStorage|document\.cookie|new\s+Function|XMLHttpRequest"
+            r"|(?<![A-Za-z0-9_$])(?:eval|alert|confirm|prompt|fetch)\s*\("
+        )
+        sink_match = bundle_sink_pattern.search(html)
+        self.assertIsNone(
+            sink_match,
+            f"Forbidden S5 sink found in ui/dist/index.html: {sink_match.group(0) if sink_match else ''!r}",
+        )
 
     def test_t2_f7_npmrc_overrides_airlock_registry(self) -> None:
         """ui/.npmrc pins public https://registry.npmjs.org/ with zero internal/auth tokens."""
@@ -1596,6 +1625,152 @@ class TestTier2F10PluginBoundaries(E2ETestCase):
         res = run_cli(["/bin/bash", str(iso_script), "--version"], env=proc_env, timeout=10.0)
         self.assertNotEqual(res.returncode, 0, f"Expected non-zero exit with bad override, stdout={res.stdout!r}")
 
+    def test_t2_f10_run_companion_sh_sha256_and_archive_security(self) -> None:
+        """run-companion.sh enforces SHA-256 verification, special checksum/tarball paths, and tarball safety (S8)."""
+        script = self.repo_root / "plugin" / "scripts" / "run-companion.sh"
+        self.assertTrue(script.is_file(), f"Missing {script}")
+        env = self.make_env()
+        work = env.root / "launcher_sec"
+        work.mkdir(parents=True, exist_ok=True)
+        proc_env = env.build_env()
+
+        def _make_tar_gz(dest: Path, entries: list[tuple[str, bytes | None, str | None]]) -> Path:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(dest, "w:gz") as tf:
+                for name, data, linkname in entries:
+                    ti = tarfile.TarInfo(name=name)
+                    if linkname is not None:
+                        ti.type = tarfile.SYMTYPE
+                        ti.linkname = linkname
+                        tf.addfile(ti)
+                    else:
+                        payload = data if data is not None else b""
+                        ti.size = len(payload)
+                        ti.mode = 0o755
+                        tf.addfile(ti, io.BytesIO(payload))
+            return dest
+
+        def _run_sourced(snippet: str, *, cwd: Path = work) -> Any:
+            cmd = ["bash", "-c", f'source "$1"; {snippet}', "_", str(script)]
+            return run_cli(cmd, env=proc_env, cwd=cwd, stdin_bytes=b"", timeout=10.0)
+
+        archive_name = "agy-companion-v0.1.0-darwin-arm64.tar.gz"
+        valid_payload = b"#!/bin/sh\necho ok\n"
+        valid_tar = _make_tar_gz(work / archive_name, [("agy-companion", valid_payload, None)])
+        valid_sha = hashlib.sha256(valid_tar.read_bytes()).hexdigest()
+
+        checksums = work / "checksums.txt"
+        checksums.write_text(f"{valid_sha}  {archive_name}\n", encoding="utf-8")
+
+        # 1. Valid archive + valid checksum succeeds & extracts exact bytes.
+        with self.subTest(case="valid_archive_and_sha256"):
+            out_dir = work / "extract_valid"
+            r = _run_sourced(
+                f'verify_sha256 "{valid_tar}" "{checksums}" "{archive_name}" && '
+                f'extract_verified_binary "{valid_tar}" "{out_dir}"'
+            )
+            self.assertEqual(r.returncode, 0, f"Expected valid archive to pass:\n{r.stdout}\n{r.stderr}")
+            extracted = Path(r.stdout.strip())
+            self.assertTrue(extracted.is_file())
+            self.assertEqual(extracted.read_bytes(), valid_payload)
+
+        # 2. Tampered SHA-256 fails closed.
+        with self.subTest(case="tampered_sha256"):
+            bad_cs = work / "bad_checksums.txt"
+            bad_cs.write_text(("0" * 64) + f"  {archive_name}\n", encoding="utf-8")
+            r = _run_sourced(f'verify_sha256 "{valid_tar}" "{bad_cs}" "{archive_name}"')
+            self.assertNotEqual(r.returncode, 0, "Tampered SHA-256 must fail")
+
+        # 3. Duplicate checksum entries fail closed.
+        with self.subTest(case="duplicate_checksum"):
+            dup_cs = work / "dup_checksums.txt"
+            dup_cs.write_text(f"{valid_sha}  {archive_name}\n{valid_sha}  {archive_name}\n", encoding="utf-8")
+            r = _run_sourced(f'lookup_expected_sha256 "{dup_cs}" "{archive_name}"')
+            self.assertNotEqual(r.returncode, 0, "Duplicate checksum entries must fail")
+
+        # 4. Relative checksum path containing '=' (CF-2) and leading '-' filename both succeed.
+        with self.subTest(case="checksum_path_with_equals_and_dash"):
+            eq_dir = work / "dir=1"
+            eq_dir.mkdir(parents=True, exist_ok=True)
+            (eq_dir / "checksums.txt").write_text(f"{valid_sha}  {archive_name}\n", encoding="utf-8")
+            r_eq = _run_sourced(f'lookup_expected_sha256 "dir=1/checksums.txt" "{archive_name}"', cwd=work)
+            self.assertEqual(r_eq.returncode, 0, f"dir=1/checksums.txt failed:\n{r_eq.stderr}")
+            self.assertEqual(r_eq.stdout.strip(), valid_sha)
+
+            dash_cs = work / "-checksums.txt"
+            dash_cs.write_text(f"{valid_sha}  {archive_name}\n", encoding="utf-8")
+            r_dash = _run_sourced(f'lookup_expected_sha256 "-checksums.txt" "{archive_name}"', cwd=work)
+            self.assertEqual(r_dash.returncode, 0, f"-checksums.txt failed:\n{r_dash.stderr}")
+            self.assertEqual(r_dash.stdout.strip(), valid_sha)
+
+        # 5. Tarball inside directory containing ':' (NEW-6 GNU tar host:file hazard) succeeds.
+        with self.subTest(case="tarball_dir_with_colon"):
+            colon_tar = _make_tar_gz(work / "dir:colon" / "plain.tar.gz", [("agy-companion", valid_payload, None)])
+            out_colon = work / "extract_colon"
+            r_col = _run_sourced(f'extract_verified_binary "dir:colon/plain.tar.gz" "{out_colon}"', cwd=work)
+            self.assertEqual(r_col.returncode, 0, f"colon tarball failed:\n{r_col.stderr}")
+            self.assertTrue(Path(r_col.stdout.strip()).is_file())
+            self.assertEqual(colon_tar.is_file(), True)
+
+        # 6. Malicious tarballs all fail closed.
+        malicious_cases: list[tuple[str, list[tuple[str, bytes | None, str | None]]]] = [
+            ("dotdot_traversal", [("../evil", b"x", None), ("agy-companion", valid_payload, None)]),
+            ("absolute_path", [("/tmp/evil", b"x", None), ("agy-companion", valid_payload, None)]),
+            ("symlink_binary", [("agy-companion", None, "/bin/sh")]),
+            ("duplicate_binary", [("agy-companion", valid_payload, None), ("./agy-companion", valid_payload, None)]),
+            ("empty_binary", [("agy-companion", b"", None)]),
+        ]
+        for name, entries in malicious_cases:
+            with self.subTest(malicious_tar=name):
+                bad_tar = _make_tar_gz(work / f"bad_{name}.tar.gz", entries)
+                out_bad = work / f"extract_{name}"
+                r_bad = _run_sourced(f'extract_verified_binary "{bad_tar}" "{out_bad}"')
+                self.assertNotEqual(
+                    r_bad.returncode,
+                    0,
+                    f"Malicious archive {name} should have been rejected, stdout={r_bad.stdout!r}",
+                )
+
+    def test_t2_f10_run_companion_sh_resolve_script_path_physical_cd_and_symlink_loop(self) -> None:
+        """resolve_script_path uses physical cd -P (avoiding symlink_dir/.. decoy) and stops symlink loops (NEW-1)."""
+        script = self.repo_root / "plugin" / "scripts" / "run-companion.sh"
+        self.assertTrue(script.is_file(), f"Missing {script}")
+        env = self.make_env()
+        base = env.root / "resolve_probe"
+        real_script = base / "real_repo" / "plugin" / "scripts" / "run-companion.sh"
+        real_sidecars = base / "real_repo" / "plugin" / "sidecars"
+        decoy_script = base / "other" / "scripts" / "run-companion.sh"
+        real_script.parent.mkdir(parents=True, exist_ok=True)
+        real_sidecars.mkdir(parents=True, exist_ok=True)
+        decoy_script.parent.mkdir(parents=True, exist_ok=True)
+        real_script.write_text("#!/bin/sh\n", encoding="utf-8")
+        decoy_script.write_text("#!/bin/sh\n", encoding="utf-8")
+        os.symlink(real_sidecars, base / "other" / "link_sidecars")
+
+        tricky_path = f"{base}/other/link_sidecars/../scripts/run-companion.sh"
+        r = run_cli(
+            ["bash", "-c", 'source "$1"; resolve_script_path "$2"', "_", str(script), tricky_path],
+            env=env.build_env(),
+        )
+        self.assertEqual(r.returncode, 0, f"resolve_script_path failed:\n{r.stderr}")
+        self.assertEqual(
+            Path(r.stdout.strip()).resolve(),
+            real_script.resolve(),
+            f"Expected physical script {real_script.resolve()}, got {r.stdout.strip()!r} (decoy={decoy_script})",
+        )
+
+        # Symlink loop (>40 hops) must exit non-zero cleanly.
+        loop_dir = base / "loop"
+        loop_dir.mkdir(parents=True, exist_ok=True)
+        os.symlink(loop_dir / "b", loop_dir / "a")
+        os.symlink(loop_dir / "a", loop_dir / "b")
+        r_loop = run_cli(
+            ["bash", "-c", 'source "$1"; resolve_script_path "$2"', "_", str(script), str(loop_dir / "a")],
+            env=env.build_env(),
+        )
+        self.assertNotEqual(r_loop.returncode, 0, "Symlink loop must exit non-zero")
+        self.assertIn("symlink loop", r_loop.stderr.lower())
+
 
 class TestTier2F11PackagingBoundaries(E2ETestCase):
     TIER = 2
@@ -1689,6 +1864,99 @@ class TestTier2F11PackagingBoundaries(E2ETestCase):
         for required in ("antigravity", "agy", "byom", "gemini"):
             self.assertIn(required, kws)
 
+    def test_t2_f11_python_find_binary_env_and_fallback_boundaries(self) -> None:
+        """Python find_binary() honors valid absolute AGY_COMPANION_BIN and rejects relative/non-exec/NUL/'..' paths."""
+        init_py = self.repo_root / "packages" / "python" / "python" / "agy_companion" / "__init__.py"
+        self.assertTrue(init_py.is_file(), f"Missing {init_py}")
+        env = self.make_env()
+        sub = env.root / "sub"
+        sub.mkdir(parents=True, exist_ok=True)
+        valid_exe = sub / "agy-companion"
+        valid_exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(valid_exe, 0o755)
+        non_exe = sub / "not-exec"
+        non_exe.write_text("plain\n", encoding="utf-8")
+        os.chmod(non_exe, 0o644)
+
+        probe_code = (
+            "import importlib.util, json, os, sys; "
+            "spec = importlib.util.spec_from_file_location('agy_c', sys.argv[1]); "
+            "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+            "mod._candidate_scripts_dirs = lambda: []; "
+            "res = mod.find_binary(); "
+            "print(json.dumps(None if res is None else str(res)))"
+        )
+
+        def _invoke(override_val: str | None) -> str | None:
+            p_env = env.build_env(extra={"PATH": "", "AGY_COMPANION_BIN": override_val})
+            r = run_cli([sys.executable, "-B", "-c", probe_code, str(init_py)], env=p_env, cwd=sub)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return json.loads(r.stdout)
+
+        # 1. Valid absolute executable file -> returns resolved Path.
+        self.assertEqual(_invoke(str(valid_exe)), str(valid_exe.resolve()))
+        # 2. Relative path -> ignored.
+        self.assertIsNone(_invoke("./agy-companion"))
+        # 3. Non-executable file -> ignored.
+        self.assertIsNone(_invoke(str(non_exe)))
+        # 4. Path containing '..' traversal -> rejected (NEW-5 / S6).
+        dotdot_path = f"{env.root}/sub/../sub/agy-companion"
+        self.assertIsNone(_invoke(dotdot_path), f"Expected '..' path {dotdot_path} to be rejected")
+        # 5. NUL byte in AGY_COMPANION_BIN (tested in-process since OS rejects NUL in subprocess env).
+        spec = importlib.util.spec_from_file_location("_e2e_py_find_bin_nul", init_py)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        fake_env = {"AGY_COMPANION_BIN": f"{valid_exe}\x00extra", "PATH": ""}
+        orig_environ = mod.os.environ
+        orig_scripts = mod._candidate_scripts_dirs
+        try:
+            mod.os.environ = fake_env  # type: ignore[assignment]
+            mod._candidate_scripts_dirs = lambda: []
+            self.assertIsNone(mod.find_binary())
+        finally:
+            mod.os.environ = orig_environ
+            mod._candidate_scripts_dirs = orig_scripts
+
+    def test_t2_f11_npm_shim_propagates_child_exit_code(self) -> None:
+        """bin/agy-companion.js launches the resolved platform binary via execFileSync and propagates exit codes."""
+        shim = self.repo_root / "packages" / "npm" / "agy-companion" / "bin" / "agy-companion.js"
+        self.assertTrue(shim.is_file(), f"Missing {shim}")
+        env = self.make_env()
+
+        # Detect current node process.platform and process.arch.
+        info_res = run_cli(
+            ["node", "-e", "console.log(JSON.stringify({p:process.platform,a:process.arch}))"],
+            env=env.build_env(),
+        )
+        self.assertEqual(info_res.returncode, 0, info_res.stderr)
+        info = info_res.json_stdout()
+        target_slug = f"{info['p']}-{info['a']}"
+        bin_name = "agy-companion.exe" if info["p"] == "win32" else "agy-companion"
+
+        # Build a stub @agy-companion/<target> package under a temporary NODE_PATH.
+        node_modules = env.root / "stub_node_modules"
+        pkg_bin_dir = node_modules / "@agy-companion" / target_slug / "bin"
+        pkg_bin_dir.mkdir(parents=True, exist_ok=True)
+        stub_bin = pkg_bin_dir / bin_name
+        stub_bin.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--fail" ]; then echo "failing:$2" >&2; exit 42; fi\n'
+            'echo "ok:$*"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        os.chmod(stub_bin, 0o755)
+
+        proc_env = env.build_env(extra={"NODE_PATH": str(node_modules)})
+        r_ok = run_cli(["node", str(shim), "--ok", "hello"], env=proc_env, cwd=env.root)
+        self.assertEqual(r_ok.returncode, 0, f"Expected exit 0:\n{r_ok.stdout}\n{r_ok.stderr}")
+        self.assertEqual(r_ok.stdout.strip(), "ok:--ok hello")
+
+        r_fail = run_cli(["node", str(shim), "--fail", "boom"], env=proc_env, cwd=env.root)
+        self.assertEqual(r_fail.returncode, 42, f"Expected exit 42, got {r_fail.returncode}:\n{r_fail.stderr}")
+        self.assertIn("failing:boom", r_fail.stderr)
+
 
 class TestTier2F12AgentCheckBoundaries(E2ETestCase):
     TIER = 2
@@ -1748,6 +2016,103 @@ class TestTier2F12AgentCheckBoundaries(E2ETestCase):
         fails = [ln for ln in res.stdout.splitlines() if ln.strip().startswith("FAIL")]
         self.assertEqual(fails, [])
 
+    def test_t2_f12_agent_check_ai_attribution_word_boundaries(self) -> None:
+        """Check 3 allows human names/emails (Craig, Kaitlyn, Abbott, @gmail.com) and blocks AI/bot trailers (CF-3a)."""
+        src_script = self.repo_root / "scripts" / "agent_check.sh"
+        self.assertTrue(src_script.is_file(), f"Missing {src_script}")
+
+        def _run_check3_on_commit_msg(message: str) -> tuple[bool, str]:
+            env = self.make_env()
+            repo = env.root / "synth_repo"
+            (repo / "scripts").mkdir(parents=True, exist_ok=True)
+            copied = repo / "scripts" / "agent_check.sh"
+            shutil.copy2(src_script, copied)
+            os.chmod(copied, 0o755)
+            p_env = env.build_env(
+                extra={
+                    "GIT_AUTHOR_NAME": "Test Author",
+                    "GIT_AUTHOR_EMAIL": "author@example.com",
+                    "GIT_COMMITTER_NAME": "Test Author",
+                    "GIT_COMMITTER_EMAIL": "author@example.com",
+                }
+            )
+            self.assertEqual(run_cli(["git", "init", "-q"], cwd=repo, env=p_env).returncode, 0)
+            (repo / "README.md").write_text("hello\n", encoding="utf-8")
+            self.assertEqual(run_cli(["git", "add", "README.md"], cwd=repo, env=p_env).returncode, 0)
+            self.assertEqual(run_cli(["git", "commit", "-q", "-m", message], cwd=repo, env=p_env).returncode, 0)
+            res = run_cli([str(copied)], cwd=repo, env=p_env, timeout=30.0)
+            check3_lines = [ln for ln in res.stdout.splitlines() if "[3/7]" in ln]
+            self.assertTrue(check3_lines, f"Missing [3/7] output:\n{res.stdout}\n{res.stderr}")
+            return check3_lines[0].startswith("PASS"), "\n".join(check3_lines)
+
+        benign_messages = [
+            "feat(core): add parser\n\nCo-Authored-By: Craig Smith <craig@example.com>",
+            "feat(core): add parser\n\nCo-Authored-By: Kaitlyn Doe <kaitlyn@example.com>",
+            "feat(core): add parser\n\nCo-Authored-By: Jane Abbott <jane@example.com>",
+            "feat(core): add parser\n\nCo-Authored-By: Alice <alice@gmail.com>",
+            "docs(readme): sync schema\n\nGenerated with Airtable",
+        ]
+        for msg in benign_messages:
+            with self.subTest(benign=msg.splitlines()[-1]):
+                passed, line = _run_check3_on_commit_msg(msg)
+                self.assertTrue(passed, f"False positive on benign commit message: {line}")
+
+        forbidden_messages = [
+            "feat(core): add parser\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+            "chore(deps): bump\n\nCo-Authored-By: dependabot[bot] <bot@example.com>",
+            "feat(core): add parser\n\nCo-Authored-By: AI Assistant <ai@example.com>",
+            "feat(core): add parser\n\nCo-Authored-By: My Bot <helper@example.com>",
+            "feat(core): add parser\n\nCo-Authored-By: GitHub Copilot <copilot@github.com>",
+            "docs(readme): draft\n\nGenerated with AI",
+            "docs(readme): draft\n\nGenerated with Claude",
+        ]
+        for msg in forbidden_messages:
+            with self.subTest(forbidden=msg.splitlines()[-1]):
+                passed, line = _run_check3_on_commit_msg(msg)
+                self.assertFalse(passed, f"Failed to block AI attribution trailer: {line}")
+
+    def test_t2_f12_agent_check_ui_ext_tag_whitespace_bypass(self) -> None:
+        """Check 6 rejects whitespace-before-'=' external tags and full S5 sinks in ui/dist/index.html (CF-3b, NEW-2)."""
+        src_script = self.repo_root / "scripts" / "agent_check.sh"
+        self.assertTrue(src_script.is_file(), f"Missing {src_script}")
+
+        def _run_check6_on_bundle(bundle_html: str) -> tuple[bool, str]:
+            env = self.make_env()
+            repo = env.root / "synth_ui_repo"
+            (repo / "scripts").mkdir(parents=True, exist_ok=True)
+            (repo / "ui" / "src").mkdir(parents=True, exist_ok=True)
+            (repo / "ui" / "dist").mkdir(parents=True, exist_ok=True)
+            copied = repo / "scripts" / "agent_check.sh"
+            shutil.copy2(src_script, copied)
+            os.chmod(copied, 0o755)
+            (repo / "ui" / "src" / "main.ts").write_text("export const ok = 1;\n", encoding="utf-8")
+            (repo / "ui" / "dist" / "index.html").write_text(bundle_html, encoding="utf-8")
+            p_env = env.build_env()
+            self.assertEqual(run_cli(["git", "init", "-q"], cwd=repo, env=p_env).returncode, 0)
+            res = run_cli([str(copied)], cwd=repo, env=p_env, timeout=30.0)
+            check6_lines = [ln for ln in res.stdout.splitlines() if "[6/7]" in ln]
+            self.assertTrue(check6_lines, f"Missing [6/7] output:\n{res.stdout}\n{res.stderr}")
+            return check6_lines[0].startswith("PASS"), "\n".join(check6_lines)
+
+        bad_bundles = {
+            "script_space_src": '<!doctype html><html><script src = "https://evil.com/x.js"></script></html>',
+            "link_space_href": '<!doctype html><html><link rel="stylesheet" href = "https://evil.com/x.css"></html>',
+            "img_space_src": '<!doctype html><html><img src = "https://evil.com/x.png"></html>',
+            "iframe_tag": '<!doctype html><html><iframe src="about:blank"></iframe></html>',
+            "css_import": "<!doctype html><html><style>@import url('https://evil.com/x.css');</style></html>",
+            "insertAdjacentHTML_sink": "<!doctype html><html><script>el.insertAdjacentHTML('beforeend','x')</script></html>",
+            "new_Function_sink": "<!doctype html><html><script>const f = new Function('return 1');</script></html>",
+            "document_cookie_sink": "<!doctype html><html><script>const c = document.cookie;</script></html>",
+        }
+        for name, html in bad_bundles.items():
+            with self.subTest(bad_bundle=name):
+                passed, line = _run_check6_on_bundle(html)
+                self.assertFalse(passed, f"Expected Check 6 FAIL for {name}, got: {line}")
+
+        clean_html = '<!doctype html><html><script data-src="foo">console.log("ok");</script></html>'
+        passed, line = _run_check6_on_bundle(clean_html)
+        self.assertTrue(passed, f"Unexpected Check 6 failure on benign data-src bundle: {line}")
+
 
 class TestTier2F14AgentDocsBoundaries(E2ETestCase):
     TIER = 2
@@ -1768,6 +2133,206 @@ class TestTier2F14AgentDocsBoundaries(E2ETestCase):
         self.assertFalse((self.repo_root / "GEMINI.md").exists())
 
 
+def scan_shell_script_for_config_json_mutations(lines: list[str]) -> list[str]:
+    """Scan shell script lines for commands that write/mutate config.json."""
+    mutation_patterns = (
+        re.compile(r"(?:>>?|\btee\b|\bsed\s+-i|\bjq\b|\bmv\b|\bcp\b|\brm\b|\bpython3?\b).*config\.json"),
+        re.compile(r"config\.json.*(?:>>?|\btee\b)"),
+    )
+    heredoc_token_re = re.compile(
+        r'"(?:\\.|[^"\\])*"'
+        r"|\$'(?:\\.|[^'\\])*'"
+        r"|'[^']*'"
+        r"|(?<!<)<<(?!<)(-)?[ \t]*(?:'([^']+)'|\"([^\"]+)\"|((?:\\.|[A-Za-z0-9_.-])+))"
+    )
+    quoted_re = re.compile(r'"(?:\\.|[^"\\])*"|\$\'(?:\\.|[^\'\\])*\'|\'[^\']*\'')
+    fd_dup_re = re.compile(r">&(?:[0-9]+|-)(?=$|[\s;|&><)])")
+    offenders: list[str] = []
+    heredoc_delim: str | None = None
+    heredoc_strip_tabs = False
+
+    def _find_heredoc_start(text: str) -> tuple[bool, str] | None:
+        for m in heredoc_token_re.finditer(text):
+            if m.group(2) is not None:
+                return (m.group(1) == "-", m.group(2))
+            if m.group(3) is not None:
+                return (m.group(1) == "-", m.group(3))
+            if m.group(4) is not None:
+                return (m.group(1) == "-", re.sub(r"\\(.)", r"\1", m.group(4)))
+        return None
+
+    def _strip_inline_comment(text: str) -> str:
+        in_single = False
+        in_ansi_single = False
+        in_double = False
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if in_single:
+                if ch == "'":
+                    in_single = False
+            elif in_ansi_single:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == "'":
+                    in_ansi_single = False
+            elif in_double:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == '"':
+                    in_double = False
+            else:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == "$" and i + 1 < n and text[i + 1] == "'":
+                    in_ansi_single = True
+                    i += 1
+                elif ch == "'":
+                    in_single = True
+                elif ch == '"':
+                    in_double = True
+                elif ch == "#" and (i == 0 or text[i - 1] in (" ", "\t", ";", "&", "|", "(")):
+                    return text[:i].rstrip()
+            i += 1
+        return text
+
+    def _split_shell_commands(text: str) -> list[str]:
+        segments: list[str] = []
+        in_single = False
+        in_ansi_single = False
+        in_double = False
+        start = 0
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if in_single:
+                if ch == "'":
+                    in_single = False
+            elif in_ansi_single:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == "'":
+                    in_ansi_single = False
+            elif in_double:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == '"':
+                    in_double = False
+            else:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == "$" and i + 1 < n and text[i + 1] == "'":
+                    in_ansi_single = True
+                    i += 1
+                elif ch == "'":
+                    in_single = True
+                elif ch == '"':
+                    in_double = True
+                elif ch == ";":
+                    segments.append(text[start:i])
+                    start = i + 1
+                elif ch == "&":
+                    is_redir_amp = (i > start and text[i - 1] in (">", "<")) or (
+                        i + 1 < n and text[i + 1] == ">"
+                    )
+                    if not is_redir_amp:
+                        segments.append(text[start:i])
+                        if i + 1 < n and text[i + 1] == "&":
+                            i += 1
+                        start = i + 1
+                elif ch == "|" and i + 1 < n and text[i + 1] == "|":
+                    segments.append(text[start:i])
+                    i += 1
+                    start = i + 1
+            i += 1
+        segments.append(text[start:])
+        return [seg.strip() for seg in segments if seg.strip()]
+
+    def _first_unquoted_shell_op(text: str) -> int | None:
+        in_single = False
+        in_ansi_single = False
+        in_double = False
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if in_single:
+                if ch == "'":
+                    in_single = False
+            elif in_ansi_single:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == "'":
+                    in_ansi_single = False
+            elif in_double:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == '"':
+                    in_double = False
+            else:
+                if ch == "\\" and i + 1 < n:
+                    i += 1
+                elif ch == "$" and i + 1 < n and text[i + 1] == "'":
+                    in_ansi_single = True
+                    i += 1
+                elif ch == "'":
+                    in_single = True
+                elif ch == '"':
+                    in_double = True
+                elif ch == ">":
+                    fd_match = fd_dup_re.match(text, i)
+                    if fd_match:
+                        i = fd_match.end() - 1
+                    else:
+                        return i
+                elif ch == "|":
+                    return i
+            i += 1
+        return None
+
+    for lineno, line in enumerate(lines, 1):
+        if heredoc_delim is not None:
+            candidate = line.lstrip("\t") if heredoc_strip_tabs else line
+            if candidate.rstrip("\r") == heredoc_delim:
+                heredoc_delim = None
+                heredoc_strip_tabs = False
+            continue
+
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        code = _strip_inline_comment(stripped)
+        if not code:
+            continue
+
+        hd_start = _find_heredoc_start(code)
+        if hd_start is not None:
+            heredoc_strip_tabs, heredoc_delim = hd_start
+
+        matched_line = False
+        for seg in _split_shell_commands(code):
+            if re.match(r"^(echo|printf)\b", seg):
+                op_idx = _first_unquoted_shell_op(seg)
+                if op_idx is not None:
+                    scan_target = quoted_re.sub(" ", seg[:op_idx]) + seg[op_idx:]
+                else:
+                    scan_target = quoted_re.sub(" ", seg)
+            else:
+                scan_target = seg
+
+            for pat in mutation_patterns:
+                if pat.search(scan_target):
+                    offenders.append(f"line {lineno}: {stripped}")
+                    matched_line = True
+                    break
+            if matched_line:
+                break
+    return offenders
+
+
 class TestTier2F15DevInstallBoundaries(E2ETestCase):
     TIER = 2
     FEATURE = "F15"
@@ -1777,196 +2342,200 @@ class TestTier2F15DevInstallBoundaries(E2ETestCase):
         script = self.repo_root / "scripts" / "dev-install.sh"
         self.assertTrue(script.is_file(), f"Missing {script}")
         lines = script.read_text(encoding="utf-8").splitlines()
-        mutation_patterns = (
-            re.compile(r"(?:>>?|\btee\b|\bsed\s+-i|\bjq\b|\bmv\b|\bcp\b|\brm\b|\bpython3?\b).*config\.json"),
-            re.compile(r"config\.json.*(?:>>?|\btee\b)"),
-        )
-        heredoc_re = re.compile(r"<<(-)?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?")
-        quoted_re = re.compile(r'"(?:\\.|[^"\\])*"|\$\'(?:\\.|[^\'\\])*\'|\'[^\']*\'')
-        fd_dup_re = re.compile(r">&(?:[0-9]+|-)(?=$|[\s;|&><)])")
-        offenders: list[str] = []
-        heredoc_delim: str | None = None
-        heredoc_strip_tabs = False
-
-        def _strip_inline_comment(text: str) -> str:
-            in_single = False
-            in_ansi_single = False
-            in_double = False
-            i = 0
-            n = len(text)
-            while i < n:
-                ch = text[i]
-                if in_single:
-                    if ch == "'":
-                        in_single = False
-                elif in_ansi_single:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == "'":
-                        in_ansi_single = False
-                elif in_double:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == '"':
-                        in_double = False
-                else:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == "$" and i + 1 < n and text[i + 1] == "'":
-                        in_ansi_single = True
-                        i += 1
-                    elif ch == "'":
-                        in_single = True
-                    elif ch == '"':
-                        in_double = True
-                    elif ch == "#" and (i == 0 or text[i - 1] in (" ", "\t", ";", "&", "|", "(")):
-                        return text[:i].rstrip()
-                i += 1
-            return text
-
-        def _split_shell_commands(text: str) -> list[str]:
-            segments: list[str] = []
-            in_single = False
-            in_ansi_single = False
-            in_double = False
-            start = 0
-            i = 0
-            n = len(text)
-            while i < n:
-                ch = text[i]
-                if in_single:
-                    if ch == "'":
-                        in_single = False
-                elif in_ansi_single:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == "'":
-                        in_ansi_single = False
-                elif in_double:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == '"':
-                        in_double = False
-                else:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == "$" and i + 1 < n and text[i + 1] == "'":
-                        in_ansi_single = True
-                        i += 1
-                    elif ch == "'":
-                        in_single = True
-                    elif ch == '"':
-                        in_double = True
-                    elif ch == ";":
-                        segments.append(text[start:i])
-                        start = i + 1
-                    elif ch == "&":
-                        is_redir_amp = (i > start and text[i - 1] in (">", "<")) or (
-                            i + 1 < n and text[i + 1] == ">"
-                        )
-                        if not is_redir_amp:
-                            segments.append(text[start:i])
-                            if i + 1 < n and text[i + 1] == "&":
-                                i += 1
-                            start = i + 1
-                    elif ch == "|" and i + 1 < n and text[i + 1] == "|":
-                        segments.append(text[start:i])
-                        i += 1
-                        start = i + 1
-                i += 1
-            segments.append(text[start:])
-            return [seg.strip() for seg in segments if seg.strip()]
-
-        def _first_unquoted_shell_op(text: str) -> int | None:
-            in_single = False
-            in_ansi_single = False
-            in_double = False
-            i = 0
-            n = len(text)
-            while i < n:
-                ch = text[i]
-                if in_single:
-                    if ch == "'":
-                        in_single = False
-                elif in_ansi_single:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == "'":
-                        in_ansi_single = False
-                elif in_double:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == '"':
-                        in_double = False
-                else:
-                    if ch == "\\" and i + 1 < n:
-                        i += 1
-                    elif ch == "$" and i + 1 < n and text[i + 1] == "'":
-                        in_ansi_single = True
-                        i += 1
-                    elif ch == "'":
-                        in_single = True
-                    elif ch == '"':
-                        in_double = True
-                    elif ch == ">":
-                        fd_match = fd_dup_re.match(text, i)
-                        if fd_match:
-                            i = fd_match.end() - 1
-                        else:
-                            return i
-                    elif ch == "|":
-                        return i
-                i += 1
-            return None
-
-        for lineno, line in enumerate(lines, 1):
-            if heredoc_delim is not None:
-                candidate = line.lstrip("\t") if heredoc_strip_tabs else line
-                if candidate.strip() == heredoc_delim:
-                    heredoc_delim = None
-                    heredoc_strip_tabs = False
-                continue
-
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-
-            code = _strip_inline_comment(stripped)
-            if not code:
-                continue
-
-            # Check for heredoc start; scan the command header line itself (e.g., `cat <<EOF > config.json`)
-            # before entering heredoc body skip mode.
-            hd_match = heredoc_re.search(code)
-            if hd_match:
-                heredoc_strip_tabs = hd_match.group(1) == "-"
-                heredoc_delim = hd_match.group(2)
-
-            # Split command lists (`;`, `&&`, `||`, `&`), then on echo/printf segments strip quoted
-            # literals only BEFORE the first unquoted file redirect or pipe (`>` excluding fd-dups
-            # like `>&2`/`2>&1`, or `|`). Safe prose like `echo >&2 "Edit ~/.gemini/config/config.json"`
-            # passes while quoted targets (`echo '{}' > "$HOME/.gemini/config/config.json"`) and
-            # chained mutations (`echo "msg" && cp /tmp/cfg "$HOME/.gemini/config/config.json"`) fail.
-            matched_line = False
-            for seg in _split_shell_commands(code):
-                if re.match(r"^(echo|printf)\b", seg):
-                    op_idx = _first_unquoted_shell_op(seg)
-                    if op_idx is not None:
-                        scan_target = quoted_re.sub(" ", seg[:op_idx]) + seg[op_idx:]
-                    else:
-                        scan_target = quoted_re.sub(" ", seg)
-                else:
-                    scan_target = seg
-
-                for pat in mutation_patterns:
-                    if pat.search(scan_target):
-                        offenders.append(f"line {lineno}: {stripped}")
-                        matched_line = True
-                        break
-                if matched_line:
-                    break
+        offenders = scan_shell_script_for_config_json_mutations(lines)
         self.assertEqual(
             offenders,
             [],
             "scripts/dev-install.sh must not mutate config.json:\n" + "\n".join(offenders),
         )
+
+    def test_t2_f15_dev_install_uninstall_physical_symlink_guard(self) -> None:
+        """dev-install.sh refuses non-symlink overwrite/removal, foreign symlinks, and enforces physical cd -P (CF-1)."""
+        script = self.repo_root / "scripts" / "dev-install.sh"
+        self.assertTrue(script.is_file(), f"Missing {script}")
+        env = self.make_env()
+        proc_env = env.build_env()
+
+        # 1. Real non-symlink directory: install & uninstall both refuse and preserve directory.
+        with self.subTest(case="real_directory_refusal"):
+            pdir = env.root / "real_dir_case"
+            real_plugin_dir = pdir / "agy-companion"
+            real_plugin_dir.mkdir(parents=True, exist_ok=True)
+            marker = real_plugin_dir / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+
+            r_inst = run_cli([str(script), "--no-build", "--plugins-dir", str(pdir)], env=proc_env)
+            self.assertNotEqual(r_inst.returncode, 0, "Must refuse overwriting real directory")
+            self.assertTrue(marker.is_file())
+
+            r_un = run_cli([str(script), "--uninstall", "--plugins-dir", str(pdir)], env=proc_env)
+            self.assertNotEqual(r_un.returncode, 0, "Must refuse removing real directory")
+            self.assertTrue(marker.is_file())
+
+        # 2. Foreign symlink: --uninstall refuses and preserves symlink.
+        with self.subTest(case="foreign_symlink_refusal"):
+            pdir = env.root / "foreign_case"
+            foreign_target = env.root / "foreign_plugin"
+            pdir.mkdir(parents=True, exist_ok=True)
+            foreign_target.mkdir(parents=True, exist_ok=True)
+            foreign_link = pdir / "agy-companion"
+            os.symlink(foreign_target, foreign_link)
+
+            r_un = run_cli([str(script), "--uninstall", "--plugins-dir", str(pdir)], env=proc_env)
+            self.assertNotEqual(r_un.returncode, 0, "Must refuse removing foreign symlink")
+            self.assertTrue(foreign_link.is_symlink())
+
+        # 3. CF-1 Probe 1A (False Allow): logical cd collapses symlinked parent dir so ../plugin looks like REPO/plugin,
+        #    while physical target is victim_dir/plugin (NOT REPO/plugin). Must REFUSE and preserve victim symlink.
+        with self.subTest(case="cf1_false_allow_physical_guard"):
+            probe = env.root / "cf1_probe_1a"
+            parent = probe / "parent"
+            victim_sub = probe / "victim_dir" / "sub"
+            victim_plugin = probe / "victim_dir" / "plugin"
+            parent.mkdir(parents=True, exist_ok=True)
+            victim_sub.mkdir(parents=True, exist_ok=True)
+            victim_plugin.mkdir(parents=True, exist_ok=True)
+
+            os.symlink(self.repo_root / "plugin", parent / "plugin")
+            os.symlink(victim_sub, parent / "link_dir")
+            victim_link = victim_sub / "agy-companion"
+            os.symlink("../plugin", victim_link)
+            self.assertEqual(victim_link.resolve(), victim_plugin.resolve())
+
+            r_1a = run_cli([str(script), "--uninstall", "--plugins-dir", str(parent / "link_dir")], env=proc_env)
+            self.assertNotEqual(
+                r_1a.returncode,
+                0,
+                f"CF-1 False Allow! Uninstall should have refused victim symlink:\n{r_1a.stdout}\n{r_1a.stderr}",
+            )
+            self.assertTrue(victim_link.is_symlink(), "Victim symlink must NOT be deleted!")
+
+        # 4. CF-1 Probe 1B (False Deny): relative symlink traverses symlink into REPO/scripts then ../plugin
+        #    (physical target IS REPO/plugin). Must ALLOW and remove valid symlink.
+        with self.subTest(case="cf1_false_deny_valid_relative_symlink"):
+            good_sub = env.root / "cf1_probe_1b" / "good_dir" / "sub"
+            good_sub.mkdir(parents=True, exist_ok=True)
+            os.symlink(self.repo_root / "scripts", good_sub / "link_to_repo_scripts")
+            good_link = good_sub / "agy-companion"
+            os.symlink("./link_to_repo_scripts/../plugin", good_link)
+            self.assertEqual(good_link.resolve(), (self.repo_root / "plugin").resolve())
+
+            r_1b = run_cli([str(script), "--uninstall", "--plugins-dir", str(good_sub)], env=proc_env)
+            self.assertEqual(
+                r_1b.returncode,
+                0,
+                f"CF-1 False Deny! Uninstall should remove valid symlink:\n{r_1b.stdout}\n{r_1b.stderr}",
+            )
+            self.assertFalse(good_link.exists() or good_link.is_symlink())
+
+
+class TestTier2F16XdgBoundaries(E2ETestCase):
+    TIER = 2
+    FEATURE = "F16"
+
+    def test_t2_f16_relative_and_empty_xdg_vars_fall_back_to_home_defaults(self) -> None:
+        """Empty, whitespace, or benign relative XDG_CONFIG_HOME/XDG_DATA_HOME fall back to $HOME/.config and $HOME/.local/share."""
+        env = self.make_env()
+        mock = self.start_mock_gemini()
+        home_cfg = env.home_dir / ".config" / "agy-companion" / "config.json"
+        home_usage = env.home_dir / ".local" / "share" / "agy-companion" / "usage"
+        env.write_config(
+            env.make_config_dict(
+                base_url=mock.base_url,
+                api_key="AIzaSyXdgFallback1234",
+                default_model="gemini-home-fallback",
+                include_usage_dir=False,
+            ),
+            path=home_cfg,
+        )
+
+        for idx, (xdg_cfg_val, xdg_data_val) in enumerate(
+            [("", ""), ("   ", "   "), ("relative/xdg_cfg", "relative/xdg_data")],
+            start=1,
+        ):
+            with self.subTest(xdg_cfg=xdg_cfg_val, xdg_data=xdg_data_val):
+                extra = {
+                    "XDG_CONFIG_HOME": xdg_cfg_val,
+                    "XDG_DATA_HOME": xdg_data_val,
+                    "AGY_COMPANION_CONFIG": None,
+                }
+                mcp = self.start_mcp(
+                    env,
+                    extra_env=extra,
+                    pass_config_flag=False,
+                    set_config_env=False,
+                )
+                sc = mcp.call_tool("get_settings", {}).get("structuredContent", {})
+                mcp.assert_clean_stdout()
+                found_m, model = find_key_recursive(sc, "gemini_default_model")
+                self.assertTrue(found_m and model == "gemini-home-fallback", f"Unexpected model in {sc!r}")
+
+                proxy = self.start_proxy(
+                    env,
+                    extra_env=extra,
+                    pass_config_flag=False,
+                    set_config_env=False,
+                )
+                resp = http_raw_request(
+                    "127.0.0.1",
+                    proxy.port,
+                    "POST",
+                    "/v1beta/models/gemini-2.5-pro:generateContent",
+                    body=b'{"contents":[]}',
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(resp.status, 200, resp.text)
+                _, events = poll_usage_events(home_usage, min_count=idx, timeout=3.0)
+                self.assertGreaterEqual(len(events), idx, f"Expected usage event in {home_usage}")
+                proxy.stop()
+
+        # Zero macOS ~/Library/Application Support drift.
+        self.assertFalse(
+            (env.home_dir / "Library" / "Application Support").exists(),
+            "Must NOT drift to ~/Library/Application Support",
+        )
+
+    def test_t2_f16_dotdot_traversal_in_xdg_config_and_data_home_rejected_fail_closed(self) -> None:
+        """'..' traversal in XDG_CONFIG_HOME or XDG_DATA_HOME is rejected fail-closed across CLI commands (S6)."""
+        binary = self.require_binary()
+        env = self.make_env()
+
+        bad_xdg_values = [
+            f"{env.root}/a/../b",
+            "../escape",
+        ]
+
+        # 1. XDG_CONFIG_HOME traversal rejected fail-closed by serve, doctor, models, ui-mcp.
+        for bad_val in bad_xdg_values:
+            p_env = env.build_env(
+                extra={"XDG_CONFIG_HOME": bad_val, "AGY_COMPANION_CONFIG": None},
+                set_config_env=False,
+            )
+            for subcmd in (["serve"], ["doctor"], ["models", "--json"], ["ui-mcp"]):
+                with self.subTest(var="XDG_CONFIG_HOME", val=bad_val, subcmd=subcmd[0]):
+                    r = run_cli([str(binary), *subcmd], env=p_env, stdin_bytes=b"", timeout=10.0)
+                    self.assertNotEqual(
+                        r.returncode,
+                        0,
+                        f"{subcmd} should fail closed for XDG_CONFIG_HOME={bad_val!r}: stdout={r.stdout!r}",
+                    )
+                    self.assertTrue(
+                        (r.stdout + r.stderr).strip(),
+                        f"Expected diagnostic error output for {subcmd}",
+                    )
+
+        # 2. XDG_DATA_HOME traversal rejected fail-closed by serve when config.usage_dir is omitted.
+        cfg = env.write_config(
+            env.make_config_dict(listen_port=find_free_port(), include_usage_dir=False),
+            path=env.root / "no_usage_dir_cfg.json",
+        )
+        for bad_val in bad_xdg_values:
+            with self.subTest(var="XDG_DATA_HOME", val=bad_val):
+                p_env = env.build_env(extra={"XDG_DATA_HOME": bad_val})
+                r = run_cli([str(binary), "serve", "--config", str(cfg)], env=p_env, timeout=10.0)
+                self.assertNotEqual(
+                    r.returncode,
+                    0,
+                    f"serve should fail closed for XDG_DATA_HOME={bad_val!r}: stdout={r.stdout!r}",
+                )
+                self.assertTrue(r.stderr.strip(), "Expected error on stderr for XDG_DATA_HOME traversal")

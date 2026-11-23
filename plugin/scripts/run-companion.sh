@@ -58,7 +58,7 @@ resolve_script_path() {
       log_err "symlink loop detected while resolving launcher path (exceeded ${max_hops} hops): $1"
       return 1
     fi
-    dir="$(cd -- "$(dirname -- "${target}")" >/dev/null 2>&1 && pwd -P)" || {
+    dir="$(cd -P -- "$(dirname -- "${target}")" >/dev/null 2>&1 && pwd -P)" || {
       log_err "failed to resolve directory for launcher path: ${target}"
       return 1
     }
@@ -72,7 +72,7 @@ resolve_script_path() {
     esac
   done
 
-  dir="$(cd -- "$(dirname -- "${target}")" >/dev/null 2>&1 && pwd -P)" || {
+  dir="$(cd -P -- "$(dirname -- "${target}")" >/dev/null 2>&1 && pwd -P)" || {
     log_err "failed to resolve parent directory for launcher path: ${target}"
     return 1
   }
@@ -163,12 +163,12 @@ compute_sha256() {
   }
 
   if command -v sha256sum >/dev/null 2>&1; then
-    raw="$(cd -- "${file_dir}" >/dev/null && sha256sum -- "${file_base}")" || {
+    raw="$(cd -P -- "${file_dir}" >/dev/null && sha256sum -- "${file_base}")" || {
       log_err "failed to compute SHA-256 for ${file_base}"
       return 1
     }
   elif command -v shasum >/dev/null 2>&1; then
-    raw="$(cd -- "${file_dir}" >/dev/null && shasum -a 256 -- "${file_base}")" || {
+    raw="$(cd -P -- "${file_dir}" >/dev/null && shasum -a 256 -- "${file_base}")" || {
       log_err "failed to compute SHA-256 for ${file_base}"
       return 1
     }
@@ -213,7 +213,7 @@ lookup_expected_sha256() {
           }
         }
       }
-    ' "${checksums_file}"
+    ' < "${checksums_file}"
   )" || {
     log_err "failed to parse checksums file: ${checksums_file}"
     return 1
@@ -271,7 +271,7 @@ extract_verified_binary() {
   esac
 
   local listing=""
-  listing="$(tar -tzf "${tarball}")" || {
+  listing="$(tar -tzf - < "${tarball}")" || {
     log_err "failed to inspect release archive: ${tarball}"
     return 1
   }
@@ -333,7 +333,7 @@ extract_verified_binary() {
     log_err "failed to set permissions on extraction directory: ${extract_dir}"
     return 1
   }
-  if ! tar -xzf "${tarball}" -C "${extract_dir}" --no-same-owner --no-same-permissions -- "${members}" >/dev/null; then
+  if ! tar -xzf - -C "${extract_dir}" --no-same-owner --no-same-permissions -- "${members}" < "${tarball}" >/dev/null; then
     log_err "failed to extract '${BINARY_NAME}' from release archive"
     return 1
   fi
@@ -430,7 +430,10 @@ download_and_install() {
   tarball_url="${base_url}/${archive_name}"
   checksums_url="${base_url}/checksums.txt"
 
-  trap cleanup EXIT INT TERM HUP
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  trap 'cleanup; exit 129' HUP
+  trap cleanup EXIT
 
   local tmp_base="${TMPDIR:-/tmp}"
   tmp_base="${tmp_base%/}"
@@ -522,11 +525,11 @@ main() {
   local script_path script_dir plugin_dir repo_root repo_prefix
   script_path="$(resolve_script_path "${BASH_SOURCE[0]:-$0}")" || exit 1
   script_dir="$(dirname -- "${script_path}")"
-  plugin_dir="$(cd -- "${script_dir}/.." >/dev/null 2>&1 && pwd -P)" || {
+  plugin_dir="$(cd -P -- "${script_dir}/.." >/dev/null 2>&1 && pwd -P)" || {
     log_err "failed to resolve plugin directory from: ${script_dir}"
     exit 1
   }
-  repo_root="$(cd -- "${plugin_dir}/.." >/dev/null 2>&1 && pwd -P)" || {
+  repo_root="$(cd -P -- "${plugin_dir}/.." >/dev/null 2>&1 && pwd -P)" || {
     log_err "failed to resolve parent directory from: ${plugin_dir}"
     exit 1
   }

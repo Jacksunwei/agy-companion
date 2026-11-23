@@ -17,6 +17,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import dataclasses
+import errno
 import http.client
 import json
 import os
@@ -238,11 +239,11 @@ class IsolatedEnv:
         default_model: str = "gemini-2.5-pro",
         timeout_secs: int = 900,
         usage_dir: str | Path | None = None,
+        include_usage_dir: bool = True,
         schema_version: int = 1,
     ) -> dict[str, Any]:
         """Build a schema_version=1 config dict pointing at isolated usage_dir by default."""
-        resolved_usage = str(self.usage_dir) if usage_dir is None else str(usage_dir)
-        return {
+        cfg: dict[str, Any] = {
             "schema_version": schema_version,
             "listen_host": listen_host,
             "listen_port": listen_port,
@@ -252,8 +253,12 @@ class IsolatedEnv:
                 "default_model": default_model,
                 "timeout_secs": timeout_secs,
             },
-            "usage_dir": resolved_usage,
         }
+        if usage_dir is not None:
+            cfg["usage_dir"] = str(usage_dir)
+        elif include_usage_dir:
+            cfg["usage_dir"] = str(self.usage_dir)
+        return cfg
 
     def write_config(
         self,
@@ -461,6 +466,18 @@ class HttpResponse:
         return json.loads(self.body.decode("utf-8"))
 
 
+_TRANSIENT_SEND_ERRNOS: frozenset[int] = frozenset(
+    getattr(errno, name)
+    for name in ("ENOBUFS", "EAGAIN", "EWOULDBLOCK", "EINTR")
+    if hasattr(errno, name)
+)
+_PEER_CLOSE_SEND_ERRNOS: frozenset[int] = frozenset(
+    getattr(errno, name)
+    for name in ("EPIPE", "ECONNRESET", "ECONNABORTED", "ESHUTDOWN")
+    if hasattr(errno, name)
+)
+
+
 def http_raw_request(
     host: str,
     port: int,
@@ -475,8 +492,9 @@ def http_raw_request(
     """Issue a raw HTTP/1.1 request without normalizing `..` paths.
 
     Gracefully handles early socket close on oversized bodies (e.g. HTTP 413
-    Payload Too Large) by catching BrokenPipeError/ConnectionResetError during
-    body transmission and still reading the server's HTTP response.
+    Payload Too Large) by catching peer-close errors during body transmission
+    while retrying transient ENOBUFS/EAGAIN/EWOULDBLOCK/EINTR socket errors
+    with bounded backoff and exact partial-write byte offset tracking.
     """
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
@@ -496,19 +514,44 @@ def http_raw_request(
 
         send_aborted = False
         if body:
+            sock = conn.sock
+            if sock is None:
+                raise OSError("HTTP connection socket closed before body transmission")
             view = memoryview(body)
             offset = 0
             total = len(body)
-            try:
-                while offset < total:
-                    end = min(offset + chunk_size, total)
-                    conn.send(view[offset:end])
-                    offset = end
-            except TimeoutError:
-                raise
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                # Server may respond early (e.g. 413 Payload Too Large) and close write side.
-                send_aborted = True
+            deadline = time.monotonic() + timeout
+            backoff = 0.005
+            while offset < total:
+                end = min(offset + chunk_size, total)
+                try:
+                    sent = sock.send(view[offset:end])
+                    if sent == 0:
+                        send_aborted = True
+                        break
+                    offset += sent
+                    backoff = 0.005
+                except TimeoutError:
+                    raise
+                except (BrokenPipeError, ConnectionResetError):
+                    # Server may respond early (e.g. 413 Payload Too Large) and close write side.
+                    send_aborted = True
+                    break
+                except OSError as exc:
+                    if exc.errno in _TRANSIENT_SEND_ERRNOS:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                f"timed out retrying transient send errno={exc.errno} "
+                                f"after {offset}/{total} bytes"
+                            ) from exc
+                        time.sleep(min(backoff, remaining))
+                        backoff = min(backoff * 2.0, 0.05)
+                        continue
+                    if exc.errno in _PEER_CLOSE_SEND_ERRNOS:
+                        send_aborted = True
+                        break
+                    raise
 
         resp = conn.getresponse()
         if send_aborted:

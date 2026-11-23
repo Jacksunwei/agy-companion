@@ -2,7 +2,7 @@
 set -euo pipefail
 unset CDPATH
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+REPO_ROOT="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
 PLUGIN_SRC="${REPO_ROOT}/plugin"
 
 NO_BUILD=0
@@ -56,12 +56,14 @@ resolve_symlink_target_dir() {
       candidate="${raw_target}"
       ;;
     *)
-      candidate="$(dirname -- "${link_path}")/${raw_target}"
+      local link_parent=""
+      link_parent="$(cd -P -- "$(dirname -- "${link_path}")" >/dev/null 2>&1 && pwd -P)" || return 1
+      candidate="${link_parent}/${raw_target}"
       ;;
   esac
 
   if [[ -d "${candidate}" ]]; then
-    (cd -- "${candidate}" >/dev/null 2>&1 && pwd -P) || return 1
+    (cd -P -- "${candidate}" >/dev/null 2>&1 && pwd -P) || return 1
     return 0
   fi
 

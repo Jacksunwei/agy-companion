@@ -1,8 +1,9 @@
-"""Tier 3: Pairwise Cross-Feature Combination Tests (15 tests).
+"""Tier 3: Pairwise Cross-Feature Combination Tests (16 tests).
 
 Covers all 14 pairwise combinations from the E2E matrix (with T3-10 enhanced
-for F15 live UI reload without restarting ui-mcp) plus T3-15 verifying F15
-symlink-aware local target/debug binary resolution in plugin/scripts/run-companion.sh.
+for F15 live UI reload without restarting ui-mcp), T3-15 verifying F15
+symlink-aware local target/debug binary resolution in plugin/scripts/run-companion.sh,
+and T3-16 verifying F16 end-to-end XDG_CONFIG_HOME & XDG_DATA_HOME coordination.
 """
 
 from __future__ import annotations
@@ -553,3 +554,116 @@ class TestTier3Combinations(E2ETestCase):
         )
         self.assertEqual(res.returncode, 0, f"Symlink-aware launcher failed:\n{res.stdout}\n{res.stderr}")
         self.assertEqual(res.stdout.strip(), "agy-companion 0.1.0")
+
+    def test_t3_16_xdg_config_and_data_home_end_to_end_proxy_and_mcp_coordination(self) -> None:
+        """F16+F8+F5+F3+F6: ui-mcp save_settings persists to XDG_CONFIG_HOME and serve streams & logs to XDG_DATA_HOME."""
+        env = self.make_env()
+        secret = "AIzaSyXdgComboSecret99"
+        mock = self.start_mock_gemini(expected_api_key=secret)
+        c1 = build_sse_events(
+            [
+                {
+                    "candidates": [{"content": {"parts": [{"text": "hello "}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 500,
+                        "cachedContentTokenCount": 200,
+                        "candidatesTokenCount": 5,
+                        "thoughtsTokenCount": 2,
+                    },
+                }
+            ]
+        )
+        c2 = build_sse_events(
+            [
+                {
+                    "candidates": [{"content": {"parts": [{"text": "xdg"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 500,
+                        "cachedContentTokenCount": 300,
+                        "candidatesTokenCount": 25,
+                        "thoughtsTokenCount": 8,
+                    },
+                }
+            ]
+        )
+        mock.enqueue(SseStreamAction(chunks=[c1, c2]))
+
+        xdg_cfg_root = env.root / "combo_xdg_cfg"
+        xdg_data_root = env.root / "combo_xdg_data"
+        expected_cfg_file = xdg_cfg_root / "agy-companion" / "config.json"
+        expected_usage_dir = xdg_data_root / "agy-companion" / "usage"
+        port = find_free_port()
+
+        xdg_extra: dict[str, str | None] = {
+            "XDG_CONFIG_HOME": str(xdg_cfg_root),
+            "XDG_DATA_HOME": str(xdg_data_root),
+            "AGY_COMPANION_CONFIG": None,
+        }
+
+        # 1. Start ui-mcp with NO --config and NO AGY_COMPANION_CONFIG; save settings via MCP.
+        mcp = self.start_mcp(
+            env,
+            extra_env=xdg_extra,
+            pass_config_flag=False,
+            pass_data_dir_flag=False,
+            set_config_env=False,
+        )
+        mcp.save_settings_smart(
+            base_url=mock.base_url,
+            api_key=secret,
+            default_model="gemini-2.5-flash",
+            listen_port=port,
+        )
+        mcp.assert_clean_stdout()
+        self.assertTrue(expected_cfg_file.is_file(), f"Expected config saved at {expected_cfg_file}")
+        self.assertEqual(stat.S_IMODE(os.stat(expected_cfg_file).st_mode), 0o600)
+
+        # 2. Start serve with NO --config, NO --port, NO AGY_COMPANION_CONFIG (pure XDG resolution).
+        proxy = self.start_proxy(
+            env,
+            port=port,
+            extra_env=xdg_extra,
+            pass_port_flag=False,
+            pass_config_flag=False,
+            set_config_env=False,
+        )
+
+        # 3. Stream SSE through proxy; verify response, /api/stats, and JSONL under XDG_DATA_HOME.
+        resp = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+            body=b'{"contents":[{"parts":[{"text":"hi"}]}]}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(resp.status, 200, resp.text)
+        self.assertIn("xdg", resp.text)
+
+        stats = poll_stats(proxy.port, min_requests=1, timeout=3.0)
+        self.assertEqual(stats.get("requests"), 1)
+        self.assertEqual(stats.get("prompt_tokens"), 500)
+        self.assertEqual(stats.get("cached_tokens"), 300)
+        self.assertEqual(stats.get("output_tokens"), 25)
+        self.assertEqual(stats.get("reasoning_tokens"), 8)
+
+        files, events = poll_usage_events(expected_usage_dir, min_count=1, timeout=3.0)
+        self.assertGreaterEqual(len(files), 1, f"Expected JSONL under {expected_usage_dir}")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["input_tokens"], 500)
+        self.assertEqual(events[0]["cached_tokens"], 300)
+        self.assertEqual(events[0]["output_tokens"], 25)
+        self.assertEqual(stat.S_IMODE(os.stat(files[0]).st_mode), 0o600)
+
+        # 4. ui-mcp get_settings sees live proxy reachable + stats + redacted key (never plaintext).
+        get_res = mcp.call_tool("get_settings", {})
+        mcp.assert_clean_stdout()
+        raw_res = json.dumps(get_res)
+        self.assertNotIn(secret, raw_res)
+        sc = get_res.get("structuredContent", {})
+        found_r, reachable = find_key_recursive(sc, "reachable")
+        found_h, hint = find_key_recursive(sc, "api_key_hint")
+        found_reqs, reqs = find_key_recursive(sc, "requests")
+        self.assertTrue(found_r and reachable is True, f"Expected reachable proxy in {sc!r}")
+        self.assertTrue(found_h and hint == "AIza...et99", f"Unexpected hint in {sc!r}")
+        self.assertTrue(found_reqs and reqs == 1, f"Expected stats.requests==1 in {sc!r}")
