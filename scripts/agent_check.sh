@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+unset CDPATH
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_ROOT}"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+cd -- "${REPO_ROOT}" >/dev/null
 
-TOTAL_CHECKS=6
+TOTAL_CHECKS=7
 FAILURES=0
 
 pass() {
@@ -80,20 +81,49 @@ check_zero_ai_attribution() {
 }
 
 # ---------------------------------------------------------------------------
-# Check 4: Shell scripts pass bash syntax check
+# Check 4: Shell scripts pass bash syntax check and launcher is executable
 # ---------------------------------------------------------------------------
 check_shell_scripts() {
+  local shell_failed=0
+  local launcher="${REPO_ROOT}/plugin/scripts/run-companion.sh"
+
+  if [[ ! -d "${REPO_ROOT}/plugin/scripts" ]]; then
+    fail "[4/${TOTAL_CHECKS}] Shell syntax: missing plugin/scripts directory"
+    shell_failed=1
+  elif [[ ! -f "${launcher}" ]]; then
+    fail "[4/${TOTAL_CHECKS}] Shell syntax: missing plugin/scripts/run-companion.sh"
+    shell_failed=1
+  elif [[ ! -x "${launcher}" ]]; then
+    fail "[4/${TOTAL_CHECKS}] Shell syntax: plugin/scripts/run-companion.sh is not executable (expected 0755)"
+    shell_failed=1
+  fi
+
+  local search_dirs=("${REPO_ROOT}/scripts")
+  if [[ -d "${REPO_ROOT}/plugin/scripts" ]]; then
+    search_dirs+=("${REPO_ROOT}/plugin/scripts")
+  fi
+
   local bad=()
+  local count=0
   while IFS= read -r script; do
+    count=$((count + 1))
     if ! bash -n "${script}"; then
       bad+=("${script}")
+    elif [[ -x /bin/bash ]] && ! /bin/bash -n "${script}"; then
+      bad+=("${script}")
     fi
-  done < <(find "${REPO_ROOT}/scripts" -type f -name '*.sh' | sort)
+  done < <(find "${search_dirs[@]}" -type f -name '*.sh' | sort)
 
-  if [[ ${#bad[@]} -gt 0 ]]; then
+  if [[ ${count} -eq 0 ]]; then
+    fail "[4/${TOTAL_CHECKS}] Shell syntax: no .sh files found under scripts/ or plugin/scripts/"
+    shell_failed=1
+  elif [[ ${#bad[@]} -gt 0 ]]; then
     fail "[4/${TOTAL_CHECKS}] Shell syntax: failed bash -n on ${bad[*]}"
-  else
-    pass "[4/${TOTAL_CHECKS}] Shell syntax: all scripts/*.sh valid"
+    shell_failed=1
+  fi
+
+  if [[ ${shell_failed} -eq 0 ]]; then
+    pass "[4/${TOTAL_CHECKS}] Shell syntax: all ${count} scripts/*.sh and plugin/scripts/*.sh valid (run-companion.sh executable)"
   fi
 }
 
@@ -188,12 +218,74 @@ check_ui_hygiene_and_bundle() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Check 7: Antigravity plugin bundle version parity & strict validation
+# ---------------------------------------------------------------------------
+check_plugin_bundle() {
+  local manifest="${REPO_ROOT}/plugin/plugin.json"
+  local cargo_toml="${REPO_ROOT}/Cargo.toml"
+
+  if [[ ! -f "${manifest}" ]]; then
+    fail "[7/${TOTAL_CHECKS}] Plugin bundle: missing plugin/plugin.json"
+    return
+  fi
+
+  if [[ ! -f "${cargo_toml}" ]]; then
+    fail "[7/${TOTAL_CHECKS}] Plugin bundle: missing Cargo.toml for version parity check"
+    return
+  fi
+
+  local cargo_version=""
+  cargo_version="$(awk '
+    /^\[workspace\.package\]/ { in_sec = 1; next }
+    /^\[/ { in_sec = 0 }
+    in_sec && /^version[[:space:]]*=/ {
+      sub(/^version[[:space:]]*=[[:space:]]*"/, "")
+      sub(/".*$/, "")
+      print
+      exit
+    }
+  ' "${cargo_toml}")"
+
+  local plugin_version=""
+  plugin_version="$(
+    { tr '\r\n' '  ' < "${manifest}"; printf '\n'; } | awk '
+      {
+        if (match($0, /(^|[{,[:space:]])"version"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+          seg = substr($0, RSTART, RLENGTH)
+          sub(/^[{,[:space:]]*"version"[[:space:]]*:[[:space:]]*"/, "", seg)
+          sub(/"$/, "", seg)
+          print seg
+          exit
+        }
+      }
+    '
+  )"
+
+  if [[ -z "${cargo_version}" || -z "${plugin_version}" || "${cargo_version}" != "${plugin_version}" ]]; then
+    fail "[7/${TOTAL_CHECKS}] Plugin bundle: version mismatch (Cargo.toml='${cargo_version}', plugin/plugin.json='${plugin_version}')"
+    return
+  fi
+
+  if ! command -v agy >/dev/null 2>&1; then
+    pass "[7/${TOTAL_CHECKS}] Plugin bundle: version ${plugin_version} matches Cargo.toml; skipped agy plugin validate --strict ./plugin (agy CLI not found on PATH)"
+    return
+  fi
+
+  if agy plugin validate --strict "${REPO_ROOT}/plugin"; then
+    pass "[7/${TOTAL_CHECKS}] Plugin bundle: version ${plugin_version} matches Cargo.toml and agy plugin validate --strict ./plugin passed"
+  else
+    fail "[7/${TOTAL_CHECKS}] Plugin bundle: agy plugin validate --strict ./plugin failed"
+  fi
+}
+
 check_governance_files
 check_no_forbidden_tracked_files
 check_zero_ai_attribution
 check_shell_scripts
 check_rust_workspace
 check_ui_hygiene_and_bundle
+check_plugin_bundle
 
 if [[ ${FAILURES} -gt 0 ]]; then
   printf '\nagent_check failed (%d failure(s))\n' "${FAILURES}"

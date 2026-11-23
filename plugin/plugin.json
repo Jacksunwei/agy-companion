@@ -1,0 +1,24 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "agy-companion",
+  "displayName": "Antigravity Companion",
+  "version": "0.1.0",
+  "description": "Bring your own models (BYOM) and track token usage in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and embedded MCP App Settings UI.",
+  "suggestedPrompts": [
+    "Open the Antigravity Companion settings panel",
+    "Generate customModelsConfig JSON for my local Antigravity Companion proxy",
+    "Run agy-companion doctor and troubleshoot my local proxy setup"
+  ],
+  "repository": "https://github.com/Jacksunwei/agy-companion",
+  "license": "Apache-2.0",
+  "keywords": [
+    "antigravity",
+    "agy",
+    "byom",
+    "proxy",
+    "gemini",
+    "ollama",
+    "usage",
+    "cost"
+  ]
+}

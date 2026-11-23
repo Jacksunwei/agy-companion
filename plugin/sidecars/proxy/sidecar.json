@@ -1,0 +1,10 @@
+{
+  "command": "bash",
+  "args": [
+    "../../scripts/run-companion.sh",
+    "serve"
+  ],
+  "restart_policy": "on-failure",
+  "display_name": "AGY Companion Proxy",
+  "description": "Local loopback Gemini pass-through proxy with SSE usageMetadata telemetry and config hot-reload."
+}

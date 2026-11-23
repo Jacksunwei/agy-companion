@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "companion": {
+      "command": "bash",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/run-companion.sh",
+        "ui-mcp",
+        "--data-dir=${PLUGIN_DATA}"
+      ]
+    }
+  }
+}

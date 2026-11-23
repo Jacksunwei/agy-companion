@@ -25,5 +25,26 @@ jobs:
           cache-dependency-path: ui/package-lock.json
       - name: Build UI single-file bundle
         run: npm --prefix ui ci && npm --prefix ui run typecheck && npm --prefix ui run build
+      - name: Validate plugin JSON manifests
+        run: |
+          node -e '
+            const fs = require("fs");
+            for (const p of [
+              "plugin/plugin.json",
+              "plugin/mcp_config.json",
+              "plugin/sidecars/proxy/sidecar.json",
+            ]) {
+              JSON.parse(fs.readFileSync(p, "utf8"));
+            }
+            console.log("All 3 plugin JSON manifests parsed cleanly.");
+          '
+      # Runs all 7 verification gates:
+      #   [1/7] Antigravity-native governance files (no GEMINI.md)
+      #   [2/7] Tracked file hygiene (no secrets/local junk)
+      #   [3/7] Zero AI attribution in commits
+      #   [4/7] Shell syntax (bash -n & /bin/bash -n on scripts/*.sh + plugin/scripts/*.sh, -x on run-companion.sh)
+      #   [5/7] Rust workspace fmt, clippy (-D warnings), and cargo test
+      #   [6/7] UI XSS hygiene & single-file bundle size (< 512000 bytes)
+      #   [7/7] Plugin version parity with Cargo.toml & agy plugin validate --strict ./plugin (clean skip if agy absent)
       - name: Run agent verification gate
         run: ./scripts/agent_check.sh
