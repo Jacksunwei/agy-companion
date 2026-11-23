@@ -8,7 +8,7 @@ Aligned with [`AGENTS.md`](../../AGENTS.md) using Antigravity customization conv
 
 ## Standing PR & Auto-Merge Rule
 
-Every completed change in this repository follows this delivery loop — never push directly to `main`:
+Every completed change in this repository follows this delivery loop — keep PRs small and self-contained, merged incrementally as slices finish, and never push directly to `main`:
 
 1. Create a focused branch: `<type>/<short-description>` (`feat/...`, `fix/...`, `chore/...`, `docs/...`, `refactor/...`).
 2. Run `./scripts/agent_check.sh` and the full relevant test suite; confirm green output.
@@ -21,8 +21,14 @@ Every completed change in this repository follows this delivery loop — never p
 
 ## Always-On Engineering Invariants
 
-- **Antigravity-Native Customizations:** Keep workspace rules in `.agents/rules/*.md` and on-demand runbooks in `.agents/skills/<name>/SKILL.md`; use root `AGENTS.md` as the single repo contract (do not add `GEMINI.md`).
+- **Antigravity-Native Customizations:** Keep workspace rules in `.agents/rules/*.md` and on-demand runbooks in `.agents/skills/<name>/SKILL.md`; use root `AGENTS.md` as the single repo contract (never create `GEMINI.md`).
+- **Small Incremental PRs:** Ship self-contained slices merged sequentially into `main`; never accumulate work into one giant PR.
 - **Strict Red → Green → Refactor TDD:** Reproduce bugs or specify new behavior with a failing test first; never skip, delete, or weaken tests to pass.
-- **Verification Before Claims:** State the expected positive success signal and confirm it in actual command output before opening or merging a PR.
-- **Zero Secrets & Clean Tree:** Never stage or commit `.env`, credentials, `.DS_Store`, or local agent runtime directories (`.antigravitycli/`, `.remember/`).
+- **Verification Before Claims:** Run `./scripts/agent_check.sh` (all 7 gates: governance, tracked-file & secret scan, zero AI attribution, shell syntax & `-x`, 4-way version parity & packaging shims, Rust fmt/clippy `-D warnings`/test & UI XSS/bundle gate, plugin JSON & `agy plugin validate --strict ./plugin`) and state/confirm positive success signals before opening or merging a PR.
+- **Zero Secrets & Safe Local Dev:** Never stage, commit, log, or echo `.env`, credentials, real `AIza...` Gemini API keys (`AIza[0-9A-Za-z_-]{35}`), `.DS_Store`, or local agent runtime directories (`.antigravitycli/`, `.remember/`). Never auto-mutate `~/.gemini/config/config.json` from repo scripts.
+- **Proxy, UI & Path Security Invariants:**
+  - Keep `reqwest` zero-compression (`default-features = false, features = ["rustls", "stream", "json", "http2"]` — no `gzip`/`brotli`/`deflate`/`zstd`) for byte-for-byte streaming pass-through and implicit cache preservation.
+  - Bind proxy strictly to loopback (`127.0.0.1`/`localhost`) and authenticate upstream via `x-goog-api-key` (never `?key=`).
+  - Enforce UI zero-`innerHTML` / zero-network-fetch DOM & CSP discipline (`ui/dist/index.html` < 512,000 bytes).
+  - Preserve XDG (`XDG_CONFIG_HOME`/`XDG_DATA_HOME`) + Windows (`%APPDATA%`/`%LOCALAPPDATA%`) path precedence with fail-closed `..`/NUL validation and atomic `0600` (Unix) / bounded-retry (Windows) persistence.
 - **Parallel Isolation:** When multiple agents run concurrently, assign disjoint file lists and isolated git worktrees.

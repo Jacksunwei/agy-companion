@@ -23,9 +23,17 @@ jobs:
           node-version: '24'
           cache: 'npm'
           cache-dependency-path: ui/package-lock.json
-      - name: Build UI single-file bundle
-        run: npm --prefix ui ci && npm --prefix ui run typecheck && npm --prefix ui run build
-      - name: Validate plugin JSON manifests
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and verify committed UI single-file bundle
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run typecheck
+          npm --prefix ui run build
+          git diff --exit-code -- ui/dist/index.html
+      - name: Validate plugin and npm JSON manifests
         run: |
           node -e '
             const fs = require("fs");
@@ -33,18 +41,19 @@ jobs:
               "plugin/plugin.json",
               "plugin/mcp_config.json",
               "plugin/sidecars/proxy/sidecar.json",
+              "packages/npm/agy-companion/package.json",
             ]) {
               JSON.parse(fs.readFileSync(p, "utf8"));
             }
-            console.log("All 3 plugin JSON manifests parsed cleanly.");
+            console.log("All 4 plugin & npm JSON manifests parsed cleanly.");
           '
       # Runs all 7 verification gates:
       #   [1/7] Antigravity-native governance files (no GEMINI.md)
-      #   [2/7] Tracked file hygiene (no secrets/local junk)
+      #   [2/7] Tracked file hygiene (incl. __pycache__/*.pyc) & Google API key secret scan (tracked, staged, commits)
       #   [3/7] Zero AI attribution in commits
-      #   [4/7] Shell syntax (bash -n & /bin/bash -n on scripts/*.sh + plugin/scripts/*.sh, -x on run-companion.sh)
-      #   [5/7] Rust workspace fmt, clippy (-D warnings), and cargo test
-      #   [6/7] UI XSS hygiene & single-file bundle size (< 512000 bytes)
-      #   [7/7] Plugin version parity with Cargo.toml & agy plugin validate --strict ./plugin (clean skip if agy absent)
+      #   [4/7] Shell syntax (bash -n & /bin/bash -n), executable bit (-x) on scripts/*.sh + plugin/scripts/*.sh, and dev-install safety
+      #   [5/7] 4-way version sync (Cargo.toml, plugin.json, npm package.json + 5 optionalDeps, pyproject.toml) & JS/Python shim checks
+      #   [6/7] Rust workspace (fmt, clippy -D warnings, cargo test) & UI XSS hygiene / single-file bundle gate (< 512000 bytes)
+      #   [7/7] Plugin JSON manifests & agy plugin validate --strict ./plugin (clean skip if agy absent)
       - name: Run agent verification gate
         run: ./scripts/agent_check.sh
