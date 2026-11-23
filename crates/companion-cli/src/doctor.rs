@@ -751,7 +751,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doctor_detects_version_skew_between_binary_and_health_response() {
         let router = Router::new().route(
             "/health",
@@ -840,7 +840,7 @@ mod tests {
         assert!(!healthy.protocol_skew);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doctor_health_probe_rejects_oversized_redirect_non200_and_hanging_server() {
         let temp = TempDir::new().expect("tempdir");
         let missing_cfg = temp.path().join("missing.json");
@@ -983,7 +983,7 @@ mod tests {
         assert!(!json.contains("AIzaSyNeverEchoHealthBody"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doctor_checks_config_permissions_0600_0400_0644_missing_symlink_and_dir() {
         let (port, handle) = spawn_mock_health_router(healthy_router()).await;
         let temp = TempDir::new().expect("tempdir");
@@ -1157,7 +1157,7 @@ mod tests {
         handle.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doctor_fails_on_invalid_config_json_and_ssrf_host_without_leaking_secret() {
         let (port, handle) = spawn_mock_health_router(healthy_router()).await;
         let temp = TempDir::new().expect("tempdir");
@@ -1224,7 +1224,7 @@ mod tests {
         handle.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doctor_redacts_gemini_api_key_and_sanitizes_base_url_env() {
         let (port, handle) = spawn_mock_health_router(healthy_router()).await;
         let temp = TempDir::new().expect("tempdir");
@@ -1314,7 +1314,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doctor_rejects_trailing_slash_and_dot_suffix_symlinks() {
         use std::os::unix::fs::symlink;
         use std::path::PathBuf;
@@ -1447,6 +1447,72 @@ mod tests {
             !rep.ok,
             "regular config file with trailing slash must fail safely"
         );
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doctor_fails_on_non_header_safe_api_key_in_config() {
+        let (port, handle) = spawn_mock_health_router(healthy_router()).await;
+        let temp = TempDir::new().expect("tempdir");
+
+        for (label, bad_key) in [
+            ("internal space", "AIzaSy Space In Key 1234"),
+            ("nbsp", "AIzaSy\u{00A0}NbspKey1234"),
+            ("emoji", "AIzaSy\u{1F511}EmojiKey1234"),
+        ] {
+            let cfg_path = temp
+                .path()
+                .join(format!("{}.json", label.replace(' ', "_")));
+            let raw = serde_json::json!({
+                "schema_version": 1,
+                "listen_host": "127.0.0.1",
+                "listen_port": port,
+                "gemini": {
+                    "base_url": "https://generativelanguage.googleapis.com",
+                    "api_key": bad_key,
+                    "default_model": "gemini-2.5-pro",
+                    "timeout_secs": 900
+                }
+            });
+            fs::write(&cfg_path, raw.to_string()).expect("write config");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+            }
+
+            let rep = run_doctor(
+                DoctorOptions {
+                    config_override: Some(cfg_path),
+                    port_override: Some(port),
+                    ..DoctorOptions::default()
+                },
+                DoctorEnv::from_raw_values(None, None),
+            )
+            .await
+            .expect("doctor report");
+            assert!(
+                !rep.ok,
+                "{label}: doctor must fail on non-header-safe api_key"
+            );
+
+            let cfg_check = rep
+                .checks
+                .iter()
+                .find(|c| c.name == "config")
+                .expect("config check");
+            assert_eq!(
+                cfg_check.status,
+                CheckStatus::Fail,
+                "{label}: config check must fail, got {cfg_check:?}"
+            );
+
+            let json = format_doctor_json(&rep).expect("format json");
+            let human = format_doctor_human(&rep);
+            assert!(!json.contains("AIzaSy"), "{label}: JSON leaked secret");
+            assert!(!human.contains("AIzaSy"), "{label}: human leaked secret");
+        }
 
         handle.abort();
     }

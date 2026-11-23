@@ -6,13 +6,13 @@ pub mod stats;
 
 use std::fs;
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use companion_core::{Config, CoreError, UsageSink, validate_path};
+use companion_core::{Config, CoreError, MAX_CONFIG_FILE_BYTES, UsageSink, validate_path};
 use companion_providers::{GeminiProvider, ProviderAdapter, ProviderError};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -23,7 +23,6 @@ pub use stats::{ProxyStats, StatsSnapshot};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 const RACY_CLEAN_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
@@ -48,9 +47,16 @@ pub(crate) struct ActiveProvider {
     pub(crate) has_configured_api_key: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectedReason {
+    Symlink,
+    NotRegularFile,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileStamp {
     Missing,
+    Rejected(RejectedReason),
     Unreadable(ErrorKind),
     Present {
         modified: Option<SystemTime>,
@@ -136,6 +142,17 @@ impl ProxyState {
             Some(path) => {
                 validate_path(&path)?;
                 let stamp = read_file_stamp(&path);
+                if let FileStamp::Rejected(reason) = stamp {
+                    let msg = match reason {
+                        RejectedReason::Symlink => {
+                            "symbolic links are not allowed for config files"
+                        }
+                        RejectedReason::NotRegularFile => "config path must be a regular file",
+                    };
+                    return Err(ProxyError::Core(CoreError::InvalidPath {
+                        reason: msg.to_string(),
+                    }));
+                }
                 let raw_bytes = read_bounded_bytes(&path, &stamp);
                 ProviderSource::HotReload(Box::new(HotReloadProvider {
                     path,
@@ -191,8 +208,18 @@ fn build_active_provider(
 }
 
 fn read_file_stamp(path: &Path) -> FileStamp {
-    match fs::metadata(path) {
+    // Strip trailing separators/dot components so POSIX lstat(2) inspects the entry itself
+    // without dereferencing symlinks or opening FIFOs/devices.
+    let check_path: PathBuf = path.components().collect();
+    match fs::symlink_metadata(&check_path) {
         Ok(meta) => {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                return FileStamp::Rejected(RejectedReason::Symlink);
+            }
+            if !file_type.is_file() {
+                return FileStamp::Rejected(RejectedReason::NotRegularFile);
+            }
             let modified = meta.modified().ok();
             let len = meta.len();
             #[cfg(unix)]
@@ -217,14 +244,73 @@ fn read_file_stamp(path: &Path) -> FileStamp {
     }
 }
 
-fn read_bounded_bytes(path: &Path, stamp: &FileStamp) -> Option<Vec<u8>> {
-    match stamp {
-        FileStamp::Missing | FileStamp::Unreadable(_) => None,
-        FileStamp::Present { len, .. } if *len > MAX_CONFIG_FILE_BYTES => None,
-        FileStamp::Present { .. } => fs::read(path)
-            .ok()
-            .filter(|bytes| (bytes.len() as u64) <= MAX_CONFIG_FILE_BYTES),
+enum BoundedReadError {
+    NotFound,
+    Oversized,
+    Rejected(RejectedReason),
+    ChangedConcurrently,
+    Io(ErrorKind),
+}
+
+fn read_verified_config_bytes(path: &Path, stamp: &FileStamp) -> Result<Vec<u8>, BoundedReadError> {
+    let FileStamp::Present {
+        len,
+        #[cfg(unix)]
+        dev,
+        #[cfg(unix)]
+        ino,
+        ..
+    } = stamp
+    else {
+        return Err(match stamp {
+            FileStamp::Missing => BoundedReadError::NotFound,
+            FileStamp::Rejected(reason) => BoundedReadError::Rejected(*reason),
+            FileStamp::Unreadable(kind) => BoundedReadError::Io(*kind),
+            FileStamp::Present { .. } => unreachable!(),
+        });
+    };
+
+    if *len > MAX_CONFIG_FILE_BYTES {
+        return Err(BoundedReadError::Oversized);
     }
+
+    let file = fs::File::open(path).map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            BoundedReadError::NotFound
+        } else {
+            BoundedReadError::Io(err.kind())
+        }
+    })?;
+
+    let open_meta = file
+        .metadata()
+        .map_err(|err| BoundedReadError::Io(err.kind()))?;
+    if !open_meta.file_type().is_file() {
+        return Err(BoundedReadError::Rejected(RejectedReason::NotRegularFile));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if open_meta.dev() != *dev || open_meta.ino() != *ino {
+            return Err(BoundedReadError::ChangedConcurrently);
+        }
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| BoundedReadError::Io(err.kind()))?;
+
+    if (bytes.len() as u64) > MAX_CONFIG_FILE_BYTES {
+        return Err(BoundedReadError::Oversized);
+    }
+
+    Ok(bytes)
+}
+
+fn read_bounded_bytes(path: &Path, stamp: &FileStamp) -> Option<Vec<u8>> {
+    read_verified_config_bytes(path, stamp).ok()
 }
 
 impl HotReloadProvider {
@@ -236,7 +322,10 @@ impl HotReloadProvider {
             let outside_racy_window = guard.checked_at.elapsed() >= RACY_CLEAN_WINDOW;
             if current_stamp == guard.stamp {
                 if outside_racy_window
-                    || matches!(current_stamp, FileStamp::Missing | FileStamp::Unreadable(_))
+                    || matches!(
+                        current_stamp,
+                        FileStamp::Missing | FileStamp::Rejected(_) | FileStamp::Unreadable(_)
+                    )
                 {
                     return guard.active.clone();
                 }
@@ -246,7 +335,12 @@ impl HotReloadProvider {
                     return guard.active.clone();
                 }
             } else if guard.last_failed_stamp.as_ref() == Some(&current_stamp) {
-                if outside_racy_window || matches!(current_stamp, FileStamp::Unreadable(_)) {
+                if outside_racy_window
+                    || matches!(
+                        current_stamp,
+                        FileStamp::Rejected(_) | FileStamp::Unreadable(_)
+                    )
+                {
                     return guard.active.clone();
                 }
                 if let Some(bytes) = read_bounded_bytes(&self.path, &current_stamp)
@@ -264,6 +358,18 @@ impl HotReloadProvider {
                 self.apply_missing_config(&mut guard);
                 guard.active.clone()
             }
+            FileStamp::Rejected(reason) => {
+                if guard.last_failed_stamp.as_ref() != Some(&current_stamp) {
+                    tracing::warn!(
+                        reason = ?reason,
+                        "ignoring rejected config path during hot-reload; retaining previous configuration"
+                    );
+                }
+                guard.last_failed_stamp = Some(current_stamp);
+                guard.last_failed_bytes = None;
+                guard.checked_at = Instant::now();
+                guard.active.clone()
+            }
             FileStamp::Unreadable(kind) => {
                 if guard.last_failed_stamp.as_ref() != Some(&current_stamp) {
                     tracing::warn!(
@@ -276,30 +382,49 @@ impl HotReloadProvider {
                 guard.checked_at = Instant::now();
                 guard.active.clone()
             }
-            FileStamp::Present { len, .. } => {
-                if len > MAX_CONFIG_FILE_BYTES {
-                    if guard.last_failed_stamp.as_ref() != Some(&current_stamp) {
-                        tracing::warn!(
-                            max_bytes = MAX_CONFIG_FILE_BYTES,
-                            "ignoring oversized config file during hot-reload; retaining previous configuration"
-                        );
-                    }
-                    guard.last_failed_stamp = Some(current_stamp);
-                    guard.last_failed_bytes = None;
-                    guard.checked_at = Instant::now();
-                    return guard.active.clone();
-                }
-
-                let bytes = match fs::read(&self.path) {
+            FileStamp::Present { .. } => {
+                let bytes = match read_verified_config_bytes(&self.path, &current_stamp) {
                     Ok(bytes) => bytes,
-                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                    Err(BoundedReadError::NotFound) => {
                         self.apply_missing_config(&mut guard);
                         return guard.active.clone();
                     }
-                    Err(err) => {
+                    Err(BoundedReadError::Oversized) => {
                         if guard.last_failed_stamp.as_ref() != Some(&current_stamp) {
                             tracing::warn!(
-                                error_kind = ?err.kind(),
+                                max_bytes = MAX_CONFIG_FILE_BYTES,
+                                "ignoring oversized config file during hot-reload; retaining previous configuration"
+                            );
+                        }
+                        guard.last_failed_stamp = Some(current_stamp);
+                        guard.last_failed_bytes = None;
+                        guard.checked_at = Instant::now();
+                        return guard.active.clone();
+                    }
+                    Err(BoundedReadError::Rejected(reason)) => {
+                        let rejected_stamp = FileStamp::Rejected(reason);
+                        if guard.last_failed_stamp.as_ref() != Some(&rejected_stamp) {
+                            tracing::warn!(
+                                reason = ?reason,
+                                "ignoring rejected config path during hot-reload; retaining previous configuration"
+                            );
+                        }
+                        guard.last_failed_stamp = Some(rejected_stamp);
+                        guard.last_failed_bytes = None;
+                        guard.checked_at = Instant::now();
+                        return guard.active.clone();
+                    }
+                    Err(BoundedReadError::ChangedConcurrently) => {
+                        tracing::warn!(
+                            "config file changed concurrently during hot-reload read; retaining previous configuration"
+                        );
+                        guard.checked_at = Instant::now();
+                        return guard.active.clone();
+                    }
+                    Err(BoundedReadError::Io(kind)) => {
+                        if guard.last_failed_stamp.as_ref() != Some(&current_stamp) {
+                            tracing::warn!(
+                                error_kind = ?kind,
                                 "failed to read config file during hot-reload; retaining previous configuration"
                             );
                         }
@@ -309,19 +434,6 @@ impl HotReloadProvider {
                         return guard.active.clone();
                     }
                 };
-
-                if (bytes.len() as u64) > MAX_CONFIG_FILE_BYTES {
-                    if guard.last_failed_stamp.as_ref() != Some(&current_stamp) {
-                        tracing::warn!(
-                            max_bytes = MAX_CONFIG_FILE_BYTES,
-                            "ignoring oversized config file during hot-reload; retaining previous configuration"
-                        );
-                    }
-                    guard.last_failed_stamp = Some(current_stamp);
-                    guard.last_failed_bytes = None;
-                    guard.checked_at = Instant::now();
-                    return guard.active.clone();
-                }
 
                 if guard.raw_bytes.as_deref() == Some(bytes.as_slice()) {
                     guard.stamp = current_stamp;
@@ -901,5 +1013,135 @@ mod tests {
         let _ = tx_shutdown.send(());
         server.await.unwrap();
         upstream_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hot_reload_rejects_post_startup_symlink_dangling_symlink_and_fifo_without_blocking() {
+        use std::os::unix::fs::symlink;
+
+        let (upstream1_addr, upstream1_keys, upstream1_handle) =
+            spawn_mock_upstream("good-upstream").await;
+        let (upstream2_addr, upstream2_keys, upstream2_handle) =
+            spawn_mock_upstream("evil-upstream").await;
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.json");
+        let evil_path = tmp.path().join("evil.json");
+
+        let mut good_cfg = Config::default();
+        good_cfg.gemini.base_url = format!("http://{upstream1_addr}");
+        good_cfg.gemini.api_key = Some("AIzaGoodOriginalKey1111".to_string());
+        good_cfg.save_secure(&config_path).unwrap();
+
+        let mut evil_cfg = Config::default();
+        evil_cfg.gemini.base_url = format!("http://{upstream2_addr}");
+        evil_cfg.gemini.api_key = Some("AIzaEvilHijackKey22222".to_string());
+        evil_cfg.save_secure(&evil_path).unwrap();
+
+        // Startup must also reject an initial symlink or FIFO config_path cleanly.
+        let initial_sym = tmp.path().join("initial_sym.json");
+        symlink(&evil_path, &initial_sym).unwrap();
+        assert!(matches!(
+            ProxyState::from_config_with_env_fallback(
+                good_cfg.clone(),
+                Some(initial_sym),
+                Arc::new(NoopUsageSink),
+                false,
+            ),
+            Err(ProxyError::Core(CoreError::InvalidPath { .. }))
+        ));
+
+        let state = ProxyState::from_config_with_env_fallback(
+            good_cfg.clone(),
+            Some(config_path.clone()),
+            Arc::new(NoopUsageSink),
+            false,
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (tx_shutdown, rx_shutdown) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_on_listener(listener, state, async move {
+                let _ = rx_shutdown.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("build loopback client");
+        let url = format!(
+            "http://{proxy_addr}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+
+        // Baseline: hits upstream 1 with original key.
+        let r0 = client.post(&url).body("{}").send().await.unwrap();
+        assert_eq!(r0.status(), StatusCode::OK);
+        assert!(r0.text().await.unwrap().contains("good-upstream"));
+
+        // (a) Post-startup swap to symlink pointing to evil.json -> must retain original upstream & key.
+        fs::remove_file(&config_path).unwrap();
+        symlink(&evil_path, &config_path).unwrap();
+        let r1 = client.post(&url).body("{}").send().await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let body1 = r1.text().await.unwrap();
+        assert!(body1.contains("good-upstream"), "body1={body1}");
+        assert!(!body1.contains("evil-upstream"));
+        assert!(
+            upstream2_keys.lock().unwrap().is_empty(),
+            "evil upstream must receive 0 hits"
+        );
+        assert_eq!(
+            upstream1_keys.lock().unwrap().last().cloned().flatten(),
+            Some("AIzaGoodOriginalKey1111".to_string())
+        );
+
+        // (b) Post-startup swap to dangling symlink -> must retain original config (NOT 401 wipe!).
+        fs::remove_file(&config_path).unwrap();
+        symlink(tmp.path().join("does-not-exist.json"), &config_path).unwrap();
+        let r2 = client.post(&url).body("{}").send().await.unwrap();
+        assert_eq!(
+            r2.status(),
+            StatusCode::OK,
+            "dangling symlink must retain active config instead of wiping to 401"
+        );
+        assert!(r2.text().await.unwrap().contains("good-upstream"));
+
+        // (c) Post-startup swap to FIFO -> must NOT hang and must retain active config.
+        fs::remove_file(&config_path).unwrap();
+        let mkfifo_status = std::process::Command::new("mkfifo")
+            .arg(&config_path)
+            .status()
+            .expect("run mkfifo");
+        assert!(mkfifo_status.success(), "mkfifo failed");
+        let r3 = tokio::time::timeout(Duration::from_secs(1), client.post(&url).body("{}").send())
+            .await
+            .expect("proxy deadlocked on FIFO config swap")
+            .expect("request succeeded");
+        assert_eq!(r3.status(), StatusCode::OK);
+        assert!(r3.text().await.unwrap().contains("good-upstream"));
+
+        // (d) Clean recovery when replaced back with regular file via save_secure.
+        fs::remove_file(&config_path).unwrap();
+        good_cfg.gemini.api_key = Some("AIzaRecoveredAfterSwap33".to_string());
+        good_cfg.save_secure(&config_path).unwrap();
+        let r4 = client.post(&url).body("{}").send().await.unwrap();
+        assert_eq!(r4.status(), StatusCode::OK);
+        let _ = r4.text().await.unwrap();
+        assert_eq!(
+            upstream1_keys.lock().unwrap().last().cloned().flatten(),
+            Some("AIzaRecoveredAfterSwap33".to_string())
+        );
+
+        let _ = tx_shutdown.send(());
+        server.await.unwrap();
+        upstream1_handle.abort();
+        upstream2_handle.abort();
     }
 }

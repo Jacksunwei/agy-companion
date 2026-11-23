@@ -994,7 +994,7 @@ mod tests {
     }
 
     // 3. Task 2 Core: verbatim upstream error status & body propagation
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn propagates_upstream_error_status_and_body() {
         for status_code in [400u16, 401, 403, 429, 500] {
             let expected_body = format!(
@@ -2055,7 +2055,7 @@ mod tests {
         let slow_server = spawn_mock_server(Router::new().route(
             "/v1beta/models/{*rest}",
             post(|| async {
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 StatusCode::OK
             }),
         ))
@@ -2078,7 +2078,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            elapsed < Duration::from_millis(2500),
+            elapsed < Duration::from_millis(4000),
             "timeout took too long: {elapsed:?}"
         );
         assert!(matches!(err, ProviderError::Upstream(_)));

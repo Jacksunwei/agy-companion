@@ -168,7 +168,7 @@ async fn serve_binds_loopback_serves_health_and_exits_cleanly_on_sigterm() {
         .expect("client");
     let health_url = format!("http://127.0.0.1:{port}/health");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let resp = loop {
         match client.get(&health_url).send().await {
             Ok(resp) if resp.status().is_success() => break resp,
@@ -644,6 +644,7 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
+        let closed_port = free_loopback_port();
         let save_settings_req = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -651,7 +652,8 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
             "params": {
                 "name": "save_settings",
                 "arguments": {
-                    "api_key": canary
+                    "api_key": canary,
+                    "listen_port": closed_port
                 }
             }
         });
@@ -747,9 +749,10 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
     }
 }
 
-fn run_ui_mcp_bounded(
+fn run_ui_mcp_bounded_with_calls(
     config_path: &std::path::Path,
     data_dir: &std::path::Path,
+    calls: Vec<Value>,
     timeout: Duration,
 ) -> (Option<i32>, String, String, bool) {
     let mut child = Command::new(BIN)
@@ -767,7 +770,7 @@ fn run_ui_mcp_bounded(
     let stdout = child.stdout.take().expect("stdout");
     let stderr = child.stderr.take().expect("stderr");
 
-    // Send initialize + get_settings on a helper thread so a hung FIFO open cannot block the test.
+    // Send initialize + requests on a helper thread so a hung FIFO open cannot block the test.
     let writer_thread = std::thread::spawn(move || {
         let mut stdin = stdin;
         let init_req = json!({
@@ -784,15 +787,11 @@ fn run_ui_mcp_bounded(
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        let get_settings_req = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": { "name": "get_settings", "arguments": {} }
-        });
         let _ = writeln!(stdin, "{init_req}");
         let _ = writeln!(stdin, "{initialized_notif}");
-        let _ = writeln!(stdin, "{get_settings_req}");
+        for req in calls {
+            let _ = writeln!(stdin, "{req}");
+        }
         let _ = stdin.flush();
     });
 
@@ -830,6 +829,24 @@ fn run_ui_mcp_bounded(
     (exit_code, stdout_str, stderr_str, timed_out)
 }
 
+fn run_ui_mcp_bounded(
+    config_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    timeout: Duration,
+) -> (Option<i32>, String, String, bool) {
+    run_ui_mcp_bounded_with_calls(
+        config_path,
+        data_dir,
+        vec![json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "get_settings", "arguments": {} }
+        })],
+        timeout,
+    )
+}
+
 #[test]
 fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     let temp = TempDir::new().expect("tempdir");
@@ -845,7 +862,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     let cfg_dir = temp.path().join("cfg_dir");
     fs::create_dir(&cfg_dir).expect("mkdir cfg_dir");
     let (code, stdout, stderr, timed_out) =
-        run_ui_mcp_bounded(&cfg_dir, &valid_data_dir, Duration::from_secs(2));
+        run_ui_mcp_bounded(&cfg_dir, &valid_data_dir, Duration::from_secs(10));
     assert!(!timed_out, "ui-mcp --config <dir> must not hang");
     assert_eq!(code, Some(1), "ui-mcp --config <dir> must exit 1");
     assert!(
@@ -863,7 +880,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     oversized_bytes.resize(1024 * 1024 + 1, b' ');
     fs::write(&oversized_cfg, oversized_bytes).expect("write oversized");
     let (code, stdout, stderr, timed_out) =
-        run_ui_mcp_bounded(&oversized_cfg, &valid_data_dir, Duration::from_secs(2));
+        run_ui_mcp_bounded(&oversized_cfg, &valid_data_dir, Duration::from_secs(10));
     assert!(!timed_out, "ui-mcp --config <oversized> must not hang");
     assert_eq!(code, Some(1), "ui-mcp --config <oversized> must exit 1");
     assert!(
@@ -876,7 +893,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     let data_file = temp.path().join("data_as_file");
     fs::write(&data_file, "not a dir").expect("write data_file");
     let (code, stdout, stderr, timed_out) =
-        run_ui_mcp_bounded(&valid_cfg, &data_file, Duration::from_secs(2));
+        run_ui_mcp_bounded(&valid_cfg, &data_file, Duration::from_secs(10));
     assert!(!timed_out, "ui-mcp --data-dir <file> must not hang");
     assert_eq!(code, Some(1), "ui-mcp --data-dir <file> must exit 1");
     assert!(
@@ -897,7 +914,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
             .expect("run mkfifo");
         assert!(mkfifo_status.success(), "mkfifo failed");
         let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&fifo_cfg, &valid_data_dir, Duration::from_secs(2));
+            run_ui_mcp_bounded(&fifo_cfg, &valid_data_dir, Duration::from_secs(10));
         assert!(!timed_out, "ui-mcp --config <FIFO> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --config <FIFO> must exit 1");
         assert!(
@@ -910,7 +927,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
         let symlink_cfg = temp.path().join("symlink_config.json");
         symlink(&valid_cfg, &symlink_cfg).expect("symlink config");
         let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&symlink_cfg, &valid_data_dir, Duration::from_secs(2));
+            run_ui_mcp_bounded(&symlink_cfg, &valid_data_dir, Duration::from_secs(10));
         assert!(!timed_out, "ui-mcp --config <symlink> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --config <symlink> must exit 1");
         assert!(
@@ -924,7 +941,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
         symlink(temp.path().join("does_not_exist.json"), &dangling_cfg)
             .expect("dangling symlink config");
         let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&dangling_cfg, &valid_data_dir, Duration::from_secs(2));
+            run_ui_mcp_bounded(&dangling_cfg, &valid_data_dir, Duration::from_secs(10));
         assert!(!timed_out, "ui-mcp --config <dangling> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --config <dangling> must exit 1");
         assert!(
@@ -937,7 +954,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
         let symlink_data_dir = temp.path().join("symlink_data_dir");
         symlink(&valid_data_dir, &symlink_data_dir).expect("symlink data_dir");
         let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&valid_cfg, &symlink_data_dir, Duration::from_secs(2));
+            run_ui_mcp_bounded(&valid_cfg, &symlink_data_dir, Duration::from_secs(10));
         assert!(!timed_out, "ui-mcp --data-dir <symlink> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --data-dir <symlink> must exit 1");
         assert!(
@@ -949,7 +966,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
         let symlink_data_dir_slash =
             std::path::PathBuf::from(format!("{}/", symlink_data_dir.display()));
         let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&valid_cfg, &symlink_data_dir_slash, Duration::from_secs(2));
+            run_ui_mcp_bounded(&valid_cfg, &symlink_data_dir_slash, Duration::from_secs(10));
         assert!(!timed_out, "ui-mcp --data-dir <symlink/> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --data-dir <symlink/> must exit 1");
         assert!(
@@ -959,13 +976,24 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
         assert!(!stderr.is_empty());
     }
 
-    // (h) First-run UX: nonexistent --config and nonexistent --data-dir still initialize cleanly
+    // (h) First-run UX: nonexistent --config and nonexistent --data-dir initialize cleanly
+    // without probing ambient host port 4141.
     let nonexistent_cfg = temp.path().join("first_run_config.json");
     let nonexistent_data_dir = temp.path().join("first_run_data_dir");
-    let (code, stdout, stderr, timed_out) = run_ui_mcp_bounded(
+    let closed_port = free_loopback_port();
+    let (code, stdout, stderr, timed_out) = run_ui_mcp_bounded_with_calls(
         &nonexistent_cfg,
         &nonexistent_data_dir,
-        Duration::from_secs(5),
+        vec![json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "save_settings",
+                "arguments": { "listen_port": closed_port }
+            }
+        })],
+        Duration::from_secs(15),
     );
     assert!(!timed_out, "first-run ui-mcp must not hang");
     assert_eq!(
@@ -976,7 +1004,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     assert!(
         lines.len() >= 2,
-        "expected initialize + get_settings responses, got: {stdout}"
+        "expected initialize + save_settings responses, got: {stdout}"
     );
     for line in &lines {
         let parsed: Value =

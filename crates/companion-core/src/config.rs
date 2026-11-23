@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 
@@ -17,6 +17,7 @@ pub const DEFAULT_LISTEN_PORT: u16 = 4141;
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-pro";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
+pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 pub const CONFIG_PATH_ENV_VAR: &str = "AGY_COMPANION_CONFIG";
 pub const XDG_CONFIG_HOME_ENV_VAR: &str = "XDG_CONFIG_HOME";
 pub const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
@@ -33,7 +34,9 @@ pub enum CoreError {
     InvalidTimeout,
     #[error("invalid default model: {reason}")]
     InvalidModel { reason: String },
-    #[error("invalid gemini.api_key: must not contain control characters")]
+    #[error(
+        "invalid gemini.api_key: must contain only printable ASCII characters without internal spaces or control characters"
+    )]
     InvalidApiKey,
     #[error("invalid upstream base URL: {reason}")]
     InvalidBaseUrl { reason: String },
@@ -462,6 +465,40 @@ fn reject_symlink_config_file(path: &Path) -> Result<(), CoreError> {
     }
 }
 
+fn inspect_existing_config_file(path: &Path) -> Result<Option<fs::Metadata>, CoreError> {
+    // Strip trailing separators/dot components so POSIX lstat(2) inspects the entry itself
+    // and rejects symlinks, FIFOs, sockets, devices, directories, and oversized files before open(2).
+    let check_path: PathBuf = path.components().collect();
+    match fs::symlink_metadata(&check_path) {
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                return Err(CoreError::InvalidPath {
+                    reason: "symbolic links are not allowed for config files".to_string(),
+                });
+            }
+            if !file_type.is_file() {
+                return Err(CoreError::InvalidPath {
+                    reason: "config path must be a regular file".to_string(),
+                });
+            }
+            if meta.len() > MAX_CONFIG_FILE_BYTES {
+                return Err(CoreError::InvalidPath {
+                    reason: format!(
+                        "config file exceeds maximum allowed size of {MAX_CONFIG_FILE_BYTES} bytes"
+                    ),
+                });
+            }
+            Ok(Some(meta))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum TargetPlatform {
@@ -776,7 +813,11 @@ impl Config {
 
         validate_upstream_url(&self.gemini.base_url)?;
         if let Some(ref key) = self.gemini.api_key
-            && key.chars().any(char::is_control)
+            && (!key.bytes().all(|b| (0x20..=0x7E).contains(&b))
+                || !key
+                    .trim_matches(' ')
+                    .bytes()
+                    .all(|b| (0x21..=0x7E).contains(&b)))
         {
             return Err(CoreError::InvalidApiKey);
         }
@@ -812,10 +853,14 @@ impl Config {
 
     pub fn load_or_default(path: &Path) -> Result<Config, CoreError> {
         validate_path(path)?;
-        reject_symlink_config_file(path)?;
+        let Some(lstat_meta) = inspect_existing_config_file(path)? else {
+            return Ok(Config::default());
+        };
 
-        let raw = match fs::read_to_string(path) {
-            Ok(contents) => contents,
+        // Open the original path so trailing slashes on a regular file still fail safely (ENOTDIR),
+        // while symlinks, FIFOs, directories, and oversized files were already rejected by lstat above.
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Config::default()),
             Err(source) => {
                 return Err(CoreError::Io {
@@ -824,6 +869,51 @@ impl Config {
                 });
             }
         };
+
+        let open_meta = file.metadata().map_err(|source| CoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if !open_meta.file_type().is_file() {
+            return Err(CoreError::InvalidPath {
+                reason: "config path must be a regular file".to_string(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if open_meta.dev() != lstat_meta.dev() || open_meta.ino() != lstat_meta.ino() {
+                return Err(CoreError::InvalidPath {
+                    reason: "config file changed concurrently during open".to_string(),
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = lstat_meta;
+
+        let mut buf = Vec::new();
+        file.take(MAX_CONFIG_FILE_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|source| CoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        if (buf.len() as u64) > MAX_CONFIG_FILE_BYTES {
+            return Err(CoreError::InvalidPath {
+                reason: format!(
+                    "config file exceeds maximum allowed size of {MAX_CONFIG_FILE_BYTES} bytes"
+                ),
+            });
+        }
+
+        let raw = String::from_utf8(buf).map_err(|_| CoreError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                ErrorKind::InvalidData,
+                "config file did not contain valid UTF-8",
+            ),
+        })?;
 
         let config: Config = serde_json::from_str(&raw).map_err(|err| CoreError::ParseConfig {
             path: path.to_path_buf(),
@@ -2676,5 +2766,115 @@ mod tests {
             leftover_temps.is_empty(),
             "no .tmp. files may be created when rejecting symlinks: {leftover_temps:?}"
         );
+    }
+
+    #[test]
+    fn rejects_non_ascii_and_internal_space_in_api_key_without_leaking_secret() {
+        for bad_key in [
+            "AIzaSy Space Key 1234",
+            "AIzaSy\u{00A0}Key1234",
+            "AIzaSy\u{1F511}Key1234",
+            "\tAIzaSyKey1234",
+            "AIzaSyKey1234\t",
+            "AIzaSy\u{007F}Key1234",
+        ] {
+            let cfg = Config {
+                gemini: GeminiConfig {
+                    api_key: Some(bad_key.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let err = cfg
+                .validate()
+                .expect_err(&format!("expected InvalidApiKey for '{bad_key:?}'"));
+            assert!(
+                matches!(err, CoreError::InvalidApiKey),
+                "unexpected error for '{bad_key:?}': {err:?}"
+            );
+
+            let display = format!("{err}");
+            let debug = format!("{err:?}");
+            assert!(
+                !display.contains("AIzaSy") && !debug.contains("AIzaSy"),
+                "error leaked secret: display={display}, debug={debug}"
+            );
+
+            let tmp = TempDir::new().expect("temp dir");
+            let cfg_path = tmp.path().join("rejected-key.json");
+            assert!(matches!(
+                cfg.save_secure(&cfg_path),
+                Err(CoreError::InvalidApiKey)
+            ));
+            assert!(!cfg_path.exists());
+        }
+
+        for good_key in ["", "   ", "  AIzaSyValidKey1234  ", "AIzaSyValidKey1234"] {
+            let cfg = Config {
+                gemini: GeminiConfig {
+                    api_key: Some(good_key.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "expected valid config for api_key='{good_key}'"
+            );
+        }
+    }
+
+    #[test]
+    fn load_or_default_rejects_oversized_file_directory_and_fifo_without_blocking() {
+        let tmp = TempDir::new().expect("temp dir");
+
+        // 1. Oversized (1 MiB + 1 byte) regular file -> rejected before reading full file.
+        let oversized_path = tmp.path().join("oversized.json");
+        let mut oversized = br#"{"schema_version":1}"#.to_vec();
+        oversized.resize(1024 * 1024 + 1, b' ');
+        fs::write(&oversized_path, oversized).expect("write oversized");
+        let err = Config::load_or_default(&oversized_path).expect_err("oversized must fail");
+        assert!(
+            matches!(err, CoreError::InvalidPath { .. }),
+            "expected InvalidPath for oversized file, got {err:?}"
+        );
+
+        // 2. Directory at config path -> rejected with InvalidPath.
+        let dir_path = tmp.path().join("config_dir");
+        fs::create_dir(&dir_path).expect("create dir");
+        let err = Config::load_or_default(&dir_path).expect_err("directory must fail");
+        assert!(
+            matches!(err, CoreError::InvalidPath { .. }),
+            "expected InvalidPath for directory, got {err:?}"
+        );
+
+        // 3. Unix FIFO -> rejected immediately (< 1s) without blocking open(2).
+        #[cfg(unix)]
+        {
+            let fifo_path = tmp.path().join("config.fifo");
+            let status = std::process::Command::new("mkfifo")
+                .arg(&fifo_path)
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success(), "mkfifo failed");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let fifo_clone = fifo_path.clone();
+            let handle = std::thread::spawn(move || {
+                let res = Config::load_or_default(&fifo_clone);
+                let _ = tx.send(res);
+            });
+
+            let res = rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("load_or_default hung on FIFO");
+            handle.join().expect("thread join");
+            let err = res.expect_err("FIFO must fail");
+            assert!(
+                matches!(err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for FIFO, got {err:?}"
+            );
+        }
     }
 }
