@@ -15,7 +15,7 @@ use companion_ui_mcp::UiMcpError;
 use thiserror::Error;
 
 pub const BINARY_NAME: &str = "agy-companion";
-pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+pub use companion_core::MAX_CONFIG_FILE_BYTES;
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -144,6 +144,7 @@ pub async fn run_serve(
     config.validate()?;
 
     let usage_dir = config.effective_usage_dir()?;
+    precheck_existing_data_dir(&usage_dir)?;
     let usage_sink: Arc<dyn UsageSink> = Arc::new(JsonlUsageSink::new(usage_dir)?);
 
     // Pre-register SIGTERM before binding so signals arriving immediately after startup are never missed.

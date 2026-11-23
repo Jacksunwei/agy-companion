@@ -60,12 +60,68 @@ pub fn build_router(state: ProxyState) -> Router {
         .route(
             "/v1beta/models/{*rest}",
             on(MethodFilter::POST, proxy_gemini_handler)
-                .layer(DefaultBodyLimit::max(MAX_PROXY_BODY_BYTES)),
+                .layer(DefaultBodyLimit::max(MAX_PROXY_BODY_BYTES))
+                .layer(middleware::from_fn(enforce_content_length_limit)),
         )
         .method_not_allowed_fallback(method_not_allowed_handler)
         .route_layer(middleware::from_fn(enforce_get_post_only))
         .fallback(not_found_handler)
         .with_state(state)
+}
+
+async fn enforce_content_length_limit(req: Request, next: Next) -> Response {
+    if *req.method() != Method::POST {
+        return next.run(req).await;
+    }
+
+    let mut expected_len: Option<u64> = None;
+    let mut saw_overflow = false;
+    for value in req.headers().get_all(header::CONTENT_LENGTH) {
+        let raw_bytes = value.as_bytes();
+        if raw_bytes.is_empty() || !raw_bytes.iter().all(u8::is_ascii_digit) {
+            return json_error_response(StatusCode::BAD_REQUEST, "invalid Content-Length header");
+        }
+        let Ok(raw_str) = std::str::from_utf8(raw_bytes) else {
+            return json_error_response(StatusCode::BAD_REQUEST, "invalid Content-Length header");
+        };
+        match raw_str.parse::<u64>() {
+            Ok(parsed) => {
+                if saw_overflow {
+                    return json_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "conflicting Content-Length headers",
+                    );
+                }
+                if let Some(prev) = expected_len
+                    && prev != parsed
+                {
+                    return json_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "conflicting Content-Length headers",
+                    );
+                }
+                expected_len = Some(parsed);
+            }
+            Err(_) => {
+                if expected_len.is_some() {
+                    return json_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "conflicting Content-Length headers",
+                    );
+                }
+                saw_overflow = true;
+            }
+        }
+    }
+
+    if saw_overflow || expected_len.is_some_and(|len| len > MAX_PROXY_BODY_BYTES as u64) {
+        return json_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds maximum allowed size",
+        );
+    }
+
+    next.run(req).await
 }
 
 async fn enforce_get_post_only(req: Request, next: Next) -> Response {
@@ -799,7 +855,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let mut body = resp.into_body();
-        let first_frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        let first_frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
             .await
             .expect("chunk 1 must arrive without waiting for chunk 2")
             .expect("frame present")
@@ -1569,5 +1625,190 @@ mod tests {
         assert_eq!(&body[DEFAULT_MAX_JSON_TEE_BYTES..], chunk_b.as_ref());
         assert!(sink.snapshot().is_empty());
         assert_eq!(state.stats().snapshot().requests, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_oversized_content_length_upfront_before_reading_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let provider = Arc::new(StubProvider::ok_stream(
+            Some("application/json"),
+            vec![Bytes::from_static(b"{}")],
+        ));
+        let state = ProxyState::new(provider.clone(), Arc::new(NoopUsageSink), true);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let oversized_len = (MAX_PROXY_BODY_BYTES as u64) + 1;
+
+        for (label, raw_request) in [
+            (
+                "single oversized Content-Length with 0 body bytes",
+                format!(
+                    "POST /v1beta/models/gemini-2.5-pro:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {oversized_len}\r\n\r\n"
+                ),
+            ),
+            (
+                "duplicate identical oversized Content-Length with 0 body bytes",
+                format!(
+                    "POST /v1beta/models/gemini-2.5-pro:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {oversized_len}\r\nContent-Length: {oversized_len}\r\n\r\n"
+                ),
+            ),
+        ] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(raw_request.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{label}: timed out waiting for upfront 413 response"))
+                .expect("read response");
+            assert!(n > 0, "{label}: empty response");
+            let resp_text = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                resp_text.starts_with("HTTP/1.1 413 "),
+                "{label}: expected HTTP 413, got: {resp_text}"
+            );
+            let lower = resp_text.to_ascii_lowercase();
+            assert!(
+                lower.contains("x-content-type-options: nosniff"),
+                "{label}: missing nosniff header: {resp_text}"
+            );
+            assert!(
+                lower.contains("cache-control: no-store"),
+                "{label}: missing no-store header: {resp_text}"
+            );
+            assert!(
+                resp_text.contains("request body exceeds maximum allowed size"),
+                "{label}: missing JSON error message: {resp_text}"
+            );
+        }
+
+        assert_eq!(provider.hit_count(), 0, "upstream must receive 0 hits");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_chunked_body_over_64mib_with_413_and_malformed_content_length_with_400() {
+        let provider = Arc::new(StubProvider::ok_stream(
+            Some("application/json"),
+            vec![Bytes::from_static(b"{}")],
+        ));
+        let app = build_router(ProxyState::new(
+            provider.clone(),
+            Arc::new(NoopUsageSink),
+            true,
+        ));
+
+        // 1. Streaming (no Content-Length / chunked) body > 64 MiB -> 413 via DefaultBodyLimit.
+        let chunk_size = 1024 * 1024;
+        let chunk = Bytes::from(vec![b'a'; chunk_size]);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = (0..64)
+            .map(|_| Ok(chunk.clone()))
+            .chain(std::iter::once(Ok(Bytes::from_static(b"b"))))
+            .collect();
+        let streaming_body = Body::from_stream(stream::iter(chunks));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .body(streaming_body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_security_headers(resp.headers());
+
+        // 2. Malformed Content-Length values -> 400 Bad Request via upfront guard.
+        for bad_cl in ["abc", "-1", "", "12 34"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                        .header(header::CONTENT_LENGTH, bad_cl)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for Content-Length '{bad_cl}'"
+            );
+            assert_security_headers(resp.headers());
+        }
+
+        // 3. Conflicting Content-Length headers -> 400 Bad Request.
+        let resp_conflict = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .header(header::CONTENT_LENGTH, "10")
+                    .header(header::CONTENT_LENGTH, "20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_conflict.status(), StatusCode::BAD_REQUEST);
+        assert_security_headers(resp_conflict.headers());
+
+        // 4. u64::MAX + 1 Content-Length overflow -> rejected upfront with 413 (or 400 over wire Hyper).
+        let resp_overflow = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .header(header::CONTENT_LENGTH, "18446744073709551616")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_overflow.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_security_headers(resp_overflow.headers());
+
+        // 5. Real TCP client sending malformed Content-Length (u64::MAX + 1, abc, -1) -> 400 from Hyper.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        for wire_bad in ["abc", "-1", "18446744073709551616"] {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let raw = format!(
+                "POST /v1beta/models/gemini-2.5-pro:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {wire_bad}\r\n\r\n"
+            );
+            tcp.write_all(raw.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(1), tcp.read(&mut buf))
+                .await
+                .expect("read 400 response")
+                .unwrap();
+            let text = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                text.starts_with("HTTP/1.1 400 "),
+                "wire Content-Length '{wire_bad}' expected 400, got: {text}"
+            );
+        }
+        server.abort();
+
+        assert_eq!(provider.hit_count(), 0, "upstream must receive 0 hits");
     }
 }

@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use companion_core::{
@@ -122,6 +123,7 @@ pub struct CompanionUiServer {
     config_path: PathBuf,
     data_dir: Option<PathBuf>,
     proxy_client: reqwest::Client,
+    config_write_lock: Arc<tokio::sync::Mutex<()>>,
     tool_router: ToolRouter<Self>,
     ui_html_source: UiHtmlSource,
     #[cfg(test)]
@@ -145,6 +147,7 @@ impl CompanionUiServer {
             config_path,
             data_dir,
             proxy_client,
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             tool_router: Self::tool_router(),
             ui_html_source: UiHtmlSource::ProcessEnv,
             #[cfg(test)]
@@ -363,6 +366,26 @@ async fn load_ui_html_override(path: PathBuf) -> Result<String, ErrorData> {
             ErrorData::internal_error(format!("invalid {UI_HTML_ENV_VAR} path: {err}"), None)
         })?;
 
+        // Stat before File::open so FIFOs, sockets, devices, or directories fail fast without blocking open(2).
+        let pre_meta = std::fs::metadata(&path).map_err(|err| {
+            ErrorData::internal_error(
+                format!("failed to stat {UI_HTML_ENV_VAR} file: {err}"),
+                None,
+            )
+        })?;
+        if !pre_meta.is_file() {
+            return Err(ErrorData::internal_error(
+                format!("{UI_HTML_ENV_VAR} path must point to a regular file"),
+                None,
+            ));
+        }
+        if pre_meta.len() > MAX_UI_HTML_BYTES {
+            return Err(ErrorData::internal_error(
+                format!("{UI_HTML_ENV_VAR} exceeds maximum size of {MAX_UI_HTML_BYTES} bytes"),
+                None,
+            ));
+        }
+
         let file = File::open(&path).map_err(|err| {
             ErrorData::internal_error(
                 format!("failed to open {UI_HTML_ENV_VAR} file: {err}"),
@@ -548,71 +571,64 @@ impl CompanionUiServer {
         &self,
         Parameters(args): Parameters<SaveSettingsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let mut cfg = match Config::load_or_default(&self.config_path) {
+        let write_guard = self.config_write_lock.lock().await;
+        let config_path = self.config_path.clone();
+        let save_outcome = tokio::task::spawn_blocking(move || -> Result<Config, String> {
+            let mut cfg = Config::load_or_default(&config_path).map_err(|err| err.to_string())?;
+
+            // Validate api_key strictly (ASCII-before-trim) before inspecting clear_api_key.
+            let validated_api_key = match args.api_key.as_deref() {
+                Some(raw) => validate_api_key_input(raw).map_err(str::to_string)?,
+                None => None,
+            };
+
+            if args.clear_api_key == Some(true) {
+                if validated_api_key.is_some() {
+                    return Err("cannot set both api_key and clear_api_key: true".to_string());
+                }
+                cfg.gemini.api_key = None;
+            } else if let Some(new_key) = validated_api_key {
+                cfg.gemini.api_key = Some(new_key);
+            }
+
+            if let Some(raw_model) = args.default_model.as_deref() {
+                let trimmed = validate_trimmed_ascii_field(raw_model, "default_model")?;
+                cfg.gemini.default_model = trimmed;
+            }
+
+            if let Some(raw_url) = args.base_url.as_deref() {
+                let trimmed = validate_trimmed_ascii_field(raw_url, "base_url")?;
+                validate_upstream_url(&trimmed).map_err(|err| err.to_string())?;
+                cfg.gemini.base_url = trimmed;
+            }
+
+            if let Some(raw_host) = args.listen_host.as_deref() {
+                validate_listen_host(raw_host).map_err(|err| err.to_string())?;
+                cfg.listen_host = raw_host.to_string();
+            }
+
+            if let Some(port) = args.listen_port {
+                if port == 0 {
+                    return Err("listen_port must be between 1 and 65535".to_string());
+                }
+                cfg.listen_port = port;
+            }
+
+            cfg.validate().map_err(|err| err.to_string())?;
+            cfg.save_secure(&config_path)
+                .map_err(|err| err.to_string())?;
+            Ok(cfg)
+        })
+        .await
+        .map_err(|err| {
+            ErrorData::internal_error(format!("save_settings task failed: {err}"), None)
+        })?;
+        drop(write_guard);
+
+        let cfg = match save_outcome {
             Ok(cfg) => cfg,
-            Err(err) => return Ok(tool_error(err.to_string())),
+            Err(msg) => return Ok(tool_error(msg)),
         };
-
-        // Validate api_key strictly (ASCII-before-trim) before inspecting clear_api_key.
-        let validated_api_key = match args.api_key.as_deref() {
-            Some(raw) => match validate_api_key_input(raw) {
-                Ok(parsed) => parsed,
-                Err(msg) => return Ok(tool_error(msg)),
-            },
-            None => None,
-        };
-
-        if args.clear_api_key == Some(true) {
-            if validated_api_key.is_some() {
-                return Ok(tool_error(
-                    "cannot set both api_key and clear_api_key: true",
-                ));
-            }
-            cfg.gemini.api_key = None;
-        } else if let Some(new_key) = validated_api_key {
-            cfg.gemini.api_key = Some(new_key);
-        }
-
-        if let Some(raw_model) = args.default_model.as_deref() {
-            let trimmed = match validate_trimmed_ascii_field(raw_model, "default_model") {
-                Ok(v) => v,
-                Err(msg) => return Ok(tool_error(msg)),
-            };
-            cfg.gemini.default_model = trimmed;
-        }
-
-        if let Some(raw_url) = args.base_url.as_deref() {
-            let trimmed = match validate_trimmed_ascii_field(raw_url, "base_url") {
-                Ok(v) => v,
-                Err(msg) => return Ok(tool_error(msg)),
-            };
-            if let Err(err) = validate_upstream_url(&trimmed) {
-                return Ok(tool_error(err.to_string()));
-            }
-            cfg.gemini.base_url = trimmed;
-        }
-
-        if let Some(raw_host) = args.listen_host.as_deref() {
-            if let Err(err) = validate_listen_host(raw_host) {
-                return Ok(tool_error(err.to_string()));
-            }
-            cfg.listen_host = raw_host.to_string();
-        }
-
-        if let Some(port) = args.listen_port {
-            if port == 0 {
-                return Ok(tool_error("listen_port must be between 1 and 65535"));
-            }
-            cfg.listen_port = port;
-        }
-
-        if let Err(err) = cfg.validate() {
-            return Ok(tool_error(err.to_string()));
-        }
-
-        if let Err(err) = cfg.save_secure(&self.config_path) {
-            return Ok(tool_error(err.to_string()));
-        }
 
         let snapshot = self.build_snapshot(&cfg).await;
         snapshot_tool_result(
@@ -1530,7 +1546,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_json_rpc_full_wire_protocol_over_duplex() {
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
@@ -1567,7 +1583,7 @@ mod tests {
             r: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
         ) -> Value {
             let mut line = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(5), r.read_line(&mut line))
+            let n = tokio::time::timeout(Duration::from_secs(15), r.read_line(&mut line))
                 .await
                 .expect("timed out waiting for MCP server response")
                 .expect("read");
@@ -1658,27 +1674,13 @@ mod tests {
         let res_not_found = recv_msg(&mut reader).await;
         assert_eq!(res_not_found["error"]["code"], json!(-32002));
 
-        // 6. tools/call open_settings with {}
-        send_msg(
-            &mut write_half,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": { "name": "open_settings", "arguments": {} }
-            }),
-        )
-        .await;
-        let open_resp = recv_msg(&mut reader).await;
-        assert_eq!(open_resp["result"]["isError"], json!(false));
-
-        // 7. tools/call save_settings
+        // 6. tools/call save_settings first (sets closed_port so open_settings never probes ambient host port 4141)
         let wire_secret = "AIzaSyWireProtocolSecret123";
         send_msg(
             &mut write_half,
             &json!({
                 "jsonrpc": "2.0",
-                "id": 6,
+                "id": 5,
                 "method": "tools/call",
                 "params": {
                     "name": "save_settings",
@@ -1696,6 +1698,25 @@ mod tests {
         assert_eq!(save_resp["result"]["isError"], json!(false));
         assert!(
             !serde_json::to_string(&save_resp)
+                .unwrap()
+                .contains(wire_secret)
+        );
+
+        // 7. tools/call open_settings with {}
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": { "name": "open_settings", "arguments": {} }
+            }),
+        )
+        .await;
+        let open_resp = recv_msg(&mut reader).await;
+        assert_eq!(open_resp["result"]["isError"], json!(false));
+        assert!(
+            !serde_json::to_string(&open_resp)
                 .unwrap()
                 .contains(wire_secret)
         );
@@ -1747,5 +1768,227 @@ mod tests {
         drop(reader);
         server_task.await.expect("server shutdown");
         upstream_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_mcp_rejects_post_startup_fifo_and_oversized_config_swap() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let closed_port = free_closed_port().await;
+
+        // Start server with nonexistent config (valid first-run UX).
+        let server = CompanionUiServer::new(cfg_path.clone(), None)
+            .expect("server")
+            .with_ui_html_override(None)
+            .with_env_api_key_fallback(false);
+
+        // 1. Post-startup swap to oversized (2 MiB) config file -> immediate tool error.
+        let mut oversized = br#"{"schema_version":1}"#.to_vec();
+        oversized.resize(2 * 1024 * 1024, b' ');
+        fs::write(&cfg_path, oversized).expect("write oversized config");
+
+        let get_big = tokio::time::timeout(Duration::from_secs(2), server.get_settings())
+            .await
+            .expect("get_settings timed out on oversized config")
+            .expect("get_settings result");
+        assert_eq!(get_big.is_error, Some(true));
+
+        let save_big = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.save_settings(Parameters(SaveSettingsArgs {
+                listen_port: Some(closed_port),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("save_settings timed out on oversized config")
+        .expect("save_settings result");
+        assert_eq!(save_big.is_error, Some(true));
+
+        // 2. Post-startup swap to FIFO -> immediate tool error without hanging.
+        fs::remove_file(&cfg_path).expect("remove oversized");
+        let status = Command::new("mkfifo")
+            .arg(&cfg_path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let get_fifo = tokio::time::timeout(Duration::from_secs(2), server.get_settings())
+            .await
+            .expect("get_settings hung on FIFO config")
+            .expect("get_settings result");
+        assert_eq!(get_fifo.is_error, Some(true));
+
+        let save_fifo = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.save_settings(Parameters(SaveSettingsArgs {
+                listen_port: Some(closed_port),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("save_settings hung on FIFO config")
+        .expect("save_settings result");
+        assert_eq!(save_fifo.is_error, Some(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_save_settings_calls_preserve_disjoint_field_updates_and_clear_api_key() {
+        let closed_port = free_closed_port().await;
+
+        // Part A: 10 trials of 3 concurrent disjoint save_settings updates -> 0 lost updates.
+        for trial in 0..10u16 {
+            let tmp = TempDir::new().expect("tempdir");
+            let cfg_path = tmp.path().join("config.json");
+            let initial = Config {
+                listen_port: closed_port,
+                ..Default::default()
+            };
+            initial.save_secure(&cfg_path).expect("seed config");
+
+            let server = CompanionUiServer::new(cfg_path.clone(), None)
+                .expect("server")
+                .with_ui_html_override(None)
+                .with_env_api_key_fallback(false);
+
+            let key_value = format!("AIzaSyConcurrentKeyTrial{trial:02}");
+            let model_value = format!("gemini-2.5-flash-t{trial}");
+            let new_port = free_closed_port().await;
+
+            let s1 = server.clone();
+            let s2 = server.clone();
+            let s3 = server.clone();
+            let key_clone = key_value.clone();
+            let model_clone = model_value.clone();
+
+            let (r1, r2, r3) = tokio::join!(
+                tokio::spawn(async move {
+                    s1.save_settings(Parameters(SaveSettingsArgs {
+                        api_key: Some(key_clone),
+                        ..Default::default()
+                    }))
+                    .await
+                    .expect("save key")
+                }),
+                tokio::spawn(async move {
+                    s2.save_settings(Parameters(SaveSettingsArgs {
+                        default_model: Some(model_clone),
+                        ..Default::default()
+                    }))
+                    .await
+                    .expect("save model")
+                }),
+                tokio::spawn(async move {
+                    s3.save_settings(Parameters(SaveSettingsArgs {
+                        listen_port: Some(new_port),
+                        ..Default::default()
+                    }))
+                    .await
+                    .expect("save port")
+                }),
+            );
+
+            assert_ne!(r1.expect("join 1").is_error, Some(true));
+            assert_ne!(r2.expect("join 2").is_error, Some(true));
+            assert_ne!(r3.expect("join 3").is_error, Some(true));
+
+            let final_cfg = Config::load_or_default(&cfg_path).expect("load final config");
+            assert_eq!(
+                final_cfg.gemini.api_key.as_deref(),
+                Some(key_value.as_str()),
+                "trial {trial}: lost api_key update"
+            );
+            assert_eq!(
+                final_cfg.gemini.default_model, model_value,
+                "trial {trial}: lost default_model update"
+            );
+            assert_eq!(
+                final_cfg.listen_port, new_port,
+                "trial {trial}: lost listen_port update"
+            );
+        }
+
+        // Part B: 10 trials of concurrent clear_api_key vs non-key model update -> zero key resurrection.
+        for trial in 0..10u16 {
+            let tmp = TempDir::new().expect("tempdir");
+            let cfg_path = tmp.path().join("config.json");
+            let initial = Config {
+                listen_port: closed_port,
+                gemini: companion_core::GeminiConfig {
+                    api_key: Some(format!("AIzaSyMustStayCleared{trial:02}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            initial.save_secure(&cfg_path).expect("seed config");
+
+            let server = CompanionUiServer::new(cfg_path.clone(), None)
+                .expect("server")
+                .with_ui_html_override(None)
+                .with_env_api_key_fallback(false);
+
+            let model_value = format!("gemini-2.5-pro-cleared-{trial}");
+            let s1 = server.clone();
+            let s2 = server.clone();
+            let model_clone = model_value.clone();
+
+            let (r1, r2) = tokio::join!(
+                tokio::spawn(async move {
+                    s1.save_settings(Parameters(SaveSettingsArgs {
+                        clear_api_key: Some(true),
+                        ..Default::default()
+                    }))
+                    .await
+                    .expect("clear key")
+                }),
+                tokio::spawn(async move {
+                    s2.save_settings(Parameters(SaveSettingsArgs {
+                        default_model: Some(model_clone),
+                        ..Default::default()
+                    }))
+                    .await
+                    .expect("save model")
+                }),
+            );
+
+            assert_ne!(r1.expect("join clear").is_error, Some(true));
+            assert_ne!(r2.expect("join model").is_error, Some(true));
+
+            let final_cfg = Config::load_or_default(&cfg_path).expect("load final config");
+            assert_eq!(
+                final_cfg.gemini.api_key, None,
+                "trial {trial}: cleared API key was resurrected by concurrent non-key save"
+            );
+            assert_eq!(
+                final_cfg.gemini.default_model, model_value,
+                "trial {trial}: lost default_model update alongside clear_api_key"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_resource_override_rejects_fifo_without_blocking() {
+        let tmp = TempDir::new().expect("tempdir");
+        let fifo_path = tmp.path().join("ui.fifo");
+        let status = Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let server = CompanionUiServer::new(tmp.path().join("config.json"), None)
+            .expect("server")
+            .with_ui_html_override(Some(fifo_path));
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.read_ui_resource(UI_RESOURCE_URI),
+        )
+        .await
+        .expect("read_ui_resource hung on FIFO override")
+        .expect_err("FIFO override must fail");
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
     }
 }

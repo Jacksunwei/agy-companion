@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -121,6 +121,22 @@ impl JsonlUsageSink {
     pub fn new(usage_dir: impl Into<PathBuf>) -> Result<Self, CoreError> {
         let usage_dir = usage_dir.into();
         validate_path(&usage_dir)?;
+        let check_dir: PathBuf = usage_dir.components().collect();
+        match fs::symlink_metadata(&check_dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(CoreError::InvalidPath {
+                    reason: "symbolic links are not allowed for usage directories".to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CoreError::Io {
+                    path: usage_dir,
+                    source,
+                });
+            }
+        }
         Ok(Self {
             usage_dir,
             write_lock: Mutex::new(()),
@@ -155,21 +171,77 @@ impl JsonlUsageSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if !self.usage_dir.exists() {
-            let mut dir_builder = fs::DirBuilder::new();
-            dir_builder.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                dir_builder.mode(0o700);
+        let check_usage_dir: PathBuf = self.usage_dir.components().collect();
+        match fs::symlink_metadata(&check_usage_dir) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::InvalidPath {
+                        reason: "symbolic links are not allowed for usage directories".to_string(),
+                    });
+                }
+                if !meta.file_type().is_dir() {
+                    return Err(CoreError::InvalidPath {
+                        reason: "usage directory path must be a directory".to_string(),
+                    });
+                }
             }
-            dir_builder
-                .create(&self.usage_dir)
-                .map_err(|source| CoreError::Io {
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                let mut dir_builder = fs::DirBuilder::new();
+                dir_builder.recursive(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    dir_builder.mode(0o700);
+                }
+                dir_builder
+                    .create(&self.usage_dir)
+                    .map_err(|source| CoreError::Io {
+                        path: self.usage_dir.clone(),
+                        source,
+                    })?;
+
+                let created_meta =
+                    fs::symlink_metadata(&check_usage_dir).map_err(|source| CoreError::Io {
+                        path: self.usage_dir.clone(),
+                        source,
+                    })?;
+                if created_meta.file_type().is_symlink() || !created_meta.file_type().is_dir() {
+                    return Err(CoreError::InvalidPath {
+                        reason: "usage directory path must be a non-symlink directory".to_string(),
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(CoreError::Io {
                     path: self.usage_dir.clone(),
                     source,
-                })?;
+                });
+            }
         }
+
+        let check_file_path: PathBuf = file_path.components().collect();
+        let pre_open_meta = match fs::symlink_metadata(&check_file_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::InvalidPath {
+                        reason: "symbolic links are not allowed for usage files".to_string(),
+                    });
+                }
+                if !meta.file_type().is_file() {
+                    return Err(CoreError::InvalidPath {
+                        reason: "usage file path must be a regular file".to_string(),
+                    });
+                }
+                Some(meta)
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(CoreError::Io {
+                    path: file_path.clone(),
+                    source,
+                });
+            }
+        };
 
         let mut open_opts = fs::OpenOptions::new();
         open_opts.create(true).append(true);
@@ -183,6 +255,45 @@ impl JsonlUsageSink {
             path: file_path.clone(),
             source,
         })?;
+
+        let open_meta = file.metadata().map_err(|source| CoreError::Io {
+            path: file_path.clone(),
+            source,
+        })?;
+        if !open_meta.file_type().is_file() {
+            return Err(CoreError::InvalidPath {
+                reason: "usage file path must be a regular file".to_string(),
+            });
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Some(lstat_meta) = pre_open_meta {
+                if open_meta.dev() != lstat_meta.dev() || open_meta.ino() != lstat_meta.ino() {
+                    return Err(CoreError::InvalidPath {
+                        reason: "usage file changed concurrently during open".to_string(),
+                    });
+                }
+            } else {
+                let post_lstat =
+                    fs::symlink_metadata(&check_file_path).map_err(|source| CoreError::Io {
+                        path: file_path.clone(),
+                        source,
+                    })?;
+                if post_lstat.file_type().is_symlink()
+                    || !post_lstat.file_type().is_file()
+                    || post_lstat.dev() != open_meta.dev()
+                    || post_lstat.ino() != open_meta.ino()
+                {
+                    return Err(CoreError::InvalidPath {
+                        reason: "usage file changed concurrently during open".to_string(),
+                    });
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pre_open_meta;
 
         #[cfg(unix)]
         {
@@ -492,6 +603,118 @@ mod tests {
         assert_eq!(
             serialize_err.to_string(),
             "failed to serialize usage event: boom"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_sink_rejects_symlink_jsonl_file_without_modifying_target_or_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = TempDir::new().expect("temp dir");
+        let usage_dir = tmp.path().join("usage");
+        fs::create_dir(&usage_dir).expect("mkdir usage");
+
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, "DO_NOT_TOUCH\n").expect("write victim");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+
+        let link_path = usage_dir.join("2026-11.jsonl");
+        symlink(&victim, &link_path).expect("symlink jsonl");
+
+        let sink = JsonlUsageSink::new(&usage_dir).expect("sink init");
+        let err = sink
+            .record_checked(&sample_event("2026-11-23T08:00:00Z", "sym-jsonl"))
+            .expect_err("symlinked JSONL file must fail");
+        assert!(
+            matches!(err, CoreError::InvalidPath { .. }),
+            "expected InvalidPath for symlinked JSONL, got {err:?}"
+        );
+
+        assert_eq!(
+            fs::read_to_string(&victim).expect("read victim"),
+            "DO_NOT_TOUCH\n",
+            "victim file contents must remain untouched"
+        );
+        let mode = fs::metadata(&victim)
+            .expect("victim meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "victim file permissions must remain 0644");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_sink_rejects_symlink_usage_dir_and_fifo_without_blocking() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("temp dir");
+
+        // 1. Symlinked usage_dir must be rejected without writing into target dir.
+        let target_dir = tmp.path().join("target_dir");
+        fs::create_dir(&target_dir).expect("mkdir target_dir");
+        let sym_usage_dir = tmp.path().join("sym_usage");
+        symlink(&target_dir, &sym_usage_dir).expect("symlink usage_dir");
+
+        // Both construction and post-construction swap must reject symlinks.
+        match JsonlUsageSink::new(&sym_usage_dir) {
+            Err(CoreError::InvalidPath { .. }) => {}
+            Ok(sink) => {
+                let err = sink
+                    .record_checked(&sample_event("2026-11-23T08:00:00Z", "sym-dir"))
+                    .expect_err("symlinked usage_dir must fail on record");
+                assert!(
+                    matches!(err, CoreError::InvalidPath { .. }),
+                    "expected InvalidPath, got {err:?}"
+                );
+            }
+            Err(other) => panic!("unexpected error for symlinked usage_dir: {other:?}"),
+        }
+
+        // Also test post-construction swap of usage_dir to a symlink.
+        let swapped_dir = tmp.path().join("swapped_usage");
+        let swapped_sink = JsonlUsageSink::new(&swapped_dir).expect("missing usage_dir allowed");
+        symlink(&target_dir, &swapped_dir).expect("swap usage_dir to symlink");
+        let swap_err = swapped_sink
+            .record_checked(&sample_event("2026-11-23T08:00:00Z", "swapped-dir"))
+            .expect_err("post-construction symlinked usage_dir must fail");
+        assert!(
+            matches!(swap_err, CoreError::InvalidPath { .. }),
+            "expected InvalidPath, got {swap_err:?}"
+        );
+        assert!(
+            fs::read_dir(&target_dir)
+                .expect("read target_dir")
+                .next()
+                .is_none(),
+            "target_dir must remain completely empty"
+        );
+
+        // 2. FIFO at YYYY-MM.jsonl must fail fast (< 1s) without blocking.
+        let fifo_usage_dir = tmp.path().join("fifo_usage");
+        fs::create_dir(&fifo_usage_dir).expect("mkdir fifo_usage");
+        let fifo_jsonl = fifo_usage_dir.join("2026-11.jsonl");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_jsonl)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let fifo_sink = JsonlUsageSink::new(&fifo_usage_dir).expect("sink init");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let res = fifo_sink.record_checked(&sample_event("2026-11-23T08:00:00Z", "fifo-req"));
+            let _ = tx.send(res);
+        });
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("record_checked hung on FIFO");
+        handle.join().expect("thread join");
+        let err = res.expect_err("FIFO JSONL must fail");
+        assert!(
+            matches!(err, CoreError::InvalidPath { .. }),
+            "expected InvalidPath for FIFO JSONL, got {err:?}"
         );
     }
 }
