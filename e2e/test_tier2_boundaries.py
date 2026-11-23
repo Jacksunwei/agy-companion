@@ -161,7 +161,7 @@ class TestTier2F1ConfigBoundaries(E2ETestCase):
                 self.assertTrue(res.stderr.strip(), f"Expected error message on stderr for {label}")
 
     def test_t2_f1_rewrites_0644_to_0600_and_protects_symlink_target(self) -> None:
-        """save_settings tightens 0644->0600 and never overwrites a symlink target (S3)."""
+        """save_settings tightens 0644->0600; symlink config fails closed at startup and post-startup (S2/S6)."""
         with self.subTest(case="tighten_0644_to_0600"):
             env = self.make_env()
             cfg = env.write_config(env.make_config_dict(), mode=0o644)
@@ -171,21 +171,75 @@ class TestTier2F1ConfigBoundaries(E2ETestCase):
             mcp.assert_clean_stdout()
             self.assertEqual(stat.S_IMODE(os.stat(cfg).st_mode), 0o600)
 
-        with self.subTest(case="protect_symlink_target"):
+        with self.subTest(case="protect_symlink_target_startup"):
+            binary = self.require_binary()
             env = self.make_env()
             victim = env.root / "victim.txt"
             sentinel_json = json.dumps(env.make_config_dict(default_model="VICTIM_SENTINEL"), indent=2) + "\n"
             victim.write_text(sentinel_json, encoding="utf-8")
             sym_cfg = env.root / "sym_config.json"
             os.symlink(victim, sym_cfg)
-            mcp = self.start_mcp(env, config_path=sym_cfg)
-            resp = mcp.save_settings_smart(default_model="gemini-2.5-flash", raw=True)
-            mcp.assert_clean_stdout()
-            # Victim file MUST NEVER be overwritten regardless of whether save rejected or atomically replaced symlink.
+            res = run_cli(
+                [str(binary), "ui-mcp", "--config", str(sym_cfg), "--data-dir", str(env.data_dir)],
+                env=env.build_env(),
+                stdin_bytes=b"",
+                timeout=10.0,
+            )
+            self.assertNotEqual(res.returncode, 0, "ui-mcp must fail closed on symlink --config at startup (S6)")
+            self.assertEqual(res.stdout, "", f"ui-mcp emitted unexpected stdout on symlink rejection: {res.stdout!r}")
+            self.assertNotIn("panicked at", res.stderr.lower())
+            stderr_lower = res.stderr.lower()
+            self.assertTrue(
+                "symlink" in stderr_lower or "symbolic link" in stderr_lower,
+                f"Expected symlink rejection diagnostic on stderr, got: {res.stderr!r}",
+            )
             self.assertEqual(victim.read_text(encoding="utf-8"), sentinel_json)
-            if not McpStdioClient.is_tool_error(resp):
-                self.assertFalse(sym_cfg.is_symlink(), "Symlink should have been atomically replaced")
-                self.assertEqual(stat.S_IMODE(os.stat(sym_cfg).st_mode), 0o600)
+            self.assertTrue(sym_cfg.is_symlink(), "Symlink config must not be mutated on startup rejection")
+
+        with self.subTest(case="protect_symlink_target_post_startup"):
+            env = self.make_env()
+            victim = env.root / "victim.txt"
+            sentinel_json = (
+                json.dumps(
+                    env.make_config_dict(
+                        default_model="VICTIM_SENTINEL",
+                        api_key="AIzaSyVictimSentinel0001",
+                    ),
+                    indent=2,
+                )
+                + "\n"
+            )
+            victim.write_text(sentinel_json, encoding="utf-8")
+            sym_cfg = env.root / "sym_config.json"
+            # Start cleanly while config does not exist yet (valid first-run UX), then swap in a symlink (TOCTOU).
+            mcp = self.start_mcp(env, config_path=sym_cfg)
+            os.symlink(victim, sym_cfg)
+
+            get_resp = mcp.call_tool_raw("get_settings", {})
+            mcp.assert_clean_stdout()
+            self.assertTrue(
+                McpStdioClient.is_tool_error(get_resp),
+                f"get_settings must reject post-startup symlink config (S6): {get_resp!r}",
+            )
+            self.assertNotIn("VICTIM_SENTINEL", json.dumps(get_resp))
+            self.assertNotIn("AIzaSyVictimSentinel0001", json.dumps(get_resp))
+            self.assertNotIn("VICTIM_SENTINEL", mcp.stderr_text)
+            self.assertNotIn("AIzaSyVictimSentinel0001", mcp.stderr_text)
+            self.assertNotIn("panicked at", mcp.stderr_text.lower())
+
+            save_resp = mcp.save_settings_smart(default_model="gemini-2.5-flash", raw=True)
+            mcp.assert_clean_stdout()
+            self.assertTrue(
+                McpStdioClient.is_tool_error(save_resp),
+                f"save_settings must reject post-startup symlink config (S6): {save_resp!r}",
+            )
+            self.assertNotIn("VICTIM_SENTINEL", json.dumps(save_resp))
+            self.assertNotIn("AIzaSyVictimSentinel0001", json.dumps(save_resp))
+            self.assertNotIn("VICTIM_SENTINEL", mcp.stderr_text)
+            self.assertNotIn("AIzaSyVictimSentinel0001", mcp.stderr_text)
+            self.assertNotIn("panicked at", mcp.stderr_text.lower())
+            self.assertEqual(victim.read_text(encoding="utf-8"), sentinel_json)
+            self.assertTrue(sym_cfg.is_symlink(), "Symlink must remain untouched when save_settings fails closed")
 
 
 class TestTier2F2RedactionBoundaries(E2ETestCase):
@@ -252,18 +306,58 @@ class TestTier2F2RedactionBoundaries(E2ETestCase):
             self.assertIsNone(hint)
 
     def test_t2_f2_whitespace_only_key_treated_as_unconfigured(self) -> None:
-        """Config with whitespace-only api_key reports unconfigured and hint=None."""
-        env = self.make_env()
-        env.write_config(env.make_config_dict(api_key="   \t\n  "))
-        mcp = self.start_mcp(env)
-        res = mcp.call_tool("get_settings", {})
-        mcp.assert_clean_stdout()
-        sc = res.get("structuredContent", {})
-        found_c, configured = find_key_recursive(sc, "api_key_configured")
-        self.assertTrue(found_c and configured is False)
-        found_h, hint = find_key_recursive(sc, "api_key_hint")
-        if found_h:
-            self.assertIsNone(hint)
+        """Space-only api_key reports unconfigured/hint=None; control-char keys reject fail-closed without leaking."""
+        with self.subTest(case="spaces_only"):
+            env = self.make_env()
+            env.write_config(env.make_config_dict(api_key="     "))
+            mcp = self.start_mcp(env)
+            res = mcp.call_tool("get_settings", {})
+            mcp.assert_clean_stdout()
+            self.assertFalse(McpStdioClient.is_tool_error(res), f"Expected success for space-only api_key, got {res!r}")
+            sc = res.get("structuredContent", {})
+            found_c, configured = find_key_recursive(sc, "api_key_configured")
+            self.assertTrue(found_c and configured is False, f"Expected api_key_configured=False in {sc!r}")
+            found_h, hint = find_key_recursive(sc, "api_key_hint")
+            if found_h:
+                self.assertIsNone(hint)
+
+        with self.subTest(case="control_char_whitespace_rejected"):
+            raw_ws = "   \t\n  "
+            env = self.make_env()
+            env.write_config(env.make_config_dict(api_key=raw_ws))
+            mcp = self.start_mcp(env)
+            raw_resp = mcp.call_tool_raw("get_settings", {})
+            mcp.assert_clean_stdout()
+            self.assertTrue(
+                McpStdioClient.is_tool_error(raw_resp),
+                f"Expected fail-closed rejection for control-char whitespace api_key, got {raw_resp!r}",
+            )
+            serialized = json.dumps(raw_resp)
+            self.assertIn("control", serialized.lower(), f"Expected control-char diagnostic, got {serialized}")
+            self.assertNotIn(raw_ws, serialized)
+            self.assertNotIn(raw_ws, mcp.stderr_text)
+            self.assertNotIn("panicked at", mcp.stderr_text.lower())
+
+        with self.subTest(case="control_char_secret_rejected_no_leak"):
+            injected_prefix = "AIzaSyCtrlReject99"
+            injected_hdr = "X-Injected"
+            bad_secret = f"{injected_prefix}\r\n{injected_hdr}: 1"
+            env = self.make_env()
+            env.write_config(env.make_config_dict(api_key=bad_secret))
+            mcp = self.start_mcp(env)
+            raw_resp = mcp.call_tool_raw("get_settings", {})
+            mcp.assert_clean_stdout()
+            self.assertTrue(
+                McpStdioClient.is_tool_error(raw_resp),
+                f"Expected fail-closed rejection for CRLF-injected api_key, got {raw_resp!r}",
+            )
+            serialized = json.dumps(raw_resp)
+            self.assertIn("control", serialized.lower(), f"Expected control-char diagnostic, got {serialized}")
+            self.assertNotIn(injected_prefix, serialized)
+            self.assertNotIn(injected_hdr, serialized)
+            self.assertNotIn(injected_prefix, mcp.stderr_text)
+            self.assertNotIn(injected_hdr, mcp.stderr_text)
+            self.assertNotIn("panicked at", mcp.stderr_text.lower())
 
     def test_t2_f2_unicode_and_special_chars_in_key(self) -> None:
         """Special ASCII keys mask safely; multi-byte Unicode keys either mask safely or reject cleanly without panic/leak (A10)."""
@@ -1532,17 +1626,26 @@ class TestTier2F11PackagingBoundaries(E2ETestCase):
             self.assertIn(target, text, f"Missing hardcoded allow-list entry {target}")
 
     def test_t2_f11_npm_shim_rejects_unsupported_platform_cleanly(self) -> None:
-        """Loading bin/agy-companion.js on unsupported platform 'freebsd' exits non-zero cleanly."""
+        """Running bin/agy-companion.js as a CLI on unsupported platform 'freebsd' exits non-zero cleanly."""
         shim = self.repo_root / "packages" / "npm" / "agy-companion" / "bin" / "agy-companion.js"
         self.assertTrue(shim.is_file(), f"Missing {shim}")
-        code = (
-            "Object.defineProperty(process, 'platform', { value: 'freebsd' });"
-            "Object.defineProperty(process, 'arch', { value: 'mips' });"
-            f"require({json.dumps(str(shim))});"
+        env = self.make_env()
+        preload = env.tmp_dir / "override_platform.cjs"
+        preload.write_text(
+            "Object.defineProperty(process, 'platform', { value: 'freebsd', configurable: true });\n"
+            "Object.defineProperty(process, 'arch', { value: 'mips', configurable: true });\n",
+            encoding="utf-8",
         )
-        res = run_cli(["node", "-e", code], cwd=self.repo_root)
+        res = run_cli(
+            ["node", "-r", str(preload), str(shim)],
+            env=env.build_env(),
+            cwd=self.repo_root,
+        )
         self.assertNotEqual(res.returncode, 0, "Expected non-zero exit on unsupported platform")
+        self.assertTrue(res.stderr.strip(), "Expected diagnostic error on stderr")
         combined = (res.stdout + "\n" + res.stderr).lower()
+        for js_err in ("syntaxerror", "referenceerror", "typeerror"):
+            self.assertNotIn(js_err, combined, f"Unexpected JS runtime error ({js_err}):\n{combined}")
         self.assertTrue(
             "freebsd" in combined or "unsupported" in combined or "platform" in combined,
             f"Expected clear unsupported platform message, got:\n{combined}",
