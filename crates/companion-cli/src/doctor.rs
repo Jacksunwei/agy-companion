@@ -1196,7 +1196,7 @@ mod tests {
         let ssrf = temp.path().join("ssrf.json");
         fs::write(
             &ssrf,
-            r#"{"schema_version":1,"listen_host":"0.0.0.0","listen_port":4141,"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyDoctorSsrfSecret888","default_model":"gemini-2.5-pro","timeout_secs":900}}"#,
+            r#"{"schema_version":1,"listen_host":"0.0.0.0","listen_port":4141,"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyDoctorSsrfSecret888","default_model":"gemini-4-hydrogen","timeout_secs":900}}"#,
         )
         .expect("write ssrf");
         #[cfg(unix)]
@@ -1471,7 +1471,7 @@ mod tests {
                 "gemini": {
                     "base_url": "https://generativelanguage.googleapis.com",
                     "api_key": bad_key,
-                    "default_model": "gemini-2.5-pro",
+                    "default_model": "gemini-4-hydrogen",
                     "timeout_secs": 900
                 }
             });

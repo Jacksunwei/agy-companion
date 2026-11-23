@@ -54,7 +54,7 @@ class TestTier4Scenarios(E2ETestCase):
             "base_url": mock.base_url,
             "api_key": api_key,
             "listen_port": port,
-            "default_model": "gemini-2.5-pro",
+            "default_model": "gemini-4-hydrogen",
         }
         if "usage_dir" in mcp.get_save_settings_schema():
             save_kwargs["usage_dir"] = str(env.usage_dir)
@@ -99,7 +99,7 @@ class TestTier4Scenarios(E2ETestCase):
                 "127.0.0.1",
                 proxy.port,
                 "POST",
-                "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+                "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse",
                 body=json.dumps({"contents": [{"parts": [{"text": prompt_txt}]}]}).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
@@ -166,7 +166,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -182,7 +182,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -193,13 +193,13 @@ class TestTier4Scenarios(E2ETestCase):
         self.assertTrue(found_h and hint == "AIza...2222")
 
         # 3. Unrelated save preserves KEY_2.
-        mcp.save_settings_smart(default_model="gemini-2.5-flash")
+        mcp.save_settings_smart(default_model="gemini-3.8-flash")
         IsolatedEnv.bump_mtime(cfg, delta=2.0)
         r3 = http_raw_request(
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -219,7 +219,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -247,7 +247,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -260,7 +260,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -269,7 +269,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -282,7 +282,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -301,7 +301,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -365,7 +365,7 @@ class TestTier4Scenarios(E2ETestCase):
                     "127.0.0.1",
                     proxy.port,
                     "POST",
-                    "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+                    "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse",
                     body=json.dumps({"tag": tag, "contents": []}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                 )
@@ -381,7 +381,7 @@ class TestTier4Scenarios(E2ETestCase):
                     "127.0.0.1",
                     proxy.port,
                     "POST",
-                    "/v1beta/models/gemini-2.5-pro:generateContent",
+                    "/v1beta/models/gemini-4-hydrogen:generateContent",
                     body=json.dumps({"tag": tag, "contents": []}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                 )
@@ -477,7 +477,7 @@ class TestTier4Scenarios(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent?key=LEAK_ATTEMPT",
+            "/v1beta/models/gemini-4-hydrogen:generateContent?key=LEAK_ATTEMPT",
             body=json.dumps({"contents": [{"parts": [{"text": canary_prompt}]}]}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )

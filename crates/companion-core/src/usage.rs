@@ -339,7 +339,7 @@ mod tests {
             timestamp_utc: timestamp_utc.to_string(),
             request_id: request_id.to_string(),
             provider: "gemini".to_string(),
-            model: "gemini-2.5-pro".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
             input_tokens: 1200,
             output_tokens: 350,
             cached_tokens: 900,
@@ -532,7 +532,7 @@ mod tests {
             cached_content_token_count: 2,
             thoughts_token_count: 1,
         };
-        let event = UsageEvent::from_gemini("gemini-2.5-pro", &usage, 123);
+        let event = UsageEvent::from_gemini("gemini-4-hydrogen", &usage, 123);
         assert_eq!(event.provider, "gemini");
         assert_eq!(event.source, "proxy");
         assert_eq!(event.input_tokens, 10);

@@ -777,7 +777,7 @@ mod tests {
         // 2. POST SSE pass-through
         let proxy_resp = client
             .post(format!(
-                "http://{proxy_addr}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+                "http://{proxy_addr}/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse"
             ))
             .header("content-type", "application/json")
             .body(r#"{"contents":[]}"#)
@@ -819,7 +819,7 @@ mod tests {
         let lines: Vec<&str> = jsonl_contents.lines().collect();
         assert_eq!(lines.len(), 1);
         let event: UsageEvent = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(event.model, "gemini-2.5-pro");
+        assert_eq!(event.model, "gemini-4-hydrogen");
         assert_eq!(event.input_tokens, 40);
         assert_eq!(event.cached_tokens, 20);
 
@@ -872,7 +872,7 @@ mod tests {
 
         let client = test_http_client();
         let url = format!(
-            "http://{proxy_addr}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+            "http://{proxy_addr}/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse"
         );
 
         // 1. Initial key hits upstream 1.
@@ -963,7 +963,7 @@ mod tests {
 
         let client = test_http_client();
         let url = format!(
-            "http://{proxy_addr}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+            "http://{proxy_addr}/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse"
         );
 
         // 1. Write corrupt JSON containing a secret -> proxy keeps last valid provider cleanly.
@@ -986,7 +986,7 @@ mod tests {
             "gemini": {
                 "base_url": format!("http://{upstream_addr}"),
                 "api_key": "AIzaINVALIDHOSTSECRET",
-                "default_model": "gemini-2.5-pro",
+                "default_model": "gemini-4-hydrogen",
                 "timeout_secs": 900
             }
         });
@@ -1077,7 +1077,7 @@ mod tests {
             .build()
             .expect("build loopback client");
         let url = format!(
-            "http://{proxy_addr}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+            "http://{proxy_addr}/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse"
         );
 
         // Baseline: hits upstream 1 with original key.

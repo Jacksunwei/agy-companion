@@ -5,7 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CliError, load_config_checked, resolve_cli_config_path};
 
-pub const CURATED_MODELS: &[&str] = &["gemini-2.5-pro", "gemini-2.5-flash"];
+pub const CURATED_MODELS: &[&str] = &[
+    "gemini-4-hydrogen",
+    "gemini-4-argon",
+    "gemini-4-neon",
+    "gemini-4-carbon",
+    "gemini-3.8-flash",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,7 +114,7 @@ mod tests {
 
     #[test]
     fn models_command_emits_valid_custom_models_config_json() {
-        let snippet = build_custom_models_config(4141, "gemini-2.5-pro")
+        let snippet = build_custom_models_config(4141, "gemini-4-hydrogen")
             .expect("default port and model should succeed");
         let rendered =
             format_models_output(&snippet, 4141, true).expect("json formatting should succeed");
@@ -120,73 +126,78 @@ mod tests {
         let models = parsed["customModelsConfig"]["customModels"]
             .as_array()
             .expect("customModels must be an array");
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 5);
         assert_eq!(
             models[0]["modelName"],
-            "gemini-api://http://127.0.0.1:4141/models/gemini-2.5-pro"
+            "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen"
         );
-        assert_eq!(models[0]["label"], "AGY Companion (gemini-2.5-pro)");
+        assert_eq!(models[0]["label"], "AGY Companion (gemini-4-hydrogen)");
         assert_eq!(
             models[1]["modelName"],
-            "gemini-api://http://127.0.0.1:4141/models/gemini-2.5-flash"
+            "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon"
         );
-        assert_eq!(models[1]["label"], "AGY Companion (gemini-2.5-flash)");
+        assert_eq!(models[1]["label"], "AGY Companion (gemini-4-argon)");
+        assert_eq!(
+            models[4]["modelName"],
+            "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash"
+        );
+        assert_eq!(models[4]["label"], "AGY Companion (gemini-3.8-flash)");
         assert!(!rendered.contains("AIza"));
 
         let human =
             format_models_output(&snippet, 4141, false).expect("human formatting should succeed");
         assert!(human.contains("~/.gemini/antigravity-cli/settings.json"));
-        assert!(human.contains("gemini-api://http://127.0.0.1:4141/models/gemini-2.5-pro"));
+        assert!(human.contains("gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen"));
     }
 
     #[test]
     fn models_includes_custom_default_model_and_deduplicates_curated_models() {
-        let pro = build_custom_models_config(4141, "gemini-2.5-pro").expect("pro");
-        assert_eq!(pro.custom_models_config.custom_models.len(), 2);
+        let hydrogen = build_custom_models_config(4141, "gemini-4-hydrogen").expect("hydrogen");
+        assert_eq!(hydrogen.custom_models_config.custom_models.len(), 5);
         assert_eq!(
-            pro.custom_models_config.custom_models[0].model_name,
-            "gemini-api://http://127.0.0.1:4141/models/gemini-2.5-pro"
+            hydrogen.custom_models_config.custom_models[0].model_name,
+            "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen"
         );
         assert_eq!(
-            pro.custom_models_config.custom_models[1].model_name,
-            "gemini-api://http://127.0.0.1:4141/models/gemini-2.5-flash"
+            hydrogen.custom_models_config.custom_models[1].model_name,
+            "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon"
         );
 
-        let flash = build_custom_models_config(4141, "gemini-2.5-flash").expect("flash");
-        assert_eq!(flash.custom_models_config.custom_models.len(), 2);
+        let flash = build_custom_models_config(4141, "gemini-3.8-flash").expect("flash");
+        assert_eq!(flash.custom_models_config.custom_models.len(), 5);
         assert_eq!(
             flash.custom_models_config.custom_models[0].model_name,
-            "gemini-api://http://127.0.0.1:4141/models/gemini-2.5-flash"
+            "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash"
         );
         assert_eq!(
             flash.custom_models_config.custom_models[1].model_name,
-            "gemini-api://http://127.0.0.1:4141/models/gemini-2.5-pro"
+            "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen"
         );
 
-        let custom = build_custom_models_config(5151, "gemini-3.8-flash").expect("custom");
-        assert_eq!(custom.custom_models_config.custom_models.len(), 3);
+        let custom = build_custom_models_config(5151, "gemini-3.6-flash").expect("custom");
+        assert_eq!(custom.custom_models_config.custom_models.len(), 6);
         assert_eq!(
             custom.custom_models_config.custom_models[0].model_name,
-            "gemini-api://http://127.0.0.1:5151/models/gemini-3.8-flash"
+            "gemini-api://http://127.0.0.1:5151/models/gemini-3.6-flash"
         );
         assert_eq!(
             custom.custom_models_config.custom_models[0].label,
-            "AGY Companion (gemini-3.8-flash)"
+            "AGY Companion (gemini-3.6-flash)"
         );
         assert_eq!(
             custom.custom_models_config.custom_models[1].model_name,
-            "gemini-api://http://127.0.0.1:5151/models/gemini-2.5-pro"
+            "gemini-api://http://127.0.0.1:5151/models/gemini-4-hydrogen"
         );
         assert_eq!(
-            custom.custom_models_config.custom_models[2].model_name,
-            "gemini-api://http://127.0.0.1:5151/models/gemini-2.5-flash"
+            custom.custom_models_config.custom_models[5].model_name,
+            "gemini-api://http://127.0.0.1:5151/models/gemini-3.8-flash"
         );
     }
 
     #[test]
     fn models_rejects_port_zero() {
-        let err =
-            build_custom_models_config(0, "gemini-2.5-pro").expect_err("port 0 must be rejected");
+        let err = build_custom_models_config(0, "gemini-4-hydrogen")
+            .expect_err("port 0 must be rejected");
         assert!(matches!(err, CliError::InvalidPort(0)));
     }
 }

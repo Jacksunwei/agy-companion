@@ -863,18 +863,17 @@ mod tests {
             b"{\n  \"z_first\": 1,\n  \"contents\": [{\"parts\": [{\"text\": \"hello \xF0\x9F\x8C\x8D\"}]}]\n}\n",
         );
 
-        let resp =
-            provider
-                .forward_gemini(ForwardRequest {
-                    path_and_query:
-                        "/v1beta/models/gemini-2.5-pro:generateContent?key=LEAK_ME&alt=json"
-                            .to_string(),
-                    body: raw_payload.clone(),
-                    content_type: Some("application/json; charset=utf-8".to_string()),
-                    api_key_override: None,
-                })
-                .await
-                .expect("forward_gemini should succeed");
+        let resp = provider
+            .forward_gemini(ForwardRequest {
+                path_and_query:
+                    "/v1beta/models/gemini-4-hydrogen:generateContent?key=LEAK_ME&alt=json"
+                        .to_string(),
+                body: raw_payload.clone(),
+                content_type: Some("application/json; charset=utf-8".to_string()),
+                api_key_override: None,
+            })
+            .await
+            .expect("forward_gemini should succeed");
 
         assert_eq!(resp.status, 200);
         assert_eq!(
@@ -903,7 +902,7 @@ mod tests {
         );
         assert_eq!(
             seen.uri,
-            "/v1beta/models/gemini-2.5-pro:generateContent?alt=json"
+            "/v1beta/models/gemini-4-hydrogen:generateContent?alt=json"
         );
         assert!(!seen.uri.contains("LEAK_ME"));
         assert!(!seen.uri.to_ascii_lowercase().contains("key="));
@@ -940,7 +939,7 @@ mod tests {
 
         let mut resp = provider
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse"
                     .to_string(),
                 body: Bytes::from_static(br#"{"contents":[]}"#),
                 content_type: None,
@@ -1022,7 +1021,7 @@ mod tests {
 
             let resp = provider
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: None,
@@ -1063,13 +1062,13 @@ mod tests {
             "/v1beta/models/gemini/../../admin",
             "/v1beta/models/foo/./bar",
             "/v1beta/other/endpoint",
-            "/v1/models/gemini-2.5-pro:generateContent",
+            "/v1/models/gemini-4-hydrogen:generateContent",
             "/v1beta/models",
             "/v1beta/models/",
             "/v1beta/models/?alt=sse",
-            "/V1BETA/models/gemini-2.5-pro:generateContent",
-            "//v1beta/models/gemini-2.5-pro:generateContent",
-            "https://evil.example/v1beta/models/gemini-2.5-pro:generateContent",
+            "/V1BETA/models/gemini-4-hydrogen:generateContent",
+            "//v1beta/models/gemini-4-hydrogen:generateContent",
+            "https://evil.example/v1beta/models/gemini-4-hydrogen:generateContent",
             "",
         ];
 
@@ -1209,37 +1208,37 @@ mod tests {
         let wire_cases = [
             (
                 server.base_url.clone(),
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 "/v1beta/models?pageSize=1",
             ),
             (
                 format!("{}/", server.base_url),
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 "/v1beta/models?pageSize=1",
             ),
             (
                 format!("{}/v1beta", server.base_url),
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 "/v1beta/models?pageSize=1",
             ),
             (
                 format!("{}/v1beta/", server.base_url),
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 "/v1beta/models?pageSize=1",
             ),
             (
                 format!("{}/v1beta/v1beta", server.base_url),
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 "/v1beta/models?pageSize=1",
             ),
             (
                 format!("{}/gw/v1beta/", server.base_url),
-                "/gw/v1beta/models/gemini-2.5-pro:generateContent",
+                "/gw/v1beta/models/gemini-4-hydrogen:generateContent",
                 "/gw/v1beta/models?pageSize=1",
             ),
             (
                 format!("{}/myv1beta", server.base_url),
-                "/myv1beta/v1beta/models/gemini-2.5-pro:generateContent",
+                "/myv1beta/v1beta/models/gemini-4-hydrogen:generateContent",
                 "/myv1beta/v1beta/models?pageSize=1",
             ),
         ];
@@ -1249,7 +1248,7 @@ mod tests {
             let provider = provider_for(&base, Some("AIzaSyWireNorm123456"), None);
             let resp = provider
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: None,
@@ -1289,7 +1288,7 @@ mod tests {
         let server = spawn_mock_server(router).await;
         let provider = provider_for(&server.base_url, Some("AIzaSyQueryHygiene12"), None);
 
-        let base_path = "/v1beta/models/gemini-2.5-pro:streamGenerateContent";
+        let base_path = "/v1beta/models/gemini-4-hydrogen:streamGenerateContent";
         let accept_cases = [
             ("?alt=sse&key=SECRET_1", format!("{base_path}?alt=sse")),
             ("?key=SECRET_1&alt=sse", format!("{base_path}?alt=sse")),
@@ -1430,8 +1429,8 @@ mod tests {
             "/v1beta/models/gemini\r\nX-Hdr: 1",
             "/v1beta/models/\u{ff0e}\u{ff0e}/admin",
             "/v1beta/models/gemini\u{200b}",
-            "/v1beta/models//gemini-2.5-pro",
-            "/v1beta/models/gemini-2.5-pro/",
+            "/v1beta/models//gemini-4-hydrogen",
+            "/v1beta/models/gemini-4-hydrogen/",
             "/v1beta/models/a//b",
         ];
 
@@ -1454,9 +1453,9 @@ mod tests {
 
         // Valid paths with `:`, `.`, `-`, `_`, multi-segment, and valid single-pass %HH into safe alphabet
         let valid_paths = [
-            "/v1beta/models/gemini-2.5-pro:generateContent",
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
-            "/v1beta/models/gemini-2.5-pro",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse",
+            "/v1beta/models/gemini-4-hydrogen",
             "/v1beta/models/gemma3:4b:generateContent",
             "/v1beta/models/gemini_2.5_pro.v1:countTokens",
             "/v1beta/models/a..b:generateContent",
@@ -1574,7 +1573,7 @@ mod tests {
             Some("AIzaSyEnvFallbackKey1"),
         );
         p.forward_gemini(ForwardRequest {
-            path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+            path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: Some("  AIzaSyOverrideKey1234  ".to_string()),
@@ -1588,7 +1587,7 @@ mod tests {
 
         // (2) whitespace-only override falls back to configured
         p.forward_gemini(ForwardRequest {
-            path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+            path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: Some("   ".to_string()),
@@ -1605,7 +1604,7 @@ mod tests {
             let p_env = provider_for(&server.base_url, cfg_key, Some("  AIzaSyEnvOnlyKey12345  "));
             p_env
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: None,
@@ -1636,7 +1635,7 @@ mod tests {
         for provider in [&p_missing_fixed, &p_missing_disabled] {
             let err = provider
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: None,
@@ -1683,7 +1682,7 @@ mod tests {
             let p = provider_for("http://127.0.0.1:4141", Some("AIzaSyGoodKey1234567"), None);
             let err = p
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: Some(bad.to_string()),
@@ -1698,7 +1697,7 @@ mod tests {
             let p_env = provider_for("http://127.0.0.1:4141", None, Some(bad));
             let err = p_env
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: None,
@@ -1733,7 +1732,7 @@ mod tests {
 
         let req = ForwardRequest {
             path_and_query:
-                "/v1beta/models/gemini-2.5-pro:generateContent?key=QUERY_SECRET_VALUE&alt=sse"
+                "/v1beta/models/gemini-4-hydrogen:generateContent?key=QUERY_SECRET_VALUE&alt=sse"
                     .to_string(),
             body: Bytes::from_static(b"SUPER_PRIVATE_PROMPT_BODY"),
             content_type: Some("application/json".to_string()),
@@ -1749,14 +1748,14 @@ mod tests {
 
         // Path without query string should not gain a bogus `?<redacted>` suffix
         let req_no_q = ForwardRequest {
-            path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+            path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
             body: Bytes::new(),
             content_type: None,
             api_key_override: None,
         };
         let req_no_q_dbg = format!("{req_no_q:?}");
         assert!(!req_no_q_dbg.contains("?<redacted>"));
-        assert!(req_no_q_dbg.contains("/v1beta/models/gemini-2.5-pro:generateContent"));
+        assert!(req_no_q_dbg.contains("/v1beta/models/gemini-4-hydrogen:generateContent"));
 
         // ForwardResponse Debug compiles and formats cleanly
         let resp = ForwardResponse {
@@ -1796,7 +1795,7 @@ mod tests {
         // None defaults to application/json
         provider
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
@@ -1808,7 +1807,7 @@ mod tests {
         // Valid MIME with parameters is preserved
         provider
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: Some("application/json; charset=utf-8".to_string()),
                 api_key_override: None,
@@ -1833,7 +1832,7 @@ mod tests {
         for bad in bad_cts {
             let err = provider
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: Some(bad.to_string()),
                     api_key_override: None,
@@ -2029,7 +2028,7 @@ mod tests {
 
         let resp = provider
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
@@ -2068,7 +2067,7 @@ mod tests {
         let start = Instant::now();
         let err = provider
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
@@ -2108,7 +2107,7 @@ mod tests {
         adapter.health_check().await.expect("health_check via dyn");
         let resp = adapter
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
@@ -2199,7 +2198,7 @@ mod tests {
             // (must fail closed with InvalidConfig instead of silently falling back!)
             let err = provider_with_configured_key
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: Some(bad.to_string()),
@@ -2215,7 +2214,7 @@ mod tests {
 
             let err = env_provider
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: None,
@@ -2246,7 +2245,7 @@ mod tests {
         .with_env_fallback(false);
         p_trimmed_cfg
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
@@ -2268,7 +2267,7 @@ mod tests {
         // ASCII spaces-only override falls back cleanly to configured key
         provider_with_configured_key
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: Some("   ".to_string()),
@@ -2283,7 +2282,7 @@ mod tests {
         // ASCII-padded override trims cleanly
         provider_with_configured_key
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: Some("  AIzaSyValid1234  ".to_string()),
@@ -2299,7 +2298,7 @@ mod tests {
                 .expect("construct provider with ASCII-padded env key");
         p_trimmed_env
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
@@ -2348,7 +2347,7 @@ mod tests {
         for bad in unicode_ws_cts {
             let err = provider
                 .forward_gemini(ForwardRequest {
-                    path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                    path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                     body: Bytes::from_static(b"{}"),
                     content_type: Some(bad.to_string()),
                     api_key_override: None,
@@ -2387,7 +2386,7 @@ mod tests {
         // Positive ASCII space trimming check
         provider
             .forward_gemini(ForwardRequest {
-                path_and_query: "/v1beta/models/gemini-2.5-pro:generateContent".to_string(),
+                path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
                 body: Bytes::from_static(b"{}"),
                 content_type: Some("  application/json  ".to_string()),
                 api_key_override: None,

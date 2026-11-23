@@ -204,7 +204,7 @@ class TestHarnessSelfTests(E2ETestCase):
             mock.host,
             mock.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent?alt=sse&foo=bar",
+            "/v1beta/models/gemini-4-hydrogen:generateContent?alt=sse&foo=bar",
             body=body,
             headers={"Content-Type": "application/json", "X-Goog-Api-Key": "TEST_KEY_01"},
         )
@@ -213,8 +213,8 @@ class TestHarnessSelfTests(E2ETestCase):
         self.assertIsNotNone(req)
         assert req is not None
         self.assertEqual(req.method, "POST")
-        self.assertEqual(req.raw_target, "/v1beta/models/gemini-2.5-pro:generateContent?alt=sse&foo=bar")
-        self.assertEqual(req.path, "/v1beta/models/gemini-2.5-pro:generateContent")
+        self.assertEqual(req.raw_target, "/v1beta/models/gemini-4-hydrogen:generateContent?alt=sse&foo=bar")
+        self.assertEqual(req.path, "/v1beta/models/gemini-4-hydrogen:generateContent")
         self.assertEqual(req.query_params, {"alt": ["sse"], "foo": ["bar"]})
         self.assertEqual(req.header("x-goog-api-key"), "TEST_KEY_01")
         self.assertEqual(req.body, body)
@@ -233,7 +233,7 @@ class TestHarnessSelfTests(E2ETestCase):
             mock.host,
             mock.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b"{}",
         )
         self.assertEqual(resp.status, 200)
@@ -263,7 +263,7 @@ class TestHarnessSelfTests(E2ETestCase):
             mock.host,
             mock.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse",
             body=b"{}",
         ) as stream:
             self.assertEqual(stream.status, 200)
@@ -392,10 +392,10 @@ class TestHarnessSelfTests(E2ETestCase):
         tools = client.list_tools()
         self.assertEqual(tools["tools"][0]["name"], "save_settings")
         # save_settings_smart should map base_url -> gemini_base_url & default_model -> gemini_default_model!
-        call_res = client.save_settings_smart(base_url="http://127.0.0.1:9999", default_model="gemini-2.5-pro")
+        call_res = client.save_settings_smart(base_url="http://127.0.0.1:9999", default_model="gemini-4-hydrogen")
         echo_args = call_res["structuredContent"]["echo_args"]
         self.assertEqual(echo_args["gemini_base_url"], "http://127.0.0.1:9999")
-        self.assertEqual(echo_args["gemini_default_model"], "gemini-2.5-pro")
+        self.assertEqual(echo_args["gemini_default_model"], "gemini-4-hydrogen")
         client.assert_clean_stdout()
         self.assertIn("fake-mcp stderr: initialized", client.stderr_text)
 
@@ -627,7 +627,7 @@ class TestHarnessSelfTests(E2ETestCase):
                     "127.0.0.1",
                     port,
                     "POST",
-                    "/v1beta/models/gemini-2.5-pro:generateContent",
+                    "/v1beta/models/gemini-4-hydrogen:generateContent",
                     body=payload,
                     headers={"Content-Type": "application/json"},
                     timeout=15.0,
@@ -810,7 +810,7 @@ class TestHarnessSelfTests(E2ETestCase):
                 mock_srv.host,
                 mock_srv.port,
                 "POST",
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 body=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=5.0,

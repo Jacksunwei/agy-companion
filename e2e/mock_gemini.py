@@ -625,7 +625,7 @@ class MockGeminiServer:
                 )
             return JsonAction(
                 status=200,
-                payload={"models": [{"name": "models/gemini-2.5-pro"}]},
+                payload={"models": [{"name": "models/gemini-4-hydrogen"}]},
             )
 
         if captured.method == "POST" and captured.path.endswith(":generateContent"):

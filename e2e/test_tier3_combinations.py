@@ -53,7 +53,7 @@ class TestTier3Combinations(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -68,7 +68,7 @@ class TestTier3Combinations(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -95,7 +95,7 @@ class TestTier3Combinations(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -235,7 +235,7 @@ class TestTier3Combinations(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -249,7 +249,7 @@ class TestTier3Combinations(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -282,7 +282,7 @@ class TestTier3Combinations(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -302,10 +302,10 @@ class TestTier3Combinations(E2ETestCase):
         proxy = self.start_proxy(env, config_path=cfg)
 
         targets = [
-            "/v1beta/models/gemini-2.5-pro:generateContent?key=SECRET_Q1",
-            "/v1beta/models/gemini-2.5-pro:generateContent?key=SECRET_Q1",
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?key=SECRET_Q2&alt=sse",
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?key=SECRET_Q2&alt=sse",
+            "/v1beta/models/gemini-4-hydrogen:generateContent?key=SECRET_Q1",
+            "/v1beta/models/gemini-4-hydrogen:generateContent?key=SECRET_Q1",
+            "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?key=SECRET_Q2&alt=sse",
+            "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?key=SECRET_Q2&alt=sse",
         ]
 
         def send_one(path: str) -> int:
@@ -417,7 +417,7 @@ class TestTier3Combinations(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -458,7 +458,7 @@ class TestTier3Combinations(E2ETestCase):
                 "127.0.0.1",
                 proxy.port,
                 "POST",
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 body=b'{"contents":[]}',
                 headers={"Content-Type": "application/json"},
             )
@@ -611,7 +611,7 @@ class TestTier3Combinations(E2ETestCase):
         mcp.save_settings_smart(
             base_url=mock.base_url,
             api_key=secret,
-            default_model="gemini-2.5-flash",
+            default_model="gemini-3.8-flash",
             listen_port=port,
         )
         mcp.assert_clean_stdout()
@@ -633,7 +633,7 @@ class TestTier3Combinations(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+            "/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse",
             body=b'{"contents":[{"parts":[{"text":"hi"}]}]}',
             headers={"Content-Type": "application/json"},
         )

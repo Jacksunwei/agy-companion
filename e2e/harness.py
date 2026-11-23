@@ -236,7 +236,7 @@ class IsolatedEnv:
         listen_port: int = 4141,
         base_url: str = "https://generativelanguage.googleapis.com",
         api_key: str | None = None,
-        default_model: str = "gemini-2.5-pro",
+        default_model: str = "gemini-4-hydrogen",
         timeout_secs: int = 900,
         usage_dir: str | Path | None = None,
         include_usage_dir: bool = True,
