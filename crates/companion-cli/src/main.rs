@@ -1,0 +1,170 @@
+#![forbid(unsafe_code)]
+
+use std::process::ExitCode;
+
+use clap::Parser;
+use companion_cli::cli::{Cli, Commands};
+use companion_cli::doctor::execute_doctor;
+use companion_cli::models::run_models;
+use companion_cli::{run_serve, run_ui_mcp};
+use tracing_subscriber::filter::{FilterExt, filter_fn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
+
+fn rmcp_ceiling_allows(target: &str, level: &tracing::Level) -> bool {
+    let is_rmcp = target == "rmcp" || target.starts_with("rmcp::");
+    !(is_rmcp && *level > tracing::Level::INFO)
+}
+
+fn init_stderr_tracing(default_level: &str) {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    // Hard ceiling: rmcp DEBUG/TRACE logs raw JSON-RPC request payloads (including save_settings
+    // plaintext api_key) before companion-ui-mcp deserializes into redacted argument structs.
+    let rmcp_ceiling = filter_fn(|meta| rmcp_ceiling_allows(meta.target(), meta.level()));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_filter(env_filter.and(rmcp_ceiling));
+    let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Serve { port, config } => {
+            init_stderr_tracing("info");
+            if let Err(err) = run_serve(port, config).await {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::UiMcp { data_dir, config } => {
+            init_stderr_tracing("warn");
+            if let Err(err) = run_ui_mcp(data_dir, config).await {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Doctor { config, port, json } => {
+            init_stderr_tracing("warn");
+            let mut stdout = std::io::stdout().lock();
+            match execute_doctor(config, port, json, &mut stdout).await {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::FAILURE,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Models { json, port, config } => {
+            init_stderr_tracing("warn");
+            let mut stdout = std::io::stdout().lock();
+            if let Err(err) = run_models(json, port, config, &mut stdout) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::filter::{FilterExt, filter_fn};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{EnvFilter, Layer};
+
+    use super::rmcp_ceiling_allows;
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("lock buf").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = BufWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(Arc::clone(&self.0))
+        }
+    }
+
+    #[test]
+    fn rmcp_ceiling_blocks_rmcp_debug_and_trace_but_preserves_companion_and_info() {
+        assert!(!rmcp_ceiling_allows("rmcp", &tracing::Level::TRACE));
+        assert!(!rmcp_ceiling_allows("rmcp", &tracing::Level::DEBUG));
+        assert!(rmcp_ceiling_allows("rmcp", &tracing::Level::INFO));
+        assert!(rmcp_ceiling_allows("rmcp", &tracing::Level::WARN));
+        assert!(rmcp_ceiling_allows("rmcp", &tracing::Level::ERROR));
+
+        assert!(!rmcp_ceiling_allows(
+            "rmcp::service",
+            &tracing::Level::TRACE
+        ));
+        assert!(!rmcp_ceiling_allows(
+            "rmcp::service",
+            &tracing::Level::DEBUG
+        ));
+        assert!(rmcp_ceiling_allows("rmcp::service", &tracing::Level::INFO));
+
+        // Companion crates retain full debug/trace observability.
+        assert!(rmcp_ceiling_allows("companion_cli", &tracing::Level::TRACE));
+        assert!(rmcp_ceiling_allows(
+            "companion_proxy::router",
+            &tracing::Level::DEBUG
+        ));
+        // Unrelated target sharing only a prefix without `::` is not blocked.
+        assert!(rmcp_ceiling_allows("rmcp_other", &tracing::Level::DEBUG));
+    }
+
+    #[test]
+    fn composed_env_filter_and_rmcp_ceiling_drops_rmcp_debug_trace_even_under_rmcp_trace() {
+        let buf = SharedBuf::default();
+        let env_filter = EnvFilter::new("companion_cli=trace,rmcp=trace");
+        let rmcp_ceiling = filter_fn(|meta| rmcp_ceiling_allows(meta.target(), meta.level()));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .with_filter(env_filter.and(rmcp_ceiling)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "rmcp", "LEAK_RMCP_ROOT_TRACE");
+            tracing::debug!(target: "rmcp::service", "LEAK_RMCP_SERVICE_DEBUG");
+            tracing::trace!(target: "rmcp::service", "LEAK_RMCP_SERVICE_TRACE");
+            tracing::info!(target: "rmcp::service", "ALLOW_RMCP_SERVICE_INFO");
+            tracing::debug!(target: "companion_cli", "ALLOW_COMPANION_DEBUG");
+            tracing::trace!(target: "companion_cli", "ALLOW_COMPANION_TRACE");
+        });
+
+        let captured = String::from_utf8(buf.0.lock().expect("lock buf").clone()).expect("utf8");
+        assert!(!captured.contains("LEAK_RMCP_ROOT_TRACE"), "{captured}");
+        assert!(!captured.contains("LEAK_RMCP_SERVICE_DEBUG"), "{captured}");
+        assert!(!captured.contains("LEAK_RMCP_SERVICE_TRACE"), "{captured}");
+        assert!(captured.contains("ALLOW_RMCP_SERVICE_INFO"), "{captured}");
+        assert!(captured.contains("ALLOW_COMPANION_DEBUG"), "{captured}");
+        assert!(captured.contains("ALLOW_COMPANION_TRACE"), "{captured}");
+    }
+}

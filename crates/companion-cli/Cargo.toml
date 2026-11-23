@@ -1,0 +1,28 @@
+[package]
+name = "companion-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agy-companion"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+companion-core.workspace = true
+companion-proxy.workspace = true
+companion-ui-mcp.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
