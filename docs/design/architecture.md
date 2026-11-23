@@ -141,6 +141,29 @@ If a second inbound format is ever added later, shared types can be factored int
   4. **Antigravity Setup Helper:** Copyable `customModelsConfig` (`gemini-api://http://127.0.0.1:4141/models/...`) JSON snippet for `~/.gemini/antigravity-cli/settings.json`.
   5. **Future Tab Slot (TODO):** Usage & Cost dashboard (scales naturally in the `global` full-page view).
 
+#### C. Configuration, Usage Data Paths & Atomic Persistence
+
+Path resolution lives in pure, deterministic helpers in `companion-core` and applies identically across `serve`, `ui-mcp`, `doctor`, and `models`:
+
+**Resolution Precedence:**
+
+| Artifact | Precedence (Highest → Lowest) | Validation & XDG Rules |
+| --- | --- | --- |
+| **Config file** | 1. `--config <path>` CLI flag<br>2. `AGY_COMPANION_CONFIG` env var<br>3. `$XDG_CONFIG_HOME/agy-companion/config.json`<br>4. Platform default (table below) | Explicit overrides (`--config`, `AGY_COMPANION_CONFIG`) and `XDG_CONFIG_HOME` values are validated via `validate_path` and platform-aware traversal/NUL checks (any `..` traversal or NUL byte fails closed with `InvalidPath`, even on relative traversal payloads). Per the XDG Base Directory Specification, unset, empty/whitespace, or benign relative `XDG_CONFIG_HOME` values (without `..` or NUL) are ignored and fall back to the platform default. Higher-precedence valid overrides short-circuit lower tiers. |
+| **Usage data directory** | 1. `config.usage_dir`<br>2. `$XDG_DATA_HOME/agy-companion/usage`<br>3. Platform default (table below) | `config.usage_dir` and `XDG_DATA_HOME` values reject `..` traversal and NUL bytes fail-closed with `InvalidPath` (even on relative traversal payloads). Unset, empty/whitespace, or benign relative `XDG_DATA_HOME` values are ignored and fall back to the platform default. Writes append-only `YYYY-MM.jsonl` files inside the resolved directory. |
+
+**Platform Defaults:**
+
+| Platform | Default Config File | Default Usage Data Directory |
+| --- | --- | --- |
+| **macOS & Linux** (`#[cfg(not(windows))]`) | `~/.config/agy-companion/config.json` *(intentional XDG default on macOS — no `~/Library/Application Support/` drift)* | `~/.local/share/agy-companion/usage` |
+| **Windows** (`#[cfg(windows)]`) | `%APPDATA%\agy-companion\config.json` *(via `dirs::config_dir()`, falling back to `%USERPROFILE%\.config\agy-companion\config.json` if unavailable)* | `%LOCALAPPDATA%\agy-companion\usage` *(via `dirs::data_local_dir()`, falling back to `%USERPROFILE%\.local\share\agy-companion\usage` if unavailable)* |
+
+**Atomic Persistence & Platform Hardening (`Config::save_secure`):**
+- Writes JSON to a unique sibling temp file, flushes with `sync_all()`, closes the handle, and atomically replaces the target via `fs::rename` (cleaning up the temp file on any error).
+- **Unix (`#[cfg(unix)]`):** Creates missing parent directories with mode `0700` and enforces mode `0600` on config files and JSONL usage logs.
+- **Windows (`#[cfg(windows)]`):** Relies on NTFS user-profile ACLs under `%APPDATA%` / `%LOCALAPPDATA%` and wraps `fs::rename` in a bounded retry (`3` attempts total with `25ms` → `50ms` backoff) retrying **only** on transient `ErrorKind::PermissionDenied` (such as concurrent reads or Windows Defender scans), immediately returning all other errors and removing the temp file only after failure.
+
 ### Milestones 2 & 3 (Deferred Until After M1): Codex Pro & Claude Subscriptions
 
 - Deferred until Milestone 1 ships and stabilizes.
@@ -157,7 +180,7 @@ If a second inbound format is ever added later, shared types can be factored int
 
 ## 6. Deferred Work (TODOs) & Day-1 Seams
 
-- **Usage & Cost Tracking Shim:** See [`docs/design/usage-tracking-todo.md`](usage-tracking-todo.md). Day-1 seam: `UsageEvent` struct + non-blocking `UsageSink` trait + append-only JSONL writer (`~/.local/share/agy-companion/usage/YYYY-MM.jsonl`).
+- **Usage & Cost Tracking Shim:** See [`docs/design/usage-tracking-todo.md`](usage-tracking-todo.md). Day-1 seam: `UsageEvent` struct + non-blocking `UsageSink` trait + append-only JSONL writer (`YYYY-MM.jsonl` under the resolved usage directory: `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → `~/.local/share/agy-companion/usage` on macOS/Linux or `%LOCALAPPDATA%\agy-companion\usage` on Windows; see Section 5.C).
 - **User Version Upgrades:** See [`docs/design/upgrade-lifecycle-todo.md`](upgrade-lifecycle-todo.md). Day-1 seams: single version source of truth (`Cargo.toml`), config `schema_version = 1`, and `GET /health` returning `{ "version", "protocol_version" }`.
 
 ---
@@ -169,12 +192,12 @@ All Milestone 1 components enforce the following boundaries:
 1. **Loopback-Only Binding:** `companion-proxy` MUST bind exclusively to `127.0.0.1` (never `0.0.0.0`).
 2. **Secret Redaction & Storage:**
    - Because `agy` CLI ignores MCP `_meta.ui.visibility: ["app"]`, `get_settings` MUST NEVER return plaintext API keys — only redacted hints (`configured: true, hint: "AIza...9x2Q"`).
-   - Store secrets in a mode `0600` config file (or OS keychain) outside any workspace; never log API keys or send them in URL query parameters (always use `x-goog-api-key` header).
+   - Store secrets outside any workspace via atomic temp-file + rename persistence (`Config::save_secure`): Unix enforces mode `0600` files / `0700` parent directories; Windows stores under user-profile ACLs (`%APPDATA%`) with a bounded retry (`3` attempts, `25ms` → `50ms` backoff) on transient `ErrorKind::PermissionDenied` during rename. Never log API keys or send them in URL query parameters (always use `x-goog-api-key` header).
 3. **Frontend XSS & CSP Discipline (`ui/`):**
    - Rely on MCP App default strict CSP (`default-src 'none'`); no external CDN scripts or `connectDomains` (all backend calls go through MCP `app.callServerTool`).
    - Zero `innerHTML`, `outerHTML`, `document.write`, or `dangerouslySetInnerHTML` — build DOM strictly with `textContent`, `document.createElement`, and `replaceChildren`.
    - Persist edits eagerly via `save_settings` (Antigravity does not send `ui/resource-teardown`).
 4. **Upstream URL & Path Validation:**
    - Upstream remote base URLs must use `https://` (allow `http://127.0.0.1` / `http://localhost` only for local providers or tests).
-   - Validate all config/data paths against traversal (`..`) and verify SHA-256 checksums before executing any binary downloaded by `plugin/scripts/run-companion.sh`.
+   - Validate all explicit config/data paths (`--config`, `AGY_COMPANION_CONFIG`, `config.usage_dir`, `--data-dir`) and `XDG_CONFIG_HOME` / `XDG_DATA_HOME` values against traversal (`..`) and NUL bytes (fail-closed, including relative traversal payloads), while ignoring unset, empty/whitespace, or benign relative XDG env vars per the XDG Base Directory Specification; verify SHA-256 checksums before executing any binary downloaded by `plugin/scripts/run-companion.sh`.
 5. **Minimal HTTP Method Surface & Headers:** Proxy exposes only required methods (`GET`, `POST`) and sets `X-Content-Type-Options: nosniff` and `Cache-Control: no-store` on internal `/health` and `/api/stats` endpoints.
