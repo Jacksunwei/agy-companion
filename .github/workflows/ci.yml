@@ -17,5 +17,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+      - name: Build UI single-file bundle
+        run: npm --prefix ui ci && npm --prefix ui run typecheck && npm --prefix ui run build
       - name: Run agent verification gate
         run: ./scripts/agent_check.sh

@@ -26,6 +26,9 @@ __pycache__/
 .mypy_cache/
 node_modules/
 dist/
+!ui/dist/
+ui/dist/*
+!ui/dist/index.html
 build/
 coverage/
 target/
