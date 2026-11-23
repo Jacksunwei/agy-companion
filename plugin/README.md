@@ -22,7 +22,7 @@ agy plugin list
 
 ### 2. Configure Your Gemini API Key
 
-Open the Settings panel in Antigravity App via the side panel `+` menu (**AGY Companion**), the left sidebar **Plugins** view, or by asking the agent:
+Open the Settings panel in Antigravity App via the side panel `+` menu (**Antigravity Companion**), the left sidebar **Plugins** view, or by asking the agent:
 
 > "Open the Antigravity Companion settings panel"
 
@@ -48,23 +48,23 @@ Paste the output into `~/.gemini/antigravity-cli/settings.json`:
     "customModels": [
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen",
-        "label": "AGY Companion (gemini-4-hydrogen)"
+        "label": "Antigravity Companion (gemini-4-hydrogen)"
       },
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon",
-        "label": "AGY Companion (gemini-4-argon)"
+        "label": "Antigravity Companion (gemini-4-argon)"
       },
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-neon",
-        "label": "AGY Companion (gemini-4-neon)"
+        "label": "Antigravity Companion (gemini-4-neon)"
       },
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-carbon",
-        "label": "AGY Companion (gemini-4-carbon)"
+        "label": "Antigravity Companion (gemini-4-carbon)"
       },
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash",
-        "label": "AGY Companion (gemini-3.8-flash)"
+        "label": "Antigravity Companion (gemini-3.8-flash)"
       }
     ]
   }

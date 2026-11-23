@@ -954,6 +954,8 @@ class TestTier1F7UiBundle(E2ETestCase):
         self.assertLess(len(raw), 500 * 1024)
         text = raw.decode("utf-8")
         self.assertTrue("<!doctype html>" in text.lower() or "<html" in text.lower())
+        self.assertIn("Antigravity Companion", text)
+        self.assertNotIn("AGY Companion", text)
 
     def test_t1_f7_ui_package_uses_expected_mcp_app_deps(self) -> None:
         """ui/package.json declares @modelcontextprotocol/ext-apps, vite-plugin-singlefile, vite, build script."""
@@ -1088,7 +1090,16 @@ class TestTier1F8McpServer(E2ETestCase):
         self.assertIsInstance(caps.get("tools"), dict)
         self.assertIsInstance(caps.get("resources"), dict)
         server_info = init_res.get("serverInfo") or {}
+        self.assertEqual(server_info.get("name"), "agy-companion")
+        self.assertEqual(server_info.get("title"), "Antigravity Companion")
         self.assertEqual(server_info.get("version"), "0.1.0")
+        icons = server_info.get("icons") or []
+        self.assertTrue(
+            isinstance(icons, list)
+            and len(icons) >= 1
+            and str(icons[0].get("src", "")).startswith("data:image/svg+xml;base64,"),
+            f"Expected SVG data-URI icon in serverInfo: {server_info!r}",
+        )
 
     def test_t1_f8_resources_list_exposes_settings_html_mcp_app_mime(self) -> None:
         """resources/list exposes ui://companion/settings.html with text/html;profile=mcp-app."""
@@ -1119,7 +1130,12 @@ class TestTier1F8McpServer(E2ETestCase):
     def test_t1_f8_tools_list_exposes_four_tools_with_correct_meta(self) -> None:
         """tools/list exposes exact 4 tools with required MCP App & Antigravity _meta."""
         env = self.make_env()
-        mcp = self.start_mcp(env)
+        mcp = self.start_mcp(env, auto_initialize=False)
+        init_res = mcp.initialize(protocol_version="2025-03-26")
+        server_info = init_res.get("serverInfo") or {}
+        self.assertEqual(server_info.get("name"), "agy-companion")
+        self.assertEqual(server_info.get("title"), "Antigravity Companion")
+
         res = mcp.list_tools()
         mcp.assert_clean_stdout()
         tools = {t["name"]: t for t in (res.get("tools") or []) if isinstance(t, dict) and "name" in t}
@@ -1131,8 +1147,15 @@ class TestTier1F8McpServer(E2ETestCase):
         open_meta = tools["open_settings"].get("_meta") or {}
         self.assertEqual((open_meta.get("ui") or {}).get("resourceUri"), "ui://companion/settings.html")
         agy_ui = open_meta.get("com.google.antigravity/ui") or {}
-        ep_types = {ep.get("type") for ep in (agy_ui.get("entrypoints") or []) if isinstance(ep, dict)}
+        entrypoints = [ep for ep in (agy_ui.get("entrypoints") or []) if isinstance(ep, dict)]
+        ep_types = {ep.get("type") for ep in entrypoints}
         self.assertTrue({"aux_pane", "global"}.issubset(ep_types), f"Missing entrypoints in {agy_ui!r}")
+        for ep in entrypoints:
+            self.assertEqual(
+                ep.get("title"),
+                "Antigravity Companion",
+                f"Expected entrypoint title 'Antigravity Companion' in {ep!r}",
+            )
 
         for app_tool in ("get_settings", "save_settings", "test_connection"):
             meta = tools[app_tool].get("_meta") or {}
@@ -1208,6 +1231,13 @@ class TestTier1F9CliBinary(E2ETestCase):
             ),
             f"Expected gemini-api://http://127.0.0.1:4141/models/ in {models!r}",
         )
+        for m in models:
+            label = str(m.get("label", ""))
+            self.assertTrue(
+                label.startswith("Antigravity Companion ("),
+                f"Expected label starting with 'Antigravity Companion (', got {label!r}",
+            )
+            self.assertNotIn("AGY Companion", label)
 
     def test_t1_f9_models_human_output_succeeds(self) -> None:
         """agy-companion models prints human-readable output referencing 127.0.0.1:4141 and gemini-api://."""
@@ -1258,29 +1288,32 @@ class TestTier1F10PluginBundle(E2ETestCase):
     FEATURE = "F10"
 
     def test_t1_f10_agy_plugin_validate_strict_passes(self) -> None:
-        """agy plugin validate --strict --json ./plugin exits 0 with 0 errors and 0 warnings."""
+        """agy plugin validate --strict --json ./plugin exits 0 with zero findings (0 errors, warnings, notes)."""
         plugin_dir = self.repo_root / "plugin"
         self.assertTrue(plugin_dir.is_dir(), f"Missing plugin dir: {plugin_dir}")
         res = run_cli(["agy", "plugin", "validate", "--strict", "--json", str(plugin_dir)])
         self.assertEqual(res.returncode, 0, f"agy plugin validate failed:\n{res.stdout}\n{res.stderr}")
         payload = res.json_stdout()
-        findings = payload.get("findings") if isinstance(payload, dict) else []
-        if isinstance(findings, list):
-            bad = [
-                f
-                for f in findings
-                if isinstance(f, dict) and str(f.get("severity", "")).lower() in ("error", "warning")
-            ]
-            self.assertEqual(bad, [], f"Unexpected errors/warnings in plugin validation: {bad!r}")
+        self.assertIsInstance(payload, dict)
+        findings = payload.get("findings")
+        self.assertEqual(findings, [], f"Expected zero plugin validation findings, got: {findings!r}")
 
     def test_t1_f10_plugin_json_metadata_and_seo_fields(self) -> None:
-        """plugin/plugin.json matches v1 schema, metadata, 1..3 suggestedPrompts, SEO keywords."""
+        """plugin/plugin.json matches v1 schema, metadata, bundled SVG logo, 1..3 suggestedPrompts, SEO keywords."""
         pj_path = self.repo_root / "plugin" / "plugin.json"
         self.assertTrue(pj_path.is_file(), f"Missing {pj_path}")
         pj = json.loads(pj_path.read_text(encoding="utf-8"))
         self.assertEqual(pj.get("$schema"), "https://antigravity.google/schemas/v1/plugin.json")
         self.assertEqual(pj.get("name"), "agy-companion")
         self.assertEqual(pj.get("displayName"), "Antigravity Companion")
+        self.assertEqual(pj.get("logo"), "assets/logo.svg")
+        logo_path = self.repo_root / "plugin" / "assets" / "logo.svg"
+        self.assertFalse(logo_path.is_symlink(), f"Logo must not be a symlink: {logo_path}")
+        self.assertTrue(logo_path.is_file(), f"Missing logo asset: {logo_path}")
+        logo_text = logo_path.read_text(encoding="utf-8")
+        self.assertGreater(len(logo_text.strip()), 0)
+        self.assertIn("<svg", logo_text.lower())
+        self.assertIsNone(re.search(r"<\s*script\b", logo_text, re.IGNORECASE))
         self.assertEqual(pj.get("version"), "0.1.0")
         self.assertEqual(pj.get("license"), "Apache-2.0")
         prompts = pj.get("suggestedPrompts") or []
@@ -1312,7 +1345,7 @@ class TestTier1F10PluginBundle(E2ETestCase):
         self.assertTrue(sc_path.is_file(), f"Missing {sc_path}")
         sc = json.loads(sc_path.read_text(encoding="utf-8"))
         self.assertEqual(sc.get("restart_policy"), "on-failure")
-        self.assertEqual(sc.get("display_name"), "AGY Companion Proxy")
+        self.assertEqual(sc.get("display_name"), "Antigravity Companion Proxy")
         combined = [str(sc.get("command", ""))] + [str(a) for a in (sc.get("args") or [])]
         self.assertTrue(
             any("../../scripts/run-companion.sh" in tok for tok in combined),

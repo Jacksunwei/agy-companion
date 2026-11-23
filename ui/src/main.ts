@@ -317,7 +317,7 @@ function buildCustomModelsSnippet(port: number, model: string): string {
         customModels: [
           {
             modelName: `gemini-api://http://127.0.0.1:${safePort}/models/${safeModel}`,
-            label: `AGY Companion (${safeModel})`,
+            label: `Antigravity Companion (${safeModel})`,
           },
         ],
       },
@@ -354,6 +354,130 @@ function el<K extends keyof HTMLElementTagNameMap>(
     }
   }
   return node;
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl(
+  tag: string,
+  attrs?: Record<string, string>,
+  ...children: SVGElement[]
+): SVGElement {
+  const node = document.createElementNS(SVG_NS, tag);
+  if (attrs) {
+    for (const [key, value] of Object.entries(attrs)) {
+      node.setAttribute(key, value);
+    }
+  }
+  for (const child of children) {
+    node.appendChild(child);
+  }
+  return node;
+}
+
+function createBrandIcon(): SVGElement {
+  const bgGrad = svgEl(
+    "linearGradient",
+    {
+      id: "agy-companion-logo-bg-grad",
+      x1: "12",
+      y1: "10",
+      x2: "116",
+      y2: "118",
+      gradientUnits: "userSpaceOnUse",
+    },
+    svgEl("stop", { offset: "0%", "stop-color": "#1A73E8" }),
+    svgEl("stop", { offset: "52%", "stop-color": "#4F46E5" }),
+    svgEl("stop", { offset: "100%", "stop-color": "#7C3AED" }),
+  );
+  const sparkGrad = svgEl(
+    "linearGradient",
+    {
+      id: "agy-companion-logo-spark-grad",
+      x1: "64",
+      y1: "34",
+      x2: "64",
+      y2: "94",
+      gradientUnits: "userSpaceOnUse",
+    },
+    svgEl("stop", { offset: "0%", "stop-color": "#FFFFFF" }),
+    svgEl("stop", { offset: "100%", "stop-color": "#DBEAFE" }),
+  );
+  const orbitGrad = svgEl(
+    "linearGradient",
+    {
+      id: "agy-companion-logo-orbit-grad",
+      x1: "25",
+      y1: "82",
+      x2: "103",
+      y2: "46",
+      gradientUnits: "userSpaceOnUse",
+    },
+    svgEl("stop", { offset: "0%", "stop-color": "#93C5FD", "stop-opacity": "0.55" }),
+    svgEl("stop", { offset: "50%", "stop-color": "#E0F2FE", "stop-opacity": "0.95" }),
+    svgEl("stop", { offset: "100%", "stop-color": "#67E8F9", "stop-opacity": "0.9" }),
+  );
+
+  return svgEl(
+    "svg",
+    {
+      class: "app-logo",
+      width: "22",
+      height: "22",
+      viewBox: "0 0 128 128",
+      fill: "none",
+      "aria-hidden": "true",
+      focusable: "false",
+    },
+    svgEl("defs", undefined, bgGrad, sparkGrad, orbitGrad),
+    svgEl("rect", {
+      x: "10",
+      y: "10",
+      width: "108",
+      height: "108",
+      rx: "28",
+      fill: "url(#agy-companion-logo-bg-grad)",
+    }),
+    svgEl("rect", {
+      x: "10.75",
+      y: "10.75",
+      width: "106.5",
+      height: "106.5",
+      rx: "27.25",
+      stroke: "#FFFFFF",
+      "stroke-opacity": "0.22",
+      "stroke-width": "1.5",
+    }),
+    svgEl("ellipse", {
+      cx: "64",
+      cy: "64",
+      rx: "39",
+      ry: "16",
+      transform: "rotate(-28 64 64)",
+      stroke: "url(#agy-companion-logo-orbit-grad)",
+      "stroke-width": "3.5",
+    }),
+    svgEl("path", {
+      d: "M64 34 C64 52 76 64 94 64 C76 64 64 76 64 94 C64 76 52 64 34 64 C52 64 64 52 64 34 Z",
+      fill: "url(#agy-companion-logo-spark-grad)",
+    }),
+    svgEl("circle", {
+      cx: "98.4",
+      cy: "45.7",
+      r: "8.5",
+      fill: "#67E8F9",
+      "fill-opacity": "0.28",
+    }),
+    svgEl("circle", { cx: "98.4", cy: "45.7", r: "5", fill: "#FFFFFF" }),
+    svgEl("circle", {
+      cx: "29.6",
+      cy: "82.3",
+      r: "7",
+      fill: "#93C5FD",
+      "fill-opacity": "0.26",
+    }),
+    svgEl("circle", { cx: "29.6", cy: "82.3", r: "4", fill: "#E0F2FE" }),
+  );
 }
 
 // DOM references populated during mount
@@ -447,7 +571,12 @@ function mountUi(root: HTMLElement): UiRefs {
       el(
         "div",
         { className: "title-group" },
-        el("h1", { className: "app-title", text: "AGY Companion" }),
+        el(
+          "div",
+          { className: "brand-lockup" },
+          createBrandIcon(),
+          el("h1", { className: "app-title", text: "Antigravity Companion" }),
+        ),
         proxyBadge,
         endpointTag,
       ),
@@ -857,7 +986,7 @@ function renderSnapshot(refs: UiRefs, snapshot: SettingsSnapshot, syncFormInputs
   if (snapshot.version_skew) {
     const runningVer = snapshot.proxy.version ?? "unknown";
     refs.skewBody.textContent =
-      `Running proxy is v${runningVer}, while the installed companion binary is v${snapshot.binary_version}. Restart the AGY Companion proxy sidecar so the running proxy matches the installed binary.`;
+      `Running proxy is v${runningVer}, while the installed companion binary is v${snapshot.binary_version}. Restart the Antigravity Companion proxy sidecar so the running proxy matches the installed binary.`;
     refs.skewBanner.classList.remove("hidden");
   } else {
     refs.skewBanner.classList.add("hidden");
@@ -971,7 +1100,7 @@ async function main(): Promise<void> {
   renderStats(refs, null);
   updateBusyControls(refs);
 
-  const app = new App({ name: "AGY Companion", version: "0.1.0" }, {});
+  const app = new App({ name: "Antigravity Companion", version: "0.1.0" }, {});
 
   async function callTool<T>(
     name: string,

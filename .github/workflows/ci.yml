@@ -54,7 +54,7 @@ jobs:
       #   [4/7] Shell syntax (bash -n & /bin/bash -n), executable bit (-x) on scripts/*.sh + plugin/scripts/*.sh, and dev-install safety
       #   [5/7] 4-way version sync (Cargo.toml, plugin.json, npm package.json + 5 optionalDeps, pyproject.toml), JS/Python shim checks, e2e/*.py py_compile & e2e/run_e2e.py --self-test
       #   [6/7] Rust workspace (fmt, clippy -D warnings, cargo test) & UI XSS hygiene / single-file bundle gate (< 512000 bytes)
-      #   [7/7] Plugin JSON manifests & agy plugin validate --strict ./plugin (clean skip if agy absent)
+      #   [7/7] Plugin JSON manifests, bundled logo asset validation (canonical relative path, non-symlink regular file, strict static SVG allowlist) & agy plugin validate --strict ./plugin (clean skip if agy absent)
       - name: Verify E2E harness syntax and self-tests (zero __pycache__)
         run: |
           python3 -B -c '

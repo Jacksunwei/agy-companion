@@ -36,10 +36,10 @@ flowchart LR
 | **Loopback Proxy** | [`crates/companion-proxy/`](crates/companion-proxy/) | Strict `127.0.0.1` Axum 0.8 proxy, `GET /health`, `GET /api/stats`, `POST /v1beta/models/{*rest}` (64 MiB cap), SSE/JSON `usageMetadata` tee, config mtime hot-reload |
 | **MCP App Server** | [`crates/companion-ui-mcp/`](crates/companion-ui-mcp/) | `rmcp 3.11` stdio MCP server serving embedded `ui://companion/settings.html` + `open_settings`, redacted `get_settings`, serialized `save_settings`, `test_connection` |
 | **Unified CLI** | [`crates/companion-cli/`](crates/companion-cli/) | Single `agy-companion` binary (`serve`, `ui-mcp`, `doctor`, `models`, `--version`) with `rmcp` `INFO` log ceiling |
-| **Embedded UI** | [`ui/`](ui/) | Vite 8 + TypeScript + `@modelcontextprotocol/ext-apps 2` single-file bundle ([`ui/dist/index.html`](ui/dist/index.html), `263,613` bytes `< 512,000`, zero `innerHTML`) |
-| **Antigravity Plugin** | [`plugin/`](plugin/) | Plugin manifest, MCP & proxy sidecar definitions, SHA-256-verifying launcher [`run-companion.sh`](plugin/scripts/run-companion.sh), companion skill |
+| **Embedded UI** | [`ui/`](ui/) | Vite 8 + TypeScript + `@modelcontextprotocol/ext-apps 2` single-file bundle ([`ui/dist/index.html`](ui/dist/index.html), `266,068` bytes `< 512,000`, zero `innerHTML`) |
+| **Antigravity Plugin** | [`plugin/`](plugin/) | Plugin manifest, bundled SVG icon ([`assets/logo.svg`](plugin/assets/logo.svg)), MCP & proxy sidecar definitions, SHA-256-verifying launcher [`run-companion.sh`](plugin/scripts/run-companion.sh), companion skill |
 | **Distribution Shims** | [`packages/`](packages/) | npm (`agy-companion` / `agyc` + 5 `@agy-companion/<os>-<arch>` optionalDeps) and Python (`maturin` `bindings = "bin"`) |
-| **Opaque-Box E2E** | [`e2e/`](e2e/) | Pure Python 3 stdlib 4-tier E2E test suite (`197` E2E tests + `21` harness self-tests; see [`e2e/README.md`](e2e/README.md)) |
+| **Opaque-Box E2E** | [`e2e/`](e2e/) | Pure Python 3 stdlib 4-tier E2E test suite (`199` E2E tests + `21` harness self-tests; see [`e2e/README.md`](e2e/README.md)) |
 
 ---
 
@@ -62,7 +62,7 @@ agy plugin list
 
 Then configure your Gemini API key in Antigravity App:
 
-1. Open **AGY Companion** via the side panel `+` menu (`aux_pane`), the left sidebar **Plugins** view (`global`), or by prompting: *"Open the Antigravity Companion settings panel"*.
+1. Open **Antigravity Companion** via the side panel `+` menu (`aux_pane`), the left sidebar **Plugins** view (`global`), or by prompting: *"Open the Antigravity Companion settings panel"*.
 2. Paste your Gemini API key (write-only; persisted atomically at Unix mode `0600` and never returned in plaintext), then click **Save Settings** and **Test Connection**.
 
 See [`plugin/README.md`](plugin/README.md) and [`plugin/skills/companion/SKILL.md`](plugin/skills/companion/SKILL.md) for full plugin usage and troubleshooting.
@@ -82,23 +82,23 @@ agy-companion models --json
     "customModels": [
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen",
-        "label": "AGY Companion (gemini-4-hydrogen)"
+        "label": "Antigravity Companion (gemini-4-hydrogen)"
       },
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon",
-        "label": "AGY Companion (gemini-4-argon)"
+        "label": "Antigravity Companion (gemini-4-argon)"
       },
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-neon",
-        "label": "AGY Companion (gemini-4-neon)"
+        "label": "Antigravity Companion (gemini-4-neon)"
       },
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-carbon",
-        "label": "AGY Companion (gemini-4-carbon)"
+        "label": "Antigravity Companion (gemini-4-carbon)"
       },
       {
         "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash",
-        "label": "AGY Companion (gemini-3.8-flash)"
+        "label": "Antigravity Companion (gemini-3.8-flash)"
       }
     ]
   }
@@ -176,7 +176,7 @@ See [`.agents/skills/local-dev/SKILL.md`](.agents/skills/local-dev/SKILL.md), [`
 #    Flags: --no-build | --release | --dry-run | --uninstall | --plugins-dir <dir> | -h/--help
 ./scripts/dev-install.sh
 
-# 2. Instant UI iteration (zero Rust rebuild — close & reopen AGY Companion aux pane)
+# 2. Instant UI iteration (zero Rust rebuild — close & reopen Antigravity Companion aux pane)
 export AGY_COMPANION_UI_HTML="$(pwd)/ui/dist/index.html"
 npm --prefix ui run build
 
@@ -187,11 +187,11 @@ npm --prefix ui run build
 # 4. Inspect sidecar logs:
 ls -la ~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/
 
-# 5. Full 7-gate local verification & Rust workspace tests (130 tests)
+# 5. Full 7-gate local verification & Rust workspace tests (132 tests)
 ./scripts/agent_check.sh
 cargo test --workspace
 
-# 6. Pure Python 3 stdlib opaque-box E2E suite (21 self-tests + 197 E2E tests: T1=82, T2=92, T3=16, T4=7)
+# 6. Pure Python 3 stdlib opaque-box E2E suite (21 self-tests + 199 E2E tests: T1=82, T2=94, T3=16, T4=7)
 python3 -B e2e/run_e2e.py --self-test -v
 python3 -B e2e/run_e2e.py --tier all --binary target/debug/agy-companion --repo-root . -v
 ```
@@ -217,7 +217,7 @@ All 5 Rust crates, `crates/companion-cli/src/main.rs`, and CLI integration tests
 
 ## Roadmap
 
-- **Milestone 1 (Complete — `v0.1.0`):** Loopback Gemini pass-through proxy with implicit cache preservation, embedded MCP App Settings UI (`aux_pane` + `global`), unified CLI (`serve`/`ui-mcp`/`doctor`/`models`), Antigravity plugin bundle, npm/PyPI distribution shims, XDG + Windows path support, day-1 `UsageSink` & version/skew seams, `130` Rust tests, `197` opaque-box E2E tests (+ `21` self-tests), and M8 Tier-5 adversarial hardening.
+- **Milestone 1 (Complete — `v0.1.0`):** Loopback Gemini pass-through proxy with implicit cache preservation, embedded MCP App Settings UI (`aux_pane` + `global`), unified CLI (`serve`/`ui-mcp`/`doctor`/`models`), Antigravity plugin bundle, npm/PyPI distribution shims, XDG + Windows path support, day-1 `UsageSink` & version/skew seams, `132` Rust tests, `199` opaque-box E2E tests (+ `21` self-tests), and M8 Tier-5 adversarial hardening.
 - **M2 & M3 (Planned):** Codex Pro and Claude provider adapters behind the `ProviderAdapter` trait ([`crates/companion-providers/`](crates/companion-providers/)).
 - **M4 (Planned):** Ollama Cloud and OpenAI-compatible 1-hop `Gemini ↔ OpenAI Chat Completions` adapter (local Ollama, OpenRouter, vLLM, LM Studio, OpenAI API).
 - **Deferred Day-1 Seams:**

@@ -13,7 +13,7 @@ use companion_providers::{GeminiProvider, ProviderAdapter};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorData, Implementation, ListResourcesResult, MetaObject,
+    CallToolResult, ContentBlock, ErrorData, Icon, Implementation, ListResourcesResult, MetaObject,
     PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
     Resource, ResourceContents, ServerCapabilities, ServerConfig,
 };
@@ -32,6 +32,7 @@ pub const UI_HTML_ENV_VAR: &str = "AGY_COMPANION_UI_HTML";
 pub const MAX_UI_HTML_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 2;
 pub const EMBEDDED_UI_HTML: &str = include_str!("../../../ui/dist/index.html");
+pub const EMBEDDED_LOGO_SVG: &[u8] = include_bytes!("../../../plugin/assets/logo.svg");
 
 const MAX_PROBE_BODY_BYTES: usize = 64 * 1024;
 const MAX_TEST_CONNECTION_TIMEOUT_SECS: u64 = 15;
@@ -170,11 +171,13 @@ impl CompanionUiServer {
     }
 
     pub fn list_ui_resources(&self) -> ListResourcesResult {
-        let resource = Resource::new(UI_RESOURCE_URI, "AGY Companion Settings")
+        let resource = Resource::new(UI_RESOURCE_URI, "Antigravity Companion Settings")
+            .with_title("Antigravity Companion Settings")
             .with_description(
                 "Embedded MCP App UI for configuring Gemini API access and inspecting local proxy telemetry.",
             )
             .with_mime_type(UI_MIME_TYPE)
+            .with_icons(companion_icons())
             .with_meta(ui_resource_meta());
         ListResourcesResult::with_all_items(vec![resource])
     }
@@ -328,6 +331,47 @@ fn ui_resource_meta() -> MetaObject {
     }))
 }
 
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut chunks = input.chunks_exact(3);
+    for chunk in &mut chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        out.push(TABLE[(n & 0x3f) as usize] as char);
+    }
+    match chunks.remainder() {
+        [a] => {
+            let n = (*a as u32) << 16;
+            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        [a, b] => {
+            let n = ((*a as u32) << 16) | ((*b as u32) << 8);
+            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        [] => {}
+        _ => unreachable!(),
+    }
+    out
+}
+
+fn companion_icons() -> Vec<Icon> {
+    let encoded = encode_base64(EMBEDDED_LOGO_SVG);
+    vec![
+        Icon::new(format!("data:image/svg+xml;base64,{encoded}"))
+            .with_mime_type("image/svg+xml")
+            .with_sizes(vec!["any".to_string()]),
+    ]
+}
+
 fn open_settings_meta() -> MetaObject {
     meta_from_value(json!({
         "ui": {
@@ -335,8 +379,8 @@ fn open_settings_meta() -> MetaObject {
         },
         "com.google.antigravity/ui": {
             "entrypoints": [
-                { "type": "aux_pane", "title": "AGY Companion" },
-                { "type": "global", "title": "AGY Companion" }
+                { "type": "aux_pane", "title": "Antigravity Companion" },
+                { "type": "global", "title": "Antigravity Companion" }
             ]
         }
     }))
@@ -507,7 +551,7 @@ fn format_snapshot_summary(snapshot: &SettingsSnapshot) -> String {
     };
 
     format!(
-        "AGY Companion v{} — proxy at {}:{} is {}, model {}, API key {}.",
+        "Antigravity Companion v{} — proxy at {}:{} is {}, model {}, API key {}.",
         snapshot.binary_version,
         snapshot.config.listen_host,
         snapshot.config.listen_port,
@@ -533,8 +577,9 @@ fn test_connection_result(payload: &TestConnectionPayload) -> Result<CallToolRes
 impl CompanionUiServer {
     #[tool(
         name = "open_settings",
-        title = "Open AGY Companion Settings",
+        title = "Open Antigravity Companion Settings",
         description = "Launch the Antigravity Companion settings and proxy telemetry panel.",
+        icons = companion_icons(),
         meta = open_settings_meta()
     )]
     pub async fn open_settings(&self) -> Result<CallToolResult, ErrorData> {
@@ -548,7 +593,7 @@ impl CompanionUiServer {
 
     #[tool(
         name = "get_settings",
-        title = "Get AGY Companion Settings",
+        title = "Get Antigravity Companion Settings",
         description = "Read redacted Antigravity Companion configuration, loopback proxy health, and live session telemetry.",
         meta = app_only_meta()
     )]
@@ -563,7 +608,7 @@ impl CompanionUiServer {
 
     #[tool(
         name = "save_settings",
-        title = "Save AGY Companion Settings",
+        title = "Save Antigravity Companion Settings",
         description = "Validate and atomically persist Antigravity Companion settings (0600 permissions) without returning plaintext secrets.",
         meta = app_only_meta()
     )]
@@ -708,10 +753,11 @@ impl ServerHandler for CompanionUiServer {
                 .enable_resources()
                 .build(),
         )
-        .with_server_info(Implementation::new(
-            "agy-companion",
-            env!("CARGO_PKG_VERSION"),
-        ))
+        .with_server_info(
+            Implementation::new("agy-companion", env!("CARGO_PKG_VERSION"))
+                .with_title("Antigravity Companion")
+                .with_icons(companion_icons()),
+        )
         .with_instructions(
             "Antigravity Companion settings and proxy telemetry MCP App. Call open_settings to launch the settings panel.",
         )
@@ -783,6 +829,73 @@ mod tests {
         (port, handle)
     }
 
+    fn decode_base64(input: &str) -> Vec<u8> {
+        let bytes = input.as_bytes();
+        assert_eq!(bytes.len() % 4, 0, "base64 length must be a multiple of 4");
+        let val = |b: u8| -> u32 {
+            match b {
+                b'A'..=b'Z' => (b - b'A') as u32,
+                b'a'..=b'z' => (b - b'a' + 26) as u32,
+                b'0'..=b'9' => (b - b'0' + 52) as u32,
+                b'+' => 62,
+                b'/' => 63,
+                other => panic!("unexpected base64 byte: {other}"),
+            }
+        };
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks_exact(4) {
+            let a = val(chunk[0]);
+            let b = val(chunk[1]);
+            let pad_c = chunk[2] == b'=';
+            let pad_d = chunk[3] == b'=';
+            let c = if pad_c { 0 } else { val(chunk[2]) };
+            let d = if pad_d { 0 } else { val(chunk[3]) };
+            let n = (a << 18) | (b << 12) | (c << 6) | d;
+            out.push(((n >> 16) & 0xff) as u8);
+            if !pad_c {
+                out.push(((n >> 8) & 0xff) as u8);
+            }
+            if !pad_d {
+                out.push((n & 0xff) as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base64_encoder_matches_rfc4648_and_companion_icons_roundtrips_logo_svg() {
+        let vectors = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
+        for (plain, expected) in vectors {
+            assert_eq!(encode_base64(plain.as_bytes()), expected);
+            assert_eq!(decode_base64(expected), plain.as_bytes());
+        }
+
+        let icons = companion_icons();
+        assert_eq!(icons.len(), 1);
+        let icon = &icons[0];
+        assert_eq!(icon.mime_type.as_deref(), Some("image/svg+xml"));
+        assert_eq!(icon.sizes.as_deref(), Some(&["any".to_string()][..]));
+        let b64 = icon
+            .src
+            .strip_prefix("data:image/svg+xml;base64,")
+            .expect("icon src must be SVG base64 data URI");
+        let decoded = decode_base64(b64);
+        assert_eq!(decoded, EMBEDDED_LOGO_SVG);
+
+        let disk_logo =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugin/assets/logo.svg");
+        let disk_bytes = fs::read(&disk_logo).expect("read plugin/assets/logo.svg");
+        assert_eq!(decoded, disk_bytes);
+    }
+
     #[test]
     fn open_settings_tool_declares_aux_pane_and_global_entrypoints() {
         let tmp = TempDir::new().expect("tempdir");
@@ -793,6 +906,18 @@ mod tests {
             .iter()
             .find(|t| t.name == "open_settings")
             .expect("open_settings tool");
+        assert_eq!(
+            open.title.as_deref(),
+            Some("Open Antigravity Companion Settings")
+        );
+        let open_icons = open.icons.as_ref().expect("open_settings icons");
+        assert_eq!(open_icons.len(), 1);
+        assert!(open_icons[0].src.starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(open_icons[0].mime_type.as_deref(), Some("image/svg+xml"));
+        assert_eq!(
+            open_icons[0].sizes.as_deref(),
+            Some(&["any".to_string()][..])
+        );
         let meta = open.meta.as_ref().expect("open_settings _meta");
         assert_eq!(
             meta.0.get("ui").and_then(|v| v.get("resourceUri")),
@@ -815,12 +940,25 @@ mod tests {
                 .iter()
                 .any(|e| e.get("type") == Some(&json!("global")))
         );
+        for ep in entrypoints {
+            assert_eq!(
+                ep.get("title"),
+                Some(&json!("Antigravity Companion")),
+                "entrypoint title must be Antigravity Companion: {ep:?}"
+            );
+        }
 
-        for app_only in ["get_settings", "save_settings", "test_connection"] {
+        let expected_titles = [
+            ("get_settings", "Get Antigravity Companion Settings"),
+            ("save_settings", "Save Antigravity Companion Settings"),
+            ("test_connection", "Test Gemini Upstream Connection"),
+        ];
+        for (app_only, expected_title) in expected_titles {
             let tool = tools
                 .iter()
                 .find(|t| t.name == app_only)
                 .unwrap_or_else(|| panic!("missing tool {app_only}"));
+            assert_eq!(tool.title.as_deref(), Some(expected_title));
             let tool_meta = tool
                 .meta
                 .as_ref()
@@ -843,7 +981,17 @@ mod tests {
         assert_eq!(listed.resources.len(), 1);
         let res = &listed.resources[0];
         assert_eq!(res.uri, UI_RESOURCE_URI);
+        assert_eq!(res.name, "Antigravity Companion Settings");
+        assert_eq!(res.title.as_deref(), Some("Antigravity Companion Settings"));
         assert_eq!(res.mime_type.as_deref(), Some(UI_MIME_TYPE));
+        let res_icons = res.icons.as_ref().expect("resource icons");
+        assert_eq!(res_icons.len(), 1);
+        assert!(res_icons[0].src.starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(res_icons[0].mime_type.as_deref(), Some("image/svg+xml"));
+        assert_eq!(
+            res_icons[0].sizes.as_deref(),
+            Some(&["any".to_string()][..])
+        );
         assert_eq!(
             res.meta
                 .as_ref()
@@ -869,6 +1017,11 @@ mod tests {
                 assert!(!text.trim().is_empty());
                 assert!(text.len() < 512_000, "embedded UI HTML must be < 500 KiB");
                 assert!(text.contains("<!doctype html>") || text.contains("<!DOCTYPE html>"));
+                assert!(text.contains("<title>Antigravity Companion Settings</title>"));
+                assert!(
+                    !text.contains("AGY Companion"),
+                    "embedded UI HTML must not contain stale AGY Companion display strings"
+                );
                 assert_eq!(
                     meta.as_ref()
                         .and_then(|m| m.0.get("ui"))
@@ -937,6 +1090,8 @@ mod tests {
             assert!(!serialized.contains(secret));
             assert!(!serialized.contains("SySecret1234"));
             assert!(serialized.contains("AIza...7890"));
+            assert!(serialized.contains("Antigravity Companion v"));
+            assert!(!serialized.contains("AGY Companion"));
 
             let snapshot: SettingsSnapshot = serde_json::from_value(
                 result
@@ -1617,6 +1772,21 @@ mod tests {
         let init_resp = recv_msg(&mut reader).await;
         assert_eq!(init_resp["id"], 1);
         assert_eq!(init_resp["result"]["serverInfo"]["name"], "agy-companion");
+        assert_eq!(
+            init_resp["result"]["serverInfo"]["title"],
+            "Antigravity Companion"
+        );
+        let init_icons = init_resp["result"]["serverInfo"]["icons"]
+            .as_array()
+            .expect("serverInfo icons array");
+        assert_eq!(init_icons.len(), 1);
+        assert!(
+            init_icons[0]["src"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("data:image/svg+xml;base64,"))
+        );
+        assert_eq!(init_icons[0]["mimeType"], "image/svg+xml");
+        assert_eq!(init_icons[0]["sizes"], json!(["any"]));
 
         // 2. notifications/initialized
         send_msg(
@@ -1650,6 +1820,19 @@ mod tests {
         assert_eq!(
             res_list["result"]["resources"][0]["uri"],
             json!(UI_RESOURCE_URI)
+        );
+        assert_eq!(
+            res_list["result"]["resources"][0]["name"],
+            json!("Antigravity Companion Settings")
+        );
+        assert_eq!(
+            res_list["result"]["resources"][0]["title"],
+            json!("Antigravity Companion Settings")
+        );
+        assert!(
+            res_list["result"]["resources"][0]["icons"][0]["src"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("data:image/svg+xml;base64,"))
         );
 
         // 5. resources/read (valid + unknown URI)

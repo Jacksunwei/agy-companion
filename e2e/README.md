@@ -14,7 +14,7 @@ Pure Python 3 standard-library opaque-box E2E test suite verifying all Milestone
 | `mock_gemini.py` | Ephemeral HTTP/1.1 `MockGeminiServer` (exact request capture, chunked SSE, split UTF-8/CRLF, FIFO fault queues, `SO_LINGER` TCP RST, `EchoChecksumAction`) & `MockHealthServer` |
 | `mcp_client.py` | Strict newline-delimited JSON-RPC 2.0 `McpStdioClient` (stdout purity auditing, fast EOF detection, thread-safe stdin writes, `save_settings_smart` schema introspection) |
 | `test_tier1_features.py` | **Tier 1** — Core happy-path feature coverage (82 tests: 6–7 per F1–F12 + 8 for F14/F15/F16) |
-| `test_tier2_boundaries.py` | **Tier 2** — Boundaries, corner cases, negative inputs & S1–S8 security tests (92 tests: 6–9 per F1–F12 + 5 for F14/F15/F16) |
+| `test_tier2_boundaries.py` | **Tier 2** — Boundaries, corner cases, negative inputs & S1–S8 security tests (94 tests: 6–9 per F1–F12 + 6 for F14/F15/F16) |
 | `test_tier3_combinations.py` | **Tier 3** — Pairwise cross-feature combinations (16 tests, including F15 live UI reload, symlink-aware launcher & F16 XDG coordination) |
 | `test_tier4_scenarios.py` | **Tier 4** — Multi-step real-world end-to-end application workloads (7 tests) |
 | `test_self.py` | **Self-Tests** — 21 pure-Python harness self-tests (`SELF-01`..`SELF-21`), runnable without the Rust binary |

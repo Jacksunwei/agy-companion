@@ -652,7 +652,522 @@ check_plugin_bundle() {
   if ! python3 -B - "${REPO_ROOT}" <<'PYEOF'
 import json
 import pathlib
+import re
 import sys
+import xml.parsers.expat as expat
+
+MAX_LOGO_BYTES = 1_048_576
+MAX_SVG_DEPTH = 64
+MAX_SVG_ELEMENTS = 10_000
+
+SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+ALLOWED_NAMESPACES = frozenset({SVG_NS, XLINK_NS, XML_NS})
+
+ALLOWED_SVG_TAGS = frozenset({
+    "svg",
+    "g",
+    "defs",
+    "title",
+    "desc",
+    "symbol",
+    "use",
+    "rect",
+    "circle",
+    "ellipse",
+    "line",
+    "polyline",
+    "polygon",
+    "path",
+    "linearGradient",
+    "radialGradient",
+    "stop",
+    "clipPath",
+    "mask",
+    "pattern",
+    "marker",
+    "filter",
+    "feBlend",
+    "feColorMatrix",
+    "feComponentTransfer",
+    "feFuncR",
+    "feFuncG",
+    "feFuncB",
+    "feFuncA",
+    "feComposite",
+    "feDropShadow",
+    "feFlood",
+    "feGaussianBlur",
+    "feMerge",
+    "feMergeNode",
+    "feMorphology",
+    "feOffset",
+    "feTurbulence",
+})
+
+TEXT_ONLY_TAGS = frozenset({"title", "desc"})
+HREF_ALLOWED_TAGS = frozenset({"use", "linearGradient", "radialGradient", "pattern"})
+ALLOWED_XLINK_ATTRS = frozenset({"href"})
+ALLOWED_XML_ATTRS = frozenset({"id", "lang", "space"})
+ALLOWED_UNNS_ATTRS = frozenset({
+    "id",
+    "role",
+    "aria-labelledby",
+    "aria-hidden",
+    "focusable",
+    "lang",
+    "version",
+    "width",
+    "height",
+    "viewBox",
+    "preserveAspectRatio",
+    "x",
+    "y",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "cx",
+    "cy",
+    "r",
+    "rx",
+    "ry",
+    "fx",
+    "fy",
+    "fr",
+    "d",
+    "points",
+    "pathLength",
+    "transform",
+    "transform-origin",
+    "gradientUnits",
+    "gradientTransform",
+    "spreadMethod",
+    "patternUnits",
+    "patternContentUnits",
+    "patternTransform",
+    "clipPathUnits",
+    "maskUnits",
+    "maskContentUnits",
+    "filterUnits",
+    "primitiveUnits",
+    "markerUnits",
+    "markerWidth",
+    "markerHeight",
+    "refX",
+    "refY",
+    "orient",
+    "overflow",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "stroke",
+    "stroke-opacity",
+    "stroke-width",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "opacity",
+    "color",
+    "stop-color",
+    "stop-opacity",
+    "flood-color",
+    "flood-opacity",
+    "visibility",
+    "display",
+    "paint-order",
+    "shape-rendering",
+    "color-interpolation",
+    "color-interpolation-filters",
+    "image-rendering",
+    "vector-effect",
+    "isolation",
+    "mix-blend-mode",
+    "mask-type",
+    "clip-path",
+    "clip-rule",
+    "mask",
+    "filter",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+    "offset",
+    "href",
+    "in",
+    "in2",
+    "result",
+    "mode",
+    "type",
+    "values",
+    "operator",
+    "k1",
+    "k2",
+    "k3",
+    "k4",
+    "stdDeviation",
+    "edgeMode",
+    "radius",
+    "dx",
+    "dy",
+    "baseFrequency",
+    "numOctaves",
+    "seed",
+    "stitchTiles",
+    "slope",
+    "intercept",
+    "amplitude",
+    "exponent",
+    "tableValues",
+})
+
+URL_ATTRS = frozenset({
+    "fill",
+    "stroke",
+    "clip-path",
+    "mask",
+    "filter",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+})
+COLOR_FUNC_ATTRS = frozenset({
+    "fill",
+    "stroke",
+    "stop-color",
+    "flood-color",
+    "color",
+})
+TRANSFORM_ATTRS = frozenset({
+    "transform",
+    "gradientTransform",
+    "patternTransform",
+})
+PAREN_ALLOWED_ATTRS = URL_ATTRS | COLOR_FUNC_ATTRS | TRANSFORM_ATTRS
+COLOR_FUNCS = frozenset({"rgb", "rgba", "hsl", "hsla"})
+TRANSFORM_FUNCS = frozenset({"matrix", "translate", "scale", "rotate", "skewX", "skewY"})
+
+LOCAL_FRAG_RE = re.compile(r"^#[A-Za-z_][A-Za-z0-9_.:-]*$")
+CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+FORBIDDEN_ATTR_TOKENS_RE = re.compile(
+    r"(?:\\|/\*|\*/|//|@import|-moz-binding|expression\s*\()",
+    re.IGNORECASE,
+)
+FUNC_CALL_RE = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z_-][A-Za-z0-9_-]*)(\s*)\(([^()]*)\)")
+NUMERIC_FUNC_ARGS_RE = re.compile(r"^[0-9.,eE% /+-]+$")
+RFC3986_SCHEME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-"
+)
+
+
+class _SvgAbort(Exception):
+    pass
+
+
+def _has_rfc3986_scheme(text):
+    if ":" not in text:
+        return False
+    for piece in text.split(":")[:-1]:
+        head = piece.rstrip()
+        idx = len(head)
+        while idx > 0 and head[idx - 1] in RFC3986_SCHEME_CHARS:
+            idx -= 1
+        if any(("A" <= ch <= "Z") or ("a" <= ch <= "z") for ch in head[idx:]):
+            return True
+    return False
+
+
+def _split_ns(name):
+    if " " in name:
+        return name.rsplit(" ", 1)
+    return "", name
+
+
+def _validate_attr_value(local_attr, attr_val):
+    if CTRL_CHAR_RE.search(attr_val):
+        raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains forbidden control character")
+    if FORBIDDEN_ATTR_TOKENS_RE.search(attr_val):
+        raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains forbidden CSS/URI token")
+
+    paren_depth = 0
+    open_count = 0
+    for ch in attr_val:
+        if ch == "(":
+            paren_depth += 1
+            open_count += 1
+            if paren_depth > 1:
+                raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains nested parentheses")
+        elif ch == ")":
+            paren_depth -= 1
+            if paren_depth < 0:
+                raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains unbalanced parentheses")
+    if paren_depth != 0:
+        raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains unclosed parentheses")
+
+    url_spans = []
+    url_targets = []
+    if open_count > 0:
+        if local_attr not in PAREN_ALLOWED_ATTRS:
+            raise _SvgAbort(f"SVG logo attribute '{local_attr}' does not permit functional notation")
+        matched_parens = 0
+        for m in FUNC_CALL_RE.finditer(attr_val):
+            matched_parens += 1
+            fn_name = m.group(1)
+            fn_ws = m.group(2)
+            fn_arg = m.group(3)
+            fn_lower = fn_name.lower()
+            if fn_lower == "url":
+                if local_attr not in URL_ATTRS:
+                    raise _SvgAbort(f"SVG logo attribute '{local_attr}' does not permit url()")
+                if fn_ws:
+                    raise _SvgAbort(
+                        f"SVG logo attribute '{local_attr}' must not have whitespace between url and '('"
+                    )
+                inner = fn_arg.strip(" ")
+                if len(inner) >= 2 and inner[0] in ("'", '"') and inner[-1] == inner[0]:
+                    inner = inner[1:-1]
+                if not LOCAL_FRAG_RE.fullmatch(inner):
+                    raise _SvgAbort(
+                        f"SVG logo attribute '{local_attr}' contains non-local url() reference"
+                    )
+                url_spans.append((m.start(), m.end()))
+                url_targets.append(inner[1:])
+            elif fn_lower in COLOR_FUNCS:
+                if local_attr not in COLOR_FUNC_ATTRS:
+                    raise _SvgAbort(f"SVG logo attribute '{local_attr}' does not permit {fn_name}()")
+                if fn_ws:
+                    raise _SvgAbort(
+                        f"SVG logo attribute '{local_attr}' must not have whitespace before '(' in {fn_name}()"
+                    )
+                if not NUMERIC_FUNC_ARGS_RE.fullmatch(fn_arg) or not fn_arg.strip(" "):
+                    raise _SvgAbort(
+                        f"SVG logo attribute '{local_attr}' contains invalid {fn_name}() arguments"
+                    )
+            elif fn_name in TRANSFORM_FUNCS:
+                if local_attr not in TRANSFORM_ATTRS:
+                    raise _SvgAbort(f"SVG logo attribute '{local_attr}' does not permit {fn_name}()")
+                if fn_ws and fn_ws.strip(" "):
+                    raise _SvgAbort(
+                        f"SVG logo attribute '{local_attr}' contains forbidden whitespace before '('"
+                    )
+                if not NUMERIC_FUNC_ARGS_RE.fullmatch(fn_arg) or not fn_arg.strip(" "):
+                    raise _SvgAbort(
+                        f"SVG logo attribute '{local_attr}' contains invalid {fn_name}() arguments"
+                    )
+            else:
+                raise _SvgAbort(
+                    f"SVG logo attribute '{local_attr}' contains disallowed function '{fn_name}()'"
+                )
+        if matched_parens != open_count:
+            raise _SvgAbort(
+                f"SVG logo attribute '{local_attr}' contains invalid parenthesized expression"
+            )
+
+    if local_attr not in ("id", "href"):
+        if url_spans:
+            parts = []
+            pos = 0
+            for start_idx, end_idx in url_spans:
+                parts.append(attr_val[pos:start_idx])
+                pos = end_idx
+            parts.append(attr_val[pos:])
+            remainder = " ".join(parts)
+        else:
+            remainder = attr_val
+        if _has_rfc3986_scheme(remainder):
+            raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains forbidden URI scheme")
+
+    return url_targets
+
+
+def _validate_svg_bytes(raw):
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"plugin/plugin.json: SVG logo is not valid UTF-8 ({exc})"]
+
+    stack = []
+    id_stack = []
+    ref_graph = {}
+    seen_root = False
+    elem_count = 0
+    xml_id_key = f"{XML_NS} id"
+
+    def _abort(msg):
+        raise _SvgAbort(msg)
+
+    def _on_xml_decl(version, encoding, _standalone):
+        if version not in (None, "1.0"):
+            _abort(f"SVG logo XML declaration version must be 1.0, got {version!r}")
+        if encoding is not None and encoding.lower() != "utf-8":
+            _abort(f"SVG logo XML declaration encoding must be UTF-8, got {encoding!r}")
+
+    def _on_start_ns(_prefix, uri):
+        if uri not in ALLOWED_NAMESPACES:
+            _abort(f"SVG logo declares forbidden XML namespace {uri!r}")
+
+    def _on_start_elem(name, attrs):
+        nonlocal seen_root, elem_count
+        elem_ns, local_tag = _split_ns(name)
+        if not seen_root:
+            seen_root = True
+            if (elem_ns, local_tag) != (SVG_NS, "svg"):
+                _abort(
+                    f"SVG logo root element must be {{{SVG_NS}}}svg, got {{{elem_ns}}}{local_tag}"
+                )
+        else:
+            if elem_ns != SVG_NS:
+                _abort(f"SVG logo element <{local_tag}> uses forbidden namespace {elem_ns!r}")
+            if stack and stack[-1] in TEXT_ONLY_TAGS:
+                _abort(f"SVG logo element <{stack[-1]}> must not contain child elements")
+
+        if local_tag not in ALLOWED_SVG_TAGS:
+            _abort(f"SVG logo contains disallowed element <{local_tag}>")
+
+        elem_count += 1
+        if elem_count > MAX_SVG_ELEMENTS:
+            _abort(f"SVG logo exceeds maximum element count ({MAX_SVG_ELEMENTS})")
+        if len(stack) + 1 > MAX_SVG_DEPTH:
+            _abort(f"SVG logo exceeds maximum nesting depth ({MAX_SVG_DEPTH})")
+
+        parent_ids = id_stack[-1] if id_stack else ()
+        elem_ids = []
+        raw_id = attrs.get("id")
+        if raw_id:
+            elem_ids.append(raw_id)
+        raw_xml_id = attrs.get(xml_id_key)
+        if raw_xml_id and raw_xml_id not in elem_ids:
+            elem_ids.append(raw_xml_id)
+        for pid in parent_ids:
+            for eid in elem_ids:
+                ref_graph.setdefault(pid, set()).add(eid)
+        effective_ids = tuple(elem_ids) if elem_ids else parent_ids
+        owner_ids = elem_ids if elem_ids else list(parent_ids)
+
+        for attr_name, attr_val in attrs.items():
+            attr_ns, local_attr = _split_ns(attr_name)
+            if local_attr.lower().startswith("on"):
+                _abort(f"SVG logo contains forbidden event handler attribute '{local_attr}'")
+            if attr_ns == "":
+                if local_attr not in ALLOWED_UNNS_ATTRS:
+                    _abort(
+                        f"SVG logo element <{local_tag}> contains disallowed attribute '{local_attr}'"
+                    )
+            elif attr_ns == XLINK_NS:
+                if local_attr not in ALLOWED_XLINK_ATTRS:
+                    _abort(
+                        f"SVG logo element <{local_tag}> contains disallowed xlink attribute '{local_attr}'"
+                    )
+            elif attr_ns == XML_NS:
+                if local_attr not in ALLOWED_XML_ATTRS:
+                    _abort(
+                        f"SVG logo element <{local_tag}> contains disallowed xml attribute '{local_attr}'"
+                    )
+            else:
+                _abort(
+                    f"SVG logo element <{local_tag}> contains attribute in forbidden namespace {attr_ns!r}"
+                )
+
+            if local_attr == "href" and attr_ns in ("", XLINK_NS):
+                if local_tag not in HREF_ALLOWED_TAGS:
+                    _abort(
+                        f"SVG logo element <{local_tag}> does not permit '{local_attr}' attribute"
+                    )
+                if not LOCAL_FRAG_RE.fullmatch(attr_val):
+                    _abort(
+                        f"SVG logo element <{local_tag}> '{local_attr}' must be a local #id fragment"
+                    )
+                target_id = attr_val[1:]
+                for owner in owner_ids:
+                    ref_graph.setdefault(owner, set()).add(target_id)
+
+            for target_id in _validate_attr_value(local_attr, attr_val):
+                for owner in owner_ids:
+                    ref_graph.setdefault(owner, set()).add(target_id)
+
+        stack.append(local_tag)
+        id_stack.append(effective_ids)
+
+    def _on_end_elem(_name):
+        stack.pop()
+        id_stack.pop()
+
+    def _on_char_data(data):
+        if not data.strip(" \t\r\n"):
+            return
+        if not stack or stack[-1] not in TEXT_ONLY_TAGS:
+            parent = stack[-1] if stack else "document"
+            _abort(f"SVG logo element <{parent}> must not contain text content")
+
+    parser = expat.ParserCreate(namespace_separator=" ")
+    parser.XmlDeclHandler = _on_xml_decl
+    parser.StartDoctypeDeclHandler = lambda *_a: _abort(
+        "SVG logo must not contain DOCTYPE or DTD declarations"
+    )
+    parser.EntityDeclHandler = lambda *_a: _abort(
+        "SVG logo must not contain ENTITY declarations"
+    )
+    parser.UnparsedEntityDeclHandler = lambda *_a: _abort(
+        "SVG logo must not contain unparsed ENTITY declarations"
+    )
+    parser.NotationDeclHandler = lambda *_a: _abort(
+        "SVG logo must not contain NOTATION declarations"
+    )
+    parser.AttlistDeclHandler = lambda *_a: _abort(
+        "SVG logo must not contain ATTLIST declarations"
+    )
+    parser.ElementDeclHandler = lambda *_a: _abort(
+        "SVG logo must not contain ELEMENT declarations"
+    )
+    parser.ExternalEntityRefHandler = lambda *_a: _abort(
+        "SVG logo must not reference external entities"
+    )
+    parser.ProcessingInstructionHandler = lambda target, _data: _abort(
+        f"SVG logo must not contain XML processing instructions (<?{target}?>)"
+    )
+    parser.StartCdataSectionHandler = lambda: _abort(
+        "SVG logo must not contain CDATA sections"
+    )
+    parser.StartNamespaceDeclHandler = _on_start_ns
+    parser.StartElementHandler = _on_start_elem
+    parser.EndElementHandler = _on_end_elem
+    parser.CharacterDataHandler = _on_char_data
+
+    try:
+        parser.Parse(raw, True)
+    except _SvgAbort as exc:
+        return [f"plugin/plugin.json: {exc}"]
+    except expat.ExpatError as exc:
+        return [f"plugin/plugin.json: SVG logo is not valid XML ({exc})"]
+
+    if not seen_root:
+        return ["plugin/plugin.json: SVG logo has no root element"]
+
+    # Iterative 3-color DFS cycle detection for local fragment references (<use>/gradient/pattern)
+    color = {}
+    for start in list(ref_graph.keys()):
+        if color.get(start, 0) != 0:
+            continue
+        dfs_stack = [(start, iter(ref_graph.get(start, ())))]
+        color[start] = 1
+        while dfs_stack:
+            node, it = dfs_stack[-1]
+            try:
+                nxt = next(it)
+            except StopIteration:
+                color[node] = 2
+                dfs_stack.pop()
+                continue
+            state = color.get(nxt, 0)
+            if state == 1:
+                return ["plugin/plugin.json: SVG logo contains cyclic local fragment reference"]
+            if state == 0:
+                color[nxt] = 1
+                dfs_stack.append((nxt, iter(ref_graph.get(nxt, ()))))
+
+    return []
 
 root = pathlib.Path(sys.argv[1])
 manifests = [
@@ -661,6 +1176,7 @@ manifests = [
     "plugin/sidecars/proxy/sidecar.json",
 ]
 errors = []
+parsed = {}
 for rel in manifests:
     path = root / rel
     if not path.is_file():
@@ -670,8 +1186,72 @@ for rel in manifests:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             errors.append(f"{rel}: top-level JSON must be an object")
+        else:
+            parsed[rel] = data
     except Exception as exc:
         errors.append(f"{rel}: invalid JSON ({exc})")
+
+plugin_manifest = parsed.get("plugin/plugin.json")
+if isinstance(plugin_manifest, dict):
+    logo = plugin_manifest.get("logo")
+    if not isinstance(logo, str) or not logo.strip() or logo != logo.strip():
+        errors.append("plugin/plugin.json: 'logo' must be a non-empty trimmed string")
+    elif "\x00" in logo or logo.startswith("/") or "\\" in logo:
+        errors.append(f"plugin/plugin.json: invalid 'logo' path {logo!r}")
+    else:
+        raw_parts = logo.split("/")
+        logo_rel = pathlib.PurePosixPath(logo)
+        if (
+            not raw_parts
+            or any(seg in {"", ".", ".."} for seg in raw_parts)
+            or logo_rel.is_absolute()
+            or ".." in logo_rel.parts
+            or not logo_rel.parts
+        ):
+            errors.append(
+                f"plugin/plugin.json: 'logo' must be a canonical relative path without '.', '..', or empty segments: {logo!r}"
+            )
+        elif logo_rel.suffix.lower() not in {".svg", ".png", ".jpg", ".jpeg", ".webp"}:
+            errors.append(f"plugin/plugin.json: unsupported 'logo' extension {logo_rel.suffix!r}")
+        else:
+            plugin_dir = root / "plugin"
+            plugin_dir_resolved = plugin_dir.resolve()
+            logo_path = plugin_dir.joinpath(*logo_rel.parts)
+            cur = plugin_dir
+            symlink_segment = False
+            for part in logo_rel.parts:
+                cur = cur / part
+                if cur.is_symlink():
+                    symlink_segment = True
+                    break
+            if symlink_segment or logo_path.is_symlink():
+                errors.append(f"plugin/plugin.json: 'logo' must not traverse or point to a symlink: {logo!r}")
+            elif not logo_path.exists() or not logo_path.is_file():
+                errors.append(f"plugin/plugin.json: 'logo' target is missing or not a regular file: {logo!r}")
+            else:
+                try:
+                    logo_resolved = logo_path.resolve()
+                    logo_resolved.relative_to(plugin_dir_resolved)
+                except Exception:
+                    errors.append(f"plugin/plugin.json: 'logo' escapes plugin root: {logo!r}")
+                else:
+                    logo_size = logo_path.stat().st_size
+                    if logo_size == 0:
+                        errors.append(f"plugin/plugin.json: 'logo' file is empty: {logo!r}")
+                    elif logo_size > MAX_LOGO_BYTES:
+                        errors.append(
+                            f"plugin/plugin.json: 'logo' file exceeds {MAX_LOGO_BYTES} bytes ({logo_size}): {logo!r}"
+                        )
+                    else:
+                        raw = logo_path.read_bytes()
+                        if len(raw) == 0:
+                            errors.append(f"plugin/plugin.json: 'logo' file is empty: {logo!r}")
+                        elif len(raw) > MAX_LOGO_BYTES:
+                            errors.append(
+                                f"plugin/plugin.json: 'logo' file exceeds {MAX_LOGO_BYTES} bytes ({len(raw)}): {logo!r}"
+                            )
+                        elif logo_rel.suffix.lower() == ".svg":
+                            errors.extend(_validate_svg_bytes(raw))
 
 if errors:
     for err in errors:
@@ -679,7 +1259,7 @@ if errors:
     sys.exit(1)
 PYEOF
   then
-    fail "[7/${TOTAL_CHECKS}] Plugin bundle: JSON manifest validation failed"
+    fail "[7/${TOTAL_CHECKS}] Plugin bundle: JSON manifest and logo validation failed"
     plugin_failed=1
   fi
 
@@ -688,12 +1268,12 @@ PYEOF
   fi
 
   if ! command -v agy >/dev/null 2>&1; then
-    pass "[7/${TOTAL_CHECKS}] Plugin bundle: all 3 plugin JSON manifests valid; skipped agy plugin validate --strict ./plugin (agy CLI not found on PATH)"
+    pass "[7/${TOTAL_CHECKS}] Plugin bundle: all 3 plugin JSON manifests and logo valid; skipped agy plugin validate --strict ./plugin (agy CLI not found on PATH)"
     return
   fi
 
   if agy plugin validate --strict "${REPO_ROOT}/plugin"; then
-    pass "[7/${TOTAL_CHECKS}] Plugin bundle: all 3 plugin JSON manifests valid and agy plugin validate --strict ./plugin passed"
+    pass "[7/${TOTAL_CHECKS}] Plugin bundle: all 3 plugin JSON manifests, logo, and agy plugin validate --strict ./plugin passed"
   else
     fail "[7/${TOTAL_CHECKS}] Plugin bundle: agy plugin validate --strict ./plugin failed"
   fi
