@@ -64,6 +64,18 @@ Then configure your Gemini API key in Antigravity App:
 
 1. Open **Antigravity Companion** via the side panel `+` menu (`aux_pane`), the left sidebar **Plugins** view (`global`), or by prompting: *"Open the Antigravity Companion settings panel"*.
 2. Paste your Gemini API key (write-only; persisted atomically at Unix mode `0600` and never returned in plaintext), then click **Save Settings** and **Test Connection**.
+3. *(Optional — Antigravity App Gateway Mode)* To populate Antigravity App's model picker directly from `agy-companion` (`GET /v1beta/models`), add the `"gateway"` block to `~/.gemini/config/config.json` and restart Antigravity App:
+
+```json
+{
+  "gateway": {
+    "url": "http://127.0.0.1:4141",
+    "wireProtocol": "genai"
+  }
+}
+```
+
+> **Note:** Gateway Mode works with personal Antigravity App (no Gemini Enterprise/MDM required), and replaces Google OAuth / AI Pro models while enabled — all model requests route through `agy-companion`. Remove `"gateway"` and restart to switch back.
 
 See [`plugin/README.md`](plugin/README.md) and [`plugin/skills/companion/SKILL.md`](plugin/skills/companion/SKILL.md) for full plugin usage and troubleshooting.
 

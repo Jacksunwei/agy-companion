@@ -30,6 +30,18 @@ In the panel:
 1. Paste your Gemini API key (stored atomically — Unix mode `0600` / parent dir `0700`, Windows user-profile ACLs with bounded `3`-attempt rename retry — never returned in plaintext), or export `GEMINI_API_KEY` in your shell environment.
 2. Adjust the default model (Gemini 3 & 4 only; default: `gemini-4-hydrogen`), upstream base URL (default: `https://generativelanguage.googleapis.com`), or loopback port (default: `4141`) if needed.
 3. Click **Save Settings**, then **Test Connection**.
+4. *(Optional — Antigravity App Gateway Mode)* To let Antigravity App discover models directly from `http://127.0.0.1:4141/v1beta/models` and route all App requests through the proxy, add the `"gateway"` block to `~/.gemini/config/config.json` and restart Antigravity App:
+
+```json
+{
+  "gateway": {
+    "url": "http://127.0.0.1:4141",
+    "wireProtocol": "genai"
+  }
+}
+```
+
+> **Note:** Gateway Mode replaces Google OAuth / AI Pro models while enabled. Remove the `"gateway"` key and restart Antigravity App to switch back.
 
 ### 3. Connect Antigravity CLI (`agy`)
 

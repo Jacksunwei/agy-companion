@@ -18,9 +18,11 @@ Invoke the bundled MCP tool **`open_settings`** (on server `agy-companion_compan
   - `save_settings` *(app-only)* — validates `api_key`, `clear_api_key`, `default_model`, `base_url`, `listen_port`, and `listen_host` (loopback only), then persists `config.json` atomically (Unix mode `0600` / Windows user-profile ACLs). Leaving `api_key` blank preserves the existing key unless `clear_api_key: true` is passed.
   - `test_connection` *(app-only)* — verifies upstream Gemini API reachability and key validity (`GET /v1beta/models?pageSize=1` via `x-goog-api-key`).
 
-## 2. Configure Antigravity CLI (`customModelsConfig`)
+## 2. Connect Antigravity App (Gateway Mode) or Antigravity CLI (`customModelsConfig`)
 
-Run `agy-companion models --json` (optionally `--port <PORT>` or `--config <CONFIG>`) to generate the ready-to-paste JSON snippet for `~/.gemini/antigravity-cli/settings.json`:
+- **Antigravity App (Gateway Mode):** Add `"gateway": { "url": "http://127.0.0.1:4141", "wireProtocol": "genai" }` to `~/.gemini/config/config.json` and restart Antigravity App. The App discovers Gemini 3 & 4 models from `GET /v1beta/models` and routes all inference through the local proxy (replacing Google OAuth / AI Pro models until `"gateway"` is removed).
+
+- **Antigravity CLI (`agy`):** Run `agy-companion models --json` (optionally `--port <PORT>` or `--config <CONFIG>`) to generate the ready-to-paste JSON snippet for `~/.gemini/antigravity-cli/settings.json`:
 
 ```json
 {
