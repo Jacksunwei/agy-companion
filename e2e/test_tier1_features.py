@@ -122,7 +122,7 @@ class TestTier1F1Config(E2ETestCase):
         mcp = self.start_mcp(env, config_path=nested_cfg)
         mcp.save_settings_smart(
             api_key="AIzaSyModeCheck12345678",
-            default_model="gemini-2.5-pro",
+            default_model="gemini-4-hydrogen",
             base_url="https://generativelanguage.googleapis.com",
         )
         mcp.assert_clean_stdout()
@@ -132,7 +132,7 @@ class TestTier1F1Config(E2ETestCase):
 
         saved = json.loads(nested_cfg.read_text(encoding="utf-8"))
         self.assertEqual(saved.get("schema_version"), 1)
-        self.assertEqual(saved.get("gemini", {}).get("default_model"), "gemini-2.5-pro")
+        self.assertEqual(saved.get("gemini", {}).get("default_model"), "gemini-4-hydrogen")
         self.assertEqual(saved.get("gemini", {}).get("api_key"), "AIzaSyModeCheck12345678")
 
     def test_t1_f1_atomic_save_leaves_no_temp_files(self) -> None:
@@ -141,14 +141,14 @@ class TestTier1F1Config(E2ETestCase):
         cfg_dir = env.root / "cfg_dir"
         cfg_path = cfg_dir / "config.json"
         mcp = self.start_mcp(env, config_path=cfg_path)
-        mcp.save_settings_smart(default_model="gemini-2.5-flash")
-        mcp.save_settings_smart(default_model="gemini-2.5-pro")
+        mcp.save_settings_smart(default_model="gemini-3.8-flash")
+        mcp.save_settings_smart(default_model="gemini-4-hydrogen")
         mcp.assert_clean_stdout()
 
         entries = sorted(p.name for p in cfg_dir.iterdir())
         self.assertEqual(entries, ["config.json"], f"Unexpected temp files left behind: {entries}")
         parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
-        self.assertEqual(parsed.get("gemini", {}).get("default_model"), "gemini-2.5-pro")
+        self.assertEqual(parsed.get("gemini", {}).get("default_model"), "gemini-4-hydrogen")
         self.assertEqual(stat.S_IMODE(os.stat(cfg_path).st_mode), 0o600)
 
     def test_t1_f1_env_var_config_path_override(self) -> None:
@@ -156,7 +156,7 @@ class TestTier1F1Config(E2ETestCase):
         env = self.make_env()
         custom_cfg = env.root / "env_cfg.json"
         env.write_config(
-            env.make_config_dict(default_model="gemini-2.5-flash"),
+            env.make_config_dict(default_model="gemini-3.8-flash"),
             mode=0o600,
             path=custom_cfg,
         )
@@ -170,7 +170,7 @@ class TestTier1F1Config(E2ETestCase):
         mcp.assert_clean_stdout()
         found, model = _find_any_key(res.get("structuredContent", {}), ("gemini_default_model", "default_model"))
         self.assertTrue(found, f"Missing default_model in {res!r}")
-        self.assertEqual(model, "gemini-2.5-flash")
+        self.assertEqual(model, "gemini-3.8-flash")
 
     def test_t1_f1_accepts_localhost_listen_host_and_https_upstream(self) -> None:
         """serve accepts listen_host='localhost' and remote https:// upstream."""
@@ -206,7 +206,7 @@ class TestTier1F1Config(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[{"parts":[{"text":"hi"}]}]}',
             headers={"Content-Type": "application/json"},
         )
@@ -341,7 +341,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[{"parts":[{"text":"count tokens"}]}]}',
             headers={"Content-Type": "application/json"},
         )
@@ -371,7 +371,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse",
             body=b'{"contents":[{"parts":[{"text":"stream"}]}]}',
             headers={"Content-Type": "application/json"},
         )
@@ -394,7 +394,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -418,7 +418,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
         self.assertRegex(str(ev["timestamp_utc"]), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
         self.assertTrue(isinstance(ev["request_id"], str) and len(ev["request_id"]) > 0)
         self.assertEqual(ev["provider"], "gemini")
-        self.assertIn("gemini-2.5-pro", str(ev["model"]))
+        self.assertIn("gemini-4-hydrogen", str(ev["model"]))
         self.assertIsInstance(ev["latency_ms"], int)
         self.assertGreaterEqual(ev["latency_ms"], 0)
         self.assertEqual(ev["source"], "proxy")
@@ -433,7 +433,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -455,7 +455,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -476,7 +476,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
                 "127.0.0.1",
                 proxy.port,
                 "POST",
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 body=b'{"contents":[]}',
                 headers={"Content-Type": "application/json"},
             )
@@ -510,7 +510,7 @@ class TestTier1F4Provider(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=raw_payload,
             headers={"Content-Type": "application/json"},
         )
@@ -531,7 +531,7 @@ class TestTier1F4Provider(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -565,7 +565,7 @@ class TestTier1F4Provider(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         ) as stream:
@@ -597,7 +597,7 @@ class TestTier1F4Provider(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json", "x-goog-api-key": caller_key},
         )
@@ -616,7 +616,7 @@ class TestTier1F4Provider(E2ETestCase):
         mock = self.start_mock_gemini()
         cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyAltSseParam1234"))
         proxy = self.start_proxy(env, config_path=cfg)
-        target = "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        target = "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse"
         resp = http_raw_request(
             "127.0.0.1",
             proxy.port,
@@ -642,7 +642,7 @@ class TestTier1F4Provider(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -687,7 +687,7 @@ class TestTier1F5Proxy(E2ETestCase):
         self.assertNotIn("0.0.0.0", proxy.stderr_text)
 
     def test_t1_f5_proxies_unary_generate_content(self) -> None:
-        """POST /v1beta/models/gemini-2.5-flash:generateContent forwards body and updates stats."""
+        """POST /v1beta/models/gemini-3.8-flash:generateContent forwards body and updates stats."""
         env = self.make_env()
         mock = self.start_mock_gemini()
         cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyUnaryProxy12345"))
@@ -696,7 +696,7 @@ class TestTier1F5Proxy(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-flash:generateContent",
+            "/v1beta/models/gemini-3.8-flash:generateContent",
             body=b'{"contents":[{"parts":[{"text":"ping"}]}]}',
             headers={"Content-Type": "application/json"},
         )
@@ -722,7 +722,7 @@ class TestTier1F5Proxy(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -773,7 +773,7 @@ class TestTier1F5Proxy(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -787,7 +787,7 @@ class TestTier1F5Proxy(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -875,7 +875,7 @@ class TestTier1F6HealthAndStats(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -927,7 +927,7 @@ class TestTier1F6HealthAndStats(E2ETestCase):
                 "127.0.0.1",
                 proxy.port,
                 "POST",
-                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
                 body=b'{"contents":[]}',
                 headers={"Content-Type": "application/json"},
             )
@@ -1155,7 +1155,7 @@ class TestTier1F8McpServer(E2ETestCase):
         env = self.make_env()
         mcp = self.start_mcp(env)
         mcp.save_settings_smart(
-            default_model="gemini-2.5-flash",
+            default_model="gemini-3.8-flash",
             base_url="https://generativelanguage.googleapis.com",
             api_key="AIzaSyRoundTripTest1234",
         )
@@ -1166,7 +1166,7 @@ class TestTier1F8McpServer(E2ETestCase):
         found_m, model = _find_any_key(sc, ("gemini_default_model", "default_model"))
         found_c, configured = find_key_recursive(sc, "api_key_configured")
         found_h, hint = find_key_recursive(sc, "api_key_hint")
-        self.assertTrue(found_m and model == "gemini-2.5-flash", f"Bad model in {sc!r}")
+        self.assertTrue(found_m and model == "gemini-3.8-flash", f"Bad model in {sc!r}")
         self.assertTrue(found_c and configured is True, f"Bad configured in {sc!r}")
         self.assertTrue(found_h and hint == "AIza...1234", f"Bad hint in {sc!r}")
 
@@ -1665,7 +1665,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 listen_port=port,
                 base_url=mock.base_url,
                 api_key="AIzaSyXdgConfigTest12",
-                default_model="gemini-2.5-flash",
+                default_model="gemini-3.8-flash",
             ),
             path=xdg_cfg_file,
         )
@@ -1680,7 +1680,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
         self.assertEqual(r_models.returncode, 0, r_models.stderr)
         models = extract_models_list(r_models.json_stdout())
         self.assertTrue(
-            any(f"127.0.0.1:{port}/models/gemini-2.5-flash" in str(m.get("modelName", "")) for m in models),
+            any(f"127.0.0.1:{port}/models/gemini-3.8-flash" in str(m.get("modelName", "")) for m in models),
             f"Expected XDG port {port} and model in models output: {models!r}",
         )
 
@@ -1697,7 +1697,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-flash:generateContent",
+            "/v1beta/models/gemini-3.8-flash:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -1721,7 +1721,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
         found_m, model = _find_any_key(sc, ("gemini_default_model", "default_model"))
         found_h, hint = find_key_recursive(sc, "api_key_hint")
         self.assertTrue(found_p and listen_port == port, f"Bad listen_port in {sc!r}")
-        self.assertTrue(found_m and model == "gemini-2.5-flash", f"Bad model in {sc!r}")
+        self.assertTrue(found_m and model == "gemini-3.8-flash", f"Bad model in {sc!r}")
         self.assertTrue(found_h and hint == "AIza...st12", f"Bad hint in {sc!r}")
 
     def test_t1_f16_xdg_data_home_honored_when_usage_dir_omitted(self) -> None:
@@ -1755,7 +1755,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
             "127.0.0.1",
             proxy.port,
             "POST",
-            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
             body=b'{"contents":[]}',
             headers={"Content-Type": "application/json"},
         )
@@ -1780,10 +1780,10 @@ class TestTier1F16XdgPaths(E2ETestCase):
         xdg_cfg = xdg_root / "agy-companion" / "config.json"
         home_cfg = env.home_dir / ".config" / "agy-companion" / "config.json"
 
-        env.write_config(env.make_config_dict(default_model="gemini-cli-win"), path=cli_cfg)
-        env.write_config(env.make_config_dict(default_model="gemini-env-win"), path=env_cfg)
-        env.write_config(env.make_config_dict(default_model="gemini-xdg-win"), path=xdg_cfg)
-        env.write_config(env.make_config_dict(default_model="gemini-home-win"), path=home_cfg)
+        env.write_config(env.make_config_dict(default_model="gemini-4-cli-win"), path=cli_cfg)
+        env.write_config(env.make_config_dict(default_model="gemini-4-env-win"), path=env_cfg)
+        env.write_config(env.make_config_dict(default_model="gemini-4-xdg-win"), path=xdg_cfg)
+        env.write_config(env.make_config_dict(default_model="gemini-4-home-win"), path=home_cfg)
 
         def _query_model(
             *,
@@ -1811,7 +1811,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 config_path=cli_cfg,
                 extra_env={"AGY_COMPANION_CONFIG": str(env_cfg), "XDG_CONFIG_HOME": str(xdg_root)},
             ),
-            "gemini-cli-win",
+            "gemini-4-cli-win",
         )
         # 2. AGY_COMPANION_CONFIG beats XDG_CONFIG_HOME and $HOME/.config
         self.assertEqual(
@@ -1820,7 +1820,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 config_path=None,
                 extra_env={"AGY_COMPANION_CONFIG": str(env_cfg), "XDG_CONFIG_HOME": str(xdg_root)},
             ),
-            "gemini-env-win",
+            "gemini-4-env-win",
         )
         # 3. XDG_CONFIG_HOME beats $HOME/.config
         self.assertEqual(
@@ -1829,7 +1829,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 config_path=None,
                 extra_env={"AGY_COMPANION_CONFIG": None, "XDG_CONFIG_HOME": str(xdg_root)},
             ),
-            "gemini-xdg-win",
+            "gemini-4-xdg-win",
         )
         # 4. Unset XDG_CONFIG_HOME falls back to $HOME/.config
         self.assertEqual(
@@ -1838,7 +1838,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 config_path=None,
                 extra_env={"AGY_COMPANION_CONFIG": None, "XDG_CONFIG_HOME": None},
             ),
-            "gemini-home-win",
+            "gemini-4-home-win",
         )
 
     def test_t1_f16_usage_dir_precedence_config_xdg_home(self) -> None:
@@ -1862,7 +1862,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
         p1 = self.start_proxy(env, config_path=cfg1, extra_env={"XDG_DATA_HOME": str(xdg_data)})
         self.assertEqual(
             http_raw_request(
-                "127.0.0.1", p1.port, "POST", "/v1beta/models/gemini-2.5-pro:generateContent", body=b"{}"
+                "127.0.0.1", p1.port, "POST", "/v1beta/models/gemini-4-hydrogen:generateContent", body=b"{}"
             ).status,
             200,
         )
@@ -1884,7 +1884,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
         p2 = self.start_proxy(env, config_path=cfg2, extra_env={"XDG_DATA_HOME": str(xdg_data)})
         self.assertEqual(
             http_raw_request(
-                "127.0.0.1", p2.port, "POST", "/v1beta/models/gemini-2.5-pro:generateContent", body=b"{}"
+                "127.0.0.1", p2.port, "POST", "/v1beta/models/gemini-4-hydrogen:generateContent", body=b"{}"
             ).status,
             200,
         )
@@ -1897,7 +1897,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
         p3 = self.start_proxy(env, config_path=cfg2, extra_env={"XDG_DATA_HOME": None})
         self.assertEqual(
             http_raw_request(
-                "127.0.0.1", p3.port, "POST", "/v1beta/models/gemini-2.5-pro:generateContent", body=b"{}"
+                "127.0.0.1", p3.port, "POST", "/v1beta/models/gemini-4-hydrogen:generateContent", body=b"{}"
             ).status,
             200,
         )

@@ -973,7 +973,7 @@ mod tests {
         let ok = server
             .save_settings(Parameters(SaveSettingsArgs {
                 api_key: Some(secret.to_string()),
-                default_model: Some("gemini-2.5-flash".to_string()),
+                default_model: Some("gemini-3.8-flash".to_string()),
                 base_url: Some("https://generativelanguage.googleapis.com".to_string()),
                 listen_port: Some(closed_port),
                 listen_host: Some("127.0.0.1".to_string()),
@@ -989,7 +989,7 @@ mod tests {
 
         let saved = Config::load_or_default(&cfg_path).expect("reload config");
         assert_eq!(saved.gemini.api_key.as_deref(), Some(secret));
-        assert_eq!(saved.gemini.default_model, "gemini-2.5-flash");
+        assert_eq!(saved.gemini.default_model, "gemini-3.8-flash");
         assert_eq!(saved.listen_port, closed_port);
 
         #[cfg(unix)]
@@ -1024,7 +1024,7 @@ mod tests {
             let res = server
                 .save_settings(Parameters(SaveSettingsArgs {
                     api_key: api_key_arg,
-                    default_model: Some("gemini-2.5-flash".to_string()),
+                    default_model: Some("gemini-3.8-flash".to_string()),
                     ..Default::default()
                 }))
                 .await
@@ -1114,6 +1114,14 @@ mod tests {
             },
             SaveSettingsArgs {
                 default_model: Some("../evil".to_string()),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                default_model: Some("gemini-2.5-pro".to_string()),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                default_model: Some("gemini-2.5-flash".to_string()),
                 ..Default::default()
             },
             SaveSettingsArgs {
@@ -1688,7 +1696,7 @@ mod tests {
                         "api_key": wire_secret,
                         "base_url": format!("http://127.0.0.1:{upstream_port}"),
                         "listen_port": closed_port,
-                        "default_model": "gemini-2.5-flash"
+                        "default_model": "gemini-3.8-flash"
                     }
                 }
             }),
@@ -1853,7 +1861,7 @@ mod tests {
                 .with_env_api_key_fallback(false);
 
             let key_value = format!("AIzaSyConcurrentKeyTrial{trial:02}");
-            let model_value = format!("gemini-2.5-flash-t{trial}");
+            let model_value = format!("gemini-3.8-flash-t{trial}");
             let new_port = free_closed_port().await;
 
             let s1 = server.clone();
@@ -1928,7 +1936,7 @@ mod tests {
                 .with_ui_html_override(None)
                 .with_env_api_key_fallback(false);
 
-            let model_value = format!("gemini-2.5-pro-cleared-{trial}");
+            let model_value = format!("gemini-4-hydrogen-cleared-{trial}");
             let s1 = server.clone();
             let s2 = server.clone();
             let model_clone = model_value.clone();

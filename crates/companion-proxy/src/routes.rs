@@ -178,6 +178,22 @@ async fn proxy_gemini_handler(
         return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
     }
 
+    let model = extract_model_name(path_and_query);
+    if model == "unknown"
+        || model == "."
+        || model.contains("..")
+        || model.contains(['?', '#', '/', '\\', '%', ';'])
+        || !model.bytes().all(|b| (0x21..=0x7E).contains(&b))
+    {
+        return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
+    }
+    if !companion_core::is_supported_gemini_model(&model) {
+        return json_error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported model: only Gemini 3 and Gemini 4 models are supported",
+        );
+    }
+
     let content_type = match validate_inbound_content_type(&headers) {
         Ok(ct) => ct,
         Err(msg) => return json_error_response(StatusCode::BAD_REQUEST, msg),
@@ -732,7 +748,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse")
+                    .uri("/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"contents":[]}"#))
                     .unwrap(),
@@ -757,7 +773,7 @@ mod tests {
         let events = sink.snapshot();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].provider, "gemini");
-        assert_eq!(events[0].model, "gemini-2.5-pro");
+        assert_eq!(events[0].model, "gemini-4-hydrogen");
         assert_eq!(events[0].input_tokens, 100);
         assert_eq!(events[0].output_tokens, 25);
         assert_eq!(events[0].cached_tokens, 60);
@@ -846,7 +862,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse")
+                    .uri("/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -881,7 +897,7 @@ mod tests {
 
         let events = sink.snapshot();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].model, "gemini-2.5-flash");
+        assert_eq!(events[0].model, "gemini-3.8-flash");
         assert_eq!(events[0].input_tokens, 50);
         assert_eq!(events[0].output_tokens, 10);
         assert_eq!(events[0].cached_tokens, 25);
@@ -907,7 +923,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/models/gemini-4-hydrogen:generateContent")
                     .header("content-type", "application/json")
                     .body(Body::from(req_bytes.clone()))
                     .unwrap(),
@@ -919,7 +935,7 @@ mod tests {
         assert_eq!(body, unary_resp_bytes);
         assert_eq!(provider.captured_requests()[0].body, req_bytes);
         assert_eq!(sink.snapshot().len(), 1);
-        assert_eq!(sink.snapshot()[0].model, "gemini-2.5-pro");
+        assert_eq!(sink.snapshot()[0].model, "gemini-4-hydrogen");
         assert_eq!(sink.snapshot()[0].input_tokens, 200);
         assert_eq!(sink.snapshot()[0].output_tokens, 40);
         assert_eq!(sink.snapshot()[0].cached_tokens, 100);
@@ -941,7 +957,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/qwen2.5:7b:streamGenerateContent")
+                    .uri("/v1beta/models/gemini-3.8-flash:preview:streamGenerateContent")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -952,7 +968,7 @@ mod tests {
         assert_eq!(body2, array_resp_bytes);
         let events2 = sink2.snapshot();
         assert_eq!(events2.len(), 1);
-        assert_eq!(events2[0].model, "qwen2.5:7b");
+        assert_eq!(events2[0].model, "gemini-3.8-flash:preview");
         assert_eq!(events2[0].input_tokens, 80);
         assert_eq!(events2[0].output_tokens, 22);
         assert_eq!(events2[0].cached_tokens, 40);
@@ -974,7 +990,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .header("x-goog-api-key", "placeholder key from agy")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -1002,7 +1018,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .header("x-goog-api-key", "  AIzaClientFallbackKey1234  ")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -1022,7 +1038,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .header("x-goog-api-key", "   ")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -1072,7 +1088,7 @@ mod tests {
                     .oneshot(
                         Request::builder()
                             .method("POST")
-                            .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                            .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                             .header("x-goog-api-key", hv)
                             .body(Body::from("{}"))
                             .unwrap(),
@@ -1093,7 +1109,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .header("x-goog-api-key", "AIzaSecret12345 extra")
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -1112,7 +1128,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                        .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                         .header("x-goog-api-key", "AIzaFirstKey12345")
                         .header("x-goog-api-key", "AIzaSecondKey12345")
                         .body(Body::from("{}"))
@@ -1132,7 +1148,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                        .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                         .header(header::CONTENT_TYPE, hv)
                         .body(Body::from("{}"))
                         .unwrap(),
@@ -1149,7 +1165,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                        .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                         .header(header::CONTENT_TYPE, empty_ct)
                         .body(Body::from("{}"))
                         .unwrap(),
@@ -1164,7 +1180,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::CONTENT_TYPE, "text/plain")
                     .body(Body::from("{}"))
@@ -1194,7 +1210,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                        .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                         .body(Body::from("{}"))
                         .unwrap(),
                 )
@@ -1225,7 +1241,7 @@ mod tests {
         for bad_uri in [
             "/v1beta/models/../secret",
             "/v1beta/models/%2e%2e/secret",
-            "/v1beta/models/gemini-2.5-pro/../../secret",
+            "/v1beta/models/gemini-4-hydrogen/../../secret",
         ] {
             let resp = app
                 .clone()
@@ -1263,7 +1279,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                        .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                         .body(Body::from("{}"))
                         .unwrap(),
                 )
@@ -1297,15 +1313,15 @@ mod tests {
         let disallowed = [
             ("HEAD", "/health"),
             ("HEAD", "/api/stats"),
-            ("HEAD", "/v1beta/models/gemini-2.5-pro:generateContent"),
+            ("HEAD", "/v1beta/models/gemini-4-hydrogen:generateContent"),
             ("PUT", "/health"),
             ("DELETE", "/api/stats"),
-            ("PATCH", "/v1beta/models/gemini-2.5-pro:generateContent"),
+            ("PATCH", "/v1beta/models/gemini-4-hydrogen:generateContent"),
             ("OPTIONS", "/health"),
             ("TRACE", "/health"),
             ("POST", "/health"),
             ("POST", "/api/stats"),
-            ("GET", "/v1beta/models/gemini-2.5-pro:generateContent"),
+            ("GET", "/v1beta/models/gemini-4-hydrogen:generateContent"),
         ];
 
         for (method, uri) in disallowed {
@@ -1390,7 +1406,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .body(Body::from(payload_3mib.clone()))
                     .unwrap(),
             )
@@ -1409,7 +1425,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .body(Body::from(payload_over))
                     .unwrap(),
             )
@@ -1478,7 +1494,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=SECRET_QUERY_LEAK")
+                    .uri("/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse&key=SECRET_QUERY_LEAK")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -1511,7 +1527,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse")
+                    .uri("/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -1548,7 +1564,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse")
+                    .uri("/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -1580,7 +1596,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse")
+                    .uri("/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -1612,7 +1628,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .body(Body::from("{}"))
                     .unwrap(),
             )
@@ -1650,13 +1666,13 @@ mod tests {
             (
                 "single oversized Content-Length with 0 body bytes",
                 format!(
-                    "POST /v1beta/models/gemini-2.5-pro:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {oversized_len}\r\n\r\n"
+                    "POST /v1beta/models/gemini-4-hydrogen:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {oversized_len}\r\n\r\n"
                 ),
             ),
             (
                 "duplicate identical oversized Content-Length with 0 body bytes",
                 format!(
-                    "POST /v1beta/models/gemini-2.5-pro:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {oversized_len}\r\nContent-Length: {oversized_len}\r\n\r\n"
+                    "POST /v1beta/models/gemini-4-hydrogen:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {oversized_len}\r\nContent-Length: {oversized_len}\r\n\r\n"
                 ),
             ),
         ] {
@@ -1719,7 +1735,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .body(streaming_body)
                     .unwrap(),
             )
@@ -1735,7 +1751,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                        .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                         .header(header::CONTENT_LENGTH, bad_cl)
                         .body(Body::empty())
                         .unwrap(),
@@ -1756,7 +1772,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .header(header::CONTENT_LENGTH, "10")
                     .header(header::CONTENT_LENGTH, "20")
                     .body(Body::empty())
@@ -1773,7 +1789,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1beta/models/gemini-2.5-pro:generateContent")
+                    .uri("/v1beta/models/gemini-4-hydrogen:generateContent")
                     .header(header::CONTENT_LENGTH, "18446744073709551616")
                     .body(Body::empty())
                     .unwrap(),
@@ -1793,7 +1809,7 @@ mod tests {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
             let raw = format!(
-                "POST /v1beta/models/gemini-2.5-pro:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {wire_bad}\r\n\r\n"
+                "POST /v1beta/models/gemini-4-hydrogen:generateContent HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {wire_bad}\r\n\r\n"
             );
             tcp.write_all(raw.as_bytes()).await.unwrap();
             let mut buf = vec![0u8; 1024];
@@ -1810,5 +1826,56 @@ mod tests {
         server.abort();
 
         assert_eq!(provider.hit_count(), 0, "upstream must receive 0 hits");
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_non_gemini_3_or_4_models_with_400_and_zero_upstream_hits() {
+        let sink = Arc::new(RecordingSink::default());
+        let provider = Arc::new(StubProvider::with_status(
+            200,
+            Some("application/json"),
+            Bytes::from_static(b"{\"candidates\":[]}"),
+        ));
+        let app = build_router(ProxyState::new(
+            Arc::clone(&provider) as Arc<dyn companion_providers::ProviderAdapter>,
+            Arc::clone(&sink) as Arc<dyn UsageSink>,
+            true,
+        ));
+
+        for uri in [
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+            "/v1beta/models/gemini-2.0-flash:generateContent",
+            "/v1beta/models/gemini-1.5-pro:generateContent",
+            "/v1beta/models/models/gemini-2.5-pro:generateContent",
+            "/v1beta/models/gemini-30-pro:generateContent",
+            "/v1beta/models/gpt-4o:generateContent",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "uri={uri}");
+            assert_security_headers(resp.headers());
+            let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("Gemini 3 and Gemini 4"),
+                "expected clear error for {uri}, got: {text}"
+            );
+        }
+
+        assert_eq!(provider.hit_count(), 0, "upstream must receive 0 hits");
+        assert!(sink.snapshot().is_empty(), "must record 0 usage events");
     }
 }

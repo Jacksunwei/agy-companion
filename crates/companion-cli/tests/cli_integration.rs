@@ -95,7 +95,7 @@ fn serve_rejects_non_loopback_config_and_port_zero() {
     let bad_host = temp.path().join("bad_host.json");
     fs::write(
         &bad_host,
-        r#"{"schema_version":1,"listen_host":"0.0.0.0","listen_port":4141,"gemini":{"base_url":"https://generativelanguage.googleapis.com","api_key":"AIzaSyServeBadHostSecret111","default_model":"gemini-2.5-pro","timeout_secs":900}}"#,
+        r#"{"schema_version":1,"listen_host":"0.0.0.0","listen_port":4141,"gemini":{"base_url":"https://generativelanguage.googleapis.com","api_key":"AIzaSyServeBadHostSecret111","default_model":"gemini-4-hydrogen","timeout_secs":900}}"#,
     )
     .expect("write bad_host");
     let out = Command::new(BIN)
@@ -124,7 +124,7 @@ fn serve_rejects_non_loopback_config_and_port_zero() {
     let bad_url = temp.path().join("bad_url.json");
     fs::write(
         &bad_url,
-        r#"{"schema_version":1,"listen_host":"127.0.0.1","listen_port":4141,"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyServeBadUrlSecret222","default_model":"gemini-2.5-pro","timeout_secs":900}}"#,
+        r#"{"schema_version":1,"listen_host":"127.0.0.1","listen_port":4141,"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyServeBadUrlSecret222","default_model":"gemini-4-hydrogen","timeout_secs":900}}"#,
     )
     .expect("write bad_url");
     let out = Command::new(BIN)
@@ -492,18 +492,26 @@ fn models_json_flag_emits_valid_custom_models_config_for_custom_port() {
     let models = parsed["customModelsConfig"]["customModels"]
         .as_array()
         .expect("customModels array");
-    assert_eq!(models.len(), 3);
+    assert_eq!(models.len(), 5);
     assert_eq!(
         models[0]["modelName"],
         "gemini-api://http://127.0.0.1:5252/models/gemini-3.8-flash"
     );
     assert_eq!(
         models[1]["modelName"],
-        "gemini-api://http://127.0.0.1:5252/models/gemini-2.5-pro"
+        "gemini-api://http://127.0.0.1:5252/models/gemini-4-hydrogen"
     );
     assert_eq!(
         models[2]["modelName"],
-        "gemini-api://http://127.0.0.1:5252/models/gemini-2.5-flash"
+        "gemini-api://http://127.0.0.1:5252/models/gemini-4-argon"
+    );
+    assert_eq!(
+        models[3]["modelName"],
+        "gemini-api://http://127.0.0.1:5252/models/gemini-4-neon"
+    );
+    assert_eq!(
+        models[4]["modelName"],
+        "gemini-api://http://127.0.0.1:5252/models/gemini-4-carbon"
     );
     assert!(!stdout.contains("AIzaSyModelsSecret4444"));
     assert!(!stderr.contains("AIzaSyModelsSecret4444"));
@@ -561,7 +569,7 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid json");
     assert_eq!(
         parsed["customModelsConfig"]["customModels"][0]["modelName"],
-        "gemini-api://http://127.0.0.1:5454/models/gemini-2.5-pro"
+        "gemini-api://http://127.0.0.1:5454/models/gemini-4-hydrogen"
     );
 
     // ui-mcp eagerly rejects path traversal in --data-dir with zero stdout

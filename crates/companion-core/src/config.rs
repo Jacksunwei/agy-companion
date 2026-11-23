@@ -15,7 +15,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
 pub const DEFAULT_LISTEN_PORT: u16 = 4141;
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
-pub const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-pro";
+pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 pub const CONFIG_PATH_ENV_VAR: &str = "AGY_COMPANION_CONFIG";
@@ -781,6 +781,41 @@ pub fn default_usage_dir() -> Result<PathBuf, CoreError> {
     )
 }
 
+/// Returns `true` if `model` belongs to the Gemini 3 or Gemini 4 model family.
+pub fn is_supported_gemini_model(model: &str) -> bool {
+    ["gemini-3-", "gemini-3.", "gemini-4-", "gemini-4."]
+        .iter()
+        .any(|prefix| {
+            model
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty())
+        })
+}
+
+/// Validates a Gemini model identifier for syntax safety and Gemini 3 / Gemini 4 membership.
+pub fn validate_gemini_model(model: &str) -> Result<(), CoreError> {
+    if model.is_empty()
+        || !model.bytes().all(|b| (0x21..=0x7E).contains(&b))
+        || model == "."
+        || model.contains("..")
+        || model.contains(['?', '#', '/', '\\', '%', ';'])
+    {
+        return Err(CoreError::InvalidModel {
+            reason:
+                "default_model must be non-empty printable ASCII free of whitespace, control, or path/query characters"
+                    .to_string(),
+        });
+    }
+    if !is_supported_gemini_model(model) {
+        return Err(CoreError::InvalidModel {
+            reason:
+                "only Gemini 3 and Gemini 4 models are supported (e.g. gemini-4-hydrogen, gemini-4-argon, gemini-3.8-flash)"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn validate(&self) -> Result<(), CoreError> {
         if self.schema_version != CURRENT_SCHEMA_VERSION {
@@ -797,19 +832,7 @@ impl Config {
             return Err(CoreError::InvalidTimeout);
         }
 
-        let model = &self.gemini.default_model;
-        if model.is_empty()
-            || !model.bytes().all(|b| (0x21..=0x7E).contains(&b))
-            || model == "."
-            || model.contains("..")
-            || model.contains(['?', '#', '/', '\\', '%', ';'])
-        {
-            return Err(CoreError::InvalidModel {
-                reason:
-                    "default_model must be non-empty printable ASCII free of whitespace, control, or path/query characters"
-                        .to_string(),
-            });
-        }
+        validate_gemini_model(&self.gemini.default_model)?;
 
         validate_upstream_url(&self.gemini.base_url)?;
         if let Some(ref key) = self.gemini.api_key
@@ -1122,7 +1145,7 @@ mod tests {
             cfg.gemini.base_url,
             "https://generativelanguage.googleapis.com"
         );
-        assert_eq!(cfg.gemini.default_model, "gemini-2.5-pro");
+        assert_eq!(cfg.gemini.default_model, "gemini-4-hydrogen");
         assert_eq!(cfg.gemini.timeout_secs, 900);
         assert!(cfg.gemini.api_key.is_none());
         assert!(cfg.usage_dir.is_none());
@@ -1196,11 +1219,23 @@ mod tests {
         for bad_model in [
             "",
             "   ",
-            "gemini-2.5-pro?key=secret",
-            "gemini-2.5-pro#frag",
+            "gemini-4-hydrogen?key=secret",
+            "gemini-4-hydrogen#frag",
             "../evil",
-            "models/gemini-2.5-pro",
-            "gemini-2.5-pro\nX-Test: 1",
+            "models/gemini-4-hydrogen",
+            "gemini-4-hydrogen\nX-Test: 1",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-30-pro",
+            "gemini-40-flash",
+            "gemini-3",
+            "gemini-4",
+            "gemini-3-",
+            "gemini-4.",
+            "gemma3:4b",
+            "gpt-4o",
         ] {
             let mut cfg = Config::default();
             cfg.gemini.default_model = bad_model.to_string();
@@ -1729,33 +1764,33 @@ mod tests {
     fn rejects_unicode_control_whitespace_and_smuggling_in_default_model() {
         let bad_models = [
             // Unicode C1 control & Unicode whitespace
-            "gemini-2.5-pro\u{0085}",
-            "gemini-2.5-pro\u{0090}",
-            "gemini-2.5-pro\u{009b}",
-            "gemini-2.5-pro\u{00a0}",
-            "gemini-2.5-pro\u{2003}",
-            "gemini-2.5-pro\u{3000}",
+            "gemini-4-hydrogen\u{0085}",
+            "gemini-4-hydrogen\u{0090}",
+            "gemini-4-hydrogen\u{009b}",
+            "gemini-4-hydrogen\u{00a0}",
+            "gemini-4-hydrogen\u{2003}",
+            "gemini-4-hydrogen\u{3000}",
             // Invisible, zero-width & bidi format chars
-            "gemini-2.5-pro\u{200b}",
-            "gemini-2.5-pro\u{200c}",
-            "gemini-2.5-pro\u{200d}",
-            "gemini-2.5-pro\u{feff}",
-            "gemini-2.5-pro\u{2060}",
-            "gemini-2.5-pro\u{00ad}",
-            "gemini-2.5-pro\u{202e}",
+            "gemini-4-hydrogen\u{200b}",
+            "gemini-4-hydrogen\u{200c}",
+            "gemini-4-hydrogen\u{200d}",
+            "gemini-4-hydrogen\u{feff}",
+            "gemini-4-hydrogen\u{2060}",
+            "gemini-4-hydrogen\u{00ad}",
+            "gemini-4-hydrogen\u{202e}",
             // ASCII control & whitespace
-            "gemini-2.5-pro\0",
-            "gemini-2.5-pro\r",
-            "gemini-2.5-pro\x7f",
-            "gemini-2.5-pro\t",
-            " gemini-2.5-pro",
-            "gemini-2.5-pro ",
+            "gemini-4-hydrogen\0",
+            "gemini-4-hydrogen\r",
+            "gemini-4-hydrogen\x7f",
+            "gemini-4-hydrogen\t",
+            " gemini-4-hydrogen",
+            "gemini-4-hydrogen ",
             // Bare dot & percent-encoded / matrix smuggling in model segment
             ".",
-            "gemini%2f..%2fevil",
-            "gemini%3fkey=secret",
-            "gemini%23frag",
-            "gemini-2.5-pro;param",
+            "gemini-4-hydrogen%2f..%2fevil",
+            "gemini-4-hydrogen%3fkey=secret",
+            "gemini-4-hydrogen%23frag",
+            "gemini-4-hydrogen;param",
         ];
 
         for bad_model in bad_models {
@@ -1852,12 +1887,16 @@ mod tests {
         }
 
         let valid_models = [
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-preview-05-20",
-            "gemini-2.0-flash-lite-001",
-            "gemini_2.5_pro.v1",
-            "gemma3:4b",
+            "gemini-4-hydrogen",
+            "gemini-4-argon",
+            "gemini-4-neon",
+            "gemini-4-carbon",
+            "gemini-4.1-pro",
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
         ];
 
         for good_model in valid_models {
@@ -2672,7 +2711,7 @@ mod tests {
         // (i) Symlink to a valid config file.
         let target = tmp.path().join("victim.json");
         let mut target_cfg = Config::default();
-        target_cfg.gemini.default_model = "victim-sentinel".to_string();
+        target_cfg.gemini.default_model = "gemini-4-victim-sentinel".to_string();
         target_cfg
             .save_secure(&target)
             .expect("write target config");
@@ -2695,7 +2734,7 @@ mod tests {
         let sym_dir_trailing_slash = PathBuf::from(format!("{}/", sym_to_dir.display()));
 
         let mut updated_cfg = Config::default();
-        updated_cfg.gemini.default_model = "gemini-2.5-flash".to_string();
+        updated_cfg.gemini.default_model = "gemini-3.8-flash".to_string();
 
         for (label, path) in [
             ("symlink to valid config", &sym_to_file),

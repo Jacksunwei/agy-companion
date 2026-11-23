@@ -69,13 +69,23 @@ const DEFAULT_CONFIG: RedactedConfig = {
   listen_host: "127.0.0.1",
   listen_port: 4141,
   gemini_base_url: "https://generativelanguage.googleapis.com",
-  gemini_default_model: "gemini-2.5-pro",
+  gemini_default_model: "gemini-4-hydrogen",
   gemini_timeout_secs: 900,
   api_key_configured: false,
   api_key_hint: null,
 };
 
-const QUICK_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"] as const;
+const QUICK_MODELS = [
+  "gemini-4-hydrogen",
+  "gemini-4-argon",
+  "gemini-4-neon",
+  "gemini-4-carbon",
+  "gemini-3.8-flash",
+] as const;
+
+function isSupportedGeminiModel(model: string): boolean {
+  return /^gemini-(?:3|4)[-.].+/.test(model);
+}
 
 interface AppState {
   connected: boolean;
@@ -1124,6 +1134,14 @@ async function main(): Promise<void> {
     const defaultModel = refs.modelInput.value.trim();
     if (!defaultModel) {
       showFormFeedback(refs, "danger", "Default model cannot be empty.");
+      return;
+    }
+    if (!isSupportedGeminiModel(defaultModel)) {
+      showFormFeedback(
+        refs,
+        "danger",
+        "Only Gemini 3 and Gemini 4 models are supported (e.g. gemini-4-hydrogen, gemini-4-argon, gemini-3.8-flash).",
+      );
       return;
     }
 

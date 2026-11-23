@@ -28,7 +28,7 @@ Open the Settings panel in Antigravity App via the side panel `+` menu (**AGY Co
 
 In the panel:
 1. Paste your Gemini API key (stored atomically — Unix mode `0600` / parent dir `0700`, Windows user-profile ACLs with bounded `3`-attempt rename retry — never returned in plaintext), or export `GEMINI_API_KEY` in your shell environment.
-2. Adjust the default model (default: `gemini-2.5-pro`), upstream base URL (default: `https://generativelanguage.googleapis.com`), or loopback port (default: `4141`) if needed.
+2. Adjust the default model (Gemini 3 & 4 only; default: `gemini-4-hydrogen`), upstream base URL (default: `https://generativelanguage.googleapis.com`), or loopback port (default: `4141`) if needed.
 3. Click **Save Settings**, then **Test Connection**.
 
 ### 3. Connect Antigravity CLI (`agy`)
@@ -47,12 +47,24 @@ Paste the output into `~/.gemini/antigravity-cli/settings.json`:
   "customModelsConfig": {
     "customModels": [
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-2.5-pro",
-        "label": "AGY Companion (gemini-2.5-pro)"
+        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen",
+        "label": "AGY Companion (gemini-4-hydrogen)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-2.5-flash",
-        "label": "AGY Companion (gemini-2.5-flash)"
+        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon",
+        "label": "AGY Companion (gemini-4-argon)"
+      },
+      {
+        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-neon",
+        "label": "AGY Companion (gemini-4-neon)"
+      },
+      {
+        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-carbon",
+        "label": "AGY Companion (gemini-4-carbon)"
+      },
+      {
+        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash",
+        "label": "AGY Companion (gemini-3.8-flash)"
       }
     ]
   }
