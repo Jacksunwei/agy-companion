@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/companion-core",
     "crates/companion-providers",
+    "crates/companion-proxy",
 ]
 
 [workspace.package]
@@ -16,15 +17,19 @@ axum = "0.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 companion-core = { path = "crates/companion-core" }
+companion-providers = { path = "crates/companion-providers" }
 dirs = "7"
 futures-util = "0.3"
 http = "1"
+http-body-util = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["set-header"] }
 tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
