@@ -1,0 +1,26 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg-grad" x1="12" y1="10" x2="116" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1A73E8"/>
+      <stop offset="52%" stop-color="#4F46E5"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="spark-grad" x1="64" y1="34" x2="64" y2="94" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#DBEAFE"/>
+    </linearGradient>
+    <linearGradient id="orbit-grad" x1="25" y1="82" x2="103" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#93C5FD" stop-opacity="0.55"/>
+      <stop offset="50%" stop-color="#E0F2FE" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#67E8F9" stop-opacity="0.9"/>
+    </linearGradient>
+  </defs>
+  <rect x="10" y="10" width="108" height="108" rx="28" fill="url(#bg-grad)"/>
+  <rect x="10.75" y="10.75" width="106.5" height="106.5" rx="27.25" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="1.5"/>
+  <ellipse cx="64" cy="64" rx="39" ry="16" transform="rotate(-28 64 64)" stroke="url(#orbit-grad)" stroke-width="3.5"/>
+  <path d="M64 34 C64 52 76 64 94 64 C76 64 64 76 64 94 C64 76 52 64 34 64 C52 64 64 52 64 34 Z" fill="url(#spark-grad)"/>
+  <circle cx="98.4" cy="45.7" r="8.5" fill="#67E8F9" fill-opacity="0.28"/>
+  <circle cx="98.4" cy="45.7" r="5" fill="#FFFFFF"/>
+  <circle cx="29.6" cy="82.3" r="7" fill="#93C5FD" fill-opacity="0.26"/>
+  <circle cx="29.6" cy="82.3" r="4" fill="#E0F2FE"/>
+</svg>

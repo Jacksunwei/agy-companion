@@ -56,7 +56,7 @@ pub fn build_custom_models_config(
         .into_iter()
         .map(|model| CustomModelEntry {
             model_name: format!("gemini-api://http://127.0.0.1:{port}/models/{model}"),
-            label: format!("AGY Companion ({model})"),
+            label: format!("Antigravity Companion ({model})"),
         })
         .collect();
 
@@ -131,17 +131,23 @@ mod tests {
             models[0]["modelName"],
             "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen"
         );
-        assert_eq!(models[0]["label"], "AGY Companion (gemini-4-hydrogen)");
+        assert_eq!(
+            models[0]["label"],
+            "Antigravity Companion (gemini-4-hydrogen)"
+        );
         assert_eq!(
             models[1]["modelName"],
             "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon"
         );
-        assert_eq!(models[1]["label"], "AGY Companion (gemini-4-argon)");
+        assert_eq!(models[1]["label"], "Antigravity Companion (gemini-4-argon)");
         assert_eq!(
             models[4]["modelName"],
             "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash"
         );
-        assert_eq!(models[4]["label"], "AGY Companion (gemini-3.8-flash)");
+        assert_eq!(
+            models[4]["label"],
+            "Antigravity Companion (gemini-3.8-flash)"
+        );
         assert!(!rendered.contains("AIza"));
 
         let human =
@@ -182,7 +188,7 @@ mod tests {
         );
         assert_eq!(
             custom.custom_models_config.custom_models[0].label,
-            "AGY Companion (gemini-3.6-flash)"
+            "Antigravity Companion (gemini-3.6-flash)"
         );
         assert_eq!(
             custom.custom_models_config.custom_models[1].model_name,

@@ -61,7 +61,7 @@ Then iterate on `ui/src/` with zero Rust recompilation:
 npm --prefix ui run build
 ```
 
-Close and reopen the **AGY Companion** aux pane to load the rebuilt bundle immediately.
+Close and reopen the **Antigravity Companion** aux pane to load the rebuilt bundle immediately.
 
 ## 4. Live Reload MCP App Server Without Restarting Antigravity App
 

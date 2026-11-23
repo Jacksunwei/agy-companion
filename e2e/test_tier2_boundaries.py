@@ -1564,6 +1564,25 @@ class TestTier2F10PluginBoundaries(E2ETestCase):
         unknown = set(pj.keys()) - allowed
         self.assertEqual(unknown, set(), f"Unknown keys in plugin.json: {unknown!r}")
 
+        logo = pj.get("logo")
+        self.assertTrue(
+            isinstance(logo, str) and bool(logo.strip()) and logo == logo.strip(),
+            f"Expected non-empty trimmed string 'logo' in plugin.json, got {logo!r}",
+        )
+        assert isinstance(logo, str)
+        self.assertNotIn("\x00", logo)
+        self.assertFalse(logo.startswith("/"), f"Logo must be relative: {logo!r}")
+        self.assertNotIn("\\", logo)
+        logo_parts = logo.split("/")
+        self.assertNotIn("..", logo_parts)
+        plugin_dir = self.repo_root / "plugin"
+        logo_path = plugin_dir.joinpath(*logo_parts)
+        self.assertIn(logo_path.suffix.lower(), {".svg", ".png", ".jpg", ".jpeg", ".webp"})
+        self.assertFalse(logo_path.is_symlink(), f"Logo must not be a symlink: {logo_path}")
+        self.assertTrue(logo_path.is_file(), f"Logo must be a regular file: {logo_path}")
+        self.assertGreater(logo_path.stat().st_size, 0)
+        logo_path.resolve().relative_to(plugin_dir.resolve())
+
     def test_t2_f10_run_companion_sh_rejects_bad_override_binary_cleanly(self) -> None:
         """run-companion.sh in an isolated dir with nonexistent AGY_COMPANION_BIN and no curl/wget fails cleanly."""
         src_script = self.repo_root / "plugin" / "scripts" / "run-companion.sh"
@@ -2109,9 +2128,249 @@ class TestTier2F12AgentCheckBoundaries(E2ETestCase):
                 passed, line = _run_check6_on_bundle(html)
                 self.assertFalse(passed, f"Expected Check 6 FAIL for {name}, got: {line}")
 
-        clean_html = '<!doctype html><html><script data-src="foo">console.log("ok");</script></html>'
+        clean_html = (
+            '<!doctype html><html><body>'
+            '<svg viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">'
+            '<circle cx="64" cy="64" r="20"/></svg>'
+            '<script data-src="foo">console.log("ok");</script></body></html>'
+        )
         passed, line = _run_check6_on_bundle(clean_html)
-        self.assertTrue(passed, f"Unexpected Check 6 failure on benign data-src bundle: {line}")
+        self.assertTrue(passed, f"Unexpected Check 6 failure on benign inline-SVG + data-src bundle: {line}")
+
+    def test_t2_f12_agent_check_plugin_logo_validation(self) -> None:
+        """Check 7 validates plugin/plugin.json logo path and enforces strict static SVG allowlist (no PIs/scripts/styles/external refs)."""
+        src_script = self.repo_root / "scripts" / "agent_check.sh"
+        src_plugin = self.repo_root / "plugin"
+        self.assertTrue(src_script.is_file(), f"Missing {src_script}")
+        self.assertTrue(src_plugin.is_dir(), f"Missing {src_plugin}")
+
+        env = self.make_env()
+        repo = env.root / "synth_plugin_repo"
+        (repo / "scripts").mkdir(parents=True, exist_ok=True)
+        copied = repo / "scripts" / "agent_check.sh"
+        shutil.copy2(src_script, copied)
+        os.chmod(copied, 0o755)
+        p_env = env.build_env()
+        self.assertEqual(run_cli(["git", "init", "-q"], cwd=repo, env=p_env).returncode, 0)
+
+        def _run_check7_with_mutation(mutate) -> tuple[bool, str]:
+            plugin_dst = repo / "plugin"
+            if plugin_dst.exists() or plugin_dst.is_symlink():
+                shutil.rmtree(plugin_dst)
+            shutil.copytree(src_plugin, plugin_dst)
+            mutate(plugin_dst)
+            res = run_cli([str(copied)], cwd=repo, env=p_env, timeout=30.0)
+            check7_lines = [ln for ln in res.stdout.splitlines() if "[7/7]" in ln]
+            self.assertTrue(check7_lines, f"Missing [7/7] output:\n{res.stdout}\n{res.stderr}")
+            return check7_lines[0].startswith("PASS"), "\n".join(check7_lines)
+
+        def _set_logo(plugin_dir: Path, value: object) -> None:
+            pj_path = plugin_dir / "plugin.json"
+            pj = json.loads(pj_path.read_text(encoding="utf-8"))
+            if value is None:
+                pj.pop("logo", None)
+            else:
+                pj["logo"] = value
+            pj_path.write_text(json.dumps(pj, indent=2), encoding="utf-8")
+
+        def _make_symlink_logo(plugin_dir: Path) -> None:
+            logo_path = plugin_dir / "assets" / "logo.svg"
+            target = plugin_dir / "assets" / "real.svg"
+            shutil.move(str(logo_path), str(target))
+            os.symlink(str(target), str(logo_path))
+
+        def _write_svg_bytes(plugin_dir: Path, payload: bytes) -> None:
+            (plugin_dir / "assets" / "logo.svg").write_bytes(payload)
+
+        bad_cases = {
+            "missing_logo_key": lambda p: _set_logo(p, None),
+            "traversal_logo": lambda p: _set_logo(p, "../assets/logo.svg"),
+            "dot_slash_logo_path": lambda p: _set_logo(p, "./assets/logo.svg"),
+            "double_slash_logo_path": lambda p: _set_logo(p, "assets//logo.svg"),
+            "unsupported_ext": lambda p: _set_logo(p, "assets/logo.ico"),
+            "missing_file": lambda p: (p / "assets" / "logo.svg").unlink(),
+            "symlink_logo": _make_symlink_logo,
+            "svg_with_script": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_ext_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><image href="https://evil.example/x.png"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_onload": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_foreign_object": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject width="100" height="100"><div xmlns="http://www.w3.org/1999/xhtml">pwn</div></foreignObject></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_javascript_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><a href="javascript:alert(1)"><rect width="10" height="10"/></a></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_protocol_relative_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><image href="//evil.test/x.png"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_style_import": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><style>@import "https://evil.test/x.css";</style></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_entity_encoded_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><image href="&#104;ttps://evil.test/x.png"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_smil_set": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><image><set attributeName="href" to="https://evil.test/x.png"/></image></svg>',
+                encoding="utf-8",
+            ),
+            "svg_malformed_xml": lambda p: (p / "assets" / "logo.svg").write_text(
+                "<!--<svg--><<<NOT VALID XML>>>",
+                encoding="utf-8",
+            ),
+            "svg_non_svg_root": lambda p: (p / "assets" / "logo.svg").write_text(
+                "<html><!--<svg/>--><body>hi</body></html>",
+                encoding="utf-8",
+            ),
+            "svg_with_doctype": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg xmlns="http://www.w3.org/2000/svg"/>',
+                encoding="utf-8",
+            ),
+            "svg_with_pi_xml_stylesheet_css": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<?xml version="1.0" encoding="UTF-8"?><?xml-stylesheet type="text/css" href="https://evil.test/x.css"?><svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_pi_xml_stylesheet_xsl": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<?xml-stylesheet type="text/xsl" href="data:application/xml,&lt;xsl:stylesheet xmlns:xsl=&apos;http://www.w3.org/1999/XSL/Transform&apos; version=&apos;1.0&apos;&gt;&lt;xsl:template match=&apos;/&apos;&gt;&lt;html xmlns=&apos;http://www.w3.org/1999/xhtml&apos;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;/html&gt;&lt;/xsl:template&gt;&lt;/xsl:stylesheet&gt;"?><svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_style_image_set": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><style>svg{background-image:image-set("//evil.test/x.png" 1x)}</style><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_style_css_hex_escape": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><style>@\\69mport "//evil.test/x.css";</style><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_inline_style": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" style="background:\\75rl(\'evil.png\')"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_tab_javascript_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><a href="java\tscript:alert(1)"><rect width="10" height="10"/></a></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_use_tab_javascript_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><use href="java\tscript:alert(1)"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_vbscript_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><a href="vbscript:msgbox(1)"><rect width="10" height="10"/></a></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_file_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><image href="file:/etc/passwd"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_relative_use_href": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><use href="other.svg#payload"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_handler_tag": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" xmlns:ev="http://www.w3.org/2001/xml-events"><handler ev:event="load">alert(1)</handler></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_xml_base": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" xml:base="/evil/"><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_disallowed_image_tag": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><image href="local.png" width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_disallowed_feimage_tag": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><defs><filter id="f"><feImage href="other.svg"/></filter></defs><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_epilog_pi": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg><?xml-stylesheet type="text/css" href="https://evil.test/x.css"?>',
+                encoding="utf-8",
+            ),
+            "svg_with_cdata": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><title><![CDATA[<script>alert(1)</script>]]></title></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_non_utf8_xmldecl": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<?xml version="1.0" encoding="ISO-8859-1"?><svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_unqualified_root": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg><rect width="10" height="10"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_uppercase_svg": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<SVG xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></SVG>',
+                encoding="utf-8",
+            ),
+            "svg_with_use_cycle": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><g id="outer"><g id="inner"><use href="#outer"/></g></g></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_url_mismatched_quotes": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" fill="url(\'#g&quot;)"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_url_two_second_evil": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" filter="url(#a) url(\'other.svg#b\')"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_dual_id_xml_id_use_cycle": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><g id="a" xml:id="b"><g id="c"><use href="#b"/></g></g></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_pattern_url_self_cycle": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><defs><pattern id="p" width="10" height="10"><rect fill="url(#p)" width="10" height="10"/></pattern></defs><rect width="10" height="10" fill="url(#p)"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_transform_nbsp_before_paren": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" transform="translate\u00a0(10 20)"/></svg>',
+                encoding="utf-8",
+            ),
+        }
+        for case_name, mutator in bad_cases.items():
+            with self.subTest(bad_logo=case_name):
+                passed, line = _run_check7_with_mutation(mutator)
+                self.assertFalse(passed, f"Expected Check 7 FAIL for {case_name}, got: {line}")
+
+        good_cases = {
+            "valid_repo_plugin": lambda _p: None,
+            "svg_url_single_quoted_local": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><defs><linearGradient id="g"><stop offset="0%" stop-color="#1A73E8"/></linearGradient></defs><rect width="10" height="10" fill="url(\'#g\')"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_url_spaced_local": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><defs><linearGradient id="g"><stop offset="0%" stop-color="#1A73E8"/></linearGradient></defs><rect width="10" height="10" fill="url( #g )"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_xml_declaration": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="10" height="10" fill="#1A73E8"/></svg>',
+                encoding="utf-8",
+            ),
+            "svg_with_utf8_bom": lambda p: _write_svg_bytes(
+                p,
+                b'\xef\xbb\xbf<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="10" height="10" fill="#1A73E8"/></svg>',
+            ),
+            "svg_with_use_local_fragment": lambda p: (p / "assets" / "logo.svg").write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><defs><rect id="local-ok" width="10" height="10" fill="#1A73E8"/></defs><use href="#local-ok"/></svg>',
+                encoding="utf-8",
+            ),
+        }
+        for case_name, mutator in good_cases.items():
+            with self.subTest(good_logo=case_name):
+                passed, line = _run_check7_with_mutation(mutator)
+                self.assertTrue(passed, f"Expected Check 7 PASS for {case_name}, got: {line}")
 
 
 class TestTier2F14AgentDocsBoundaries(E2ETestCase):

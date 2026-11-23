@@ -13,7 +13,7 @@ Follows the Antigravity CLI community convention (`agy-resume`, `agy-export`, `a
 | --- | --- | --- |
 | **Repo / npm / PyPI / Plugin `name`** | `agy-companion` | Short, memorable install & run UX (`npx agy-companion`, `uvx agy-companion`). |
 | **npm platform binary packages** | `@agy-companion/<os>-<arch>` | Scoped org packages (the `esbuild` / `turbo` / `oxlint` pattern) under `optionalDependencies`; prevents squatting and keeps npm search clean. |
-| **Plugin `displayName`** | `Antigravity Companion` | Full product brand in Antigravity UI cards and Marketplace listings. |
+| **Plugin `displayName` & user-facing brand** | `Antigravity Companion` | Unified product brand across Antigravity UI cards, Marketplace listings, MCP App entrypoints/header, sidecar (`Antigravity Companion Proxy`), and CLI `models` labels. |
 | **Plugin `description` & keywords** | *"Bring your own models (BYOM) and track token usage and costs in Google Antigravity (agy). Runs a local Rust proxy sidecar for Gemini API (with context caching), Ollama Cloud, and more."* | Covers high-intent human & agent substrings (`antigravity`, `agy`, `byom`, `model`, `proxy`, `sidecar`, `gemini`, `cache`, `ollama`, `usage`, `cost`, `companion`). |
 | **CLI binaries (`bin` / `scripts`)** | `agy-companion` + short alias `agyc` | Natural everyday command (`agy-companion serve`, `agyc doctor`, `agyc usage`). |
 
@@ -82,7 +82,9 @@ agy-companion/
 │       ├── pyproject.toml            # Maturin `bindings = "bin"` -> PyPI `agy-companion`
 │       └── python/agy_companion/     # Thin Python launcher shim
 ├── plugin/                           # Distributable Antigravity plugin (`agy plugin validate --strict ./plugin`)
-│   ├── plugin.json                   # Manifest (version synced from Cargo.toml)
+│   ├── plugin.json                   # Manifest (version synced from Cargo.toml, `"logo": "assets/logo.svg"`)
+│   ├── assets/
+│   │   └── logo.svg                  # Bundled standalone SVG plugin icon (128x128, light/dark legible)
 │   ├── README.md                     # Pre-install / Marketplace docs
 │   ├── mcp_config.json               # Launches `run-companion.sh ui-mcp --data-dir=${PLUGIN_DATA}`
 │   ├── scripts/

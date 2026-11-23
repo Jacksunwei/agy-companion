@@ -416,6 +416,15 @@ fn ui_mcp_stdio_initialize_emits_strict_json_rpc_only_on_stdout() {
     assert_eq!(init_resp["id"], 1);
     assert_eq!(init_resp["result"]["serverInfo"]["name"], "agy-companion");
     assert_eq!(
+        init_resp["result"]["serverInfo"]["title"],
+        "Antigravity Companion"
+    );
+    assert!(
+        init_resp["result"]["serverInfo"]["icons"][0]["src"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("data:image/svg+xml;base64,"))
+    );
+    assert_eq!(
         init_resp["result"]["serverInfo"]["version"],
         env!("CARGO_PKG_VERSION")
     );
@@ -498,20 +507,34 @@ fn models_json_flag_emits_valid_custom_models_config_for_custom_port() {
         "gemini-api://http://127.0.0.1:5252/models/gemini-3.8-flash"
     );
     assert_eq!(
+        models[0]["label"],
+        "Antigravity Companion (gemini-3.8-flash)"
+    );
+    assert_eq!(
         models[1]["modelName"],
         "gemini-api://http://127.0.0.1:5252/models/gemini-4-hydrogen"
+    );
+    assert_eq!(
+        models[1]["label"],
+        "Antigravity Companion (gemini-4-hydrogen)"
     );
     assert_eq!(
         models[2]["modelName"],
         "gemini-api://http://127.0.0.1:5252/models/gemini-4-argon"
     );
+    assert_eq!(models[2]["label"], "Antigravity Companion (gemini-4-argon)");
     assert_eq!(
         models[3]["modelName"],
         "gemini-api://http://127.0.0.1:5252/models/gemini-4-neon"
     );
+    assert_eq!(models[3]["label"], "Antigravity Companion (gemini-4-neon)");
     assert_eq!(
         models[4]["modelName"],
         "gemini-api://http://127.0.0.1:5252/models/gemini-4-carbon"
+    );
+    assert_eq!(
+        models[4]["label"],
+        "Antigravity Companion (gemini-4-carbon)"
     );
     assert!(!stdout.contains("AIzaSyModelsSecret4444"));
     assert!(!stderr.contains("AIzaSyModelsSecret4444"));
