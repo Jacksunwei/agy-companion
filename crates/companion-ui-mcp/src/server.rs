@@ -1,0 +1,1751 @@
+use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use companion_core::{
+    Config, RedactedConfig, api_key_hint, validate_listen_host, validate_path,
+    validate_upstream_url,
+};
+use companion_providers::{GeminiProvider, ProviderAdapter};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolResult, ContentBlock, ErrorData, Implementation, ListResourcesResult, MetaObject,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+    Resource, ResourceContents, ServerCapabilities, ServerConfig,
+};
+use rmcp::service::RequestContext;
+use rmcp::transport::io::stdio;
+use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use thiserror::Error;
+
+pub const UI_RESOURCE_URI: &str = "ui://companion/settings.html";
+pub const UI_MIME_TYPE: &str = "text/html;profile=mcp-app";
+pub const UI_HTML_ENV_VAR: &str = "AGY_COMPANION_UI_HTML";
+pub const MAX_UI_HTML_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 2;
+pub const EMBEDDED_UI_HTML: &str = include_str!("../../../ui/dist/index.html");
+
+const MAX_PROBE_BODY_BYTES: usize = 64 * 1024;
+const MAX_TEST_CONNECTION_TIMEOUT_SECS: u64 = 15;
+
+#[derive(Debug, Error)]
+pub enum UiMcpError {
+    #[error("failed to initialize HTTP probe client: {0}")]
+    HttpClient(String),
+    #[error("MCP server initialization failed: {0}")]
+    Initialize(String),
+    #[error("MCP server task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyHealthPayload {
+    pub reachable: bool,
+    pub status: Option<String>,
+    pub version: Option<String>,
+    pub protocol_version: Option<u32>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProxyStatsPayload {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_hit_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettingsSnapshot {
+    pub config: RedactedConfig,
+    pub binary_version: String,
+    pub proxy: ProxyHealthPayload,
+    pub version_skew: bool,
+    pub stats: Option<ProxyStatsPayload>,
+}
+
+#[derive(Clone, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SaveSettingsArgs {
+    pub api_key: Option<String>,
+    pub clear_api_key: Option<bool>,
+    pub default_model: Option<String>,
+    pub base_url: Option<String>,
+    pub listen_port: Option<u16>,
+    pub listen_host: Option<String>,
+}
+
+impl fmt::Debug for SaveSettingsArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SaveSettingsArgs")
+            .field("api_key", &api_key_hint(self.api_key.as_deref()))
+            .field("clear_api_key", &self.clear_api_key)
+            .field("default_model", &self.default_model)
+            .field("base_url", &self.base_url)
+            .field("listen_port", &self.listen_port)
+            .field("listen_host", &self.listen_host)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestConnectionPayload {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProxyHealth {
+    status: String,
+    version: String,
+    protocol_version: u32,
+}
+
+#[derive(Clone)]
+enum UiHtmlSource {
+    ProcessEnv,
+    #[cfg(test)]
+    Override(std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>),
+}
+
+#[derive(Clone)]
+pub struct CompanionUiServer {
+    config_path: PathBuf,
+    data_dir: Option<PathBuf>,
+    proxy_client: reqwest::Client,
+    tool_router: ToolRouter<Self>,
+    ui_html_source: UiHtmlSource,
+    #[cfg(test)]
+    env_api_key_fallback: bool,
+    #[cfg(test)]
+    test_connection_timeout_override: Option<u64>,
+}
+
+impl CompanionUiServer {
+    pub fn new(config_path: PathBuf, data_dir: Option<PathBuf>) -> Result<Self, UiMcpError> {
+        let proxy_client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(DEFAULT_PROBE_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(DEFAULT_PROBE_TIMEOUT_SECS))
+            .user_agent(concat!("agy-companion/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|err| UiMcpError::HttpClient(err.to_string()))?;
+
+        Ok(Self {
+            config_path,
+            data_dir,
+            proxy_client,
+            tool_router: Self::tool_router(),
+            ui_html_source: UiHtmlSource::ProcessEnv,
+            #[cfg(test)]
+            env_api_key_fallback: true,
+            #[cfg(test)]
+            test_connection_timeout_override: None,
+        })
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
+    }
+
+    pub fn list_tool_definitions(&self) -> Vec<rmcp::model::Tool> {
+        self.tool_router.list_all()
+    }
+
+    pub fn list_ui_resources(&self) -> ListResourcesResult {
+        let resource = Resource::new(UI_RESOURCE_URI, "AGY Companion Settings")
+            .with_description(
+                "Embedded MCP App UI for configuring Gemini API access and inspecting local proxy telemetry.",
+            )
+            .with_mime_type(UI_MIME_TYPE)
+            .with_meta(ui_resource_meta());
+        ListResourcesResult::with_all_items(vec![resource])
+    }
+
+    pub async fn read_ui_resource(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+        if uri != UI_RESOURCE_URI {
+            return Err(ErrorData::resource_not_found(
+                format!("unknown resource: {uri}"),
+                None,
+            ));
+        }
+
+        let override_path = self.resolve_ui_html_override_path();
+        let html = match override_path {
+            Some(path) => load_ui_html_override(path).await?,
+            None => EMBEDDED_UI_HTML.to_string(),
+        };
+
+        let contents = ResourceContents::text(html, UI_RESOURCE_URI)
+            .with_mime_type(UI_MIME_TYPE)
+            .with_meta(ui_resource_meta());
+        Ok(ReadResourceResult::new(vec![contents]))
+    }
+
+    fn resolve_ui_html_override_path(&self) -> Option<PathBuf> {
+        match &self.ui_html_source {
+            UiHtmlSource::ProcessEnv => {
+                let raw = std::env::var_os(UI_HTML_ENV_VAR)?;
+                if raw.is_empty() {
+                    return None;
+                }
+                if let Some(text) = raw.to_str() {
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    return Some(PathBuf::from(trimmed));
+                }
+                Some(PathBuf::from(raw))
+            }
+            #[cfg(test)]
+            UiHtmlSource::Override(slot) => slot.lock().ok().and_then(|guard| guard.clone()),
+        }
+    }
+
+    async fn read_bounded_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, String> {
+        let mut resp = self
+            .proxy_client
+            .get(url)
+            .send()
+            .await
+            .map_err(sanitize_probe_error)?;
+
+        if !resp.status().is_success() {
+            return Err(format!("proxy returned HTTP {}", resp.status().as_u16()));
+        }
+
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(sanitize_probe_error)? {
+            if buf.len().saturating_add(chunk.len()) > MAX_PROBE_BODY_BYTES {
+                return Err(format!(
+                    "proxy response exceeded {MAX_PROBE_BODY_BYTES} byte limit"
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        serde_json::from_slice(&buf).map_err(|_| "invalid JSON payload from proxy".to_string())
+    }
+
+    async fn probe_proxy(
+        &self,
+        listen_port: u16,
+        binary_version: &str,
+    ) -> (ProxyHealthPayload, bool, Option<ProxyStatsPayload>) {
+        let health_url = format!("http://127.0.0.1:{listen_port}/health");
+        match self.read_bounded_json::<RawProxyHealth>(&health_url).await {
+            Ok(raw) => {
+                let version_skew = raw.version != binary_version;
+                let stats_url = format!("http://127.0.0.1:{listen_port}/api/stats");
+                let stats = self
+                    .read_bounded_json::<ProxyStatsPayload>(&stats_url)
+                    .await
+                    .ok();
+                let proxy = ProxyHealthPayload {
+                    reachable: true,
+                    status: Some(raw.status),
+                    version: Some(raw.version),
+                    protocol_version: Some(raw.protocol_version),
+                    error: None,
+                };
+                (proxy, version_skew, stats)
+            }
+            Err(err) => {
+                let proxy = ProxyHealthPayload {
+                    reachable: false,
+                    status: None,
+                    version: None,
+                    protocol_version: None,
+                    error: Some(err),
+                };
+                (proxy, false, None)
+            }
+        }
+    }
+
+    async fn build_snapshot(&self, cfg: &Config) -> SettingsSnapshot {
+        let binary_version = env!("CARGO_PKG_VERSION").to_string();
+        let (proxy, version_skew, stats) = self.probe_proxy(cfg.listen_port, &binary_version).await;
+        SettingsSnapshot {
+            config: cfg.redacted(),
+            binary_version,
+            proxy,
+            version_skew,
+            stats,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_ui_html_override(mut self, path: Option<PathBuf>) -> Self {
+        self.ui_html_source =
+            UiHtmlSource::Override(std::sync::Arc::new(std::sync::Mutex::new(path)));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_env_api_key_fallback(mut self, enabled: bool) -> Self {
+        self.env_api_key_fallback = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_connection_timeout_secs(mut self, secs: u64) -> Self {
+        self.test_connection_timeout_override = Some(secs);
+        self
+    }
+}
+
+fn meta_from_value(value: Value) -> MetaObject {
+    match value {
+        Value::Object(map) => MetaObject::from(map),
+        _ => MetaObject::from(Map::new()),
+    }
+}
+
+fn ui_resource_meta() -> MetaObject {
+    meta_from_value(json!({
+        "ui": {
+            "prefersBorder": false
+        }
+    }))
+}
+
+fn open_settings_meta() -> MetaObject {
+    meta_from_value(json!({
+        "ui": {
+            "resourceUri": UI_RESOURCE_URI
+        },
+        "com.google.antigravity/ui": {
+            "entrypoints": [
+                { "type": "aux_pane", "title": "AGY Companion" },
+                { "type": "global", "title": "AGY Companion" }
+            ]
+        }
+    }))
+}
+
+fn app_only_meta() -> MetaObject {
+    meta_from_value(json!({
+        "ui": {
+            "visibility": ["app"]
+        }
+    }))
+}
+
+fn sanitize_probe_error(err: reqwest::Error) -> String {
+    if err.is_timeout() {
+        "loopback proxy probe timed out".to_string()
+    } else if err.is_connect() {
+        "failed to connect to loopback proxy".to_string()
+    } else {
+        "loopback proxy probe failed".to_string()
+    }
+}
+
+async fn load_ui_html_override(path: PathBuf) -> Result<String, ErrorData> {
+    tokio::task::spawn_blocking(move || {
+        validate_path(&path).map_err(|err| {
+            ErrorData::internal_error(format!("invalid {UI_HTML_ENV_VAR} path: {err}"), None)
+        })?;
+
+        let file = File::open(&path).map_err(|err| {
+            ErrorData::internal_error(
+                format!("failed to open {UI_HTML_ENV_VAR} file: {err}"),
+                None,
+            )
+        })?;
+
+        let metadata = file.metadata().map_err(|err| {
+            ErrorData::internal_error(
+                format!("failed to stat {UI_HTML_ENV_VAR} file: {err}"),
+                None,
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(ErrorData::internal_error(
+                format!("{UI_HTML_ENV_VAR} path must point to a regular file"),
+                None,
+            ));
+        }
+
+        let mut buf = Vec::new();
+        file.take(MAX_UI_HTML_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|err| {
+                ErrorData::internal_error(
+                    format!("failed to read {UI_HTML_ENV_VAR} file: {err}"),
+                    None,
+                )
+            })?;
+
+        if (buf.len() as u64) > MAX_UI_HTML_BYTES {
+            return Err(ErrorData::internal_error(
+                format!("{UI_HTML_ENV_VAR} exceeds maximum size of {MAX_UI_HTML_BYTES} bytes"),
+                None,
+            ));
+        }
+
+        let html = String::from_utf8(buf).map_err(|_| {
+            ErrorData::internal_error(format!("{UI_HTML_ENV_VAR} must be valid UTF-8"), None)
+        })?;
+
+        if html.trim().is_empty() {
+            return Err(ErrorData::internal_error(
+                format!("{UI_HTML_ENV_VAR} must not be empty"),
+                None,
+            ));
+        }
+
+        Ok(html)
+    })
+    .await
+    .map_err(|err| ErrorData::internal_error(format!("UI HTML load task failed: {err}"), None))?
+}
+
+fn validate_api_key_input(raw: &str) -> Result<Option<String>, &'static str> {
+    if !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return Err("api_key contains invalid header characters");
+    }
+
+    let trimmed = raw.trim_matches(' ');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if !trimmed.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return Err("api_key contains invalid header characters");
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn validate_trimmed_ascii_field(raw: &str, field_name: &str) -> Result<String, String> {
+    if !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return Err(format!("{field_name} contains invalid characters"));
+    }
+    Ok(raw.trim_matches(' ').to_string())
+}
+
+fn tool_error(message: impl Into<String>) -> CallToolResult {
+    let message = message.into();
+    let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
+    result.structured_content = Some(json!({
+        "ok": false,
+        "error": message,
+    }));
+    result
+}
+
+fn snapshot_tool_result(
+    summary: String,
+    snapshot: &SettingsSnapshot,
+) -> Result<CallToolResult, ErrorData> {
+    let structured = serde_json::to_value(snapshot).map_err(|err| {
+        ErrorData::internal_error(
+            format!("failed to serialize settings snapshot: {err}"),
+            None,
+        )
+    })?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(summary)]);
+    result.structured_content = Some(structured);
+    Ok(result)
+}
+
+fn format_snapshot_summary(snapshot: &SettingsSnapshot) -> String {
+    let proxy_state = if snapshot.proxy.reachable {
+        match snapshot.proxy.version.as_deref() {
+            Some(ver) if snapshot.version_skew => format!("reachable (v{ver}, version skew)"),
+            Some(ver) => format!("reachable (v{ver})"),
+            None => "reachable".to_string(),
+        }
+    } else {
+        "unreachable".to_string()
+    };
+
+    let key_state = match snapshot.config.api_key_hint.as_deref() {
+        Some(hint) => format!("configured ({hint})"),
+        None if snapshot.config.api_key_configured => "configured".to_string(),
+        None => "not configured".to_string(),
+    };
+
+    format!(
+        "AGY Companion v{} — proxy at {}:{} is {}, model {}, API key {}.",
+        snapshot.binary_version,
+        snapshot.config.listen_host,
+        snapshot.config.listen_port,
+        proxy_state,
+        snapshot.config.gemini_default_model,
+        key_state
+    )
+}
+
+fn test_connection_result(payload: &TestConnectionPayload) -> Result<CallToolResult, ErrorData> {
+    let structured = serde_json::to_value(payload).map_err(|err| {
+        ErrorData::internal_error(
+            format!("failed to serialize test_connection result: {err}"),
+            None,
+        )
+    })?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(payload.message.clone())]);
+    result.structured_content = Some(structured);
+    Ok(result)
+}
+
+#[tool_router]
+impl CompanionUiServer {
+    #[tool(
+        name = "open_settings",
+        title = "Open AGY Companion Settings",
+        description = "Launch the Antigravity Companion settings and proxy telemetry panel.",
+        meta = open_settings_meta()
+    )]
+    pub async fn open_settings(&self) -> Result<CallToolResult, ErrorData> {
+        let cfg = match Config::load_or_default(&self.config_path) {
+            Ok(cfg) => cfg,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
+        let snapshot = self.build_snapshot(&cfg).await;
+        snapshot_tool_result(format_snapshot_summary(&snapshot), &snapshot)
+    }
+
+    #[tool(
+        name = "get_settings",
+        title = "Get AGY Companion Settings",
+        description = "Read redacted Antigravity Companion configuration, loopback proxy health, and live session telemetry.",
+        meta = app_only_meta()
+    )]
+    pub async fn get_settings(&self) -> Result<CallToolResult, ErrorData> {
+        let cfg = match Config::load_or_default(&self.config_path) {
+            Ok(cfg) => cfg,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
+        let snapshot = self.build_snapshot(&cfg).await;
+        snapshot_tool_result(format_snapshot_summary(&snapshot), &snapshot)
+    }
+
+    #[tool(
+        name = "save_settings",
+        title = "Save AGY Companion Settings",
+        description = "Validate and atomically persist Antigravity Companion settings (0600 permissions) without returning plaintext secrets.",
+        meta = app_only_meta()
+    )]
+    pub async fn save_settings(
+        &self,
+        Parameters(args): Parameters<SaveSettingsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut cfg = match Config::load_or_default(&self.config_path) {
+            Ok(cfg) => cfg,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
+
+        // Validate api_key strictly (ASCII-before-trim) before inspecting clear_api_key.
+        let validated_api_key = match args.api_key.as_deref() {
+            Some(raw) => match validate_api_key_input(raw) {
+                Ok(parsed) => parsed,
+                Err(msg) => return Ok(tool_error(msg)),
+            },
+            None => None,
+        };
+
+        if args.clear_api_key == Some(true) {
+            if validated_api_key.is_some() {
+                return Ok(tool_error(
+                    "cannot set both api_key and clear_api_key: true",
+                ));
+            }
+            cfg.gemini.api_key = None;
+        } else if let Some(new_key) = validated_api_key {
+            cfg.gemini.api_key = Some(new_key);
+        }
+
+        if let Some(raw_model) = args.default_model.as_deref() {
+            let trimmed = match validate_trimmed_ascii_field(raw_model, "default_model") {
+                Ok(v) => v,
+                Err(msg) => return Ok(tool_error(msg)),
+            };
+            cfg.gemini.default_model = trimmed;
+        }
+
+        if let Some(raw_url) = args.base_url.as_deref() {
+            let trimmed = match validate_trimmed_ascii_field(raw_url, "base_url") {
+                Ok(v) => v,
+                Err(msg) => return Ok(tool_error(msg)),
+            };
+            if let Err(err) = validate_upstream_url(&trimmed) {
+                return Ok(tool_error(err.to_string()));
+            }
+            cfg.gemini.base_url = trimmed;
+        }
+
+        if let Some(raw_host) = args.listen_host.as_deref() {
+            if let Err(err) = validate_listen_host(raw_host) {
+                return Ok(tool_error(err.to_string()));
+            }
+            cfg.listen_host = raw_host.to_string();
+        }
+
+        if let Some(port) = args.listen_port {
+            if port == 0 {
+                return Ok(tool_error("listen_port must be between 1 and 65535"));
+            }
+            cfg.listen_port = port;
+        }
+
+        if let Err(err) = cfg.validate() {
+            return Ok(tool_error(err.to_string()));
+        }
+
+        if let Err(err) = cfg.save_secure(&self.config_path) {
+            return Ok(tool_error(err.to_string()));
+        }
+
+        let snapshot = self.build_snapshot(&cfg).await;
+        snapshot_tool_result(
+            format!("Settings saved. {}", format_snapshot_summary(&snapshot)),
+            &snapshot,
+        )
+    }
+
+    #[tool(
+        name = "test_connection",
+        title = "Test Gemini Upstream Connection",
+        description = "Verify connectivity and API key authentication against the configured Gemini upstream endpoint.",
+        meta = app_only_meta()
+    )]
+    pub async fn test_connection(&self) -> Result<CallToolResult, ErrorData> {
+        let cfg = match Config::load_or_default(&self.config_path) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                return test_connection_result(&TestConnectionPayload {
+                    ok: false,
+                    message: err.to_string(),
+                });
+            }
+        };
+
+        let timeout_secs = cfg
+            .gemini
+            .timeout_secs
+            .clamp(1, MAX_TEST_CONNECTION_TIMEOUT_SECS);
+        #[cfg(test)]
+        let timeout_secs = self
+            .test_connection_timeout_override
+            .unwrap_or(timeout_secs);
+
+        let provider = match GeminiProvider::new(
+            &cfg.gemini.base_url,
+            cfg.gemini.api_key.clone(),
+            timeout_secs,
+        ) {
+            Ok(provider) => {
+                #[cfg(test)]
+                let provider = provider.with_env_fallback(self.env_api_key_fallback);
+                provider
+            }
+            Err(err) => {
+                return test_connection_result(&TestConnectionPayload {
+                    ok: false,
+                    message: err.to_string(),
+                });
+            }
+        };
+
+        let payload = match provider.health_check().await {
+            Ok(()) => TestConnectionPayload {
+                ok: true,
+                message: format!(
+                    "Connected to Gemini upstream ({}) successfully.",
+                    cfg.gemini.base_url
+                ),
+            },
+            Err(err) => TestConnectionPayload {
+                ok: false,
+                message: err.to_string(),
+            },
+        };
+
+        test_connection_result(&payload)
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for CompanionUiServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "agy-companion",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Antigravity Companion settings and proxy telemetry MCP App. Call open_settings to launch the settings panel.",
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(self.list_ui_resources())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let result = self.read_ui_resource(&request.uri).await?;
+        Ok(result.into())
+    }
+}
+
+pub async fn serve_stdio(
+    config_path: PathBuf,
+    data_dir: Option<PathBuf>,
+) -> Result<(), UiMcpError> {
+    let server = CompanionUiServer::new(config_path, data_dir)?;
+    let running = server
+        .serve(stdio())
+        .await
+        .map_err(|err| UiMcpError::Initialize(err.to_string()))?;
+    let _quit = running.waiting().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use companion_core::Config;
+    use rmcp::model::ErrorCode;
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    async fn free_closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    async fn spawn_mock_http(router: Router) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn open_settings_tool_declares_aux_pane_and_global_entrypoints() {
+        let tmp = TempDir::new().expect("tempdir");
+        let server = CompanionUiServer::new(tmp.path().join("config.json"), None).expect("server");
+        let tools = server.list_tool_definitions();
+
+        let open = tools
+            .iter()
+            .find(|t| t.name == "open_settings")
+            .expect("open_settings tool");
+        let meta = open.meta.as_ref().expect("open_settings _meta");
+        assert_eq!(
+            meta.0.get("ui").and_then(|v| v.get("resourceUri")),
+            Some(&json!(UI_RESOURCE_URI))
+        );
+        let entrypoints = meta
+            .0
+            .get("com.google.antigravity/ui")
+            .and_then(|v| v.get("entrypoints"))
+            .and_then(Value::as_array)
+            .expect("entrypoints array");
+        assert_eq!(entrypoints.len(), 2);
+        assert!(
+            entrypoints
+                .iter()
+                .any(|e| e.get("type") == Some(&json!("aux_pane")))
+        );
+        assert!(
+            entrypoints
+                .iter()
+                .any(|e| e.get("type") == Some(&json!("global")))
+        );
+
+        for app_only in ["get_settings", "save_settings", "test_connection"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == app_only)
+                .unwrap_or_else(|| panic!("missing tool {app_only}"));
+            let tool_meta = tool
+                .meta
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing _meta for {app_only}"));
+            assert_eq!(
+                tool_meta.0.get("ui").and_then(|v| v.get("visibility")),
+                Some(&json!(["app"]))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_resource_serves_mcp_app_mime_and_non_empty_html() {
+        let tmp = TempDir::new().expect("tempdir");
+        let server = CompanionUiServer::new(tmp.path().join("config.json"), None)
+            .expect("server")
+            .with_ui_html_override(None);
+
+        let listed = server.list_ui_resources();
+        assert_eq!(listed.resources.len(), 1);
+        let res = &listed.resources[0];
+        assert_eq!(res.uri, UI_RESOURCE_URI);
+        assert_eq!(res.mime_type.as_deref(), Some(UI_MIME_TYPE));
+        assert_eq!(
+            res.meta
+                .as_ref()
+                .and_then(|m| m.0.get("ui"))
+                .and_then(|u| u.get("prefersBorder")),
+            Some(&json!(false))
+        );
+
+        let read = server
+            .read_ui_resource(UI_RESOURCE_URI)
+            .await
+            .expect("read_ui_resource");
+        assert_eq!(read.contents.len(), 1);
+        match &read.contents[0] {
+            ResourceContents::TextResourceContents {
+                uri,
+                mime_type,
+                text,
+                meta,
+            } => {
+                assert_eq!(uri, UI_RESOURCE_URI);
+                assert_eq!(mime_type.as_deref(), Some(UI_MIME_TYPE));
+                assert!(!text.trim().is_empty());
+                assert!(text.len() < 512_000, "embedded UI HTML must be < 500 KiB");
+                assert!(text.contains("<!doctype html>") || text.contains("<!DOCTYPE html>"));
+                assert_eq!(
+                    meta.as_ref()
+                        .and_then(|m| m.0.get("ui"))
+                        .and_then(|u| u.get("prefersBorder")),
+                    Some(&json!(false))
+                );
+            }
+            other => panic!("expected text resource contents, got {other:?}"),
+        }
+
+        // Verify ui/src has zero forbidden DOM/JS sinks
+        let ui_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src");
+        let forbidden = [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "dangerouslySetInnerHTML",
+            "localStorage",
+            "sessionStorage",
+            "document.cookie",
+            "new Function",
+            "XMLHttpRequest",
+            "eval(",
+            "alert(",
+            "confirm(",
+            "prompt(",
+            "fetch(",
+        ];
+        for entry in fs::read_dir(&ui_src).expect("read ui/src") {
+            let path = entry.expect("entry").path();
+            if path.is_file() {
+                let content = fs::read_to_string(&path).expect("read src file");
+                for token in forbidden {
+                    assert!(
+                        !content.contains(token),
+                        "forbidden token `{token}` found in {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_settings_never_returns_plaintext_api_key() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let secret = "AIzaSySecret1234567890";
+
+        let mut cfg = Config {
+            listen_port: free_closed_port().await,
+            ..Default::default()
+        };
+        cfg.gemini.api_key = Some(secret.to_string());
+        cfg.save_secure(&cfg_path).expect("save config");
+
+        let server = CompanionUiServer::new(cfg_path, None).expect("server");
+
+        for result in [
+            server.get_settings().await.expect("get_settings"),
+            server.open_settings().await.expect("open_settings"),
+        ] {
+            assert_eq!(result.is_error, Some(false));
+            let serialized = serde_json::to_string(&result).expect("serialize result");
+            assert!(!serialized.contains(secret));
+            assert!(!serialized.contains("SySecret1234"));
+            assert!(serialized.contains("AIza...7890"));
+
+            let snapshot: SettingsSnapshot = serde_json::from_value(
+                result
+                    .structured_content
+                    .clone()
+                    .expect("structured_content"),
+            )
+            .expect("parse SettingsSnapshot");
+            assert!(snapshot.config.api_key_configured);
+            assert_eq!(snapshot.config.api_key_hint.as_deref(), Some("AIza...7890"));
+        }
+    }
+
+    #[tokio::test]
+    async fn save_settings_persists_eagerly_and_validates_inputs() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let closed_port = free_closed_port().await;
+        let server = CompanionUiServer::new(cfg_path.clone(), None).expect("server");
+
+        // Reject remote http:// URL
+        let bad = server
+            .save_settings(Parameters(SaveSettingsArgs {
+                base_url: Some("http://example.com".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .expect("save_settings error result");
+        assert_eq!(bad.is_error, Some(true));
+        assert!(!cfg_path.exists());
+
+        // Persist valid settings atomically at 0600
+        let secret = "AIzaSyValidSaveTestKey9876";
+        let ok = server
+            .save_settings(Parameters(SaveSettingsArgs {
+                api_key: Some(secret.to_string()),
+                default_model: Some("gemini-2.5-flash".to_string()),
+                base_url: Some("https://generativelanguage.googleapis.com".to_string()),
+                listen_port: Some(closed_port),
+                listen_host: Some("127.0.0.1".to_string()),
+                clear_api_key: None,
+            }))
+            .await
+            .expect("save_settings ok");
+        assert_eq!(ok.is_error, Some(false));
+
+        let serialized = serde_json::to_string(&ok).expect("serialize");
+        assert!(!serialized.contains(secret));
+        assert!(serialized.contains("AIza...9876"));
+
+        let saved = Config::load_or_default(&cfg_path).expect("reload config");
+        assert_eq!(saved.gemini.api_key.as_deref(), Some(secret));
+        assert_eq!(saved.gemini.default_model, "gemini-2.5-flash");
+        assert_eq!(saved.listen_port, closed_port);
+
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&cfg_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn save_settings_preserves_existing_key_when_omitted_or_blank_and_clears_on_flag() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let closed_port = free_closed_port().await;
+        let initial_key = "AIzaSyKeepThisSecretKey4321";
+
+        let mut cfg = Config {
+            listen_port: closed_port,
+            ..Default::default()
+        };
+        cfg.gemini.api_key = Some(initial_key.to_string());
+        cfg.save_secure(&cfg_path).expect("save initial");
+
+        let server = CompanionUiServer::new(cfg_path.clone(), None).expect("server");
+
+        // Omitted, empty, and ASCII-spaces-only api_key all preserve existing key
+        for api_key_arg in [None, Some(String::new()), Some("   ".to_string())] {
+            let res = server
+                .save_settings(Parameters(SaveSettingsArgs {
+                    api_key: api_key_arg,
+                    default_model: Some("gemini-2.5-flash".to_string()),
+                    ..Default::default()
+                }))
+                .await
+                .expect("save");
+            assert_eq!(res.is_error, Some(false));
+            let reloaded = Config::load_or_default(&cfg_path).expect("reload");
+            assert_eq!(reloaded.gemini.api_key.as_deref(), Some(initial_key));
+        }
+
+        // Conflicting clear_api_key: true + non-empty api_key must be rejected without echoing secret
+        let conflicting_secret = "AIzaSyConflictingKeyValue999";
+        let conflict = server
+            .save_settings(Parameters(SaveSettingsArgs {
+                api_key: Some(conflicting_secret.to_string()),
+                clear_api_key: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .expect("conflict");
+        assert_eq!(conflict.is_error, Some(true));
+        let conflict_json = serde_json::to_string(&conflict).expect("serialize");
+        assert!(!conflict_json.contains(conflicting_secret));
+        let reloaded = Config::load_or_default(&cfg_path).expect("reload");
+        assert_eq!(reloaded.gemini.api_key.as_deref(), Some(initial_key));
+
+        // Explicit clear_api_key: true clears saved key
+        let cleared = server
+            .save_settings(Parameters(SaveSettingsArgs {
+                clear_api_key: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .expect("clear");
+        assert_eq!(cleared.is_error, Some(false));
+        let reloaded = Config::load_or_default(&cfg_path).expect("reload");
+        assert_eq!(reloaded.gemini.api_key, None);
+    }
+
+    #[tokio::test]
+    async fn save_settings_rejects_invalid_inputs_without_echoing_secret() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let server = CompanionUiServer::new(cfg_path.clone(), None).expect("server");
+
+        // Verify SaveSettingsArgs Debug redacts api_key
+        let debug_args = SaveSettingsArgs {
+            api_key: Some("AIzaSyDebugSecretShouldHide".to_string()),
+            ..Default::default()
+        };
+        let dbg = format!("{debug_args:?}");
+        assert!(!dbg.contains("AIzaSyDebugSecretShouldHide"));
+        assert!(dbg.contains("AIza...Hide"));
+
+        // Invalid API keys: non-ASCII, control chars, embedded space, whitespace+CRLF
+        for bad_key in [
+            "AIza\u{00A0}SecretNonAsciiKey",
+            "AIzaSyControl\r\nSecretKey",
+            "AIzaSy Embedded SpaceKey",
+            "  \r\n  ",
+        ] {
+            let res = server
+                .save_settings(Parameters(SaveSettingsArgs {
+                    api_key: Some(bad_key.to_string()),
+                    ..Default::default()
+                }))
+                .await
+                .expect("invalid key result");
+            assert_eq!(
+                res.is_error,
+                Some(true),
+                "expected rejection for {bad_key:?}"
+            );
+            let serialized = serde_json::to_string(&res).expect("serialize");
+            assert!(!serialized.contains("Secret"));
+            assert!(!serialized.contains("Embedded"));
+        }
+
+        // Invalid host, port, model, remote http URL, credentialed URL
+        let invalid_cases = [
+            SaveSettingsArgs {
+                listen_host: Some("0.0.0.0".to_string()),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                listen_port: Some(0),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                default_model: Some("../evil".to_string()),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                base_url: Some("http://evil.com".to_string()),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                base_url: Some("https://user:pass@generativelanguage.googleapis.com".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        for args in invalid_cases {
+            let res = server
+                .save_settings(Parameters(args))
+                .await
+                .expect("invalid settings result");
+            assert_eq!(res.is_error, Some(true));
+        }
+
+        assert!(!cfg_path.exists());
+    }
+
+    #[tokio::test]
+    async fn get_settings_detects_proxy_health_version_skew_and_stats() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+
+        // Case 1: Reachable with matching version
+        let matching_router = Router::new()
+            .route(
+                "/health",
+                get(|| async {
+                    axum::Json(json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "protocol_version": 1
+                    }))
+                }),
+            )
+            .route(
+                "/api/stats",
+                get(|| async {
+                    axum::Json(json!({
+                        "requests": 7,
+                        "prompt_tokens": 1000,
+                        "cached_tokens": 600,
+                        "output_tokens": 250,
+                        "reasoning_tokens": 50,
+                        "cache_hit_ratio": 0.6
+                    }))
+                }),
+            );
+        let (port_match, handle_match) = spawn_mock_http(matching_router).await;
+
+        let mut cfg = Config {
+            listen_port: port_match,
+            ..Default::default()
+        };
+        cfg.save_secure(&cfg_path).expect("save");
+
+        let server = CompanionUiServer::new(cfg_path.clone(), None).expect("server");
+        let res = server.get_settings().await.expect("get_settings");
+        assert_eq!(res.is_error, Some(false));
+        let snap: SettingsSnapshot =
+            serde_json::from_value(res.structured_content.expect("structured")).expect("parse");
+        assert!(snap.proxy.reachable);
+        assert_eq!(snap.proxy.status.as_deref(), Some("ok"));
+        assert_eq!(
+            snap.proxy.version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(snap.proxy.protocol_version, Some(1));
+        assert_eq!(snap.proxy.error, None);
+        assert!(!snap.version_skew);
+        let stats = snap.stats.expect("stats");
+        assert_eq!(stats.requests, 7);
+        assert_eq!(stats.cached_tokens, 600);
+        handle_match.abort();
+
+        // Case 2: Reachable with mismatched version (skew = true)
+        let skew_router = Router::new().route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({
+                    "status": "ok",
+                    "version": "9.9.9",
+                    "protocol_version": 1
+                }))
+            }),
+        );
+        let (port_skew, handle_skew) = spawn_mock_http(skew_router).await;
+        cfg.listen_port = port_skew;
+        cfg.save_secure(&cfg_path).expect("save skew");
+
+        let res_skew = server.get_settings().await.expect("get_settings skew");
+        let snap_skew: SettingsSnapshot =
+            serde_json::from_value(res_skew.structured_content.expect("structured"))
+                .expect("parse");
+        assert!(snap_skew.proxy.reachable);
+        assert!(snap_skew.version_skew);
+        assert_eq!(snap_skew.proxy.version.as_deref(), Some("9.9.9"));
+        assert!(snap_skew.stats.is_none());
+        handle_skew.abort();
+
+        // Case 3: Oversized /health body (> 64 KiB) rejected cleanly without OOM
+        let huge_router = Router::new().route(
+            "/health",
+            get(|| async { "x".repeat(MAX_PROBE_BODY_BYTES + 1024) }),
+        );
+        let (port_huge, handle_huge) = spawn_mock_http(huge_router).await;
+        cfg.listen_port = port_huge;
+        cfg.save_secure(&cfg_path).expect("save huge");
+        let res_huge = server.get_settings().await.expect("get_settings huge");
+        let snap_huge: SettingsSnapshot =
+            serde_json::from_value(res_huge.structured_content.expect("structured"))
+                .expect("parse");
+        assert!(!snap_huge.proxy.reachable);
+        assert!(
+            snap_huge
+                .proxy
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("limit"))
+        );
+        handle_huge.abort();
+
+        // Case 4: Unreachable closed port
+        cfg.listen_port = free_closed_port().await;
+        cfg.save_secure(&cfg_path).expect("save closed");
+        let res_down = server.get_settings().await.expect("get_settings down");
+        let snap_down: SettingsSnapshot =
+            serde_json::from_value(res_down.structured_content.expect("structured"))
+                .expect("parse");
+        assert!(!snap_down.proxy.reachable);
+        assert!(!snap_down.version_skew);
+        assert!(snap_down.proxy.error.is_some());
+        assert!(snap_down.stats.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_probe_ignores_hostile_http_proxy_env() {
+        if std::env::var_os("AGY_COMPANION_HOSTILE_PROXY_CHILD").is_some() {
+            let router = Router::new()
+                .route(
+                    "/health",
+                    get(|| async {
+                        axum::Json(json!({
+                            "status": "ok",
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "protocol_version": 1
+                        }))
+                    }),
+                )
+                .route(
+                    "/api/stats",
+                    get(|| async {
+                        axum::Json(json!({
+                            "requests": 2,
+                            "prompt_tokens": 100,
+                            "cached_tokens": 50,
+                            "output_tokens": 20,
+                            "reasoning_tokens": 5,
+                            "cache_hit_ratio": 0.5
+                        }))
+                    }),
+                );
+            let (port, handle) = spawn_mock_http(router).await;
+            let tmp = TempDir::new().expect("tempdir");
+            let cfg_path = tmp.path().join("config.json");
+            let cfg = Config {
+                listen_port: port,
+                ..Default::default()
+            };
+            cfg.save_secure(&cfg_path).expect("save");
+
+            let server = CompanionUiServer::new(cfg_path, None).expect("server");
+            let res = server.get_settings().await.expect("get_settings");
+            let snap: SettingsSnapshot =
+                serde_json::from_value(res.structured_content.expect("structured")).expect("parse");
+            assert!(snap.proxy.reachable);
+            assert_eq!(snap.stats.expect("stats").requests, 2);
+            handle.abort();
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let output = Command::new(exe)
+            .arg("--exact")
+            .arg("server::tests::proxy_probe_ignores_hostile_http_proxy_env")
+            .arg("--nocapture")
+            .env("AGY_COMPANION_HOSTILE_PROXY_CHILD", "1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .output()
+            .expect("spawn child test");
+        assert!(
+            output.status.success(),
+            "hostile proxy child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_handles_ok_invalid_key_missing_key_timeout_without_leaking_key() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let valid_secret = "AIzaSyConnectionOkKey123456";
+        let bad_secret = "AIzaSyBadKeyMustNotLeak9999";
+
+        // 1. Upstream 200 OK
+        let ok_router = Router::new().route(
+            "/v1beta/models",
+            get(|| async { (StatusCode::OK, axum::Json(json!({ "models": [] }))) }),
+        );
+        let (ok_port, ok_handle) = spawn_mock_http(ok_router).await;
+        let mut cfg = Config::default();
+        cfg.gemini.base_url = format!("http://127.0.0.1:{ok_port}");
+        cfg.gemini.api_key = Some(valid_secret.to_string());
+        cfg.save_secure(&cfg_path).expect("save ok");
+
+        let server = CompanionUiServer::new(cfg_path.clone(), None)
+            .expect("server")
+            .with_env_api_key_fallback(false);
+        let res_ok = server.test_connection().await.expect("test ok");
+        assert_eq!(res_ok.is_error, Some(false));
+        let serialized_ok = serde_json::to_string(&res_ok).expect("serialize ok");
+        assert!(!serialized_ok.contains(valid_secret));
+        let payload_ok: TestConnectionPayload =
+            serde_json::from_value(res_ok.structured_content.expect("structured")).expect("parse");
+        assert!(payload_ok.ok);
+        ok_handle.abort();
+
+        // 2. Upstream 400 API_KEY_INVALID echoing secret in body -> must NOT leak key
+        let bad_secret_owned = bad_secret.to_string();
+        let bad_router = Router::new().route(
+            "/v1beta/models",
+            get(move || {
+                let leak = bad_secret_owned.clone();
+                async move {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({
+                            "error": {
+                                "status": "INVALID_ARGUMENT",
+                                "message": format!("API key not valid: {leak}"),
+                                "details": [{ "reason": "API_KEY_INVALID" }]
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        let (bad_port, bad_handle) = spawn_mock_http(bad_router).await;
+        cfg.gemini.base_url = format!("http://127.0.0.1:{bad_port}");
+        cfg.gemini.api_key = Some(bad_secret.to_string());
+        cfg.save_secure(&cfg_path).expect("save bad");
+
+        let res_bad = server.test_connection().await.expect("test bad");
+        assert_eq!(res_bad.is_error, Some(false));
+        let serialized_bad = serde_json::to_string(&res_bad).expect("serialize bad");
+        assert!(!serialized_bad.contains(bad_secret));
+        let payload_bad: TestConnectionPayload =
+            serde_json::from_value(res_bad.structured_content.expect("structured")).expect("parse");
+        assert!(!payload_bad.ok);
+        assert!(
+            payload_bad.message.contains("API_KEY_INVALID") || payload_bad.message.contains("400")
+        );
+        bad_handle.abort();
+
+        // 3. Missing API key (deterministic with env fallback disabled)
+        cfg.gemini.api_key = None;
+        cfg.save_secure(&cfg_path).expect("save missing");
+        let res_missing = server.test_connection().await.expect("test missing");
+        assert_eq!(res_missing.is_error, Some(false));
+        let payload_missing: TestConnectionPayload =
+            serde_json::from_value(res_missing.structured_content.expect("structured"))
+                .expect("parse");
+        assert!(!payload_missing.ok);
+
+        // 4. Slow upstream timeout
+        let slow_router = Router::new().route(
+            "/v1beta/models",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                (StatusCode::OK, axum::Json(json!({ "models": [] })))
+            }),
+        );
+        let (slow_port, slow_handle) = spawn_mock_http(slow_router).await;
+        cfg.gemini.base_url = format!("http://127.0.0.1:{slow_port}");
+        cfg.gemini.api_key = Some(valid_secret.to_string());
+        cfg.save_secure(&cfg_path).expect("save slow");
+
+        let fast_timeout_server = CompanionUiServer::new(cfg_path, None)
+            .expect("server")
+            .with_env_api_key_fallback(false)
+            .with_test_connection_timeout_secs(1);
+        let res_timeout = fast_timeout_server
+            .test_connection()
+            .await
+            .expect("test timeout");
+        assert_eq!(res_timeout.is_error, Some(false));
+        let serialized_timeout = serde_json::to_string(&res_timeout).expect("serialize");
+        assert!(!serialized_timeout.contains(valid_secret));
+        let payload_timeout: TestConnectionPayload =
+            serde_json::from_value(res_timeout.structured_content.expect("structured"))
+                .expect("parse");
+        assert!(!payload_timeout.ok);
+        slow_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ui_resource_dynamic_reload_oversized_rejection_and_unknown_uri() {
+        let tmp = TempDir::new().expect("tempdir");
+        let html_path = tmp.path().join("override.html");
+        fs::write(&html_path, "<!doctype html><title>v1</title>").expect("write v1");
+
+        let server = CompanionUiServer::new(tmp.path().join("config.json"), None)
+            .expect("server")
+            .with_ui_html_override(Some(html_path.clone()));
+
+        // Read v1
+        let r1 = server
+            .read_ui_resource(UI_RESOURCE_URI)
+            .await
+            .expect("read v1");
+        let text1 = match &r1.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(text1.contains("v1"));
+
+        // Overwrite file -> read v2 dynamically on same server instance
+        fs::write(&html_path, "<!doctype html><title>v2-reloaded</title>").expect("write v2");
+        let r2 = server
+            .read_ui_resource(UI_RESOURCE_URI)
+            .await
+            .expect("read v2");
+        let text2 = match &r2.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(text2.contains("v2-reloaded"));
+
+        // Oversized (> 10 MiB) rejected cleanly
+        let oversized = vec![b'a'; (MAX_UI_HTML_BYTES + 1) as usize];
+        fs::write(&html_path, oversized).expect("write oversized");
+        let err_big = server
+            .read_ui_resource(UI_RESOURCE_URI)
+            .await
+            .expect_err("oversized must fail");
+        assert_eq!(err_big.code, ErrorCode::INTERNAL_ERROR);
+
+        // Empty rejected
+        fs::write(&html_path, "   \n  ").expect("write empty");
+        let err_empty = server
+            .read_ui_resource(UI_RESOURCE_URI)
+            .await
+            .expect_err("empty must fail");
+        assert_eq!(err_empty.code, ErrorCode::INTERNAL_ERROR);
+
+        // Invalid UTF-8 rejected
+        fs::write(&html_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+        let err_utf8 = server
+            .read_ui_resource(UI_RESOURCE_URI)
+            .await
+            .expect_err("non-utf8 must fail");
+        assert_eq!(err_utf8.code, ErrorCode::INTERNAL_ERROR);
+
+        // Directory path rejected
+        let dir_server = CompanionUiServer::new(tmp.path().join("config.json"), None)
+            .expect("server")
+            .with_ui_html_override(Some(tmp.path().to_path_buf()));
+        let err_dir = dir_server
+            .read_ui_resource(UI_RESOURCE_URI)
+            .await
+            .expect_err("directory must fail");
+        assert_eq!(err_dir.code, ErrorCode::INTERNAL_ERROR);
+
+        // Unknown URI -> RESOURCE_NOT_FOUND
+        let err_uri = server
+            .read_ui_resource("ui://companion/unknown.html")
+            .await
+            .expect_err("unknown uri must fail");
+        assert_eq!(err_uri.code, ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ui_resource_reads_process_env_var_dynamically() {
+        if std::env::var_os("AGY_COMPANION_UI_HTML_CHILD").is_some() {
+            let tmp = TempDir::new().expect("tempdir");
+            let server =
+                CompanionUiServer::new(tmp.path().join("config.json"), None).expect("server");
+            let read = server
+                .read_ui_resource(UI_RESOURCE_URI)
+                .await
+                .expect("read env override");
+            let text = match &read.contents[0] {
+                ResourceContents::TextResourceContents { text, .. } => text.as_str(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(text.contains("env-override-live-marker"));
+            return;
+        }
+
+        let tmp = TempDir::new().expect("tempdir");
+        let html_path = tmp.path().join("live.html");
+        fs::write(
+            &html_path,
+            "<!doctype html><title>env-override-live-marker</title>",
+        )
+        .expect("write live html");
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let output = Command::new(exe)
+            .arg("--exact")
+            .arg("server::tests::ui_resource_reads_process_env_var_dynamically")
+            .arg("--nocapture")
+            .env("AGY_COMPANION_UI_HTML_CHILD", "1")
+            .env(UI_HTML_ENV_VAR, &html_path)
+            .output()
+            .expect("spawn child");
+        assert!(
+            output.status.success(),
+            "env override child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_json_rpc_full_wire_protocol_over_duplex() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let closed_port = free_closed_port().await;
+
+        let upstream_router = Router::new().route(
+            "/v1beta/models",
+            get(|| async { (StatusCode::OK, axum::Json(json!({ "models": [] }))) }),
+        );
+        let (upstream_port, upstream_handle) = spawn_mock_http(upstream_router).await;
+
+        let server = CompanionUiServer::new(cfg_path, None)
+            .expect("server")
+            .with_ui_html_override(None)
+            .with_env_api_key_fallback(false);
+
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server_task = tokio::spawn(async move {
+            let running = server.serve(server_io).await.expect("serve duplex");
+            let _ = running.waiting().await;
+        });
+
+        let (read_half, mut write_half) = tokio::io::split(client_io);
+        let mut reader = BufReader::new(read_half);
+
+        async fn send_msg(w: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>, msg: &Value) {
+            let mut line = serde_json::to_string(msg).expect("json");
+            line.push('\n');
+            w.write_all(line.as_bytes()).await.expect("write");
+            w.flush().await.expect("flush");
+        }
+
+        async fn recv_msg(
+            r: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        ) -> Value {
+            let mut line = String::new();
+            let n = tokio::time::timeout(Duration::from_secs(5), r.read_line(&mut line))
+                .await
+                .expect("timed out waiting for MCP server response")
+                .expect("read");
+            assert!(n > 0, "unexpected EOF from MCP server");
+            serde_json::from_str(&line).expect("parse json-rpc response")
+        }
+
+        // 1. initialize
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test-client", "version": "0.1.0" }
+                }
+            }),
+        )
+        .await;
+        let init_resp = recv_msg(&mut reader).await;
+        assert_eq!(init_resp["id"], 1);
+        assert_eq!(init_resp["result"]["serverInfo"]["name"], "agy-companion");
+
+        // 2. notifications/initialized
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }),
+        )
+        .await;
+
+        // 3. tools/list
+        send_msg(
+            &mut write_half,
+            &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+        )
+        .await;
+        let tools_resp = recv_msg(&mut reader).await;
+        let tools = tools_resp["result"]["tools"]
+            .as_array()
+            .expect("tools array");
+        assert_eq!(tools.len(), 4);
+
+        // 4. resources/list
+        send_msg(
+            &mut write_half,
+            &json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {} }),
+        )
+        .await;
+        let res_list = recv_msg(&mut reader).await;
+        assert_eq!(
+            res_list["result"]["resources"][0]["uri"],
+            json!(UI_RESOURCE_URI)
+        );
+
+        // 5. resources/read (valid + unknown URI)
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "resources/read",
+                "params": { "uri": UI_RESOURCE_URI }
+            }),
+        )
+        .await;
+        let res_read = recv_msg(&mut reader).await;
+        assert_eq!(
+            res_read["result"]["contents"][0]["mimeType"],
+            json!(UI_MIME_TYPE)
+        );
+
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 404,
+                "method": "resources/read",
+                "params": { "uri": "ui://companion/does-not-exist.html" }
+            }),
+        )
+        .await;
+        let res_not_found = recv_msg(&mut reader).await;
+        assert_eq!(res_not_found["error"]["code"], json!(-32002));
+
+        // 6. tools/call open_settings with {}
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": { "name": "open_settings", "arguments": {} }
+            }),
+        )
+        .await;
+        let open_resp = recv_msg(&mut reader).await;
+        assert_eq!(open_resp["result"]["isError"], json!(false));
+
+        // 7. tools/call save_settings
+        let wire_secret = "AIzaSyWireProtocolSecret123";
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "save_settings",
+                    "arguments": {
+                        "api_key": wire_secret,
+                        "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                        "listen_port": closed_port,
+                        "default_model": "gemini-2.5-flash"
+                    }
+                }
+            }),
+        )
+        .await;
+        let save_resp = recv_msg(&mut reader).await;
+        assert_eq!(save_resp["result"]["isError"], json!(false));
+        assert!(
+            !serde_json::to_string(&save_resp)
+                .unwrap()
+                .contains(wire_secret)
+        );
+
+        // 8. tools/call get_settings
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": { "name": "get_settings", "arguments": {} }
+            }),
+        )
+        .await;
+        let get_resp = recv_msg(&mut reader).await;
+        assert_eq!(get_resp["result"]["isError"], json!(false));
+        assert_eq!(
+            get_resp["result"]["structuredContent"]["config"]["api_key_hint"],
+            json!("AIza...t123")
+        );
+        assert!(
+            !serde_json::to_string(&get_resp)
+                .unwrap()
+                .contains(wire_secret)
+        );
+
+        // 9. tools/call test_connection
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": { "name": "test_connection", "arguments": {} }
+            }),
+        )
+        .await;
+        let test_resp = recv_msg(&mut reader).await;
+        assert_eq!(test_resp["result"]["isError"], json!(false));
+        assert_eq!(test_resp["result"]["structuredContent"]["ok"], json!(true));
+        assert!(
+            !serde_json::to_string(&test_resp)
+                .unwrap()
+                .contains(wire_secret)
+        );
+
+        drop(write_half);
+        drop(reader);
+        server_task.await.expect("server shutdown");
+        upstream_handle.abort();
+    }
+}

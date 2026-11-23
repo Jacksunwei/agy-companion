@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-TOTAL_CHECKS=5
+TOTAL_CHECKS=6
 FAILURES=0
 
 pass() {
@@ -47,7 +47,7 @@ check_governance_files() {
 # ---------------------------------------------------------------------------
 check_no_forbidden_tracked_files() {
   local tracked=""
-  tracked="$(git ls-files | grep -E '(^|/)\.DS_Store$|(^|/)\.env($|\.)|(^|/)\.antigravitycli/|(^|/)\.remember/|^target/|\.(pem|key)$' | grep -vE '(^|/)\.env\.example$' || true)"
+  tracked="$(git ls-files | grep -E '(^|/)\.DS_Store$|(^|/)\.env($|\.)|(^|/)\.antigravitycli/|(^|/)\.remember/|^target/|(^|/)node_modules/|\.(pem|key)$' | grep -vE '(^|/)\.env\.example$' || true)"
   if [[ -n "${tracked}" ]]; then
     fail "[2/${TOTAL_CHECKS}] Tracked file hygiene: forbidden files tracked in git"
     printf '%s\n' "${tracked}" | sed 's/^/  - /'
@@ -130,11 +130,70 @@ check_rust_workspace() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Check 6: UI static XSS hygiene & single-file bundle size gate
+# ---------------------------------------------------------------------------
+check_ui_hygiene_and_bundle() {
+  local ui_src="${REPO_ROOT}/ui/src"
+  local ui_bundle="${REPO_ROOT}/ui/dist/index.html"
+  local max_bytes=512000
+
+  if [[ ! -d "${ui_src}" ]]; then
+    fail "[6/${TOTAL_CHECKS}] UI hygiene & bundle: missing ui/src directory"
+    return
+  fi
+
+  local ui_failed=0
+  local src_sink_pattern='innerHTML|outerHTML|insertAdjacentHTML|document\.write|dangerouslySetInnerHTML|localStorage|sessionStorage|document\.cookie|new Function|XMLHttpRequest|(^|[^[:alnum:]_$])(eval|alert|confirm|prompt|fetch)\('
+  local src_hits=""
+  src_hits="$(grep -rnE -- "${src_sink_pattern}" "${ui_src}" || true)"
+  if [[ -n "${src_hits}" ]]; then
+    fail "[6/${TOTAL_CHECKS}] UI hygiene & bundle: forbidden DOM/JS/network sink(s) detected in ui/src/"
+    printf '%s\n' "${src_hits}" | sed 's/^/  - /'
+    ui_failed=1
+  fi
+
+  local bundle_bytes="0"
+  if [[ ! -f "${ui_bundle}" || ! -s "${ui_bundle}" ]]; then
+    fail "[6/${TOTAL_CHECKS}] UI hygiene & bundle: ui/dist/index.html missing or empty"
+    ui_failed=1
+  else
+    bundle_bytes="$(wc -c < "${ui_bundle}" | tr -d '[:space:]')"
+    if [[ ! "${bundle_bytes}" =~ ^[0-9]+$ || "${bundle_bytes}" -le 0 || "${bundle_bytes}" -ge "${max_bytes}" ]]; then
+      fail "[6/${TOTAL_CHECKS}] UI hygiene & bundle: ui/dist/index.html size ${bundle_bytes} bytes must be > 0 and < ${max_bytes} bytes"
+      ui_failed=1
+    fi
+
+    local ext_tag_pattern='<script[^>]+src=|<link[^>]+href=|<img[^>]+src=|<iframe|@import'
+    local ext_hits=""
+    ext_hits="$(grep -nE -- "${ext_tag_pattern}" "${ui_bundle}" || true)"
+    if [[ -n "${ext_hits}" ]]; then
+      fail "[6/${TOTAL_CHECKS}] UI hygiene & bundle: external resource tag(s) detected in ui/dist/index.html"
+      printf '%s\n' "${ext_hits}" | sed 's/^/  - /'
+      ui_failed=1
+    fi
+
+    local bundle_sink_pattern='innerHTML|outerHTML|document\.write|localStorage|sessionStorage|XMLHttpRequest|(^|[^[:alnum:]_$])(eval|fetch)\('
+    local bundle_hits=""
+    bundle_hits="$(grep -nE -- "${bundle_sink_pattern}" "${ui_bundle}" || true)"
+    if [[ -n "${bundle_hits}" ]]; then
+      fail "[6/${TOTAL_CHECKS}] UI hygiene & bundle: forbidden sink(s) detected in ui/dist/index.html"
+      printf '%s\n' "${bundle_hits}" | sed 's/^/  - /'
+      ui_failed=1
+    fi
+  fi
+
+  if [[ ${ui_failed} -eq 0 ]]; then
+    pass "[6/${TOTAL_CHECKS}] UI hygiene & bundle: 0 forbidden sinks/external tags, ui/dist/index.html is ${bundle_bytes} bytes (< ${max_bytes})"
+  fi
+}
+
 check_governance_files
 check_no_forbidden_tracked_files
 check_zero_ai_attribution
 check_shell_scripts
 check_rust_workspace
+check_ui_hygiene_and_bundle
 
 if [[ ${FAILURES} -gt 0 ]]; then
   printf '\nagent_check failed (%d failure(s))\n' "${FAILURES}"
