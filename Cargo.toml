@@ -5,6 +5,7 @@ members = [
     "crates/companion-providers",
     "crates/companion-proxy",
     "crates/companion-ui-mcp",
+    "crates/companion-cli",
 ]
 
 [workspace.package]
@@ -17,8 +18,10 @@ repository = "https://github.com/Jacksunwei/agy-companion"
 axum = "0.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 companion-core = { path = "crates/companion-core" }
 companion-providers = { path = "crates/companion-providers" }
+companion-proxy = { path = "crates/companion-proxy" }
 companion-ui-mcp = { path = "crates/companion-ui-mcp" }
 dirs = "7"
 futures-util = "0.3"
@@ -35,5 +38,6 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["set-header"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
