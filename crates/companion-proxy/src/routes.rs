@@ -12,7 +12,9 @@ use axum::routing::{MethodFilter, on};
 use axum::{Json, Router};
 use bytes::Bytes;
 use companion_core::{GeminiUsageMetadata, UsageEvent, UsageSink};
-use companion_providers::{ByteStream, ForwardRequest, ProviderError};
+use companion_providers::{
+    ByteStream, ForwardRequest, ProviderError, curated_gemini_models, filter_and_order_models,
+};
 use futures_util::Stream;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
@@ -55,7 +57,11 @@ pub fn build_router(state: ProxyState) -> Router {
         )
         .route(
             "/api/stats",
-            on(MethodFilter::GET, stats_handler).layer(internal_security_headers),
+            on(MethodFilter::GET, stats_handler).layer(internal_security_headers.clone()),
+        )
+        .route(
+            "/v1beta/models",
+            on(MethodFilter::GET, list_models_handler).layer(internal_security_headers),
         )
         .route(
             "/v1beta/models/{*rest}",
@@ -149,6 +155,34 @@ async fn health_handler() -> Json<HealthResponse> {
 
 async fn stats_handler(State(state): State<ProxyState>) -> impl IntoResponse {
     Json(state.stats().snapshot())
+}
+
+async fn list_models_handler(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    let active = state.active_provider();
+    let api_key_override = match validate_inbound_api_key(&headers, active.has_configured_api_key) {
+        Ok(key) => key,
+        Err(msg) => return json_error_response(StatusCode::BAD_REQUEST, msg),
+    };
+
+    let catalog = match active.provider.list_models(api_key_override).await {
+        Ok(list) => {
+            let ordered = filter_and_order_models(list.models, Some(&active.default_model));
+            if ordered.models.is_empty() {
+                curated_gemini_models(Some(&active.default_model))
+            } else {
+                ordered
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "upstream model discovery unavailable; serving curated Gemini 4/3 catalog"
+            );
+            curated_gemini_models(Some(&active.default_model))
+        }
+    };
+
+    Json(catalog).into_response()
 }
 
 async fn proxy_gemini_handler(
@@ -1877,5 +1911,140 @@ mod tests {
 
         assert_eq!(provider.hit_count(), 0, "upstream must receive 0 hits");
         assert!(sink.snapshot().is_empty(), "must record 0 usage events");
+    }
+
+    #[tokio::test]
+    async fn get_v1beta_models_returns_curated_fallback_and_live_filtered_catalog_with_security_headers()
+     {
+        // 1. StubProvider falls back cleanly to curated Gemini 4/3 catalog with security headers.
+        let sink = Arc::new(RecordingSink::default());
+        let stub = Arc::new(StubProvider::with_status(
+            200,
+            Some("application/json"),
+            Bytes::from_static(b"{}"),
+        ));
+        let app = build_router(ProxyState::new(
+            Arc::clone(&stub) as Arc<dyn companion_providers::ProviderAdapter>,
+            Arc::clone(&sink) as Arc<dyn UsageSink>,
+            true,
+        ));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1beta/models?pageSize=1000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_security_headers(resp.headers());
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let models = parsed["models"].as_array().expect("models array");
+        assert_eq!(models[0]["name"], "models/gemini-4-hydrogen");
+        assert_eq!(models[0]["thinking"], true);
+        assert!(
+            models
+                .iter()
+                .any(|m| m["name"] == "models/gemini-3.8-flash")
+        );
+
+        // POST /v1beta/models must still return 405 Method Not Allowed.
+        let post_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_security_headers(post_resp.headers());
+
+        // 2. Real GeminiProvider against a mock upstream returns filtered live catalog with default_model first.
+        let upstream_router = Router::new().route(
+            "/v1beta/models",
+            axum::routing::get(|| async {
+                let payload = serde_json::json!({
+                    "models": [
+                        {
+                            "name": "models/gemini-2.5-pro",
+                            "displayName": "Gemini 2.5 Pro",
+                            "supportedGenerationMethods": ["generateContent"]
+                        },
+                        {
+                            "name": "models/gemini-4-carbon",
+                            "displayName": "Gemini 4 Carbon",
+                            "inputTokenLimit": 1048576,
+                            "outputTokenLimit": 65536,
+                            "supportedGenerationMethods": ["generateContent"]
+                        },
+                        {
+                            "name": "models/gemini-3.8-flash",
+                            "displayName": "Gemini 3.8 Flash",
+                            "inputTokenLimit": 1048576,
+                            "outputTokenLimit": 65536,
+                            "supportedGenerationMethods": ["generateContent"]
+                        }
+                    ]
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    payload.to_string(),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(listener, upstream_router).await.unwrap();
+        });
+
+        let mut cfg = companion_core::Config::default();
+        cfg.gemini.base_url = format!("http://{upstream_addr}");
+        cfg.gemini.api_key = Some("AIzaSyGatewayDiscovery123".to_string());
+        cfg.gemini.default_model = "gemini-3.8-flash".to_string();
+        let live_state =
+            ProxyState::from_config_with_env_fallback(cfg, None, Arc::new(NoopUsageSink), false)
+                .unwrap();
+        let live_app = build_router(live_state);
+
+        let live_resp = live_app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1beta/models?pageSize=1000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live_resp.status(), StatusCode::OK);
+        assert_security_headers(live_resp.headers());
+        let live_body = axum::body::to_bytes(live_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let live_parsed: serde_json::Value = serde_json::from_slice(&live_body).unwrap();
+        let live_models = live_parsed["models"].as_array().expect("live models array");
+        let names: Vec<&str> = live_models
+            .iter()
+            .filter_map(|m| m["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["models/gemini-3.8-flash", "models/gemini-4-carbon"]
+        );
+
+        upstream_server.abort();
     }
 }

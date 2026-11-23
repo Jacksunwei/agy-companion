@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use companion_core::{Config, CoreError, MAX_CONFIG_FILE_BYTES, UsageSink, validate_path};
+use companion_core::{
+    Config, CoreError, DEFAULT_GEMINI_MODEL, MAX_CONFIG_FILE_BYTES, UsageSink, validate_path,
+};
 use companion_providers::{GeminiProvider, ProviderAdapter, ProviderError};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -45,6 +47,7 @@ pub enum ProxyError {
 pub(crate) struct ActiveProvider {
     pub(crate) provider: Arc<dyn ProviderAdapter>,
     pub(crate) has_configured_api_key: bool,
+    pub(crate) default_model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +117,7 @@ impl ProxyState {
                 source: ProviderSource::Static(ActiveProvider {
                     provider,
                     has_configured_api_key,
+                    default_model: DEFAULT_GEMINI_MODEL.to_string(),
                 }),
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
@@ -204,6 +208,7 @@ fn build_active_provider(
     Ok(ActiveProvider {
         provider: Arc::new(provider),
         has_configured_api_key,
+        default_model: config.gemini.default_model.clone(),
     })
 }
 

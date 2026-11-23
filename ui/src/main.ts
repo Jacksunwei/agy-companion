@@ -307,6 +307,20 @@ function formatRatioPercent(ratio: number): string {
   return `${(clamped * 100).toFixed(1)}%`;
 }
 
+function buildGatewaySnippet(port: number): string {
+  const safePort = Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
+  return JSON.stringify(
+    {
+      gateway: {
+        url: `http://127.0.0.1:${safePort}`,
+        wireProtocol: "genai",
+      },
+    },
+    null,
+    2,
+  );
+}
+
 function buildCustomModelsSnippet(port: number, model: string): string {
   const safePort = Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
   const safeModel = model.trim() || DEFAULT_CONFIG.gemini_default_model;
@@ -510,6 +524,10 @@ interface UiRefs {
   saveBtn: HTMLButtonElement;
   testBtn: HTMLButtonElement;
   formFeedback: HTMLDivElement;
+
+  gatewaySnippetCode: HTMLElement;
+  gatewayCopyBtn: HTMLButtonElement;
+  gatewayCopyStatus: HTMLSpanElement;
 
   snippetCode: HTMLElement;
   copyBtn: HTMLButtonElement;
@@ -752,7 +770,46 @@ function mountUi(root: HTMLElement): UiRefs {
     form,
   );
 
-  // Section 3: Copyable customModelsConfig JSON Snippet
+  // Section 3: Copyable Antigravity App Gateway Snippet
+  const gatewaySnippetCode = el("code", {
+    id: "gateway-snippet",
+    text: buildGatewaySnippet(DEFAULT_CONFIG.listen_port),
+  });
+  const gatewayCopyBtn = el("button", {
+    className: "btn btn-sm",
+    text: "Copy JSON",
+    attrs: { type: "button" },
+  });
+  const gatewayCopyStatus = el("span", {
+    className: "copy-status",
+    attrs: { role: "status", "aria-live": "polite" },
+  });
+
+  const gatewayCard = el(
+    "section",
+    { className: "card", attrs: { "aria-label": "Antigravity App gateway snippet" } },
+    el(
+      "div",
+      { className: "card-header" },
+      el(
+        "div",
+        {},
+        el("h2", { className: "section-title", text: "Antigravity App (Gateway Mode)" }),
+        el("p", {
+          className: "section-subtitle",
+          text: "Add to ~/.gemini/config/config.json and restart Antigravity App to discover models from /v1beta/models",
+        }),
+      ),
+      el("div", { className: "action-row" }, gatewayCopyStatus, gatewayCopyBtn),
+    ),
+    el("pre", { className: "code-block" }, gatewaySnippetCode),
+    el("p", {
+      className: "footer-note",
+      text: "Gateway Mode routes all Antigravity App model calls through this proxy (replacing Google OAuth / AI Pro models). Remove the gateway key and restart to switch back.",
+    }),
+  );
+
+  // Section 4: Copyable customModelsConfig JSON Snippet (agy CLI)
   const snippetCode = el("code", {
     id: "config-snippet",
     text: buildCustomModelsSnippet(DEFAULT_CONFIG.listen_port, DEFAULT_CONFIG.gemini_default_model),
@@ -787,7 +844,7 @@ function mountUi(root: HTMLElement): UiRefs {
     el("pre", { className: "code-block" }, snippetCode),
   );
 
-  // Section 4: Usage & Cost Telemetry
+  // Section 5: Usage & Cost Telemetry
   const statsBadge = el("span", { className: "badge", text: "Proxy offline" });
   const statsBody = el("div");
   const statsCard = el(
@@ -806,7 +863,7 @@ function mountUi(root: HTMLElement): UiRefs {
     }),
   );
 
-  root.replaceChildren(globalBanner, statusCard, settingsCard, snippetCard, statsCard);
+  root.replaceChildren(globalBanner, statusCard, settingsCard, gatewayCard, snippetCard, statsCard);
 
   return {
     globalBanner,
@@ -835,6 +892,9 @@ function mountUi(root: HTMLElement): UiRefs {
     saveBtn,
     testBtn,
     formFeedback,
+    gatewaySnippetCode,
+    gatewayCopyBtn,
+    gatewayCopyStatus,
     snippetCode,
     copyBtn,
     copyStatus,
@@ -874,6 +934,7 @@ function updateSnippet(refs: UiRefs): void {
       ? parsedPort
       : state.savedPort;
   const model = refs.modelInput.value.trim() || DEFAULT_CONFIG.gemini_default_model;
+  refs.gatewaySnippetCode.textContent = buildGatewaySnippet(port);
   refs.snippetCode.textContent = buildCustomModelsSnippet(port, model);
 
   const editedPortDiffers =
@@ -1031,7 +1092,11 @@ function applyHostContext(ctx: Partial<McpUiHostContext> | undefined): void {
   }
 }
 
-async function copySnippetWithFallback(refs: UiRefs, snippet: string): Promise<void> {
+async function copySnippetWithFallback(
+  codeEl: HTMLElement,
+  statusEl: HTMLSpanElement,
+  snippet: string,
+): Promise<void> {
   let copied = false;
 
   // Tier 1: Clipboard API
@@ -1065,10 +1130,10 @@ async function copySnippetWithFallback(refs: UiRefs, snippet: string): Promise<v
   }
 
   if (copied) {
-    refs.copyStatus.textContent = "Copied!";
+    statusEl.textContent = "Copied!";
     window.setTimeout(() => {
-      if (refs.copyStatus.textContent === "Copied!") {
-        refs.copyStatus.textContent = "";
+      if (statusEl.textContent === "Copied!") {
+        statusEl.textContent = "";
       }
     }, 2500);
     return;
@@ -1078,11 +1143,11 @@ async function copySnippetWithFallback(refs: UiRefs, snippet: string): Promise<v
   const selection = window.getSelection();
   if (selection) {
     const range = document.createRange();
-    range.selectNodeContents(refs.snippetCode);
+    range.selectNodeContents(codeEl);
     selection.removeAllRanges();
     selection.addRange(range);
   }
-  refs.copyStatus.textContent = "Select & press Cmd/Ctrl+C to copy";
+  statusEl.textContent = "Select & press Cmd/Ctrl+C to copy";
 }
 
 function formatCaughtError(err: unknown): string {
@@ -1349,8 +1414,16 @@ async function main(): Promise<void> {
     }
   });
 
+  refs.gatewayCopyBtn.addEventListener("click", () => {
+    void copySnippetWithFallback(
+      refs.gatewaySnippetCode,
+      refs.gatewayCopyStatus,
+      refs.gatewaySnippetCode.textContent ?? "",
+    );
+  });
+
   refs.copyBtn.addEventListener("click", () => {
-    void copySnippetWithFallback(refs, refs.snippetCode.textContent ?? "");
+    void copySnippetWithFallback(refs.snippetCode, refs.copyStatus, refs.snippetCode.textContent ?? "");
   });
 
   // Connect to host with graceful standalone fallback

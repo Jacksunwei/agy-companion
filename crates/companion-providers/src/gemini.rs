@@ -7,7 +7,8 @@ use http::header::{self, HeaderName, HeaderValue};
 use url::Url;
 
 use crate::{
-    BoxFuture, ByteStream, ForwardRequest, ForwardResponse, ProviderAdapter, ProviderError,
+    BoxFuture, ByteStream, ForwardRequest, ForwardResponse, GeminiModelList, ProviderAdapter,
+    ProviderError, filter_and_order_models,
 };
 
 pub const GEMINI_API_KEY_ENV_VAR: &str = "GEMINI_API_KEY";
@@ -16,6 +17,8 @@ const GEMINI_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-goog-api-ke
 const GEMINI_MODELS_PREFIX: &str = "/v1beta/models/";
 const MAX_CONNECT_TIMEOUT_SECS: u64 = 30;
 const HEALTH_CHECK_ERROR_BODY_LIMIT: usize = 8 * 1024;
+const LIST_MODELS_TIMEOUT_SECS: u64 = 10;
+const LIST_MODELS_BODY_LIMIT: usize = 4 * 1024 * 1024;
 const KNOWN_GEMINI_ERROR_CODES: &[&str] = &[
     "API_KEY_INVALID",
     "API_KEY_HTTP_REFERRER_BLOCKED",
@@ -371,6 +374,52 @@ impl ProviderAdapter for GeminiProvider {
             }
         })
     }
+
+    fn list_models(
+        &self,
+        api_key_override: Option<String>,
+    ) -> BoxFuture<'_, Result<GeminiModelList, ProviderError>> {
+        Box::pin(async move {
+            let api_key_header = self.resolve_api_key_header(api_key_override.as_deref())?;
+            let expected_path = format!("{}/v1beta/models", self.normalized_base_path);
+            let candidate = format!("{}/v1beta/models?pageSize=1000", self.normalized_base_url);
+            let target_url =
+                self.parse_and_verify_url(&candidate, &expected_path, Some("pageSize=1000"))?;
+
+            tracing::debug!(
+                base_url = %self.normalized_base_url,
+                "fetching upstream Gemini model catalog"
+            );
+
+            let timeout = self
+                .timeout
+                .min(Duration::from_secs(LIST_MODELS_TIMEOUT_SECS));
+            let response = self
+                .client
+                .get(target_url)
+                .timeout(timeout)
+                .header(GEMINI_API_KEY_HEADER, api_key_header)
+                .send()
+                .await
+                .map_err(sanitize_reqwest_error)?;
+
+            if !response.status().is_success() {
+                let code = response.status().as_u16();
+                return Err(ProviderError::Upstream(format!(
+                    "upstream model discovery failed with HTTP {code}"
+                )));
+            }
+
+            let body = read_bounded_body_strict(response, LIST_MODELS_BODY_LIMIT).await?;
+            let parsed: GeminiModelList = serde_json::from_slice(&body).map_err(|_| {
+                ProviderError::Upstream(
+                    "upstream model discovery returned invalid JSON".to_string(),
+                )
+            })?;
+
+            Ok(filter_and_order_models(parsed.models, None))
+        })
+    }
 }
 
 fn is_loopback_url(url: &Url) -> bool {
@@ -708,6 +757,22 @@ async fn read_bounded_body(mut response: reqwest::Response, max_bytes: usize) ->
         }
     }
     body
+}
+
+async fn read_bounded_body_strict(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(sanitize_reqwest_error)? {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(ProviderError::Upstream(
+                "upstream model discovery response exceeded size limit".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn match_known_gemini_error_code(candidate: &str) -> Option<&'static str> {
@@ -2395,5 +2460,113 @@ mod tests {
             .expect("ASCII-padded Content-Type should trim cleanly");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(seen_ct.lock().await.as_deref(), Some("application/json"));
+    }
+
+    #[tokio::test]
+    async fn list_models_filters_to_chat_gemini_3_and_4_and_preserves_metadata() {
+        let seen_key = Arc::new(Mutex::new(None::<String>));
+        let seen_key_handler = Arc::clone(&seen_key);
+        let router = Router::new().route(
+            "/v1beta/models",
+            get(move |headers: HeaderMap| {
+                let seen_key_handler = Arc::clone(&seen_key_handler);
+                async move {
+                    *seen_key_handler.lock().await = headers
+                        .get("x-goog-api-key")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    let payload = serde_json::json!({
+                        "models": [
+                            {
+                                "name": "models/gemini-2.5-pro",
+                                "displayName": "Gemini 2.5 Pro",
+                                "supportedGenerationMethods": ["generateContent"]
+                            },
+                            {
+                                "name": "models/gemini-4-hydrogen",
+                                "displayName": "Gemini 4 Hydrogen",
+                                "inputTokenLimit": 1048576,
+                                "outputTokenLimit": 65536,
+                                "supportedGenerationMethods": ["generateContent"]
+                            },
+                            {
+                                "name": "models/gemini-3.8-flash",
+                                "displayName": "Gemini 3.8 Flash",
+                                "inputTokenLimit": 1048576,
+                                "outputTokenLimit": 65536,
+                                "supportedGenerationMethods": ["generateContent"],
+                                "thinking": true
+                            },
+                            {
+                                "name": "models/gemini-3.8-flash-tts",
+                                "displayName": "Gemini 3.8 Flash TTS",
+                                "supportedGenerationMethods": ["generateContent"]
+                            },
+                            {
+                                "name": "models/gemini-3-pro-image",
+                                "displayName": "Nano Banana Pro",
+                                "supportedGenerationMethods": ["generateContent"]
+                            },
+                            {
+                                "name": "models/gemini-3.5-transcribe",
+                                "displayName": "Gemini 3.5 Transcribe",
+                                "supportedGenerationMethods": ["generateContent"]
+                            },
+                            {
+                                "name": "models/gemini-4-embed",
+                                "displayName": "Embed Only",
+                                "supportedGenerationMethods": ["embedContent"]
+                            }
+                        ]
+                    });
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        payload.to_string(),
+                    )
+                }
+            }),
+        );
+        let server = spawn_mock_server(router).await;
+        let provider = provider_for(&server.base_url, Some("AIzaSyListModelsKey123"), None);
+
+        let list = provider.list_models(None).await.expect("list_models ok");
+        assert_eq!(
+            seen_key.lock().await.as_deref(),
+            Some("AIzaSyListModelsKey123")
+        );
+        let names: Vec<&str> = list.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["models/gemini-4-hydrogen", "models/gemini-3.8-flash"]
+        );
+        assert_eq!(list.models[0].input_token_limit, Some(1_048_576));
+        assert_eq!(list.models[0].output_token_limit, Some(65_536));
+        assert_eq!(list.models[0].thinking, Some(true));
+    }
+
+    #[tokio::test]
+    async fn list_models_rejects_non_200_invalid_json_and_missing_key_without_leaking_secret() {
+        let router = Router::new().route(
+            "/v1beta/models",
+            get(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "bad key AIzaSyListModelsSecret999",
+                )
+            }),
+        );
+        let server = spawn_mock_server(router).await;
+        let provider = provider_for(&server.base_url, Some("AIzaSyListModelsSecret999"), None);
+        let err = provider.list_models(None).await.expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("401"), "unexpected error: {msg}");
+        assert!(!msg.contains("AIzaSyListModelsSecret999"));
+
+        let no_key = provider_for(&server.base_url, None, None);
+        assert!(matches!(
+            no_key.list_models(None).await,
+            Err(ProviderError::MissingApiKey)
+        ));
     }
 }

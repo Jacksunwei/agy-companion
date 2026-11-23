@@ -147,10 +147,12 @@ pub async fn run_serve(
     precheck_existing_data_dir(&usage_dir)?;
     let usage_sink: Arc<dyn UsageSink> = Arc::new(JsonlUsageSink::new(usage_dir)?);
 
-    // Pre-register SIGTERM before binding so signals arriving immediately after startup are never missed.
+    // Pre-register SIGTERM and SIGHUP before binding so host-restart signals are never missed.
     #[cfg(unix)]
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
 
     let listener = companion_proxy::bind_loopback_listener(&config).await?;
     let bound_addr = listener.local_addr().map_err(ProxyError::Serve)?;
@@ -179,12 +181,27 @@ pub async fn run_serve(
         #[cfg(not(unix))]
         let terminate = std::future::pending::<()>();
 
+        #[cfg(unix)]
+        let hangup = async {
+            if let Some(ref mut stream) = sighup {
+                let _ = stream.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+
+        #[cfg(not(unix))]
+        let hangup = std::future::pending::<()>();
+
         tokio::select! {
             _ = ctrl_c => {
                 tracing::info!("received Ctrl-C, shutting down proxy");
             }
             _ = terminate => {
                 tracing::info!("received SIGTERM, shutting down proxy");
+            }
+            _ = hangup => {
+                tracing::info!("received SIGHUP, shutting down proxy");
             }
         }
     };

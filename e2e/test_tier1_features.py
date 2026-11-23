@@ -1937,3 +1937,71 @@ class TestTier1F16XdgPaths(E2ETestCase):
         _, ev3 = poll_usage_events(home_usage, min_count=1, timeout=3.0)
         self.assertEqual(len(ev3), 1)
         p3.stop()
+
+    def test_t1_gateway_v1beta_models_discovery_live_and_fallback(self) -> None:
+        """GET /v1beta/models serves filtered live Gemini 3/4 models (default first) and falls back cleanly."""
+        env = self.make_env()
+        mock = self.start_mock_gemini()
+        mock.enqueue(
+            JsonAction(
+                status=200,
+                payload={
+                    "models": [
+                        {
+                            "name": "models/gemini-2.5-pro",
+                            "displayName": "Gemini 2.5 Pro",
+                            "supportedGenerationMethods": ["generateContent"],
+                        },
+                        {
+                            "name": "models/gemini-4-carbon",
+                            "displayName": "Gemini 4 Carbon",
+                            "inputTokenLimit": 1048576,
+                            "outputTokenLimit": 65536,
+                            "supportedGenerationMethods": ["generateContent"],
+                        },
+                        {
+                            "name": "models/gemini-3.8-flash",
+                            "displayName": "Gemini 3.8 Flash",
+                            "inputTokenLimit": 1048576,
+                            "outputTokenLimit": 65536,
+                            "supportedGenerationMethods": ["generateContent"],
+                            "thinking": True,
+                        },
+                        {
+                            "name": "models/gemini-3.8-flash-tts",
+                            "displayName": "Gemini 3.8 Flash TTS",
+                            "supportedGenerationMethods": ["generateContent"],
+                        },
+                    ]
+                },
+            )
+        )
+        cfg = env.write_config(
+            env.make_config_dict(
+                base_url=mock.base_url,
+                api_key="AIzaSyGatewayList123",
+                default_model="gemini-3.8-flash",
+            )
+        )
+        proxy = self.start_proxy(env, config_path=cfg)
+
+        # 1. Live filtered catalog from upstream with default_model first and security headers.
+        resp = http_raw_request("127.0.0.1", proxy.port, "GET", "/v1beta/models?pageSize=1000")
+        self.assertEqual(resp.status, 200, resp.text)
+        self.assertEqual(resp.header("x-content-type-options"), "nosniff")
+        self.assertIn("no-store", resp.header("cache-control"))
+        names = [m["name"] for m in json.loads(resp.text)["models"]]
+        self.assertEqual(names, ["models/gemini-3.8-flash", "models/gemini-4-carbon"])
+
+        # 2. Fallback to curated Gemini 4/3 catalog when upstream returns 503.
+        mock.enqueue(JsonAction(status=503, payload={"error": {"message": "overloaded"}}))
+        fb_resp = http_raw_request("127.0.0.1", proxy.port, "GET", "/v1beta/models?pageSize=1000")
+        self.assertEqual(fb_resp.status, 200, fb_resp.text)
+        fb_names = [m["name"] for m in json.loads(fb_resp.text)["models"]]
+        self.assertEqual(fb_names[0], "models/gemini-3.8-flash")
+        self.assertIn("models/gemini-4-hydrogen", fb_names)
+
+        # 3. POST /v1beta/models remains rejected with 405.
+        post_resp = http_raw_request("127.0.0.1", proxy.port, "POST", "/v1beta/models", body=b"{}")
+        self.assertEqual(post_resp.status, 405, post_resp.text)
+        proxy.stop()
