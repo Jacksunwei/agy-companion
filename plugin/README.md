@@ -30,18 +30,22 @@ In the panel:
 1. Paste your Gemini API key (stored atomically — Unix mode `0600` / parent dir `0700`, Windows user-profile ACLs with bounded `3`-attempt rename retry — never returned in plaintext), or export `GEMINI_API_KEY` in your shell environment.
 2. Adjust the default model (Gemini 3 & 4 only; default: `gemini-4-hydrogen`), upstream base URL (default: `https://generativelanguage.googleapis.com`), or loopback port (default: `4141`) if needed.
 3. Click **Save Settings**, then **Test Connection**.
-4. *(Optional — Antigravity App Gateway Mode)* To let Antigravity App discover models directly from `http://127.0.0.1:4141/v1beta/models` and route all App requests through the proxy, add the `"gateway"` block to `~/.gemini/config/config.json` and restart Antigravity App:
+4. *(Recommended — Antigravity App Hybrid Mode)* Launch Antigravity App via `agy-companion launch` to keep **all original Google AI Pro models (with thinking levels)** AND add `[Proxy]` Gemini 4 / 3 models (with thinking levels) side-by-side:
 
-```json
-{
-  "gateway": {
-    "url": "http://127.0.0.1:4141",
-    "wireProtocol": "genai"
-  }
-}
+```bash
+agy-companion launch
 ```
 
-> **Note:** Gateway Mode replaces Google OAuth / AI Pro models while enabled. Remove the `"gateway"` key and restart Antigravity App to switch back.
+Or launch with explicit environment variables:
+
+```bash
+CLOUD_CODE_URL="http://127.0.0.1:4141" \
+GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4141" \
+GEMINI_API_KEY="agy-companion-local" \
+/Applications/Antigravity.app/Contents/MacOS/Antigravity
+```
+
+> **Note:** Hybrid Mode passes `/v1internal:*` through to `cloudcode_upstream_url` (default `https://daily-cloudcode-pa.googleapis.com` for Personal Google AI Pro; set `https://cloudcode-pa.googleapis.com` for Workspace/PayGo in Settings), preserving all original Google models and injecting `[Proxy]` models alongside them.
 
 ### 3. Connect Antigravity CLI (`agy`)
 
@@ -113,7 +117,8 @@ export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4141"
 
 | Command | Description |
 | --- | --- |
-| `agy-companion serve [--port <PORT>] [--config <CONFIG>]` | Start the loopback proxy (`127.0.0.1:<port>`) |
+| `agy-companion serve [--port <PORT>] [--config <CONFIG>] [--adopt-running]` | Start the loopback proxy (`127.0.0.1:<port>`) |
+| `agy-companion launch [--port <PORT>] [--config <CONFIG>] [--app <PATH>] [--print-env]` | Start proxy if needed and launch Antigravity App in Hybrid Mode |
 | `agy-companion ui-mcp [--data-dir <DATA_DIR>] [--config <CONFIG>]` | Start the stdio MCP App server (stdout strictly JSON-RPC; logs to stderr) |
 | `agy-companion doctor [--config <CONFIG>] [--port <PORT>] [--json]` | Verify config permissions, config schema, proxy `/health`, version match, and env vars |
 | `agy-companion models [--json] [--port <PORT>] [--config <CONFIG>]` | Print `customModelsConfig` JSON for `~/.gemini/antigravity-cli/settings.json` |

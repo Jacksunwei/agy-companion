@@ -64,18 +64,24 @@ Then configure your Gemini API key in Antigravity App:
 
 1. Open **Antigravity Companion** via the side panel `+` menu (`aux_pane`), the left sidebar **Plugins** view (`global`), or by prompting: *"Open the Antigravity Companion settings panel"*.
 2. Paste your Gemini API key (write-only; persisted atomically at Unix mode `0600` and never returned in plaintext), then click **Save Settings** and **Test Connection**.
-3. *(Optional — Antigravity App Gateway Mode)* To populate Antigravity App's model picker directly from `agy-companion` (`GET /v1beta/models`), add the `"gateway"` block to `~/.gemini/config/config.json` and restart Antigravity App:
+3. *(Recommended — Antigravity App Hybrid Mode)* Launch Antigravity App with `agy-companion launch` to keep **all original Google AI Pro models (with thinking levels)** AND add `[Proxy]` Gemini 4 / 3 models (with thinking levels) side-by-side:
 
-```json
-{
-  "gateway": {
-    "url": "http://127.0.0.1:4141",
-    "wireProtocol": "genai"
-  }
-}
+```bash
+agy-companion launch
 ```
 
-> **Note:** Gateway Mode works with personal Antigravity App (no Gemini Enterprise/MDM required), and replaces Google OAuth / AI Pro models while enabled — all model requests route through `agy-companion`. Remove `"gateway"` and restart to switch back.
+Or launch Antigravity App directly with environment variables:
+
+```bash
+CLOUD_CODE_URL="http://127.0.0.1:4141" \
+GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4141" \
+GEMINI_API_KEY="agy-companion-local" \
+/Applications/Antigravity.app/Contents/MacOS/Antigravity
+```
+
+> **How Hybrid Mode works:** Antigravity stays signed in with your personal Google AI Pro (or Workspace/PayGo) account. `agy-companion` passes `/v1internal:*` calls transparently to `cloudcode_upstream_url` (default `https://daily-cloudcode-pa.googleapis.com` for Personal Google AI Pro; set `https://cloudcode-pa.googleapis.com` for Workspace/PayGo), merges `[Proxy]` models (with `modelUrl: "gemini-api://..."` and `groupedModels` thinking levels) into `v1internal:fetchAvailableModels`, and routes only `[Proxy]` model calls through your local Gemini API key + telemetry tee. Original Google AI Pro models stay 100% untouched.
+
+*(Alternative — Gateway Mode)* If you prefer routing all Antigravity App calls exclusively through the proxy without Google OAuth, add `"gateway": {"url": "http://127.0.0.1:4141", "wireProtocol": "genai"}` to `~/.gemini/config/config.json` (`GET /v1beta/models` discovery).
 
 See [`plugin/README.md`](plugin/README.md) and [`plugin/skills/companion/SKILL.md`](plugin/skills/companion/SKILL.md) for full plugin usage and troubleshooting.
 
@@ -147,14 +153,17 @@ agy-companion doctor --json   # machine-readable JSON output
 
 | Surface | Invocation / Route | Flags / Behavior |
 | --- | --- | --- |
-| **Proxy Server** | `agy-companion serve` | `[--port <PORT>]` (`1–65535`, default `4141`), `[--config <CONFIG>]`; binds strictly to `127.0.0.1`, no `--host` flag |
+| **Proxy Server** | `agy-companion serve` | `[--port <PORT>]` (`1–65535`, default `4141`), `[--config <CONFIG>]`, `[--adopt-running]`; binds strictly to `127.0.0.1`, no `--host` flag |
+| **Hybrid Launcher** | `agy-companion launch` | `[--port <PORT>]`, `[--config <CONFIG>]`, `[--app <PATH>]`, `[--print-env]`; starts proxy if needed and launches Antigravity App in Hybrid Mode |
 | **MCP App Server** | `agy-companion ui-mcp` | `[--data-dir <DATA_DIR>]`, `[--config <CONFIG>]`; `stdout` strictly JSON-RPC, logs strictly `stderr` |
 | **Diagnostics** | `agy-companion doctor` | `[--config <CONFIG>]`, `[--port <PORT>]`, `[--json]`; checks config perms, schema, `/health`, version skew, env vars |
 | **Model Config** | `agy-companion models` | `[--json]`, `[--port <PORT>]`, `[--config <CONFIG>]`; emits `customModelsConfig` JSON for `agy` CLI |
 | **Version** | `agy-companion --version` | Prints `agy-companion 0.1.0` |
 | **Health Probe** | `GET /health` | `200 OK` JSON `{status, version, protocol_version: 1}` (`nosniff`, `no-store`) |
 | **Telemetry Stats** | `GET /api/stats` | `200 OK` JSON `{requests, prompt_tokens, cached_tokens, output_tokens, reasoning_tokens, cache_hit_ratio}` (`nosniff`, `no-store`) |
+| **Model Discovery** | `GET /v1beta/models` | Filtered Gemini 3 & 4 chat model list (`default_model` first) with curated fallback |
 | **Gemini Proxy** | `POST /v1beta/models/{*rest}` | `:generateContent` & `:streamGenerateContent?alt=sse`; 64 MiB cap, byte-for-byte streaming pass-through, `usageMetadata` tee |
+| **CloudCode Hybrid** | `POST /v1internal:fetchAvailableModels`<br>`GET/POST /v1internal:*` | Transparent pass-through to `cloudcode_upstream_url` preserving original Google AI Pro models & thinking levels while injecting `[Proxy]` models (`gemini-api://...`, `groupedModels`) |
 
 ---
 

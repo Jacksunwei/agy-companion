@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod cloudcode;
 pub mod routes;
 pub mod sse;
 pub mod stats;
@@ -13,12 +14,17 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use companion_core::{
-    Config, CoreError, DEFAULT_GEMINI_MODEL, MAX_CONFIG_FILE_BYTES, UsageSink, validate_path,
+    Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_GEMINI_MODEL, DEFAULT_TIMEOUT_SECS,
+    MAX_CONFIG_FILE_BYTES, UsageSink, validate_path,
 };
 use companion_providers::{GeminiProvider, ProviderAdapter, ProviderError};
 use thiserror::Error;
 use tokio::net::TcpListener;
 
+pub use cloudcode::{
+    CloudCodeClient, CloudCodeError, MAX_CLOUDCODE_CATALOG_BYTES, is_cloudcode_path,
+    merge_available_models, validate_cloudcode_path,
+};
 pub use routes::{DEFAULT_MAX_JSON_TEE_BYTES, HealthResponse, MAX_PROXY_BODY_BYTES, build_router};
 pub use sse::{DEFAULT_MAX_SSE_EVENT_BYTES, SseUsageTracker};
 pub use stats::{ProxyStats, StatsSnapshot};
@@ -33,6 +39,8 @@ pub enum ProxyError {
     Core(#[from] CoreError),
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
+    #[error("cloudcode proxy error: {0}")]
+    CloudCode(#[from] CloudCodeError),
     #[error("failed to bind loopback listener on {addr}: {source}")]
     Bind {
         addr: SocketAddr,
@@ -46,6 +54,7 @@ pub enum ProxyError {
 #[derive(Clone)]
 pub(crate) struct ActiveProvider {
     pub(crate) provider: Arc<dyn ProviderAdapter>,
+    pub(crate) cloudcode: Arc<CloudCodeClient>,
     pub(crate) has_configured_api_key: bool,
     pub(crate) default_model: String,
 }
@@ -112,10 +121,15 @@ impl ProxyState {
         usage_sink: Arc<dyn UsageSink>,
         has_configured_api_key: bool,
     ) -> Self {
+        let cloudcode = Arc::new(
+            CloudCodeClient::new(DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_TIMEOUT_SECS)
+                .expect("default cloudcode upstream URL must be valid"),
+        );
         Self {
             inner: Arc::new(ProxyStateInner {
                 source: ProviderSource::Static(ActiveProvider {
                     provider,
+                    cloudcode,
                     has_configured_api_key,
                     default_model: DEFAULT_GEMINI_MODEL.to_string(),
                 }),
@@ -204,9 +218,12 @@ fn build_active_provider(
     env_fallback: bool,
 ) -> Result<ActiveProvider, ProxyError> {
     let provider = GeminiProvider::from_config(&config.gemini)?.with_env_fallback(env_fallback);
+    let cloudcode =
+        CloudCodeClient::new(&config.cloudcode_upstream_url, config.gemini.timeout_secs)?;
     let has_configured_api_key = provider.api_key_hint().is_some();
     Ok(ActiveProvider {
         provider: Arc::new(provider),
+        cloudcode: Arc::new(cloudcode),
         has_configured_api_key,
         default_model: config.gemini.default_model.clone(),
     })

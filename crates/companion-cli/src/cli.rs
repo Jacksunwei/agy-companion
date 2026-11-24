@@ -24,6 +24,10 @@ pub enum Commands {
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).
         #[arg(long)]
         config: Option<PathBuf>,
+        /// If another healthy agy-companion proxy already occupies the port, monitor it
+        /// instead of failing with address-in-use (intended for sidecar startup).
+        #[arg(long = "adopt-running")]
+        adopt_running: bool,
     },
     /// Run the embedded MCP App settings UI server over stdio.
     UiMcp {
@@ -57,6 +61,21 @@ pub enum Commands {
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+    /// Launch Antigravity App in Hybrid Mode (original Google AI Pro models + proxy models).
+    Launch {
+        /// Proxy port (1-65535; overrides config.listen_port).
+        #[arg(long, value_parser = parse_nonzero_port)]
+        port: Option<u16>,
+        /// Path to config.json (overrides AGY_COMPANION_CONFIG).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override path to the Antigravity executable.
+        #[arg(long)]
+        app: Option<PathBuf>,
+        /// Print the shell launch command without starting Antigravity.
+        #[arg(long = "print-env")]
+        print_env: bool,
     },
 }
 
@@ -94,6 +113,7 @@ mod tests {
             Commands::Serve {
                 port: Some(4242),
                 config: Some(PathBuf::from("/tmp/c.json")),
+                adopt_running: false,
             }
         );
 
@@ -104,6 +124,18 @@ mod tests {
             Commands::Serve {
                 port: None,
                 config: None,
+                adopt_running: false,
+            }
+        );
+
+        let serve_adopt = Cli::try_parse_from(["agy-companion", "serve", "--adopt-running"])
+            .expect("serve --adopt-running should parse");
+        assert_eq!(
+            serve_adopt.command,
+            Commands::Serve {
+                port: None,
+                config: None,
+                adopt_running: true,
             }
         );
 
@@ -192,6 +224,27 @@ mod tests {
             Commands::Serve {
                 port: Some(5151),
                 config: Some(PathBuf::from("/tmp/c.json")),
+                adopt_running: false,
+            }
+        );
+
+        let launch = Cli::try_parse_from([
+            "agy-companion",
+            "launch",
+            "--port",
+            "4141",
+            "--print-env",
+            "--app",
+            "/opt/antigravity",
+        ])
+        .expect("launch args should parse");
+        assert_eq!(
+            launch.command,
+            Commands::Launch {
+                port: Some(4141),
+                config: None,
+                app: Some(PathBuf::from("/opt/antigravity")),
+                print_env: true,
             }
         );
 

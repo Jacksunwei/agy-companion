@@ -12,6 +12,7 @@ companion-core.workspace = true
 companion-providers.workspace = true
 futures-util.workspace = true
 http.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -21,6 +22,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
-reqwest.workspace = true
 tempfile.workspace = true
 tower.workspace = true

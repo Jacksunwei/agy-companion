@@ -15,6 +15,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
 pub const DEFAULT_LISTEN_PORT: u16 = 4141;
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+pub const DEFAULT_CLOUDCODE_UPSTREAM_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
@@ -100,6 +101,7 @@ pub struct Config {
     pub listen_host: String,
     pub listen_port: u16,
     pub gemini: GeminiConfig,
+    pub cloudcode_upstream_url: String,
     pub usage_dir: Option<PathBuf>,
 }
 
@@ -110,6 +112,7 @@ impl Default for Config {
             listen_host: DEFAULT_LISTEN_HOST.to_string(),
             listen_port: DEFAULT_LISTEN_PORT,
             gemini: GeminiConfig::default(),
+            cloudcode_upstream_url: DEFAULT_CLOUDCODE_UPSTREAM_URL.to_string(),
             usage_dir: None,
         }
     }
@@ -835,6 +838,7 @@ impl Config {
         validate_gemini_model(&self.gemini.default_model)?;
 
         validate_upstream_url(&self.gemini.base_url)?;
+        validate_upstream_url(&self.cloudcode_upstream_url)?;
         if let Some(ref key) = self.gemini.api_key
             && (!key.bytes().all(|b| (0x20..=0x7E).contains(&b))
                 || !key
@@ -869,6 +873,7 @@ impl Config {
             gemini_base_url: self.gemini.base_url.clone(),
             gemini_default_model: self.gemini.default_model.clone(),
             gemini_timeout_secs: self.gemini.timeout_secs,
+            cloudcode_upstream_url: self.cloudcode_upstream_url.clone(),
             api_key_configured: hint.is_some(),
             api_key_hint: hint,
         }
@@ -2913,6 +2918,69 @@ mod tests {
             assert!(
                 matches!(err, CoreError::InvalidPath { .. }),
                 "expected InvalidPath for FIFO, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloudcode_upstream_url_defaults_deserializes_compatibly_and_validates_s3() {
+        let cfg = Config::default();
+        assert_eq!(cfg.cloudcode_upstream_url, DEFAULT_CLOUDCODE_UPSTREAM_URL);
+        assert_eq!(
+            cfg.redacted().cloudcode_upstream_url,
+            DEFAULT_CLOUDCODE_UPSTREAM_URL
+        );
+
+        // Legacy config JSON without cloudcode_upstream_url deserializes to default.
+        let legacy: Config = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "listen_host": "127.0.0.1",
+                "listen_port": 4141,
+                "gemini": {
+                    "base_url": "https://generativelanguage.googleapis.com",
+                    "default_model": "gemini-4-hydrogen",
+                    "timeout_secs": 900
+                }
+            }"#,
+        )
+        .expect("legacy config must deserialize");
+        assert_eq!(
+            legacy.cloudcode_upstream_url,
+            DEFAULT_CLOUDCODE_UPSTREAM_URL
+        );
+        legacy.validate().expect("legacy config must validate");
+
+        // Loopback http and https prod URLs are accepted.
+        for ok_url in [
+            "https://daily-cloudcode-pa.googleapis.com",
+            "https://cloudcode-pa.googleapis.com",
+            "http://127.0.0.1:49999",
+            "http://localhost:49999",
+        ] {
+            let c = Config {
+                cloudcode_upstream_url: ok_url.to_string(),
+                ..Default::default()
+            };
+            c.validate()
+                .unwrap_or_else(|e| panic!("expected {ok_url} to be valid, got {e}"));
+        }
+
+        // Non-loopback http, embedded creds, and traversal are rejected (S3).
+        for bad_url in [
+            "http://daily-cloudcode-pa.googleapis.com",
+            "https://user:pass@cloudcode-pa.googleapis.com",
+            "https://cloudcode-pa.googleapis.com/../secret",
+            "ftp://cloudcode-pa.googleapis.com",
+            "",
+        ] {
+            let c = Config {
+                cloudcode_upstream_url: bad_url.to_string(),
+                ..Default::default()
+            };
+            assert!(
+                matches!(c.validate(), Err(CoreError::InvalidBaseUrl { .. })),
+                "expected InvalidBaseUrl for {bad_url}"
             );
         }
     }

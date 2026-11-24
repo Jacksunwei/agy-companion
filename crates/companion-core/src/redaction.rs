@@ -8,6 +8,7 @@ pub struct RedactedConfig {
     pub gemini_base_url: String,
     pub gemini_default_model: String,
     pub gemini_timeout_secs: u64,
+    pub cloudcode_upstream_url: String,
     pub api_key_configured: bool,
     pub api_key_hint: Option<String>,
 }

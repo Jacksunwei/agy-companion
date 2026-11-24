@@ -82,6 +82,7 @@ pub struct SaveSettingsArgs {
     pub clear_api_key: Option<bool>,
     pub default_model: Option<String>,
     pub base_url: Option<String>,
+    pub cloudcode_upstream_url: Option<String>,
     pub listen_port: Option<u16>,
     pub listen_host: Option<String>,
 }
@@ -93,6 +94,7 @@ impl fmt::Debug for SaveSettingsArgs {
             .field("clear_api_key", &self.clear_api_key)
             .field("default_model", &self.default_model)
             .field("base_url", &self.base_url)
+            .field("cloudcode_upstream_url", &self.cloudcode_upstream_url)
             .field("listen_port", &self.listen_port)
             .field("listen_host", &self.listen_host)
             .finish()
@@ -647,6 +649,12 @@ impl CompanionUiServer {
                 cfg.gemini.base_url = trimmed;
             }
 
+            if let Some(raw_cc_url) = args.cloudcode_upstream_url.as_deref() {
+                let trimmed = validate_trimmed_ascii_field(raw_cc_url, "cloudcode_upstream_url")?;
+                validate_upstream_url(&trimmed).map_err(|err| err.to_string())?;
+                cfg.cloudcode_upstream_url = trimmed;
+            }
+
             if let Some(raw_host) = args.listen_host.as_deref() {
                 validate_listen_host(raw_host).map_err(|err| err.to_string())?;
                 cfg.listen_host = raw_host.to_string();
@@ -1130,6 +1138,7 @@ mod tests {
                 api_key: Some(secret.to_string()),
                 default_model: Some("gemini-3.8-flash".to_string()),
                 base_url: Some("https://generativelanguage.googleapis.com".to_string()),
+                cloudcode_upstream_url: Some("https://cloudcode-pa.googleapis.com".to_string()),
                 listen_port: Some(closed_port),
                 listen_host: Some("127.0.0.1".to_string()),
                 clear_api_key: None,
@@ -1285,6 +1294,12 @@ mod tests {
             },
             SaveSettingsArgs {
                 base_url: Some("https://user:pass@generativelanguage.googleapis.com".to_string()),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                cloudcode_upstream_url: Some(
+                    "http://daily-cloudcode-pa.googleapis.com".to_string(),
+                ),
                 ..Default::default()
             },
         ];
