@@ -28,6 +28,10 @@ pub enum Commands {
         /// instead of failing with address-in-use (intended for sidecar startup).
         #[arg(long = "adopt-running")]
         adopt_running: bool,
+        /// Automatically exit cleanly after this many seconds with zero in-flight requests
+        /// (0 or omitted disables idle shutdown).
+        #[arg(long = "idle-shutdown-secs")]
+        idle_shutdown_secs: Option<u64>,
     },
     /// Run the embedded MCP App settings UI server over stdio.
     UiMcp {
@@ -114,6 +118,7 @@ mod tests {
                 port: Some(4242),
                 config: Some(PathBuf::from("/tmp/c.json")),
                 adopt_running: false,
+                idle_shutdown_secs: None,
             }
         );
 
@@ -125,6 +130,7 @@ mod tests {
                 port: None,
                 config: None,
                 adopt_running: false,
+                idle_shutdown_secs: None,
             }
         );
 
@@ -136,6 +142,33 @@ mod tests {
                 port: None,
                 config: None,
                 adopt_running: true,
+                idle_shutdown_secs: None,
+            }
+        );
+
+        let serve_idle =
+            Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs", "1800"])
+                .expect("serve --idle-shutdown-secs should parse");
+        assert_eq!(
+            serve_idle.command,
+            Commands::Serve {
+                port: None,
+                config: None,
+                adopt_running: false,
+                idle_shutdown_secs: Some(1800),
+            }
+        );
+
+        let serve_idle_zero =
+            Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs=0"])
+                .expect("serve --idle-shutdown-secs=0 should parse");
+        assert_eq!(
+            serve_idle_zero.command,
+            Commands::Serve {
+                port: None,
+                config: None,
+                adopt_running: false,
+                idle_shutdown_secs: Some(0),
             }
         );
 
@@ -225,6 +258,7 @@ mod tests {
                 port: Some(5151),
                 config: Some(PathBuf::from("/tmp/c.json")),
                 adopt_running: false,
+                idle_shutdown_secs: None,
             }
         );
 
@@ -282,6 +316,14 @@ mod tests {
         assert!(
             Cli::try_parse_from(["agy-companion", "models", "--port", "0"]).is_err(),
             "models --port 0 must fail during CLI parsing"
+        );
+        assert!(
+            Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs", "abc"]).is_err(),
+            "non-numeric --idle-shutdown-secs must fail"
+        );
+        assert!(
+            Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs", "-1"]).is_err(),
+            "negative --idle-shutdown-secs must fail"
         );
     }
 }

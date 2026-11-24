@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener as StdTcpListener;
+use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,10 @@ impl ChildGuard {
         self.child.as_ref().expect("child present").id()
     }
 
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().expect("child present").try_wait()
+    }
+
     fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
         self.child.take().expect("child present").wait_with_output()
     }
@@ -43,9 +47,215 @@ impl Drop for ChildGuard {
     }
 }
 
+const SERVE_START_MAX_ATTEMPTS: usize = 5;
+
 fn free_loopback_port() -> u16 {
-    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    // Allocate outside both macOS/Windows (49152..=65535) and Linux (32768..=60999)
+    // OS ephemeral port ranges so concurrent `127.0.0.1:0` listeners and outbound
+    // client sockets in the same test binary never collide with ports reserved for
+    // `agy-companion serve` subprocesses. Assign each PID a disjoint 50-port block
+    // (240 * 50 = 12_000 <= RANGE_SPAN) so consecutive parallel test processes do
+    // not overlap across their ~12 allocated ports.
+    const RANGE_START: u16 = 20_000;
+    const RANGE_END: u16 = 32_000;
+    const RANGE_SPAN: u16 = RANGE_END - RANGE_START + 1;
+    const BLOCK_STRIDE: u32 = 50;
+
+    struct PortAllocator {
+        cursor: u16,
+        claimed: HashSet<u16>,
+    }
+
+    static ALLOCATOR: OnceLock<Mutex<PortAllocator>> = OnceLock::new();
+    let allocator = ALLOCATOR.get_or_init(|| {
+        let initial_offset = u16::try_from((std::process::id() % 240) * BLOCK_STRIDE).unwrap_or(0);
+        Mutex::new(PortAllocator {
+            cursor: initial_offset,
+            claimed: HashSet::new(),
+        })
+    });
+
+    let mut state = allocator.lock().expect("lock port allocator");
+    for _ in 0..RANGE_SPAN {
+        let candidate = RANGE_START + state.cursor;
+        state.cursor = (state.cursor + 1) % RANGE_SPAN;
+        if state.claimed.contains(&candidate) {
+            continue;
+        }
+        if let Ok(listener) = StdTcpListener::bind((Ipv4Addr::LOCALHOST, candidate)) {
+            drop(listener);
+            state.claimed.insert(candidate);
+            return candidate;
+        }
+    }
+
+    panic!(
+        "unable to find an available loopback port in {RANGE_START}..={RANGE_END} (claimed={})",
+        state.claimed.len()
+    );
+}
+
+fn is_addr_in_use_stderr(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("address already in use")
+        || lower.contains("addrinuse")
+        || lower.contains("only one usage of each socket address")
+}
+
+fn proxy_pid_matches_child(
+    pid_path: &std::path::Path,
+    expected_pid: u32,
+    expected_port: u16,
+) -> bool {
+    let Ok(raw) = fs::read_to_string(pid_path) else {
+        return false;
+    };
+    let Ok(info) = serde_json::from_str::<companion_cli::daemon::ProxyPidInfo>(&raw) else {
+        return false;
+    };
+    info.pid == expected_pid && info.port == expected_port
+}
+
+async fn spawn_serve_with_port_picker<P, F>(
+    client: &reqwest::Client,
+    cfg_path: &std::path::Path,
+    mut pick_port: P,
+    mut build_cmd: F,
+) -> (ChildGuard, u16, reqwest::Response)
+where
+    P: FnMut(usize) -> u16,
+    F: FnMut(u16) -> Command,
+{
+    let mut last_addr_in_use = String::new();
+    for attempt in 1..=SERVE_START_MAX_ATTEMPTS {
+        let port = pick_port(attempt);
+        let mut cfg = Config::load_or_default(cfg_path).expect("load temp config");
+        if cfg.listen_port != port {
+            cfg.listen_port = port;
+            cfg.save_secure(cfg_path)
+                .expect("update temp config listen_port");
+        }
+        let pid_path = companion_cli::daemon::resolve_runtime_data_dir(&cfg)
+            .expect("resolve runtime data dir")
+            .join(companion_cli::daemon::PROXY_PID_FILENAME);
+
+        let child = build_cmd(port)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn serve");
+        let mut guard = ChildGuard::new(child);
+
+        let health_url = format!("http://127.0.0.1:{port}/health");
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        loop {
+            if let Some(status) = guard.try_wait().expect("try_wait serve") {
+                let output = tokio::task::spawn_blocking(move || guard.wait_with_output())
+                    .await
+                    .expect("join wait_with_output")
+                    .expect("wait_with_output");
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                if is_addr_in_use_stderr(&stderr) && attempt < SERVE_START_MAX_ATTEMPTS {
+                    last_addr_in_use = stderr;
+                    break;
+                }
+                panic!(
+                    "serve exited prematurely on port {port} (attempt {attempt}/{SERVE_START_MAX_ATTEMPTS}, status={status}): stdout={stdout:?}, stderr={stderr}"
+                );
+            }
+
+            let last_err = match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if proxy_pid_matches_child(&pid_path, guard.id(), port) {
+                        if let Some(status) = guard.try_wait().expect("try_wait serve after health")
+                        {
+                            let output =
+                                tokio::task::spawn_blocking(move || guard.wait_with_output())
+                                    .await
+                                    .expect("join wait_with_output")
+                                    .expect("wait_with_output");
+                            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                            if is_addr_in_use_stderr(&stderr) && attempt < SERVE_START_MAX_ATTEMPTS
+                            {
+                                last_addr_in_use = stderr;
+                                break;
+                            }
+                            panic!(
+                                "serve exited prematurely on port {port} (attempt {attempt}/{SERVE_START_MAX_ATTEMPTS}, status={status}): stderr={stderr}"
+                            );
+                        }
+                        return (guard, port, resp);
+                    }
+                    if let Some(status) = guard
+                        .try_wait()
+                        .expect("try_wait serve after foreign health")
+                    {
+                        let output = tokio::task::spawn_blocking(move || guard.wait_with_output())
+                            .await
+                            .expect("join wait_with_output")
+                            .expect("wait_with_output");
+                        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                        if is_addr_in_use_stderr(&stderr) && attempt < SERVE_START_MAX_ATTEMPTS {
+                            last_addr_in_use = stderr;
+                            break;
+                        }
+                        panic!(
+                            "serve exited prematurely on port {port} (attempt {attempt}/{SERVE_START_MAX_ATTEMPTS}, status={status}): stderr={stderr}"
+                        );
+                    }
+                    format!(
+                        "health on port {port} not yet owned by child pid {} in {}",
+                        guard.id(),
+                        pid_path.display()
+                    )
+                }
+                Ok(resp) => format!("unexpected status {}", resp.status()),
+                Err(err) => err.to_string(),
+            };
+
+            if Instant::now() >= deadline {
+                if let Some(status) = guard.try_wait().expect("try_wait serve at deadline") {
+                    let output = tokio::task::spawn_blocking(move || guard.wait_with_output())
+                        .await
+                        .expect("join wait_with_output")
+                        .expect("wait_with_output");
+                    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                    if is_addr_in_use_stderr(&stderr) && attempt < SERVE_START_MAX_ATTEMPTS {
+                        last_addr_in_use = stderr;
+                        break;
+                    }
+                    panic!(
+                        "serve exited before becoming healthy on port {port} (attempt {attempt}/{SERVE_START_MAX_ATTEMPTS}, status={status}): stderr={stderr}"
+                    );
+                }
+                panic!(
+                    "proxy never became healthy on port {port} (attempt {attempt}/{SERVE_START_MAX_ATTEMPTS}, last_err={last_err})"
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    panic!(
+        "serve failed to bind after {SERVE_START_MAX_ATTEMPTS} attempts due to AddrInUse; last stderr={last_addr_in_use}"
+    );
+}
+
+async fn spawn_serve_and_wait_healthy<F>(
+    client: &reqwest::Client,
+    cfg_path: &std::path::Path,
+    build_cmd: F,
+) -> (ChildGuard, u16, reqwest::Response)
+where
+    F: FnMut(u16) -> Command,
+{
+    spawn_serve_with_port_picker(client, cfg_path, |_| free_loopback_port(), build_cmd).await
 }
 
 async fn spawn_mock_health(
@@ -150,35 +360,20 @@ async fn serve_binds_loopback_serves_health_and_exits_cleanly_on_sigterm() {
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
 
-    let port = free_loopback_port();
-    let child = Command::new(BIN)
-        .args(["serve", "--port", &port.to_string(), "--config"])
-        .arg(&cfg_path)
-        .env("GEMINI_API_KEY", "AIzaSyServeEnvSecret7777")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn serve");
-    let guard = ChildGuard::new(child);
-
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()
         .expect("client");
-    let health_url = format!("http://127.0.0.1:{port}/health");
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let resp = loop {
-        match client.get(&health_url).send().await {
-            Ok(resp) if resp.status().is_success() => break resp,
-            _ if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(err) => panic!("proxy never became healthy: {err}"),
-            Ok(resp) => panic!("proxy returned unexpected status: {}", resp.status()),
-        }
-    };
+    let (guard, _port, resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["serve", "--port", &port.to_string(), "--config"])
+            .arg(&cfg_path)
+            .env("GEMINI_API_KEY", "AIzaSyServeEnvSecret7777");
+        cmd
+    })
+    .await;
 
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     assert_eq!(
@@ -1172,4 +1367,442 @@ async fn doctor_rejects_trailing_slash_and_dot_suffix_symlinks_via_flag_and_env(
     }
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn serve_writes_0600_proxy_pid_and_proxy_log_in_isolated_dir_and_cleans_pid_on_sigterm() {
+    let temp = TempDir::new().expect("tempdir");
+    let cfg_path = temp.path().join("config.json");
+    let usage_dir = temp.path().join("usage");
+
+    let mut cfg = Config::default();
+    cfg.gemini.api_key = Some("AIzaSyPidLogSecret12345".to_string());
+    cfg.usage_dir = Some(usage_dir);
+    cfg.save_secure(&cfg_path).expect("save_secure");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("client");
+    let (guard, port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["serve", "--port", &port.to_string(), "--config"])
+            .arg(&cfg_path);
+        cmd
+    })
+    .await;
+    let expected_pid = guard.id();
+
+    let pid_path = temp.path().join("proxy.pid");
+    let log_path = temp.path().join("proxy.log");
+    assert!(pid_path.is_file(), "proxy.pid must exist in isolated dir");
+    assert!(log_path.is_file(), "proxy.log must exist in isolated dir");
+
+    let pid_json: Value =
+        serde_json::from_str(&fs::read_to_string(&pid_path).expect("read proxy.pid"))
+            .expect("parse proxy.pid JSON");
+    assert_eq!(pid_json["pid"], expected_pid);
+    assert_eq!(pid_json["port"], port);
+    assert_eq!(pid_json["version"], env!("CARGO_PKG_VERSION"));
+    assert!(pid_json["started_at_ms"].as_u64().is_some_and(|v| v > 0));
+    assert!(
+        pid_json["binary_path"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&pid_path)
+                .expect("pid meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&log_path)
+                .expect("log meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let log_text = fs::read_to_string(&log_path).expect("read proxy.log");
+    assert!(
+        log_text.contains("agy-companion proxy listening"),
+        "proxy.log missing startup line: {log_text}"
+    );
+    assert!(!log_text.contains("AIzaSyPidLogSecret12345"));
+
+    #[cfg(unix)]
+    {
+        let kill_status = Command::new("kill")
+            .args(["-TERM", &expected_pid.to_string()])
+            .status()
+            .expect("send SIGTERM");
+        assert!(kill_status.success());
+
+        let output = tokio::task::spawn_blocking(move || guard.wait_with_output())
+            .await
+            .expect("join wait")
+            .expect("wait_with_output");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            !pid_path.exists(),
+            "proxy.pid must be removed on clean SIGTERM shutdown"
+        );
+    }
+}
+
+#[tokio::test]
+async fn serve_idle_shutdown_waits_for_in_flight_stream_then_exits_zero() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Mock upstream SSE server that holds the stream open for 1.6s (> 1s idle timeout).
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream");
+    let upstream_port = upstream_listener.local_addr().expect("addr").port();
+    let upstream_handle = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = upstream_listener.accept().await {
+            let mut req_buf = [0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let chunk1 =
+                b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"part1\"}]}}]}\n\n";
+            let _ = stream
+                .write_all(format!("{:x}\r\n", chunk1.len()).as_bytes())
+                .await;
+            let _ = stream.write_all(chunk1).await;
+            let _ = stream.write_all(b"\r\n").await;
+            let _ = stream.flush().await;
+
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+
+            let chunk2 = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"part2\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}\n\n";
+            let _ = stream
+                .write_all(format!("{:x}\r\n", chunk2.len()).as_bytes())
+                .await;
+            let _ = stream.write_all(chunk2).await;
+            let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let temp = TempDir::new().expect("tempdir");
+    let cfg_path = temp.path().join("config.json");
+    let usage_dir = temp.path().join("usage");
+
+    let mut cfg = Config::default();
+    cfg.gemini.base_url = format!("http://127.0.0.1:{upstream_port}");
+    cfg.gemini.api_key = Some("AIzaSyIdleStreamKey1234".to_string());
+    cfg.usage_dir = Some(usage_dir);
+    cfg.save_secure(&cfg_path).expect("save_secure");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client");
+    let (guard, port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["serve", "--port", &port.to_string(), "--config"])
+            .arg(&cfg_path)
+            .args(["--idle-shutdown-secs", "1"]);
+        cmd
+    })
+    .await;
+
+    let pid_path = temp.path().join("proxy.pid");
+    assert!(pid_path.is_file());
+
+    // Start slow SSE stream; proxy must stay alive through the entire 1.6s stream despite 1s idle timeout.
+    let stream_started = Instant::now();
+    let stream_resp = client
+        .post(format!(
+            "http://127.0.0.1:{port}/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse"
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#)
+        .send()
+        .await
+        .expect("stream request");
+    assert_eq!(stream_resp.status(), reqwest::StatusCode::OK);
+    let stream_body = stream_resp.text().await.expect("read full stream");
+    let stream_elapsed = stream_started.elapsed();
+    assert!(
+        stream_elapsed >= Duration::from_millis(1400),
+        "stream ended too early ({stream_elapsed:?}); idle shutdown must not interrupt active stream"
+    );
+    assert!(stream_body.contains("part1"));
+    assert!(stream_body.contains("part2"));
+
+    // Now that zero requests are in flight, serve must exit cleanly with code 0 after ~1s idle.
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || guard.wait_with_output()),
+    )
+    .await
+    .expect("serve did not exit after idle shutdown timeout")
+    .expect("join wait")
+    .expect("wait_with_output");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "idle shutdown must exit 0; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !pid_path.exists(),
+        "proxy.pid must be removed on clean idle shutdown"
+    );
+
+    upstream_handle.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms() {
+    let temp = TempDir::new().expect("tempdir");
+    let cfg_path = temp.path().join("config.json");
+    let usage_dir = temp.path().join("usage");
+
+    let cfg = Config {
+        usage_dir: Some(usage_dir),
+        ..Default::default()
+    };
+    cfg.save_secure(&cfg_path).expect("save_secure");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("client");
+    let (primary_guard, port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["serve", "--port", &port.to_string(), "--config"])
+            .arg(&cfg_path);
+        cmd
+    })
+    .await;
+    let primary_pid = primary_guard.id();
+    let health_url = format!("http://127.0.0.1:{port}/health");
+
+    let pid_path = temp.path().join("proxy.pid");
+    let primary_pid_json: Value =
+        serde_json::from_str(&fs::read_to_string(&pid_path).expect("read pid")).expect("parse");
+    assert_eq!(primary_pid_json["pid"], primary_pid);
+
+    // Start standby with --adopt-running.
+    let standby_child = Command::new(BIN)
+        .args(["serve", "--port", &port.to_string(), "--config"])
+        .arg(&cfg_path)
+        .arg("--adopt-running")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn standby");
+    let mut standby_guard = ChildGuard::new(standby_child);
+    let standby_pid = standby_guard.id();
+
+    // Standby must NOT clobber primary's proxy.pid while parked.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    if let Some(status) = standby_guard.try_wait().expect("try_wait standby") {
+        let output = tokio::task::spawn_blocking(move || standby_guard.wait_with_output())
+            .await
+            .expect("join standby")
+            .expect("wait standby");
+        panic!(
+            "standby exited prematurely while parked (status={status}): stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let parked_pid_json: Value =
+        serde_json::from_str(&fs::read_to_string(&pid_path).expect("read pid")).expect("parse");
+    assert_eq!(parked_pid_json["pid"], primary_pid);
+
+    // Stop primary; standby must take over within ~1.5s and update proxy.pid to standby_pid.
+    let takeover_start = Instant::now();
+    let kill_primary = Command::new("kill")
+        .args(["-TERM", &primary_pid.to_string()])
+        .status()
+        .expect("kill primary");
+    assert!(kill_primary.success());
+    let primary_out = tokio::task::spawn_blocking(move || primary_guard.wait_with_output())
+        .await
+        .expect("join primary")
+        .expect("wait primary");
+    assert_eq!(primary_out.status.code(), Some(0));
+
+    let takeover_deadline = Instant::now() + Duration::from_millis(2000);
+    loop {
+        if let Some(status) = standby_guard.try_wait().expect("try_wait standby") {
+            let output = tokio::task::spawn_blocking(move || standby_guard.wait_with_output())
+                .await
+                .expect("join standby")
+                .expect("wait standby");
+            panic!(
+                "standby exited prematurely during takeover (status={status}): stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if let Ok(raw) = fs::read_to_string(&pid_path)
+            && let Ok(parsed) = serde_json::from_str::<Value>(&raw)
+            && parsed["pid"] == standby_pid
+            && let Ok(resp) = client.get(&health_url).send().await
+            && resp.status().is_success()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < takeover_deadline,
+            "standby failed to take over within 2s (elapsed={:?})",
+            takeover_start.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Stop standby cleanly and verify proxy.pid is removed.
+    let kill_standby = Command::new("kill")
+        .args(["-TERM", &standby_pid.to_string()])
+        .status()
+        .expect("kill standby");
+    assert!(kill_standby.success());
+    let standby_out = tokio::task::spawn_blocking(move || standby_guard.wait_with_output())
+        .await
+        .expect("join standby")
+        .expect("wait standby");
+    assert_eq!(standby_out.status.code(), Some(0));
+    assert!(!pid_path.exists());
+}
+
+#[tokio::test]
+async fn doctor_cli_quarantines_placeholder_gemini_api_key() {
+    let (port, handle) = spawn_mock_health("ok", env!("CARGO_PKG_VERSION"), PROTOCOL_VERSION).await;
+    let temp = TempDir::new().expect("tempdir");
+    let cfg_path = temp.path().join("config.json");
+    Config::default().save_secure(&cfg_path).expect("save");
+
+    let output = tokio::process::Command::new(BIN)
+        .args(["doctor", "--config"])
+        .arg(&cfg_path)
+        .args(["--port", &port.to_string(), "--json"])
+        .env("GEMINI_API_KEY", companion_core::PROXY_PLACEHOLDER_API_KEY)
+        .output()
+        .await
+        .expect("run doctor");
+    handle.abort();
+
+    assert_eq!(output.status.code(), Some(0));
+    let parsed: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parse doctor JSON");
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["env"]["gemini_api_key_set"], false);
+    let key_check = parsed["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "env_gemini_api_key")
+        .expect("env_gemini_api_key check");
+    assert_eq!(key_check["status"], "warn");
+}
+
+#[tokio::test]
+async fn spawn_serve_rejects_foreign_health_and_retries_fresh_port() {
+    let (foreign_port, foreign_handle) =
+        spawn_mock_health("ok", env!("CARGO_PKG_VERSION"), PROTOCOL_VERSION).await;
+
+    let temp = TempDir::new().expect("tempdir");
+    let cfg_path = temp.path().join("config.json");
+    let usage_dir = temp.path().join("usage");
+    let cfg = Config {
+        usage_dir: Some(usage_dir),
+        ..Default::default()
+    };
+    cfg.save_secure(&cfg_path).expect("save_secure");
+
+    // Pre-seed a stale proxy.pid with matching port but non-matching PID (0) to verify
+    // that foreign /health 200 OK cannot pass ownership verification even if port matches.
+    let pid_path = temp.path().join(companion_cli::daemon::PROXY_PID_FILENAME);
+    let stale_pid = companion_cli::daemon::ProxyPidInfo {
+        pid: 0,
+        port: foreign_port,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at_ms: 1,
+        binary_path: BIN.to_string(),
+    };
+    fs::write(
+        &pid_path,
+        serde_json::to_vec(&stale_pid).expect("serialize stale pid"),
+    )
+    .expect("write stale pid");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("client");
+
+    let mut attempts_seen = 0usize;
+    let (guard, actual_port, resp) = spawn_serve_with_port_picker(
+        &client,
+        &cfg_path,
+        |attempt| {
+            attempts_seen = attempt;
+            if attempt == 1 {
+                foreign_port
+            } else {
+                free_loopback_port()
+            }
+        },
+        |port| {
+            let mut cmd = Command::new(BIN);
+            cmd.args(["serve", "--port", &port.to_string(), "--config"])
+                .arg(&cfg_path);
+            cmd
+        },
+    )
+    .await;
+
+    foreign_handle.abort();
+
+    assert!(
+        attempts_seen >= 2,
+        "expected AddrInUse retry after foreign /health rejection, saw attempts={attempts_seen}"
+    );
+    assert_ne!(
+        actual_port, foreign_port,
+        "child must retry onto a fresh port instead of accepting foreign /health"
+    );
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(
+        proxy_pid_matches_child(&pid_path, guard.id(), actual_port),
+        "proxy.pid must match our child's PID and fresh port"
+    );
+
+    #[cfg(unix)]
+    {
+        let kill_status = Command::new("kill")
+            .args(["-TERM", &guard.id().to_string()])
+            .status()
+            .expect("send SIGTERM");
+        assert!(kill_status.success());
+
+        let output = tokio::task::spawn_blocking(move || guard.wait_with_output())
+            .await
+            .expect("join wait")
+            .expect("wait_with_output");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(!pid_path.exists());
+    }
 }

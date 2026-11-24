@@ -24,6 +24,7 @@ pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 pub const CONFIG_PATH_ENV_VAR: &str = "AGY_COMPANION_CONFIG";
 pub const XDG_CONFIG_HOME_ENV_VAR: &str = "XDG_CONFIG_HOME";
 pub const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
+pub const PROXY_PLACEHOLDER_API_KEY: &str = "agy-companion-local";
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -127,6 +128,12 @@ pub fn validate_listen_host(host: &str) -> Result<(), CoreError> {
             host: host.to_string(),
         }),
     }
+}
+
+/// Returns `true` when `key` (ignoring surrounding whitespace) equals the
+/// internal local-proxy placeholder sentinel (`"agy-companion-local"`).
+pub fn is_placeholder_api_key(key: &str) -> bool {
+    key.trim() == PROXY_PLACEHOLDER_API_KEY
 }
 
 fn decode_ascii_hex_nibble(byte: u8) -> Option<u8> {
@@ -461,12 +468,12 @@ pub fn validate_path(path: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn reject_symlink_config_file(path: &Path) -> Result<(), CoreError> {
+fn reject_symlink_target_file(path: &Path, label: &str) -> Result<(), CoreError> {
     // Strip trailing separators/dot components so POSIX lstat(2) inspects the symlink itself.
     let check_path: PathBuf = path.components().collect();
     match fs::symlink_metadata(&check_path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::InvalidPath {
-            reason: "symbolic links are not allowed for config files".to_string(),
+            reason: format!("symbolic links are not allowed for {label}"),
         }),
         Ok(_) => Ok(()),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
@@ -699,14 +706,14 @@ fn resolve_config_path_for_platform(
         .join("config.json"))
 }
 
-fn resolve_usage_dir_for_platform(
+fn resolve_data_dir_for_platform(
     xdg_data_home: Option<&str>,
     platform_data_local_dir: Option<PathBuf>,
     home: Option<PathBuf>,
     platform: TargetPlatform,
 ) -> Result<PathBuf, CoreError> {
     if let Some(xdg_base) = resolve_xdg_base(xdg_data_home, platform)? {
-        return Ok(xdg_base.join("agy-companion").join("usage"));
+        return Ok(xdg_base.join("agy-companion"));
     }
 
     match platform {
@@ -715,7 +722,7 @@ fn resolve_usage_dir_for_platform(
                 platform_data_local_dir.filter(|dir| is_non_empty_dir(dir))
             {
                 validate_platform_dir(&data_local_dir, platform)?;
-                return Ok(data_local_dir.join("agy-companion").join("usage"));
+                return Ok(data_local_dir.join("agy-companion"));
             }
         }
         TargetPlatform::Unix => {}
@@ -725,11 +732,30 @@ fn resolve_usage_dir_for_platform(
         .filter(|dir| is_non_empty_dir(dir))
         .ok_or(CoreError::HomeDirUnavailable)?;
     validate_platform_dir(&home_dir, platform)?;
-    Ok(home_dir
-        .join(".local")
-        .join("share")
-        .join("agy-companion")
-        .join("usage"))
+    Ok(home_dir.join(".local").join("share").join("agy-companion"))
+}
+
+fn resolve_usage_dir_for_platform(
+    xdg_data_home: Option<&str>,
+    platform_data_local_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+    platform: TargetPlatform,
+) -> Result<PathBuf, CoreError> {
+    Ok(
+        resolve_data_dir_for_platform(xdg_data_home, platform_data_local_dir, home, platform)?
+            .join("usage"),
+    )
+}
+
+fn resolve_plugins_dir_for_platform(
+    home: Option<PathBuf>,
+    platform: TargetPlatform,
+) -> Result<PathBuf, CoreError> {
+    let home_dir = home
+        .filter(|dir| is_non_empty_dir(dir))
+        .ok_or(CoreError::HomeDirUnavailable)?;
+    validate_platform_dir(&home_dir, platform)?;
+    Ok(home_dir.join(".gemini").join("config").join("plugins"))
 }
 
 fn read_optional_env(var_name: &str) -> Result<Option<String>, CoreError> {
@@ -749,8 +775,16 @@ pub fn resolve_config_path(
     resolve_config_path_for_platform(env_override, None, None, home, TargetPlatform::current())
 }
 
+pub fn resolve_data_dir(home: Option<PathBuf>) -> Result<PathBuf, CoreError> {
+    resolve_data_dir_for_platform(None, None, home, TargetPlatform::current())
+}
+
 pub fn resolve_usage_dir(home: Option<PathBuf>) -> Result<PathBuf, CoreError> {
     resolve_usage_dir_for_platform(None, None, home, TargetPlatform::current())
+}
+
+pub fn resolve_plugins_dir(home: Option<PathBuf>) -> Result<PathBuf, CoreError> {
+    resolve_plugins_dir_for_platform(home, TargetPlatform::current())
 }
 
 pub fn default_config_path() -> Result<PathBuf, CoreError> {
@@ -777,7 +811,7 @@ pub fn default_config_path() -> Result<PathBuf, CoreError> {
     )
 }
 
-pub fn default_usage_dir() -> Result<PathBuf, CoreError> {
+pub fn default_data_dir() -> Result<PathBuf, CoreError> {
     let platform = TargetPlatform::current();
     let xdg_data_home = read_optional_env(XDG_DATA_HOME_ENV_VAR)?;
     #[cfg(windows)]
@@ -785,12 +819,20 @@ pub fn default_usage_dir() -> Result<PathBuf, CoreError> {
     #[cfg(not(windows))]
     let platform_data_local_dir = None;
 
-    resolve_usage_dir_for_platform(
+    resolve_data_dir_for_platform(
         xdg_data_home.as_deref(),
         platform_data_local_dir,
         dirs::home_dir(),
         platform,
     )
+}
+
+pub fn default_usage_dir() -> Result<PathBuf, CoreError> {
+    Ok(default_data_dir()?.join("usage"))
+}
+
+pub fn default_plugins_dir() -> Result<PathBuf, CoreError> {
+    resolve_plugins_dir_for_platform(dirs::home_dir(), TargetPlatform::current())
 }
 
 /// Returns `true` if `model` belongs to the Gemini 3 or Gemini 4 model family.
@@ -964,33 +1006,7 @@ impl Config {
     pub fn save_secure(&self, path: &Path) -> Result<(), CoreError> {
         validate_path(path)?;
         self.validate()?;
-        reject_symlink_config_file(path)?;
-
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| CoreError::InvalidPath {
-                reason: "config path must include a valid UTF-8 file name".to_string(),
-            })?;
-
-        let parent = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-
-        if !parent.exists() {
-            let mut dir_builder = fs::DirBuilder::new();
-            dir_builder.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                dir_builder.mode(0o700);
-            }
-            dir_builder.create(parent).map_err(|source| CoreError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
+        reject_symlink_target_file(path, "config files")?;
 
         let mut payload =
             serde_json::to_string_pretty(self).map_err(|err| CoreError::SerializeConfig {
@@ -998,56 +1014,91 @@ impl Config {
             })?;
         payload.push('\n');
 
-        let tmp_path = parent.join(format!(".{file_name}.tmp.{}", Uuid::new_v4()));
+        write_file_atomic_secure(path, payload.as_bytes())
+    }
+}
 
-        let mut open_opts = fs::OpenOptions::new();
-        open_opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open_opts.mode(0o600);
-        }
+/// Atomically writes `payload` to `path` with mode `0600` (and `0700` parent dir on Unix),
+/// rejecting path traversal, NUL bytes, and symlink targets fail-closed.
+pub fn write_file_atomic_secure(path: &Path, payload: &[u8]) -> Result<(), CoreError> {
+    validate_path(path)?;
+    reject_symlink_target_file(path, "target files")?;
 
-        let mut file = open_opts.open(&tmp_path).map_err(|source| CoreError::Io {
-            path: tmp_path.clone(),
-            source,
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CoreError::InvalidPath {
+            reason: "target path must include a valid UTF-8 file name".to_string(),
         })?;
 
-        let write_result = (|| -> std::io::Result<()> {
-            file.write_all(payload.as_bytes())?;
-            file.sync_all()?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            }
-            Ok(())
-        })();
-        drop(file);
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
 
-        if let Err(source) = write_result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(CoreError::Io {
-                path: tmp_path,
-                source,
-            });
+    if !parent.exists() {
+        let mut dir_builder = fs::DirBuilder::new();
+        dir_builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dir_builder.mode(0o700);
         }
-
-        #[cfg(windows)]
-        let rename_result = retry_rename_on_permission_denied(&tmp_path, path);
-        #[cfg(not(windows))]
-        let rename_result = fs::rename(&tmp_path, path);
-
-        if let Err(source) = rename_result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(CoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-
-        Ok(())
+        dir_builder.create(parent).map_err(|source| CoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
+
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}", Uuid::new_v4()));
+
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+
+    let mut file = open_opts.open(&tmp_path).map_err(|source| CoreError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(payload)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    drop(file);
+
+    if let Err(source) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(CoreError::Io {
+            path: tmp_path,
+            source,
+        });
+    }
+
+    #[cfg(windows)]
+    let rename_result = retry_rename_on_permission_denied(&tmp_path, path);
+    #[cfg(not(windows))]
+    let rename_result = fs::rename(&tmp_path, path);
+
+    if let Err(source) = rename_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(CoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -2993,5 +3044,300 @@ mod tests {
                 "expected InvalidBaseUrl for {bad_url}"
             );
         }
+    }
+
+    #[test]
+    fn placeholder_api_key_predicate_and_validation_behavior() {
+        assert!(is_placeholder_api_key(PROXY_PLACEHOLDER_API_KEY));
+        assert!(is_placeholder_api_key("  agy-companion-local  "));
+        assert!(is_placeholder_api_key("\tagy-companion-local\n"));
+
+        for non_placeholder in [
+            "",
+            "   ",
+            "agy-companion-local-2",
+            "AGY-COMPANION-LOCAL",
+            "AIzaSyRealKeyTest1234",
+        ] {
+            assert!(
+                !is_placeholder_api_key(non_placeholder),
+                "expected false for '{non_placeholder}'"
+            );
+        }
+
+        // Legacy configs containing syntactically valid placeholder still validate so users
+        // aren't locked out of loading/clearing config, while redacted() treats it as unset.
+        for legacy_placeholder in [PROXY_PLACEHOLDER_API_KEY, "  agy-companion-local  "] {
+            let cfg = Config {
+                gemini: GeminiConfig {
+                    api_key: Some(legacy_placeholder.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            cfg.validate()
+                .expect("legacy placeholder stays syntactically loadable");
+            let redacted = cfg.redacted();
+            assert!(!redacted.api_key_configured);
+            assert_eq!(redacted.api_key_hint, None);
+        }
+
+        // Control characters / non-ASCII variants of the placeholder still fail header validation.
+        for bad_placeholder in [
+            "\tagy-companion-local\n",
+            "agy-companion-local\r\n",
+            "agy-companion-local\u{00A0}",
+        ] {
+            let cfg = Config {
+                gemini: GeminiConfig {
+                    api_key: Some(bad_placeholder.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(CoreError::InvalidApiKey)),
+                "expected InvalidApiKey for '{bad_placeholder:?}'"
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_data_dir_and_plugins_dir_with_s6_precedence() {
+        // Unix XDG_DATA_HOME precedence & fallback (no macOS Library/Application Support drift).
+        let unix_xdg = resolve_data_dir_for_platform(
+            Some("/tmp/xdg-data"),
+            Some(PathBuf::from("/Users/test/Library/Application Support")),
+            Some(PathBuf::from("/Users/test")),
+            TargetPlatform::Unix,
+        )
+        .expect("unix xdg data dir");
+        assert_eq!(unix_xdg, PathBuf::from("/tmp/xdg-data/agy-companion"));
+
+        let unix_default = resolve_data_dir_for_platform(
+            Some("relative/path"),
+            Some(PathBuf::from("/Users/test/Library/Application Support")),
+            Some(PathBuf::from("/Users/test")),
+            TargetPlatform::Unix,
+        )
+        .expect("unix relative xdg falls back to ~/.local/share");
+        assert_eq!(
+            unix_default,
+            PathBuf::from("/Users/test/.local/share/agy-companion")
+        );
+
+        let unix_blank = resolve_data_dir_for_platform(
+            Some("   "),
+            None,
+            Some(PathBuf::from("/Users/test")),
+            TargetPlatform::Unix,
+        )
+        .expect("blank xdg falls back");
+        assert_eq!(
+            unix_blank,
+            PathBuf::from("/Users/test/.local/share/agy-companion")
+        );
+
+        // Windows precedence: XDG_DATA_HOME -> %LOCALAPPDATA% -> %USERPROFILE%\.local\share.
+        let win_xdg = resolve_data_dir_for_platform(
+            Some(r"C:\XdgData"),
+            Some(PathBuf::from(r"C:\Users\Alice\AppData\Local")),
+            Some(PathBuf::from(r"C:\Users\Alice")),
+            TargetPlatform::Windows,
+        )
+        .expect("windows xdg data dir");
+        assert_eq!(win_xdg, PathBuf::from(r"C:\XdgData").join("agy-companion"));
+
+        let win_local = resolve_data_dir_for_platform(
+            None,
+            Some(PathBuf::from(r"C:\Users\Alice\AppData\Local")),
+            Some(PathBuf::from(r"C:\Users\Alice")),
+            TargetPlatform::Windows,
+        )
+        .expect("windows localappdata");
+        assert_eq!(
+            win_local,
+            PathBuf::from(r"C:\Users\Alice\AppData\Local").join("agy-companion")
+        );
+
+        let win_home = resolve_data_dir_for_platform(
+            None,
+            None,
+            Some(PathBuf::from(r"C:\Users\Alice")),
+            TargetPlatform::Windows,
+        )
+        .expect("windows home fallback");
+        assert_eq!(
+            win_home,
+            PathBuf::from(r"C:\Users\Alice")
+                .join(".local")
+                .join("share")
+                .join("agy-companion")
+        );
+
+        // Fail-closed traversal / NUL / missing home checks.
+        for bad in ["/tmp/../escape", "/tmp/bad\0data"] {
+            assert!(matches!(
+                resolve_data_dir_for_platform(
+                    Some(bad),
+                    None,
+                    Some(PathBuf::from("/Users/test")),
+                    TargetPlatform::Unix,
+                ),
+                Err(CoreError::InvalidPath { .. })
+            ));
+        }
+        assert!(matches!(
+            resolve_data_dir_for_platform(None, None, None, TargetPlatform::Unix),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+
+        // Parity between default_usage_dir() and default_data_dir().join("usage").
+        if let (Ok(data_dir), Ok(usage_dir)) = (default_data_dir(), default_usage_dir()) {
+            assert_eq!(usage_dir, data_dir.join("usage"));
+        }
+        let resolved_data =
+            resolve_data_dir(Some(PathBuf::from("/Users/test"))).expect("resolve_data_dir");
+        let resolved_usage =
+            resolve_usage_dir(Some(PathBuf::from("/Users/test"))).expect("resolve_usage_dir");
+        assert_eq!(resolved_usage, resolved_data.join("usage"));
+
+        // Plugins dir resolution on Unix & Windows + fail-closed checks.
+        assert_eq!(
+            resolve_plugins_dir_for_platform(
+                Some(PathBuf::from("/Users/test")),
+                TargetPlatform::Unix
+            )
+            .expect("unix plugins dir"),
+            PathBuf::from("/Users/test/.gemini/config/plugins")
+        );
+        assert_eq!(
+            resolve_plugins_dir_for_platform(
+                Some(PathBuf::from(r"C:\Users\Alice")),
+                TargetPlatform::Windows
+            )
+            .expect("windows plugins dir"),
+            PathBuf::from(r"C:\Users\Alice")
+                .join(".gemini")
+                .join("config")
+                .join("plugins")
+        );
+        assert_eq!(
+            resolve_plugins_dir(Some(PathBuf::from("/Users/test"))).expect("resolve_plugins_dir"),
+            PathBuf::from("/Users/test/.gemini/config/plugins")
+        );
+        assert!(matches!(
+            resolve_plugins_dir_for_platform(None, TargetPlatform::Unix),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+        assert!(matches!(
+            resolve_plugins_dir_for_platform(Some(PathBuf::from("   ")), TargetPlatform::Unix),
+            Err(CoreError::HomeDirUnavailable)
+        ));
+        assert!(matches!(
+            resolve_plugins_dir_for_platform(
+                Some(PathBuf::from("/Users/../escape")),
+                TargetPlatform::Unix
+            ),
+            Err(CoreError::InvalidPath { .. })
+        ));
+    }
+
+    #[test]
+    fn write_file_atomic_secure_enforces_permissions_symlink_rejection_and_cleanup() {
+        let tmp = TempDir::new().expect("temp dir");
+        let nested_dir = tmp.path().join("state-dir");
+        let target = nested_dir.join("proxy.pid");
+
+        write_file_atomic_secure(&target, b"{\"pid\":123}\n").expect("atomic write succeeds");
+        assert_eq!(fs::read(&target).expect("read target"), b"{\"pid\":123}\n");
+
+        // Zero leftover .tmp. files in parent directory.
+        let leftover_tmps: Vec<_> = fs::read_dir(&nested_dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "leftover tmp files: {leftover_tmps:?}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = fs::metadata(&nested_dir)
+                .expect("dir meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            let file_mode = fs::metadata(&target)
+                .expect("file meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600);
+
+            // Reject live symlink, dangling symlink, and trailing-slash symlink without mutating target.
+            let real_target = tmp.path().join("real.txt");
+            fs::write(&real_target, b"original").expect("write real target");
+            let live_link = tmp.path().join("live.link");
+            std::os::unix::fs::symlink(&real_target, &live_link).expect("create live symlink");
+            let err = write_file_atomic_secure(&live_link, b"overwritten")
+                .expect_err("live symlink must be rejected");
+            assert!(
+                matches!(&err, CoreError::InvalidPath { reason } if reason.contains("symbolic link")),
+                "unexpected error: {err:?}"
+            );
+            assert_eq!(fs::read(&real_target).expect("read real"), b"original");
+
+            let dangling_link = tmp.path().join("dangling.link");
+            std::os::unix::fs::symlink(tmp.path().join("missing.txt"), &dangling_link)
+                .expect("create dangling symlink");
+            let err = write_file_atomic_secure(&dangling_link, b"data")
+                .expect_err("dangling symlink must be rejected");
+            assert!(
+                matches!(&err, CoreError::InvalidPath { reason } if reason.contains("symbolic link")),
+                "unexpected error: {err:?}"
+            );
+
+            let trailing_link = PathBuf::from(format!("{}/", live_link.display()));
+            let err = write_file_atomic_secure(&trailing_link, b"data")
+                .expect_err("trailing-slash symlink must be rejected");
+            assert!(
+                matches!(&err, CoreError::InvalidPath { reason } if reason.contains("symbolic link")),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        // Reject .. traversal and NUL bytes.
+        assert!(matches!(
+            write_file_atomic_secure(&tmp.path().join("../escape.txt"), b"x"),
+            Err(CoreError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            write_file_atomic_secure(Path::new("/tmp/bad\0file"), b"x"),
+            Err(CoreError::InvalidPath { .. })
+        ));
+
+        // Renaming over an existing directory fails with CoreError::Io and cleans up temp file.
+        let dir_target = tmp.path().join("existing_dir");
+        fs::create_dir(&dir_target).expect("create dir target");
+        let err = write_file_atomic_secure(&dir_target, b"data")
+            .expect_err("rename over directory must fail");
+        assert!(
+            matches!(err, CoreError::Io { .. }),
+            "expected CoreError::Io, got {err:?}"
+        );
+        let leftover_root_tmps: Vec<_> = fs::read_dir(tmp.path())
+            .expect("read tmp root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover_root_tmps.is_empty(),
+            "leftover tmp files after rename error: {leftover_root_tmps:?}"
+        );
     }
 }

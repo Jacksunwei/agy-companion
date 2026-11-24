@@ -10,6 +10,7 @@ use std::future::Future;
 use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -55,6 +56,8 @@ pub enum ProxyError {
 pub(crate) struct ActiveProvider {
     pub(crate) provider: Arc<dyn ProviderAdapter>,
     pub(crate) cloudcode: Arc<CloudCodeClient>,
+    pub(crate) cloudcode_upstream_url: String,
+    pub(crate) cloudcode_timeout_secs: u64,
     pub(crate) has_configured_api_key: bool,
     pub(crate) default_model: String,
 }
@@ -104,10 +107,74 @@ enum ProviderSource {
     HotReload(Box<HotReloadProvider>),
 }
 
+struct ActivityTracker {
+    in_flight: AtomicUsize,
+    started_at: Instant,
+    last_activity_ms: AtomicU64,
+}
+
+impl ActivityTracker {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            started_at: Instant::now(),
+            last_activity_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn touch(&self) {
+        let now_ms = self.elapsed_ms();
+        self.last_activity_ms.fetch_max(now_ms, Ordering::Release);
+    }
+
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.touch();
+        InFlightGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    fn in_flight_requests(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    fn idle_duration(&self) -> Duration {
+        if self.in_flight_requests() > 0 {
+            return Duration::ZERO;
+        }
+        let now_ms = self.elapsed_ms();
+        let last_ms = self.last_activity_ms.load(Ordering::Acquire);
+        Duration::from_millis(now_ms.saturating_sub(last_ms))
+    }
+}
+
+pub(crate) struct InFlightGuard {
+    tracker: Arc<ActivityTracker>,
+}
+
+impl InFlightGuard {
+    pub(crate) fn touch(&self) {
+        self.tracker.touch();
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.tracker.touch();
+        self.tracker.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct ProxyStateInner {
     source: ProviderSource,
     stats: Arc<ProxyStats>,
     usage_sink: Arc<dyn UsageSink>,
+    activity: Arc<ActivityTracker>,
 }
 
 #[derive(Clone)]
@@ -130,11 +197,14 @@ impl ProxyState {
                 source: ProviderSource::Static(ActiveProvider {
                     provider,
                     cloudcode,
+                    cloudcode_upstream_url: DEFAULT_CLOUDCODE_UPSTREAM_URL.to_string(),
+                    cloudcode_timeout_secs: DEFAULT_TIMEOUT_SECS,
                     has_configured_api_key,
                     default_model: DEFAULT_GEMINI_MODEL.to_string(),
                 }),
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
+                activity: Arc::new(ActivityTracker::new()),
             }),
         }
     }
@@ -154,7 +224,7 @@ impl ProxyState {
         env_fallback: bool,
     ) -> Result<Self, ProxyError> {
         config.validate()?;
-        let active = build_active_provider(&config, env_fallback)?;
+        let active = build_active_provider(&config, env_fallback, None)?;
 
         let source = match config_path {
             Some(path) => {
@@ -193,6 +263,7 @@ impl ProxyState {
                 source,
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
+                activity: Arc::new(ActivityTracker::new()),
             }),
         })
     }
@@ -203,6 +274,18 @@ impl ProxyState {
 
     pub fn usage_sink(&self) -> &Arc<dyn UsageSink> {
         &self.inner.usage_sink
+    }
+
+    pub fn in_flight_requests(&self) -> usize {
+        self.inner.activity.in_flight_requests()
+    }
+
+    pub fn idle_duration(&self) -> Duration {
+        self.inner.activity.idle_duration()
+    }
+
+    pub(crate) fn enter_request(&self) -> InFlightGuard {
+        self.inner.activity.enter()
     }
 
     pub(crate) fn active_provider(&self) -> ActiveProvider {
@@ -216,14 +299,27 @@ impl ProxyState {
 fn build_active_provider(
     config: &Config,
     env_fallback: bool,
+    previous_active: Option<&ActiveProvider>,
 ) -> Result<ActiveProvider, ProxyError> {
     let provider = GeminiProvider::from_config(&config.gemini)?.with_env_fallback(env_fallback);
-    let cloudcode =
-        CloudCodeClient::new(&config.cloudcode_upstream_url, config.gemini.timeout_secs)?;
+    let cloudcode = match previous_active {
+        Some(prev)
+            if prev.cloudcode_upstream_url == config.cloudcode_upstream_url
+                && prev.cloudcode_timeout_secs == config.gemini.timeout_secs =>
+        {
+            Arc::clone(&prev.cloudcode)
+        }
+        _ => Arc::new(CloudCodeClient::new(
+            &config.cloudcode_upstream_url,
+            config.gemini.timeout_secs,
+        )?),
+    };
     let has_configured_api_key = provider.api_key_hint().is_some();
     Ok(ActiveProvider {
         provider: Arc::new(provider),
-        cloudcode: Arc::new(cloudcode),
+        cloudcode,
+        cloudcode_upstream_url: config.cloudcode_upstream_url.clone(),
+        cloudcode_timeout_secs: config.gemini.timeout_secs,
         has_configured_api_key,
         default_model: config.gemini.default_model.clone(),
     })
@@ -497,7 +593,11 @@ impl HotReloadProvider {
                     return guard.active.clone();
                 }
 
-                let new_active = match build_active_provider(&parsed, self.env_fallback) {
+                let new_active = match build_active_provider(
+                    &parsed,
+                    self.env_fallback,
+                    Some(&guard.active),
+                ) {
                     Ok(active) => active,
                     Err(_) => {
                         tracing::warn!(
@@ -528,7 +628,9 @@ impl HotReloadProvider {
             guard.checked_at = Instant::now();
             return;
         }
-        if let Ok(default_active) = build_active_provider(&Config::default(), self.env_fallback) {
+        if let Ok(default_active) =
+            build_active_provider(&Config::default(), self.env_fallback, Some(&guard.active))
+        {
             guard.active = default_active;
             guard.stamp = FileStamp::Missing;
             guard.raw_bytes = None;
@@ -1165,5 +1267,194 @@ mod tests {
         server.await.unwrap();
         upstream1_handle.abort();
         upstream2_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn hot_reload_preserves_cloudcode_routing_cache_when_upstream_and_timeout_unchanged_and_rebuilds_on_change()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.json");
+
+        let mut cfg = Config {
+            cloudcode_upstream_url: DEFAULT_CLOUDCODE_UPSTREAM_URL.to_string(),
+            ..Default::default()
+        };
+        cfg.gemini.timeout_secs = 900;
+        cfg.save_secure(&config_path).unwrap();
+
+        let state = ProxyState::from_config_with_env_fallback(
+            cfg.clone(),
+            Some(config_path.clone()),
+            Arc::new(NoopUsageSink),
+            false,
+        )
+        .unwrap();
+
+        let initial_cloudcode = Arc::clone(&state.active_provider().cloudcode);
+        assert_eq!(initial_cloudcode.mode_label(), "auto");
+
+        // Saving a new API key without changing cloudcode_upstream_url or timeout_secs
+        // must preserve the exact same Arc<CloudCodeClient> (and its routing LRU cache).
+        cfg.gemini.api_key = Some("AIzaSyReloadPreservesLru1".to_string());
+        cfg.save_secure(&config_path).unwrap();
+        let after_key_save = state.active_provider();
+        assert!(after_key_save.has_configured_api_key);
+        assert!(
+            Arc::ptr_eq(&initial_cloudcode, &after_key_save.cloudcode),
+            "CloudCodeClient Arc must be preserved across API key hot-reload"
+        );
+
+        // Changing timeout_secs must rebuild CloudCodeClient.
+        cfg.gemini.timeout_secs = 600;
+        cfg.save_secure(&config_path).unwrap();
+        let after_timeout_change = state.active_provider();
+        assert!(
+            !Arc::ptr_eq(&initial_cloudcode, &after_timeout_change.cloudcode),
+            "CloudCodeClient Arc must rebuild when timeout_secs changes"
+        );
+
+        // Changing cloudcode_upstream_url must also rebuild CloudCodeClient.
+        let prev = Arc::clone(&after_timeout_change.cloudcode);
+        cfg.cloudcode_upstream_url = "https://cloudcode-pa.googleapis.com".to_string();
+        cfg.save_secure(&config_path).unwrap();
+        let after_url_change = state.active_provider();
+        assert!(
+            !Arc::ptr_eq(&prev, &after_url_change.cloudcode),
+            "CloudCodeClient Arc must rebuild when cloudcode_upstream_url changes"
+        );
+        assert_eq!(after_url_change.cloudcode.mode_label(), "fixed");
+    }
+
+    #[tokio::test]
+    async fn activity_tracker_keeps_in_flight_active_across_long_sse_stream_and_resets_idle_after_eof_and_disconnect()
+     {
+        use axum::body::Body;
+        use axum::http::Request;
+        use bytes::Bytes;
+        use http_body_util::BodyExt;
+        use tokio::sync::{Notify, mpsc};
+        use tower::ServiceExt;
+
+        let chunk1_sent = Arc::new(Notify::new());
+        let release_chunk2 = Arc::new(Notify::new());
+        let c1 = Arc::clone(&chunk1_sent);
+        let r2 = Arc::clone(&release_chunk2);
+
+        let stream_handler = move || {
+            let c1 = Arc::clone(&c1);
+            let r2 = Arc::clone(&r2);
+            async move {
+                let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(Ok(Bytes::from_static(b"data: {\"chunk\":1}\n\n")))
+                        .await;
+                    c1.notify_one();
+                    r2.notified().await;
+                    let _ = tx
+                        .send(Ok(Bytes::from_static(b"data: {\"chunk\":2}\n\n")))
+                        .await;
+                });
+                let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(body_stream),
+                )
+            }
+        };
+
+        let upstream = Router::new()
+            .route(
+                "/v1beta/models/gemini-4-hydrogen:streamGenerateContent",
+                post(stream_handler.clone()),
+            )
+            .route("/v1internal:streamGenerateContent", post(stream_handler));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.gemini.base_url = format!("http://{upstream_addr}");
+        cfg.gemini.api_key = Some("AIzaSyActivityTestKey123".to_string());
+        cfg.cloudcode_upstream_url = format!("http://{upstream_addr}");
+
+        let state =
+            ProxyState::from_config_with_env_fallback(cfg, None, Arc::new(NoopUsageSink), false)
+                .unwrap();
+        assert_eq!(state.in_flight_requests(), 0);
+        let app = build_router(state.clone());
+
+        // 1. /v1beta/models/* SSE stream: stays in_flight == 1 while paused mid-stream, returns to 0 after EOF.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let first_frame = body.frame().await.expect("chunk 1").unwrap();
+        assert!(!first_frame.into_data().unwrap().is_empty());
+        chunk1_sent.notified().await;
+
+        assert_eq!(state.in_flight_requests(), 1);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            state.idle_duration(),
+            Duration::ZERO,
+            "idle_duration must stay ZERO while SSE stream is active"
+        );
+
+        release_chunk2.notify_one();
+        while body.frame().await.is_some() {}
+        drop(body);
+        assert_eq!(state.in_flight_requests(), 0);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            state.idle_duration() >= Duration::from_millis(15),
+            "idle_duration must advance once stream completes"
+        );
+
+        // 2. /v1internal:streamGenerateContent early client disconnect releases in_flight back to 0.
+        let cc_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1internal:streamGenerateContent?alt=sse")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cc_resp.status(), StatusCode::OK);
+        let mut cc_body = cc_resp.into_body();
+        let _ = cc_body.frame().await.expect("cc chunk 1").unwrap();
+        chunk1_sent.notified().await;
+        assert_eq!(state.in_flight_requests(), 1);
+        assert_eq!(state.idle_duration(), Duration::ZERO);
+
+        // Drop response body early without waiting for chunk 2!
+        drop(cc_body);
+        assert_eq!(
+            state.in_flight_requests(),
+            0,
+            "early client disconnect must decrement in_flight back to 0"
+        );
+        release_chunk2.notify_one();
+
+        upstream_srv.abort();
     }
 }
