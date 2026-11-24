@@ -20,7 +20,7 @@ Invoke the bundled MCP tool **`open_settings`** (on server `agy-companion_compan
 
 ## 2. Connect Antigravity App (Hybrid Mode) or Antigravity CLI (`customModelsConfig`)
 
-- **Antigravity App (Hybrid Mode — Recommended):** Run `agy-companion launch` (or start Antigravity with `CLOUD_CODE_URL=http://127.0.0.1:4141 GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4141 GEMINI_API_KEY=agy-companion-local`). This keeps all original Google AI Pro models and thinking levels intact while injecting `[Proxy]` Gemini 4 / 3 models with thinking levels side-by-side. Configure `cloudcode_upstream_url` in Settings (`https://daily-cloudcode-pa.googleapis.com` for Personal Google AI Pro, `https://cloudcode-pa.googleapis.com` for Workspace/PayGo).
+- **Antigravity App (Hybrid Mode — Recommended):** Run `agy-companion launch` (or start Antigravity with `CLOUD_CODE_URL=http://127.0.0.1:4141 GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4141 GEMINI_API_KEY=agy-companion-local`). This keeps all original Google AI Pro models and thinking levels intact while appending `(Proxy)` Gemini 4 / 3 models with native **Thinking effort** submenus side-by-side (`cloudcode_upstream_url` defaults to `"auto"` for both Personal Google AI Pro and Workspace/PayGo).
 
 - **Antigravity CLI (`agy`):** Run `agy-companion models --json` (optionally `--port <PORT>` or `--config <CONFIG>`) to generate the ready-to-paste JSON snippet for `~/.gemini/antigravity-cli/settings.json`:
 

@@ -5,11 +5,13 @@ pub mod redaction;
 pub mod usage;
 
 pub use config::{
-    CONFIG_PATH_ENV_VAR, CURRENT_SCHEMA_VERSION, Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL,
+    CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CONFIG_PATH_ENV_VAR,
+    CURRENT_SCHEMA_VERSION, Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL,
     DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL, DEFAULT_LISTEN_HOST, DEFAULT_LISTEN_PORT,
     DEFAULT_TIMEOUT_SECS, GeminiConfig, MAX_CONFIG_FILE_BYTES, default_config_path,
     default_usage_dir, is_supported_gemini_model, resolve_config_path, resolve_usage_dir,
-    validate_gemini_model, validate_listen_host, validate_path, validate_upstream_url,
+    validate_cloudcode_upstream_url, validate_gemini_model, validate_listen_host, validate_path,
+    validate_upstream_url,
 };
 pub use redaction::{RedactedConfig, api_key_hint, mask_api_key};
 pub use usage::{GeminiUsageMetadata, JsonlUsageSink, NoopUsageSink, UsageEvent, UsageSink};

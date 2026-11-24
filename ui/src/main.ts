@@ -73,12 +73,16 @@ const DEFAULT_CONFIG: RedactedConfig = {
   gemini_base_url: "https://generativelanguage.googleapis.com",
   gemini_default_model: "gemini-4-hydrogen",
   gemini_timeout_secs: 900,
-  cloudcode_upstream_url: "https://daily-cloudcode-pa.googleapis.com",
+  cloudcode_upstream_url: "auto",
   api_key_configured: false,
   api_key_hint: null,
 };
 
 const QUICK_CLOUDCODE_UPSTREAMS = [
+  {
+    label: "Auto (Recommended)",
+    url: "auto",
+  },
   {
     label: "Personal Google AI Pro",
     url: "https://daily-cloudcode-pa.googleapis.com",
@@ -328,7 +332,7 @@ function buildHybridLaunchSnippet(port: number): string {
   const safePort = Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
   return [
     "# Keep all original Google AI Pro models (with thinking levels)",
-    "# AND add [Proxy] Gemini 4 / 3 models side-by-side:",
+    "# AND add (Proxy) Gemini 4 / 3 models side-by-side:",
     `agy-companion launch --port ${safePort}`,
     "",
     "# Or launch Antigravity.app directly with env vars:",
@@ -758,9 +762,9 @@ function mountUi(root: HTMLElement): UiRefs {
     id: "cloudcode-upstream-input",
     className: "input",
     attrs: {
-      type: "url",
+      type: "text",
       value: DEFAULT_CONFIG.cloudcode_upstream_url,
-      placeholder: DEFAULT_CONFIG.cloudcode_upstream_url,
+      placeholder: "auto",
       spellcheck: "false",
     },
   });
@@ -783,7 +787,7 @@ function mountUi(root: HTMLElement): UiRefs {
     el("div", { className: "chip-row" }, ...cloudcodeChipButtons),
     el("p", {
       className: "field-help",
-      text: "Passes through original Antigravity OAuth calls while merging [Proxy] models with thinking levels. Use daily-cloudcode-pa for Personal Google AI Pro.",
+      text: "Auto-detects Personal Google AI Pro (daily-cloudcode-pa) vs Workspace / PayGo (cloudcode-pa), keeping all original models while adding (Proxy) models with thinking effort submenus.",
     }),
   );
 
@@ -851,7 +855,7 @@ function mountUi(root: HTMLElement): UiRefs {
         el("h2", { className: "section-title", text: "Antigravity App (Hybrid Mode)" }),
         el("p", {
           className: "section-subtitle",
-          text: "Keeps all original Google AI Pro models + thinking levels and adds [Proxy] models side-by-side",
+          text: "Keeps all original Google AI Pro models + thinking levels and adds (Proxy) models side-by-side",
         }),
       ),
       el("div", { className: "action-row" }, hybridCopyStatus, hybridCopyBtn),
@@ -859,7 +863,7 @@ function mountUi(root: HTMLElement): UiRefs {
     el("pre", { className: "code-block" }, hybridSnippetCode),
     el("p", {
       className: "footer-note",
-      text: "Original Google AI Pro models stay untouched. Selecting a [Proxy] model routes through this local proxy with your Gemini API key, implicit caching, and thinking levels.",
+      text: "Original Google AI Pro models stay untouched. Selecting a (Proxy) model routes through this local proxy with your Gemini API key, implicit caching, and thinking effort submenu.",
     }),
   );
 

@@ -651,7 +651,8 @@ impl CompanionUiServer {
 
             if let Some(raw_cc_url) = args.cloudcode_upstream_url.as_deref() {
                 let trimmed = validate_trimmed_ascii_field(raw_cc_url, "cloudcode_upstream_url")?;
-                validate_upstream_url(&trimmed).map_err(|err| err.to_string())?;
+                companion_core::validate_cloudcode_upstream_url(&trimmed)
+                    .map_err(|err| err.to_string())?;
                 cfg.cloudcode_upstream_url = trimmed;
             }
 
