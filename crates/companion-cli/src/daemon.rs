@@ -46,8 +46,11 @@ pub fn resolve_runtime_data_dir(config: &Config) -> Result<PathBuf, CoreError> {
 pub struct ProxyPidInfo {
     pub pid: u32,
     pub port: u16,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub started_at_ms: u64,
+    #[serde(default)]
     pub binary_path: String,
 }
 
@@ -564,8 +567,10 @@ pub(crate) fn spawn_detached_proxy_daemon_with_exe(
     idle_shutdown_secs: u64,
 ) -> Result<std::process::Child, CliError> {
     let mut cmd = std::process::Command::new(exe);
+    // Detached daemons intentionally omit `--adopt-running` so bind-race losers exit
+    // immediately on AddrInUse instead of parking as unsupervised standbys (`--adopt-running`
+    // is reserved for SidecarManager-supervised sidecar processes).
     cmd.arg("serve")
-        .arg("--adopt-running")
         .arg("--idle-shutdown-secs")
         .arg(idle_shutdown_secs.to_string())
         .arg("--port")
@@ -856,5 +861,25 @@ mod tests {
         .expect("should succeed on third attempt");
         assert_eq!(attempts, 3);
         assert_eq!(slept, WINDOWS_RENAME_BACKOFFS.to_vec());
+    }
+
+    #[test]
+    fn read_proxy_pid_accepts_minimal_json_with_defaults() {
+        let temp = TempDir::new().expect("tempdir");
+        let pid_path = temp.path().join(PROXY_PID_FILENAME);
+        fs::write(
+            &pid_path,
+            r#"{"pid": 12345, "port": 4141, "version": "0.1.0"}"#,
+        )
+        .expect("write minimal pid");
+
+        let info = read_proxy_pid(&pid_path)
+            .expect("read pid")
+            .expect("pid info present");
+        assert_eq!(info.pid, 12345);
+        assert_eq!(info.port, 4141);
+        assert_eq!(info.version, "0.1.0");
+        assert_eq!(info.started_at_ms, 0);
+        assert!(info.binary_path.is_empty());
     }
 }

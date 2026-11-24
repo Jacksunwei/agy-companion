@@ -4,6 +4,7 @@ pub mod cli;
 pub mod daemon;
 pub mod doctor;
 pub mod hook_env;
+pub mod install;
 pub mod integration;
 pub mod launch;
 pub mod models;
@@ -44,6 +45,8 @@ pub enum CliError {
     InvalidDataDir { path: PathBuf, reason: String },
     #[error("failed to serialize output: {0}")]
     Serialization(String),
+    #[error("{0}")]
+    Install(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -14,6 +14,7 @@ clap.workspace = true
 companion-core.workspace = true
 companion-proxy.workspace = true
 companion-ui-mcp.workspace = true
+dirs.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +23,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

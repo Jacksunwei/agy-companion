@@ -23,6 +23,8 @@ import json
 import os
 import signal
 import socket
+import socketserver
+import stat
 import subprocess
 import tempfile
 import threading
@@ -51,7 +53,9 @@ SAFE_HOST_ENV_VARS: tuple[str, ...] = (
 
 STRIPPED_ENV_VARS: tuple[str, ...] = (
     "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
     "GOOGLE_GEMINI_BASE_URL",
+    "CLOUD_CODE_URL",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -63,11 +67,23 @@ STRIPPED_ENV_VARS: tuple[str, ...] = (
     "AGY_COMPANION_CONFIG",
     "AGY_COMPANION_UI_HTML",
     "AGY_COMPANION_BIN",
+    "AGY_COMPANION_HOOK_ACTIVE",
+    "AGY_COMPANION_ALLOW_REMOTE_SSH",
+    "JETSKI_MCP_ENV_RESTORE_PREFIX",
+    "JETSKI_MCP_ENV_RESTORE_VARS",
     "ANTIGRAVITY_EXECUTABLE_DATA_DIR",
+    "ANTIGRAVITY_RESOLVING_ENVIRONMENT",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "ZDOTDIR",
+    "SHELL",
 )
 
 _ACTIVE_COMPANION_PIDS: set[int] = set()
 _ACTIVE_COMPANION_LOCK = threading.Lock()
+_WATCHED_PIDFILES: dict[int, tuple[Path, Path | None, str | None]] = {}
+_WATCHED_PIDFILES_NEXT_ID = 0
+_WATCHED_PIDFILES_LOCK = threading.Lock()
 
 
 def _cleanup_active_companion_pids() -> None:
@@ -83,7 +99,242 @@ def _cleanup_active_companion_pids() -> None:
                 pass
 
 
+def _read_process_cmdline(pid: int) -> str | None:
+    """Read live OS process command line for `pid` (POSIX only; None on Windows/failure)."""
+    if os.name == "nt":
+        return None
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    if proc_cmdline.exists():
+        try:
+            raw = proc_cmdline.read_bytes()
+        except OSError:
+            return None
+        text = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        return text or None
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    text = completed.stdout.decode("utf-8", errors="replace").strip()
+    return text or None
+
+
+def _matches_expected_daemon(
+    cmdline: str,
+    *,
+    expected_binary: Path | None,
+    expected_cmdline_substr: str | None,
+) -> bool:
+    """Verify OS command line matches either an explicit test token or `agy-companion serve`."""
+    if expected_cmdline_substr is not None:
+        if not expected_cmdline_substr.strip():
+            return False
+        return expected_cmdline_substr in cmdline
+    if "agy-companion" not in cmdline or "serve" not in cmdline:
+        return False
+    if expected_binary is not None:
+        return str(expected_binary) in cmdline or expected_binary.name in cmdline
+    return True
+
+
+def _signal_pid_safely(pid: int, sig: int) -> None:
+    """Signal PGID only when `pid` is its own process-group leader and not our own PGID."""
+    use_pgid = False
+    if hasattr(os, "getpgid") and hasattr(os, "getpgrp") and hasattr(os, "killpg"):
+        try:
+            pgid = os.getpgid(pid)
+            if pgid == pid and pgid != os.getpgrp():
+                use_pgid = True
+        except (OSError, OverflowError, ValueError):
+            use_pgid = False
+    try:
+        if use_pgid:
+            os.killpg(pid, sig)
+        else:
+            os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError, OSError, OverflowError, ValueError):
+        pass
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check whether `pid` is still alive, reaping it cleanly if it is our direct child."""
+    if hasattr(os, "waitpid") and hasattr(os, "WNOHANG"):
+        try:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                return False
+        except ChildProcessError:
+            pass
+        except (OSError, OverflowError, ValueError):
+            pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError, ValueError):
+        return False
+
+
+def reap_pidfile_daemon(
+    pid_path: Path,
+    *,
+    expected_binary: str | Path | None = None,
+    expected_cmdline_substr: str | None = None,
+    timeout: float = 3.0,
+) -> bool:
+    """Safely terminate a detached daemon referenced by a JSON `proxy.pid` file.
+
+    Enforces 5 safety layers before signalling:
+      1. `pid_path` must open with `O_NOFOLLOW | O_NONBLOCK` and `fstat` as a regular file (<= 64 KiB).
+      2. JSON `"pid"` must be a strict int in `2..=0x7FFFFFFF` and neither current PID nor parent PID.
+      3. Process must be alive and accessible via `os.kill(pid, 0)`.
+      4. Live OS cmdline (`/proc/<pid>/cmdline` or `/bin/ps`) must match expected daemon.
+      5. Safe PGID-or-PID `SIGTERM` -> poll -> re-verify cmdline -> `SIGKILL`.
+    """
+    if os.name == "nt":
+        return False
+    path = Path(pid_path)
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, open_flags)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
+            return False
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 65536:
+                return False
+            chunks.append(chunk)
+        raw_bytes = b"".join(chunks)
+    except OSError:
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    pid = payload.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return False
+    if pid <= 1 or pid > 0x7FFFFFFF or pid == os.getpid() or pid == os.getppid():
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError, OverflowError, ValueError):
+        return False
+
+    exp_bin = Path(expected_binary) if expected_binary is not None else None
+    cmdline = _read_process_cmdline(pid)
+    if not cmdline or not _matches_expected_daemon(
+        cmdline,
+        expected_binary=exp_bin,
+        expected_cmdline_substr=expected_cmdline_substr,
+    ):
+        return False
+
+    _signal_pid_safely(pid, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.05, timeout)
+    while time.monotonic() < deadline:
+        if not _is_pid_alive(pid):
+            return True
+        time.sleep(0.05)
+
+    # Re-verify identity before SIGKILL escalation to prevent killing a recycled PID.
+    recheck_cmdline = _read_process_cmdline(pid)
+    if recheck_cmdline and _matches_expected_daemon(
+        recheck_cmdline,
+        expected_binary=exp_bin,
+        expected_cmdline_substr=expected_cmdline_substr,
+    ):
+        _signal_pid_safely(pid, signal.SIGKILL)
+        kill_deadline = time.monotonic() + 1.0
+        while time.monotonic() < kill_deadline:
+            if not _is_pid_alive(pid):
+                break
+            time.sleep(0.05)
+    return not _is_pid_alive(pid)
+
+
+def _cleanup_watched_pidfiles() -> None:
+    with _WATCHED_PIDFILES_LOCK:
+        entries = list(_WATCHED_PIDFILES.values())
+        _WATCHED_PIDFILES.clear()
+    for pid_path, exp_bin, exp_substr in entries:
+        try:
+            reap_pidfile_daemon(
+                pid_path,
+                expected_binary=exp_bin,
+                expected_cmdline_substr=exp_substr,
+                timeout=1.5,
+            )
+        except Exception:
+            pass
+
+
+def register_pidfile_cleanup(
+    stack: contextlib.ExitStack,
+    pid_path: Path,
+    *,
+    expected_binary: str | Path | None = None,
+    expected_cmdline_substr: str | None = None,
+    timeout: float = 3.0,
+) -> Path:
+    """Register a detached-daemon `proxy.pid` reaper on `stack` and `atexit`."""
+    global _WATCHED_PIDFILES_NEXT_ID
+    # Anchor relative paths without dereferencing symlinks so Layer 1 symlink rejection stays intact.
+    resolved = Path(os.path.abspath(pid_path))
+    exp_bin = Path(expected_binary) if expected_binary is not None else None
+    with _WATCHED_PIDFILES_LOCK:
+        _WATCHED_PIDFILES_NEXT_ID += 1
+        reg_id = _WATCHED_PIDFILES_NEXT_ID
+        _WATCHED_PIDFILES[reg_id] = (resolved, exp_bin, expected_cmdline_substr)
+
+    def _teardown() -> None:
+        try:
+            reap_pidfile_daemon(
+                resolved,
+                expected_binary=exp_bin,
+                expected_cmdline_substr=expected_cmdline_substr,
+                timeout=timeout,
+            )
+        finally:
+            with _WATCHED_PIDFILES_LOCK:
+                _WATCHED_PIDFILES.pop(reg_id, None)
+
+    stack.callback(_teardown)
+    return resolved
+
+
 atexit.register(_cleanup_active_companion_pids)
+atexit.register(_cleanup_watched_pidfiles)
 
 
 @dataclasses.dataclass
@@ -241,6 +492,7 @@ class IsolatedEnv:
         usage_dir: str | Path | None = None,
         include_usage_dir: bool = True,
         schema_version: int = 1,
+        cloudcode_upstream_url: str | None = None,
     ) -> dict[str, Any]:
         """Build a schema_version=1 config dict pointing at isolated usage_dir by default."""
         cfg: dict[str, Any] = {
@@ -258,6 +510,8 @@ class IsolatedEnv:
             cfg["usage_dir"] = str(usage_dir)
         elif include_usage_dir:
             cfg["usage_dir"] = str(self.usage_dir)
+        if cloudcode_upstream_url is not None:
+            cfg["cloudcode_upstream_url"] = cloudcode_upstream_url
         return cfg
 
     def write_config(
@@ -893,6 +1147,142 @@ class CompanionProcess:
         self.stop()
 
 
+class _ConnectProxyTcpServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 128
+
+
+class MockConnectProxy:
+    """Loopback HTTP CONNECT proxy that records requested targets and returns 502 Bad Gateway."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 0) -> None:
+        self.host = host
+        self._cond = threading.Condition()
+        self._close_lock = threading.Lock()
+        self._connect_targets: list[str] = []
+        self._captured_connects: list[dict[str, Any]] = []
+        self._closed = False
+        self._server_closed = False
+
+        parent = self
+
+        class _Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                sock = self.request
+                sock.settimeout(3.0)
+                buf = bytearray()
+                try:
+                    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                except OSError:
+                    return
+
+                head_bytes = bytes(buf).split(b"\r\n\r\n", 1)[0]
+                lines = head_bytes.decode("iso-8859-1", errors="replace").split("\r\n")
+                if lines and lines[0].strip():
+                    parts = lines[0].strip().split()
+                    if len(parts) >= 2 and parts[0].upper() == "CONNECT":
+                        target = parts[1]
+                        version = parts[2] if len(parts) >= 3 else "HTTP/1.1"
+                        raw_headers: list[tuple[str, str]] = []
+                        headers: dict[str, str] = {}
+                        for hline in lines[1:]:
+                            if ":" in hline:
+                                k, v = hline.split(":", 1)
+                                key = k.strip()
+                                val = v.strip()
+                                raw_headers.append((key, val))
+                                headers[key.lower()] = val
+                        with parent._cond:
+                            parent._connect_targets.append(target)
+                            parent._captured_connects.append(
+                                {
+                                    "method": parts[0].upper(),
+                                    "target": target,
+                                    "version": version,
+                                    "headers": headers,
+                                    "raw_headers": raw_headers,
+                                }
+                            )
+                            parent._cond.notify_all()
+                try:
+                    sock.sendall(
+                        b"HTTP/1.1 502 Bad Gateway\r\n"
+                        b"Content-Length: 0\r\n"
+                        b"Connection: close\r\n"
+                        b"\r\n"
+                    )
+                except OSError:
+                    pass
+
+        self._server = _ConnectProxyTcpServer((host, port), _Handler)
+        self.port = int(self._server.server_address[1])
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def proxy_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    @property
+    def connect_targets(self) -> list[str]:
+        with self._cond:
+            return list(self._connect_targets)
+
+    @property
+    def captured_connects(self) -> list[dict[str, Any]]:
+        with self._cond:
+            return list(self._captured_connects)
+
+    def clear_targets(self) -> None:
+        with self._cond:
+            self._connect_targets.clear()
+            self._captured_connects.clear()
+
+    def wait_for_connects(self, count: int, timeout: float = 5.0) -> list[str]:
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while not self._closed and len(self._connect_targets) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=remaining)
+            return list(self._connect_targets)
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+        with self._close_lock:
+            if self._server_closed:
+                return
+            self._server_closed = True
+            try:
+                self._server.shutdown()
+            except OSError:
+                pass
+            try:
+                self._server.server_close()
+            except OSError:
+                pass
+            if self._thread.is_alive():
+                self._thread.join(timeout=2.0)
+
+    def __enter__(self) -> MockConnectProxy:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+
 class E2ETestCase(unittest.TestCase):
     """Base TestCase for all E2E tiers with deterministic ExitStack resource teardown."""
 
@@ -921,6 +1311,38 @@ class E2ETestCase(unittest.TestCase):
 
     def make_env(self) -> IsolatedEnv:
         return self.stack.enter_context(IsolatedEnv())
+
+    def register_pidfile_cleanup(
+        self,
+        pid_path: Path | None = None,
+        *,
+        env: IsolatedEnv | None = None,
+        expected_binary: str | Path | None = None,
+        expected_cmdline_substr: str | None = None,
+        timeout: float = 3.0,
+    ) -> Path:
+        """Register detached-daemon `proxy.pid` cleanup on `self.stack` (call AFTER `make_env()`)."""
+        if pid_path is None:
+            if env is None:
+                raise ValueError("register_pidfile_cleanup requires either pid_path or env")
+            pid_path = env.data_dir / "proxy.pid"
+        if expected_binary is None and expected_cmdline_substr is None:
+            expected_binary = self.cfg.binary_path
+        return register_pidfile_cleanup(
+            self.stack,
+            pid_path,
+            expected_binary=expected_binary,
+            expected_cmdline_substr=expected_cmdline_substr,
+            timeout=timeout,
+        )
+
+    def start_mock_connect_proxy(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 0,
+    ) -> MockConnectProxy:
+        return self.stack.enter_context(MockConnectProxy(host=host, port=port))
 
     def start_mock_gemini(
         self,

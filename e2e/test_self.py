@@ -1,4 +1,4 @@
-"""Pure-Python harness self-tests (`SELF-01` .. `SELF-21`).
+"""Pure-Python harness self-tests (`SELF-01` .. `SELF-25`).
 
 Runs via `python3 e2e/run_e2e.py --self-test` with zero external dependencies
 and without requiring the compiled `agy-companion` binary.
@@ -7,6 +7,7 @@ and without requiring the compiled `agy-companion` binary.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import errno
 import hashlib
 import http.client
@@ -14,9 +15,11 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from typing import Any
@@ -27,10 +30,13 @@ from harness import (
     CompanionStartError,
     E2ETestCase,
     IsolatedEnv,
+    MockConnectProxy,
     STRIPPED_ENV_VARS,
     find_free_port,
     http_raw_request,
     http_stream_request,
+    reap_pidfile_daemon,
+    register_pidfile_cleanup,
     resolve_binary,
     run_cli,
 )
@@ -942,3 +948,355 @@ class TestHarnessSelfTests(E2ETestCase):
                         [],
                         f"Case {name}: unexpected false-positive offenders: {offenders!r}",
                     )
+
+    def test_self_22_isolated_env_strips_rollout_shell_and_hook_vars(self) -> None:
+        """SELF-22: IsolatedEnv strips all rollout shell/hook/SSH/API vars and supports explicit overrides."""
+        rollout_vars = (
+            "CLOUD_CODE_URL",
+            "AGY_COMPANION_HOOK_ACTIVE",
+            "AGY_COMPANION_ALLOW_REMOTE_SSH",
+            "JETSKI_MCP_ENV_RESTORE_PREFIX",
+            "JETSKI_MCP_ENV_RESTORE_VARS",
+            "ANTIGRAVITY_RESOLVING_ENVIRONMENT",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "ZDOTDIR",
+            "SHELL",
+            "GOOGLE_API_KEY",
+        )
+        for var in rollout_vars:
+            self.assertIn(var, STRIPPED_ENV_VARS, f"{var} missing from STRIPPED_ENV_VARS")
+
+        env = self.make_env()
+        polluted = {var: f"polluted-{var}" for var in rollout_vars}
+        with unittest_mock.patch.dict(os.environ, polluted, clear=False):
+            clean = env.build_env()
+            for var in rollout_vars:
+                self.assertNotIn(var, clean, f"{var} leaked into clean build_env()")
+
+            overridden = env.build_env(
+                extra={"SHELL": "/bin/zsh", "ZDOTDIR": str(env.home_dir)}
+            )
+            self.assertEqual(overridden["SHELL"], "/bin/zsh")
+            self.assertEqual(overridden["ZDOTDIR"], str(env.home_dir))
+            self.assertNotIn("SSH_CONNECTION", overridden)
+            self.assertNotIn("GOOGLE_API_KEY", overridden)
+
+        cfg_default = env.make_config_dict()
+        self.assertNotIn("cloudcode_upstream_url", cfg_default)
+        cfg_cc = env.make_config_dict(cloudcode_upstream_url="http://127.0.0.1:49999")
+        self.assertEqual(cfg_cc["cloudcode_upstream_url"], "http://127.0.0.1:49999")
+
+    def test_self_23_pidfile_reaper_kills_verified_daemon_and_refuses_unsafe_targets(self) -> None:
+        """SELF-23: PID-file reaper terminates verified detached daemon in LIFO teardown and refuses unsafe targets."""
+        if os.name == "nt":
+            self.skipTest("POSIX process inspection self-test")
+
+        token = f"agy-self23-sentinel-{os.getpid()}-{time.time_ns()}"
+        sleeper_code = "import signal, time; signal.signal(signal.SIGTERM, lambda *_: exit(0)); time.sleep(60)"
+
+        # 1. Verify LIFO teardown: register_pidfile_cleanup registered AFTER IsolatedEnv reaps before tempdir removal.
+        proc1 = subprocess.Popen(
+            [sys.executable, "-c", sleeper_code, token],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            with contextlib.ExitStack() as lifo_stack:
+                iso = lifo_stack.enter_context(IsolatedEnv(prefix="agy-self23-"))
+                pid_file = iso.data_dir / "proxy.pid"
+                register_pidfile_cleanup(
+                    lifo_stack,
+                    pid_file,
+                    expected_cmdline_substr=token,
+                    timeout=3.0,
+                )
+                pid_file.write_text(
+                    json.dumps({"pid": proc1.pid, "port": 4141, "version": "0.1.0"}),
+                    encoding="utf-8",
+                )
+            # Exiting lifo_stack must have terminated proc1 cleanly.
+            rc1 = proc1.wait(timeout=3.0)
+            self.assertIsNotNone(rc1)
+        finally:
+            if proc1.poll() is None:
+                proc1.kill()
+                proc1.wait(timeout=2.0)
+
+        # 2. Verify safe refusal on unsafe/invalid/mismatched PID files while live sleeper stays untouched.
+        env = self.make_env()
+        proc2 = subprocess.Popen(
+            [sys.executable, "-c", sleeper_code, f"{token}-keepalive"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            real_pid_file = env.data_dir / "real.pid"
+            real_pid_file.write_text(json.dumps({"pid": proc2.pid}), encoding="utf-8")
+
+            # Mismatched explicit token
+            self.assertFalse(
+                reap_pidfile_daemon(real_pid_file, expected_cmdline_substr="nonexistent-token-xyz")
+            )
+            self.assertIsNone(proc2.poll(), "Sleeper must survive mismatched cmdline token")
+
+            # Default companion check refuses non-companion Python process
+            self.assertFalse(reap_pidfile_daemon(real_pid_file))
+            self.assertIsNone(proc2.poll(), "Sleeper must survive default agy-companion check")
+
+            # Symlinked proxy.pid refused even when token matches
+            sym_pid = env.data_dir / "symlink.pid"
+            os.symlink(real_pid_file, sym_pid)
+            self.assertFalse(
+                reap_pidfile_daemon(sym_pid, expected_cmdline_substr=f"{token}-keepalive")
+            )
+            self.assertIsNone(proc2.poll(), "Sleeper must survive symlinked proxy.pid")
+
+            # Empty and whitespace expected_cmdline_substr must fail closed (never wildcard-match).
+            for bad_substr in ("", "   ", "\t\n"):
+                with self.subTest(bad_substr=repr(bad_substr)):
+                    self.assertFalse(
+                        reap_pidfile_daemon(real_pid_file, expected_cmdline_substr=bad_substr)
+                    )
+                    self.assertIsNone(proc2.poll(), "Sleeper must survive empty/whitespace substr")
+
+            # Unsafe PID values and malformed files (including C pid_t overflow values)
+            unsafe_cases: list[tuple[str, str]] = [
+                ("pid_zero", json.dumps({"pid": 0})),
+                ("pid_one", json.dumps({"pid": 1})),
+                ("pid_neg", json.dumps({"pid": -42})),
+                ("pid_self", json.dumps({"pid": os.getpid()})),
+                ("pid_parent", json.dumps({"pid": os.getppid()})),
+                ("pid_bool", json.dumps({"pid": True})),
+                ("pid_str", json.dumps({"pid": str(proc2.pid)})),
+                ("pid_overflow_i32", json.dumps({"pid": 2**31})),
+                ("pid_overflow_i64", json.dumps({"pid": 2**63})),
+                ("corrupt_json", "{not-json"),
+                ("non_dict_json", "[1, 2, 3]"),
+            ]
+            for label, content in unsafe_cases:
+                with self.subTest(unsafe_case=label):
+                    bad_path = env.data_dir / f"{label}.pid"
+                    bad_path.write_text(content, encoding="utf-8")
+                    self.assertFalse(
+                        reap_pidfile_daemon(bad_path, expected_cmdline_substr=f"{token}-keepalive")
+                    )
+
+            # Missing file
+            self.assertFalse(
+                reap_pidfile_daemon(env.data_dir / "does_not_exist.pid", expected_cmdline_substr=token)
+            )
+
+            # Matching token reaps proc2 cleanly, then dead PID returns False
+            self.assertTrue(
+                reap_pidfile_daemon(real_pid_file, expected_cmdline_substr=f"{token}-keepalive")
+            )
+            proc2.wait(timeout=3.0)
+            self.assertFalse(
+                reap_pidfile_daemon(real_pid_file, expected_cmdline_substr=f"{token}-keepalive")
+            )
+        finally:
+            if proc2.poll() is None:
+                proc2.kill()
+                proc2.wait(timeout=2.0)
+
+        # 3. Verify relative pid_path anchoring survives os.chdir() and nested ExitStacks stay tracked.
+        import harness as harness_mod
+
+        orig_cwd = os.getcwd()
+        sub_a = env.root / "rel_a"
+        sub_b = env.root / "rel_b"
+        sub_a.mkdir(parents=True, exist_ok=True)
+        sub_b.mkdir(parents=True, exist_ok=True)
+        rel_token = f"{token}-relchdir"
+        proc3 = subprocess.Popen(
+            [sys.executable, "-c", sleeper_code, rel_token],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            with contextlib.ExitStack() as outer_stack:
+                os.chdir(sub_a)
+                anchored = register_pidfile_cleanup(
+                    outer_stack,
+                    Path("proxy.pid"),
+                    expected_cmdline_substr=rel_token,
+                    timeout=3.0,
+                )
+                self.assertTrue(anchored.is_absolute())
+                with contextlib.ExitStack() as inner_stack:
+                    register_pidfile_cleanup(
+                        inner_stack,
+                        Path("proxy.pid"),
+                        expected_cmdline_substr="unrelated-inner-token",
+                        timeout=0.2,
+                    )
+                    (sub_a / "proxy.pid").write_text(
+                        json.dumps({"pid": proc3.pid}), encoding="utf-8"
+                    )
+                    os.chdir(sub_b)
+                # Inner stack exit must not untrack outer stack's registration in _WATCHED_PIDFILES.
+                with harness_mod._WATCHED_PIDFILES_LOCK:
+                    remaining_paths = [entry[0] for entry in harness_mod._WATCHED_PIDFILES.values()]
+                self.assertIn(anchored, remaining_paths)
+                self.assertIsNone(proc3.poll(), "Inner mismatched token must not kill proc3")
+            # Exiting outer_stack from sub_b must still reap proc3 via anchored path.
+            rc3 = proc3.wait(timeout=3.0)
+            self.assertIsNotNone(rc3)
+        finally:
+            os.chdir(orig_cwd)
+            if proc3.poll() is None:
+                proc3.kill()
+                proc3.wait(timeout=2.0)
+
+    def test_self_24_multi_module_tier_discovery_and_duplicate_rejection(self) -> None:
+        """SELF-24: run_e2e supports tuple and str TIER_MODULES, rejects cross-module duplicates, and filters by module."""
+        import run_e2e
+
+        mod_a_name = "_self24_fake_mod_a"
+        mod_b_name = "_self24_fake_mod_b"
+        mod_dup_name = "_self24_fake_mod_dup"
+
+        mod_a = types.ModuleType(mod_a_name)
+        mod_b = types.ModuleType(mod_b_name)
+        mod_dup = types.ModuleType(mod_dup_name)
+
+        class _FakeCaseA(E2ETestCase):
+            TIER = 1
+            FEATURE = "FAKE_A"
+
+            def test_fake_alpha(self) -> None:
+                """Alpha synthetic test."""
+
+        class _FakeCaseB(E2ETestCase):
+            TIER = 1
+            FEATURE = "FAKE_B"
+
+            def test_fake_beta(self) -> None:
+                """Beta synthetic test."""
+
+        class _FakeCaseDup(E2ETestCase):
+            TIER = 1
+            FEATURE = "FAKE_DUP"
+
+            def test_fake_alpha(self) -> None:
+                """Duplicate alpha synthetic test."""
+
+        _FakeCaseA.__module__ = mod_a_name
+        _FakeCaseB.__module__ = mod_b_name
+        _FakeCaseDup.__module__ = mod_dup_name
+        setattr(mod_a, "_FakeCaseA", _FakeCaseA)
+        setattr(mod_b, "_FakeCaseB", _FakeCaseB)
+        setattr(mod_dup, "_FakeCaseDup", _FakeCaseDup)
+
+        fake_mods = {mod_a_name: mod_a, mod_b_name: mod_b, mod_dup_name: mod_dup}
+        with unittest_mock.patch.dict(sys.modules, fake_mods, clear=False):
+            # 1. Tuple multi-module discovery
+            with unittest_mock.patch.dict(
+                run_e2e.TIER_MODULES, {1: (mod_a_name, mod_b_name)}, clear=True
+            ):
+                discovered = run_e2e.discover_tests([1], include_self=False)
+                self.assertEqual([t.name for t in discovered], ["test_fake_alpha", "test_fake_beta"])
+                # filter_tests matches module_name
+                only_b = run_e2e.filter_tests(discovered, mod_b_name)
+                self.assertEqual([t.name for t in only_b], ["test_fake_beta"])
+
+            # 2. Legacy single-str entry compatibility
+            with unittest_mock.patch.dict(
+                run_e2e.TIER_MODULES, {1: mod_a_name}, clear=True  # type: ignore[dict-item]
+            ):
+                discovered_single = run_e2e.discover_tests([1], include_self=False)
+                self.assertEqual([t.name for t in discovered_single], ["test_fake_alpha"])
+
+            # 3. Cross-module duplicate rejection
+            with unittest_mock.patch.dict(
+                run_e2e.TIER_MODULES, {1: (mod_a_name, mod_dup_name)}, clear=True
+            ):
+                with self.assertRaises(ValueError):
+                    run_e2e.discover_tests([1], include_self=False)
+
+    def test_self_25_mock_connect_proxy_captures_targets_and_returns_502(self) -> None:
+        """SELF-25: MockConnectProxy records CONNECT targets/headers, returns 502, and cleans up via ExitStack."""
+        with contextlib.ExitStack() as stack:
+            proxy = stack.enter_context(MockConnectProxy())
+            self.assertTrue(proxy.proxy_url.startswith("http://127.0.0.1:"))
+            proxy_port = proxy.port
+
+            for target in (
+                "daily-cloudcode-pa.googleapis.com:443",
+                "cloudcode-pa.googleapis.com:443",
+            ):
+                with socket.create_connection(("127.0.0.1", proxy_port), timeout=3.0) as sock:
+                    req = (
+                        f"CONNECT {target} HTTP/1.1\r\n"
+                        f"Host: {target}\r\n"
+                        "User-Agent: antigravity/2.34.0\r\n"
+                        "\r\n"
+                    ).encode("ascii")
+                    sock.sendall(req)
+                    raw_resp = sock.recv(4096)
+                self.assertTrue(
+                    raw_resp.startswith(b"HTTP/1.1 502 Bad Gateway\r\n"),
+                    f"Unexpected CONNECT response: {raw_resp!r}",
+                )
+
+            targets = proxy.wait_for_connects(2, timeout=3.0)
+            self.assertEqual(
+                targets,
+                [
+                    "daily-cloudcode-pa.googleapis.com:443",
+                    "cloudcode-pa.googleapis.com:443",
+                ],
+            )
+            self.assertEqual(len(proxy.captured_connects), 2)
+            self.assertEqual(
+                proxy.captured_connects[0]["headers"].get("user-agent"),
+                "antigravity/2.34.0",
+            )
+            proxy.clear_targets()
+            self.assertEqual(proxy.connect_targets, [])
+
+            # 20-parallel-socket burst must capture 100% of CONNECT requests with zero drops.
+            burst_n = 20
+            barrier = threading.Barrier(burst_n)
+
+            def _send_burst_connect(idx: int) -> bytes:
+                barrier.wait(timeout=5.0)
+                target = f"burst-{idx}.cloudcode-pa.googleapis.com:443"
+                with socket.create_connection(("127.0.0.1", proxy_port), timeout=5.0) as sock:
+                    sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("ascii"))
+                    return sock.recv(4096)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=burst_n) as pool:
+                futs = [pool.submit(_send_burst_connect, i) for i in range(burst_n)]
+                for fut in futs:
+                    raw_resp = fut.result(timeout=10.0)
+                    self.assertTrue(
+                        raw_resp.startswith(b"HTTP/1.1 502 Bad Gateway\r\n"),
+                        f"Unexpected burst CONNECT response: {raw_resp!r}",
+                    )
+            burst_targets = proxy.wait_for_connects(burst_n, timeout=3.0)
+            self.assertEqual(len(burst_targets), burst_n)
+            self.assertEqual(len(set(burst_targets)), burst_n)
+            proxy.clear_targets()
+
+            # Closing the proxy must promptly wake a blocked wait_for_connects() caller.
+            t0 = time.monotonic()
+            closer = threading.Timer(0.1, proxy.close)
+            closer.start()
+            try:
+                woke = proxy.wait_for_connects(1, timeout=3.0)
+            finally:
+                closer.cancel()
+                closer.join(timeout=2.0)
+            elapsed = time.monotonic() - t0
+            self.assertEqual(woke, [])
+            self.assertLess(elapsed, 1.5, f"close() did not wake wait_for_connects promptly: {elapsed:.2f}s")
+
+        # After ExitStack teardown, proxy socket must refuse new connections.
+        with self.assertRaises(OSError):
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.5):
+                pass

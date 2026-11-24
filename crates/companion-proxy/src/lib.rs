@@ -1457,4 +1457,58 @@ mod tests {
 
         upstream_srv.abort();
     }
+
+    #[tokio::test]
+    async fn passive_health_and_stats_probes_do_not_reset_idle_duration() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = ProxyState::from_config_with_env_fallback(
+            Config::default(),
+            None,
+            Arc::new(NoopUsageSink),
+            false,
+        )
+        .unwrap();
+        let app = build_router(state.clone());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let idle_before = state.idle_duration();
+        assert!(
+            idle_before >= Duration::from_millis(45),
+            "expected idle_before >= 45ms, got {idle_before:?}"
+        );
+
+        let health_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), StatusCode::OK);
+
+        let stats_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats_resp.status(), StatusCode::OK);
+
+        assert_eq!(state.in_flight_requests(), 0);
+        let idle_after = state.idle_duration();
+        assert!(
+            idle_after >= idle_before,
+            "passive /health and /api/stats probes must not reset idle_duration (before={idle_before:?}, after={idle_after:?})"
+        );
+    }
 }

@@ -27,6 +27,7 @@ import math
 import os
 import time
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -38,11 +39,11 @@ if str(E2E_DIR) not in sys.path:
 import harness  # noqa: E402
 
 
-TIER_MODULES: dict[int, str] = {
-    1: "test_tier1_features",
-    2: "test_tier2_boundaries",
-    3: "test_tier3_combinations",
-    4: "test_tier4_scenarios",
+TIER_MODULES: dict[int, tuple[str, ...]] = {
+    1: ("test_tier1_features", "test_tier1_rollout"),
+    2: ("test_tier2_boundaries", "test_tier2_rollout"),
+    3: ("test_tier3_combinations", "test_tier3_rollout"),
+    4: ("test_tier4_scenarios", "test_tier4_rollout"),
 }
 SELF_TEST_MODULE = "test_self"
 
@@ -100,8 +101,15 @@ def discover_tests(
     if include_self:
         module_names.append((0, SELF_TEST_MODULE))
     for tier in tiers:
-        if tier in TIER_MODULES:
-            module_names.append((tier, TIER_MODULES[tier]))
+        mods: str | Sequence[str] | None = TIER_MODULES.get(tier)
+        if not mods:
+            continue
+        if isinstance(mods, str):
+            mod_list: Sequence[str] = (mods,)
+        else:
+            mod_list = mods
+        for mod_name in mod_list:
+            module_names.append((tier, mod_name))
 
     discovered: list[DiscoveredTest] = []
     seen_names: set[str] = set()
@@ -161,6 +169,7 @@ def filter_tests(tests: list[DiscoveredTest], substr: str | None) -> list[Discov
         if needle in t.name.lower()
         or needle in t.feature.lower()
         or needle in t.class_name.lower()
+        or needle in t.module_name.lower()
         or needle in t.tier_label.lower()
         or needle in t.description.lower()
     ]

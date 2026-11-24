@@ -12,10 +12,6 @@ use crate::{CliError, load_config_checked, resolve_cli_config_path};
 pub use companion_core::PROXY_PLACEHOLDER_API_KEY;
 pub const MAX_PROBE_HEALTH_BODY_BYTES: usize = 64 * 1024;
 pub const DEFAULT_PROBE_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(target_os = "macos")]
-const DEFAULT_APP_BIN: &str = "/Applications/Antigravity.app/Contents/MacOS/Antigravity";
-#[cfg(not(target_os = "macos"))]
-const DEFAULT_APP_BIN: &str = "antigravity";
 const HEALTH_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -222,8 +218,58 @@ pub async fn probe_running_companion_proxy(port: u16) -> Option<HealthResponse> 
     probe_running_companion_proxy_with_timeout(port, DEFAULT_PROBE_HEALTH_TIMEOUT).await
 }
 
+#[cfg(any(windows, test))]
+fn is_valid_windows_base_dir(dir: &Path) -> bool {
+    !dir.as_os_str().is_empty()
+        && !dir.to_string_lossy().trim().is_empty()
+        && dir.is_absolute()
+        && companion_core::validate_path(dir).is_ok()
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn discover_windows_antigravity_exe(
+    local_app_data: Option<&Path>,
+    program_files: Option<&Path>,
+) -> PathBuf {
+    let candidates = [
+        local_app_data
+            .filter(|dir| is_valid_windows_base_dir(dir))
+            .map(|dir| {
+                dir.join("Programs")
+                    .join("Antigravity")
+                    .join("Antigravity.exe")
+            }),
+        program_files
+            .filter(|dir| is_valid_windows_base_dir(dir))
+            .map(|dir| dir.join("Antigravity").join("Antigravity.exe")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_file()) {
+            return candidate;
+        }
+    }
+    PathBuf::from("antigravity")
+}
+
 pub fn default_antigravity_app_path() -> PathBuf {
-    PathBuf::from(DEFAULT_APP_BIN)
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Applications/Antigravity.app/Contents/MacOS/Antigravity")
+    }
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from);
+        let program_files = std::env::var_os("ProgramFiles")
+            .filter(|v| !v.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from);
+        discover_windows_antigravity_exe(local_app_data.as_deref(), program_files.as_deref())
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        PathBuf::from("antigravity")
+    }
 }
 
 pub fn format_hybrid_launch_command(port: u16, app_path: &Path) -> String {
@@ -670,6 +716,81 @@ mod tests {
             let (err_port, err_handle) = spawn_mock_router(err_router).await;
             assert_eq!(probe_running_companion_proxy(err_port).await, None);
             err_handle.abort();
+        }
+    }
+
+    #[test]
+    fn discover_windows_antigravity_exe_prefers_local_app_data_then_program_files_then_fallback() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let local_app_data = tmp.path().join("LocalAppData");
+        let program_files = tmp.path().join("ProgramFiles");
+
+        // Neither installed -> fallback to "antigravity"
+        assert_eq!(
+            discover_windows_antigravity_exe(Some(&local_app_data), Some(&program_files)),
+            PathBuf::from("antigravity")
+        );
+
+        // Only ProgramFiles installed -> returns ProgramFiles\Antigravity\Antigravity.exe
+        let pf_exe = program_files.join("Antigravity").join("Antigravity.exe");
+        std::fs::create_dir_all(pf_exe.parent().unwrap()).expect("mkdir pf");
+        std::fs::write(&pf_exe, b"stub").expect("write pf exe");
+        assert_eq!(
+            discover_windows_antigravity_exe(Some(&local_app_data), Some(&program_files)),
+            pf_exe
+        );
+
+        // Both installed -> prefers %LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe
+        let local_exe = local_app_data
+            .join("Programs")
+            .join("Antigravity")
+            .join("Antigravity.exe");
+        std::fs::create_dir_all(local_exe.parent().unwrap()).expect("mkdir local");
+        std::fs::write(&local_exe, b"stub").expect("write local exe");
+        assert_eq!(
+            discover_windows_antigravity_exe(Some(&local_app_data), Some(&program_files)),
+            local_exe
+        );
+
+        // Empty, whitespace, relative, and traversal env values must fall back to "antigravity".
+        for bad in [
+            Path::new(""),
+            Path::new("   "),
+            Path::new("."),
+            Path::new("../escape"),
+        ] {
+            assert_eq!(
+                discover_windows_antigravity_exe(Some(bad), Some(bad)),
+                PathBuf::from("antigravity"),
+                "invalid Windows base dir {:?} must be rejected",
+                bad
+            );
+        }
+
+        // Symlinked Antigravity.exe must be rejected (no symlink following).
+        #[cfg(unix)]
+        {
+            let sym_local = tmp.path().join("SymLocal");
+            let sym_pf = tmp.path().join("SymPf");
+            let decoy_target = tmp.path().join("decoy.exe");
+            std::fs::write(&decoy_target, b"decoy").expect("write decoy");
+
+            let sym_local_exe = sym_local
+                .join("Programs")
+                .join("Antigravity")
+                .join("Antigravity.exe");
+            std::fs::create_dir_all(sym_local_exe.parent().unwrap()).expect("mkdir sym local");
+            std::os::unix::fs::symlink(&decoy_target, &sym_local_exe).expect("symlink local");
+
+            let sym_pf_exe = sym_pf.join("Antigravity").join("Antigravity.exe");
+            std::fs::create_dir_all(sym_pf_exe.parent().unwrap()).expect("mkdir sym pf");
+            std::os::unix::fs::symlink(&decoy_target, &sym_pf_exe).expect("symlink pf");
+
+            assert_eq!(
+                discover_windows_antigravity_exe(Some(&sym_local), Some(&sym_pf)),
+                PathBuf::from("antigravity"),
+                "symlinked Antigravity.exe must be rejected"
+            );
         }
     }
 }

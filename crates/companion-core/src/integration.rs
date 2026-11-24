@@ -336,6 +336,7 @@ pub fn render_env_sh(binary_path: &Path) -> Result<String, CoreError> {
     let quoted_bin = posix_single_quote(bin_str);
     let placeholder = PROXY_PLACEHOLDER_API_KEY;
     let default_prefix = DEFAULT_RESTORE_PREFIX;
+    let tab = '\t';
 
     Ok(format!(
         r#"# Managed by Antigravity Companion (agy-companion). Do not edit manually.
@@ -380,6 +381,13 @@ if [ "${{ANTIGRAVITY_RESOLVING_ENVIRONMENT:-}}" = "1" ] && [ "${{AGY_COMPANION_H
 
       _agy_vars="${{JETSKI_MCP_ENV_RESTORE_VARS:-}}"
       _agy_orig_vars_csv=",${{_agy_vars}},"
+      while :; do
+        case "$_agy_orig_vars_csv" in
+          *' '*) _agy_orig_vars_csv="${{_agy_orig_vars_csv%% *}}${{_agy_orig_vars_csv#* }}" ;;
+          *'{tab}'*) _agy_orig_vars_csv="${{_agy_orig_vars_csv%%{tab}*}}${{_agy_orig_vars_csv#*{tab}}}" ;;
+          *) break ;;
+        esac
+      done
 
       if [ -n "${{CLOUD_CODE_URL+x}}" ]; then
         export AGY_COMPANION_ORIG_CLOUD_CODE_URL="$CLOUD_CODE_URL"
@@ -570,7 +578,7 @@ if test "$AGY_COMPANION_ALLOW_REMOTE_SSH" = "1"; or begin; test -z "$SSH_CONNECT
                     if set -q JETSKI_MCP_ENV_RESTORE_VARS
                         set _agy_vars "$JETSKI_MCP_ENV_RESTORE_VARS"
                     end
-                    set -l _agy_orig_csv ",$_agy_vars,"
+                    set -l _agy_orig_csv ","(string replace -ra '[ \t]+' '' -- "$_agy_vars")","
 
                     if set -q CLOUD_CODE_URL
                         set -gx AGY_COMPANION_ORIG_CLOUD_CODE_URL "$CLOUD_CODE_URL"
@@ -756,6 +764,8 @@ pub fn render_rc_snippet(shell: ShellKind, target_path: &Path) -> Result<String,
 
 pub fn write_env_script(env_script_path: &Path, binary_path: &Path) -> Result<(), CoreError> {
     validate_shell_safe_path(env_script_path)?;
+    let home = dirs::home_dir();
+    validate_env_script_parent_dir(env_script_path, home.as_deref())?;
     let content = render_env_sh(binary_path)?;
     write_file_atomic_with_mode(
         env_script_path,
@@ -795,15 +805,23 @@ fn split_lines_preserving_eol(content: &str) -> (Vec<&str>, &'static str, bool) 
     (lines, eol, had_trailing_newline)
 }
 
+fn is_begin_marker(trimmed: &str) -> bool {
+    trimmed.starts_with("# >>> agy-companion")
+}
+
+fn is_end_marker(trimmed: &str) -> bool {
+    trimmed.starts_with("# <<< agy-companion")
+}
+
 fn parse_markers(path: &Path, lines: &[&str]) -> Result<MarkerState, CoreError> {
     let mut begins = Vec::new();
     let mut ends = Vec::new();
 
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed == HOOK_BEGIN_MARKER {
+        if is_begin_marker(trimmed) {
             begins.push(idx + 1);
-        } else if trimmed == HOOK_END_MARKER {
+        } else if is_end_marker(trimmed) {
             ends.push(idx + 1);
         }
     }
@@ -1033,6 +1051,190 @@ enum RcInspection {
     },
 }
 
+#[derive(Debug)]
+enum DirChainInspection {
+    SafeDir,
+    Missing,
+    Symlink {
+        symlink_dir: PathBuf,
+        link_target: Option<PathBuf>,
+    },
+    NotDirectory {
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug)]
+enum DirTargetState {
+    Ready,
+    Missing,
+    NotDirectory { path: PathBuf },
+}
+
+fn default_fish_dir_chain(
+    home: &Path,
+    xdg_config_home: Option<&Path>,
+) -> Result<(PathBuf, &'static [&'static str]), CoreError> {
+    if let Some(xdg) = resolve_optional_absolute_dir(xdg_config_home)? {
+        let default_dot_config = home.join(".config");
+        let norm_xdg: PathBuf = xdg.components().collect();
+        let norm_default: PathBuf = default_dot_config.components().collect();
+        if norm_xdg != norm_default {
+            return Ok((xdg, &["fish", "conf.d"]));
+        }
+    }
+    Ok((home.to_path_buf(), &[".config", "fish", "conf.d"]))
+}
+
+fn inspect_dir_chain(root: &Path, rel_dirs: &[&str]) -> Result<DirChainInspection, CoreError> {
+    let mut current = root.to_path_buf();
+    for segment in rel_dirs {
+        current.push(segment);
+        let check_path: PathBuf = current.components().collect();
+        match fs::symlink_metadata(&check_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    let link_target = fs::read_link(&check_path).ok();
+                    return Ok(DirChainInspection::Symlink {
+                        symlink_dir: current,
+                        link_target,
+                    });
+                }
+                if !meta.file_type().is_dir() {
+                    return Ok(DirChainInspection::NotDirectory { path: current });
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Ok(DirChainInspection::Missing);
+            }
+            Err(source) => {
+                return Err(CoreError::Io {
+                    path: current,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(DirChainInspection::SafeDir)
+}
+
+fn validate_env_script_parent_dir(env_path: &Path, home: Option<&Path>) -> Result<(), CoreError> {
+    let data_dir = env_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| CoreError::InvalidPath {
+            reason: format!(
+                "env script path '{}' must include a parent directory",
+                env_path.display()
+            ),
+        })?;
+    let norm_data_dir: PathBuf = data_dir.components().collect();
+    if let Some(home_dir) = home {
+        let default_data_dir: PathBuf = home_dir
+            .join(".local")
+            .join("share")
+            .join("agy-companion")
+            .components()
+            .collect();
+        if norm_data_dir == default_data_dir {
+            match inspect_dir_chain(home_dir, &[".local", "share", "agy-companion"])? {
+                DirChainInspection::SafeDir | DirChainInspection::Missing => return Ok(()),
+                DirChainInspection::Symlink { symlink_dir, .. } => {
+                    return Err(CoreError::InvalidPath {
+                        reason: format!(
+                            "symbolic links are not allowed for env script data directory '{}'",
+                            symlink_dir.display()
+                        ),
+                    });
+                }
+                DirChainInspection::NotDirectory { path } => {
+                    return Err(CoreError::InvalidPath {
+                        reason: format!(
+                            "intermediate directory '{}' for '{}' is not a directory",
+                            path.display(),
+                            env_path.display()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    match fs::symlink_metadata(&norm_data_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(CoreError::InvalidPath {
+                    reason: format!(
+                        "symbolic links are not allowed for env script data directory '{}'",
+                        data_dir.display()
+                    ),
+                });
+            }
+            if !meta.file_type().is_dir() {
+                return Err(CoreError::InvalidPath {
+                    reason: format!(
+                        "env script parent directory '{}' must be a directory",
+                        data_dir.display()
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CoreError::Io {
+            path: data_dir.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn validate_env_script_dir_chain(ctx: &ResolvedContext) -> Result<(), CoreError> {
+    let Some(env_path) = ctx.env_script_path.as_deref() else {
+        return Ok(());
+    };
+    validate_env_script_parent_dir(env_path, Some(&ctx.home))?;
+    let check_path: PathBuf = env_path.components().collect();
+    match fs::symlink_metadata(&check_path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::InvalidPath {
+            reason: format!(
+                "symbolic links are not allowed for env script '{}'",
+                env_path.display()
+            ),
+        }),
+        Ok(meta) if !meta.file_type().is_file() => Err(CoreError::InvalidPath {
+            reason: format!("env script '{}' must be a regular file", env_path.display()),
+        }),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CoreError::Io {
+            path: env_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn inspect_symlinked_dir_chain_target(
+    root: &Path,
+    rel_dirs: &[&str],
+) -> Result<DirTargetState, CoreError> {
+    let mut current = root.to_path_buf();
+    for segment in rel_dirs {
+        current.push(segment);
+        let check_path: PathBuf = current.components().collect();
+        match fs::metadata(&check_path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(DirTargetState::NotDirectory { path: current }),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(DirTargetState::Missing),
+            Err(source) => {
+                return Err(CoreError::Io {
+                    path: current,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(DirTargetState::Ready)
+}
+
 fn inspect_rc_file(path: &Path) -> Result<RcInspection, CoreError> {
     validate_path(path)?;
     let check_path: PathBuf = path.components().collect();
@@ -1247,6 +1449,7 @@ fn remove_env_script_if_unused(ctx: &ResolvedContext) -> Result<(), CoreError> {
     let Some(env_path) = ctx.env_script_path.as_deref() else {
         return Ok(());
     };
+    validate_env_script_dir_chain(ctx)?;
     if env_script_still_referenced_elsewhere(ctx, &ctx.rc_path)? {
         return Ok(());
     }
@@ -1362,11 +1565,70 @@ fn status_with_env(
         shell_env,
         default_data_override,
     )?;
+    validate_env_script_dir_chain(&ctx)?;
     let snippet = render_block_for_context(&ctx)?;
     let env_exists = ctx
         .env_script_path
         .as_deref()
         .is_some_and(is_regular_file_existing);
+
+    if ctx.shell == ShellKind::Fish && opts.rc_file.is_none() {
+        let (fish_root, fish_rel_dirs) =
+            default_fish_dir_chain(&ctx.home, ctx.xdg_config_home.as_deref())?;
+        match inspect_dir_chain(&fish_root, fish_rel_dirs)? {
+            DirChainInspection::SafeDir | DirChainInspection::Missing => {}
+            DirChainInspection::NotDirectory { path } => {
+                return Err(CoreError::InvalidPath {
+                    reason: format!(
+                        "intermediate directory '{}' for '{}' is not a directory",
+                        path.display(),
+                        ctx.rc_path.display()
+                    ),
+                });
+            }
+            DirChainInspection::Symlink {
+                symlink_dir,
+                link_target,
+            } => {
+                let has_markers =
+                    match inspect_symlinked_dir_chain_target(&fish_root, fish_rel_dirs)? {
+                        DirTargetState::Ready => matches!(
+                            inspect_rc_file(&ctx.rc_path)?,
+                            RcInspection::Regular {
+                                markers: MarkerState::Valid { .. },
+                                ..
+                            } | RcInspection::Symlink {
+                                target: SymlinkTargetKind::Regular {
+                                    markers: MarkerState::Valid { .. },
+                                    ..
+                                },
+                                ..
+                            }
+                        ),
+                        DirTargetState::Missing | DirTargetState::NotDirectory { .. } => false,
+                    };
+                let enabled = has_markers;
+                let manual_required = !has_markers;
+                let symlink_target = link_target.or_else(|| fs::canonicalize(&symlink_dir).ok());
+                return Ok(IntegrationStatus {
+                    supported: true,
+                    enabled,
+                    manual_required,
+                    shell: Some(ctx.shell),
+                    rc_path: Some(ctx.rc_path),
+                    env_script_path: ctx.env_script_path,
+                    binary_path: Some(ctx.binary_path),
+                    symlink_target,
+                    manual_snippet: manual_required.then_some(snippet),
+                    hybrid_active,
+                    message: manual_required.then(|| {
+                        "Fish configuration directory is a symlink (likely managed by Nix, Stow, or Chezmoi); add the snippet manually."
+                            .to_string()
+                    }),
+                });
+            }
+        }
+    }
 
     match inspect_rc_file(&ctx.rc_path)? {
         RcInspection::Missing => Ok(IntegrationStatus {
@@ -1449,6 +1711,7 @@ fn status_with_env(
 }
 
 fn ensure_env_script(ctx: &ResolvedContext) -> Result<(), CoreError> {
+    validate_env_script_dir_chain(ctx)?;
     if let Some(env_path) = ctx.env_script_path.as_deref() {
         write_env_script(env_path, &ctx.binary_path)?;
     }
@@ -1478,11 +1741,135 @@ fn enable_with_env(
         shell_env,
         default_data_override,
     )?;
+    validate_env_script_dir_chain(&ctx)?;
 
     // Inspect RC and render snippet BEFORE writing env.sh so fail-closed errors
     // (corrupted markers, FIFO/oversized/non-UTF-8 RC, unfollowable symlink) never
     // leave an orphan env.sh on disk.
     let snippet = render_block_for_context(&ctx)?;
+    let mut followed_dir_symlink_target: Option<PathBuf> = None;
+    if ctx.shell == ShellKind::Fish && opts.rc_file.is_none() {
+        let (fish_root, fish_rel_dirs) =
+            default_fish_dir_chain(&ctx.home, ctx.xdg_config_home.as_deref())?;
+        match inspect_dir_chain(&fish_root, fish_rel_dirs)? {
+            DirChainInspection::SafeDir | DirChainInspection::Missing => {}
+            DirChainInspection::NotDirectory { path } => {
+                return Err(CoreError::InvalidPath {
+                    reason: format!(
+                        "intermediate directory '{}' for '{}' is not a directory",
+                        path.display(),
+                        ctx.rc_path.display()
+                    ),
+                });
+            }
+            DirChainInspection::Symlink {
+                symlink_dir,
+                link_target,
+            } => {
+                let target_display = link_target.or_else(|| fs::canonicalize(&symlink_dir).ok());
+                if !opts.follow_rc_symlink {
+                    let (existing_content, has_valid_markers) =
+                        match inspect_symlinked_dir_chain_target(&fish_root, fish_rel_dirs)? {
+                            DirTargetState::Ready => match inspect_rc_file(&ctx.rc_path)? {
+                                RcInspection::Regular {
+                                    file,
+                                    markers: MarkerState::Valid { .. },
+                                } => (Some(file.content), true),
+                                RcInspection::Symlink {
+                                    target:
+                                        SymlinkTargetKind::Regular {
+                                            file,
+                                            markers: MarkerState::Valid { .. },
+                                            ..
+                                        },
+                                    ..
+                                } => (Some(file.content), true),
+                                _ => (None, false),
+                            },
+                            DirTargetState::Missing | DirTargetState::NotDirectory { .. } => {
+                                (None, false)
+                            }
+                        };
+                    if has_valid_markers {
+                        let fish_needs_update = existing_content
+                            .as_deref()
+                            .is_some_and(|content| !content.contains(&snippet));
+                        return Ok(IntegrationStatus {
+                            supported: true,
+                            enabled: true,
+                            manual_required: fish_needs_update,
+                            shell: Some(ctx.shell),
+                            rc_path: Some(ctx.rc_path),
+                            env_script_path: ctx.env_script_path,
+                            binary_path: Some(ctx.binary_path),
+                            symlink_target: target_display,
+                            manual_snippet: fish_needs_update.then_some(snippet),
+                            hybrid_active,
+                            message: fish_needs_update.then(|| {
+                                "Fish configuration directory is a symlink; existing hook could not be updated automatically."
+                                    .to_string()
+                            }),
+                        });
+                    }
+                    return Ok(IntegrationStatus {
+                        supported: true,
+                        enabled: false,
+                        manual_required: true,
+                        shell: Some(ctx.shell),
+                        rc_path: Some(ctx.rc_path),
+                        env_script_path: ctx.env_script_path,
+                        binary_path: Some(ctx.binary_path),
+                        symlink_target: target_display,
+                        manual_snippet: Some(snippet),
+                        hybrid_active,
+                        message: Some(
+                            "Fish configuration directory is a symlink; left untouched. Add the snippet manually or re-run with --follow-rc-symlink."
+                                .to_string(),
+                        ),
+                    });
+                }
+
+                let sym_check: PathBuf = symlink_dir.components().collect();
+                match fs::metadata(&sym_check) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => {
+                        return Err(CoreError::InvalidPath {
+                            reason: format!(
+                                "Fish directory symlink '{}' does not point to a directory",
+                                symlink_dir.display()
+                            ),
+                        });
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        return Err(CoreError::InvalidPath {
+                            reason: format!(
+                                "cannot follow dangling Fish directory symlink '{}'",
+                                symlink_dir.display()
+                            ),
+                        });
+                    }
+                    Err(source) => {
+                        return Err(CoreError::Io {
+                            path: symlink_dir,
+                            source,
+                        });
+                    }
+                }
+                if let DirTargetState::NotDirectory { path } =
+                    inspect_symlinked_dir_chain_target(&fish_root, fish_rel_dirs)?
+                {
+                    return Err(CoreError::InvalidPath {
+                        reason: format!(
+                            "intermediate directory '{}' for '{}' is not a directory",
+                            path.display(),
+                            ctx.rc_path.display()
+                        ),
+                    });
+                }
+                followed_dir_symlink_target = fs::canonicalize(&sym_check).ok().or(target_display);
+            }
+        }
+    }
     let inspection = inspect_rc_file(&ctx.rc_path)?;
 
     match inspection {
@@ -1648,7 +2035,7 @@ fn enable_with_env(
                     rc_path: Some(ctx.rc_path),
                     env_script_path: ctx.env_script_path,
                     binary_path: Some(ctx.binary_path),
-                    symlink_target: None,
+                    symlink_target: followed_dir_symlink_target,
                     manual_snippet: manual_required.then_some(snippet),
                     hybrid_active,
                     message: manual_required.then(|| {
@@ -1677,7 +2064,7 @@ fn enable_with_env(
                     rc_path: Some(ctx.rc_path),
                     env_script_path: ctx.env_script_path,
                     binary_path: Some(ctx.binary_path),
-                    symlink_target: None,
+                    symlink_target: followed_dir_symlink_target,
                     manual_snippet: None,
                     hybrid_active,
                     message: None,
@@ -1693,7 +2080,7 @@ fn enable_with_env(
                         rc_path: Some(ctx.rc_path),
                         env_script_path: ctx.env_script_path,
                         binary_path: Some(ctx.binary_path),
-                        symlink_target: None,
+                        symlink_target: followed_dir_symlink_target,
                         manual_snippet: Some(snippet),
                         hybrid_active,
                         message: Some(
@@ -1725,7 +2112,7 @@ fn enable_with_env(
                     rc_path: Some(ctx.rc_path),
                     env_script_path: ctx.env_script_path,
                     binary_path: Some(ctx.binary_path),
-                    symlink_target: None,
+                    symlink_target: followed_dir_symlink_target,
                     manual_snippet: None,
                     hybrid_active,
                     message: None,
@@ -1741,7 +2128,7 @@ fn enable_with_env(
                         rc_path: Some(ctx.rc_path),
                         env_script_path: ctx.env_script_path,
                         binary_path: Some(ctx.binary_path),
-                        symlink_target: None,
+                        symlink_target: followed_dir_symlink_target,
                         manual_snippet: Some(snippet),
                         hybrid_active,
                         message: Some(
@@ -1779,6 +2166,99 @@ fn disable_with_env(
         shell_env,
         default_data_override,
     )?;
+    validate_env_script_dir_chain(&ctx)?;
+
+    let mut followed_dir_symlink_target: Option<PathBuf> = None;
+    if ctx.shell == ShellKind::Fish && opts.rc_file.is_none() {
+        let (fish_root, fish_rel_dirs) =
+            default_fish_dir_chain(&ctx.home, ctx.xdg_config_home.as_deref())?;
+        match inspect_dir_chain(&fish_root, fish_rel_dirs)? {
+            DirChainInspection::SafeDir | DirChainInspection::Missing => {}
+            DirChainInspection::NotDirectory { path } => {
+                return Err(CoreError::InvalidPath {
+                    reason: format!(
+                        "intermediate directory '{}' for '{}' is not a directory",
+                        path.display(),
+                        ctx.rc_path.display()
+                    ),
+                });
+            }
+            DirChainInspection::Symlink {
+                symlink_dir,
+                link_target,
+            } => {
+                let target_display = link_target.or_else(|| fs::canonicalize(&symlink_dir).ok());
+                match inspect_symlinked_dir_chain_target(&fish_root, fish_rel_dirs)? {
+                    DirTargetState::Missing | DirTargetState::NotDirectory { .. } => {
+                        return Ok(IntegrationStatus {
+                            supported: true,
+                            enabled: false,
+                            manual_required: false,
+                            shell: Some(ctx.shell),
+                            rc_path: Some(ctx.rc_path),
+                            env_script_path: ctx.env_script_path,
+                            binary_path: Some(ctx.binary_path),
+                            symlink_target: target_display,
+                            manual_snippet: None,
+                            hybrid_active,
+                            message: None,
+                        });
+                    }
+                    DirTargetState::Ready => {
+                        if !opts.follow_rc_symlink {
+                            let has_valid_markers = matches!(
+                                inspect_rc_file(&ctx.rc_path)?,
+                                RcInspection::Regular {
+                                    markers: MarkerState::Valid { .. },
+                                    ..
+                                } | RcInspection::Symlink {
+                                    target: SymlinkTargetKind::Regular {
+                                        markers: MarkerState::Valid { .. },
+                                        ..
+                                    },
+                                    ..
+                                }
+                            );
+                            if !has_valid_markers {
+                                return Ok(IntegrationStatus {
+                                    supported: true,
+                                    enabled: false,
+                                    manual_required: false,
+                                    shell: Some(ctx.shell),
+                                    rc_path: Some(ctx.rc_path),
+                                    env_script_path: ctx.env_script_path,
+                                    binary_path: Some(ctx.binary_path),
+                                    symlink_target: target_display,
+                                    manual_snippet: None,
+                                    hybrid_active,
+                                    message: None,
+                                });
+                            }
+                            return Ok(IntegrationStatus {
+                                supported: true,
+                                enabled: true,
+                                manual_required: true,
+                                shell: Some(ctx.shell),
+                                rc_path: Some(ctx.rc_path),
+                                env_script_path: ctx.env_script_path,
+                                binary_path: Some(ctx.binary_path),
+                                symlink_target: target_display,
+                                manual_snippet: None,
+                                hybrid_active,
+                                message: Some(
+                                    "Fish configuration directory is a symlink and was left untouched. Remove the hook manually or re-run with --follow-rc-symlink."
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                        let sym_check: PathBuf = symlink_dir.components().collect();
+                        followed_dir_symlink_target =
+                            fs::canonicalize(&sym_check).ok().or(target_display);
+                    }
+                }
+            }
+        }
+    }
 
     match inspect_rc_file(&ctx.rc_path)? {
         RcInspection::Missing => {
@@ -1791,7 +2271,7 @@ fn disable_with_env(
                 rc_path: Some(ctx.rc_path),
                 env_script_path: ctx.env_script_path,
                 binary_path: Some(ctx.binary_path),
-                symlink_target: None,
+                symlink_target: followed_dir_symlink_target,
                 manual_snippet: None,
                 hybrid_active,
                 message: None,
@@ -1921,7 +2401,7 @@ fn disable_with_env(
                     rc_path: Some(ctx.rc_path),
                     env_script_path: ctx.env_script_path,
                     binary_path: Some(ctx.binary_path),
-                    symlink_target: None,
+                    symlink_target: followed_dir_symlink_target,
                     manual_snippet: None,
                     hybrid_active,
                     message: None,
@@ -1938,7 +2418,7 @@ fn disable_with_env(
                     rc_path: Some(ctx.rc_path),
                     env_script_path: ctx.env_script_path,
                     binary_path: Some(ctx.binary_path),
-                    symlink_target: None,
+                    symlink_target: followed_dir_symlink_target,
                     manual_snippet: None,
                     hybrid_active,
                     message: Some(
@@ -1963,7 +2443,7 @@ fn disable_with_env(
                             rc_path: Some(ctx.rc_path),
                             env_script_path: ctx.env_script_path,
                             binary_path: Some(ctx.binary_path),
-                            symlink_target: None,
+                            symlink_target: followed_dir_symlink_target,
                             manual_snippet: None,
                             hybrid_active,
                             message: Some(
@@ -2002,7 +2482,7 @@ fn disable_with_env(
                             rc_path: Some(ctx.rc_path),
                             env_script_path: ctx.env_script_path,
                             binary_path: Some(ctx.binary_path),
-                            symlink_target: None,
+                            symlink_target: followed_dir_symlink_target,
                             manual_snippet: None,
                             hybrid_active,
                             message: Some(
@@ -2024,7 +2504,7 @@ fn disable_with_env(
                 rc_path: Some(ctx.rc_path),
                 env_script_path: ctx.env_script_path,
                 binary_path: Some(ctx.binary_path),
-                symlink_target: None,
+                symlink_target: followed_dir_symlink_target,
                 manual_snippet: None,
                 hybrid_active,
                 message: None,
@@ -2085,9 +2565,58 @@ pub fn strip_all_known_rc_files(
     dry_run: bool,
 ) -> Result<StripReport, CoreError> {
     let candidates = collect_known_rc_paths(home, zdotdir, xdg_config_home, true)?;
+    let (fish_root, fish_rel_dirs) = default_fish_dir_chain(home, xdg_config_home)?;
+    let mut fish_dropin_path = fish_root.clone();
+    for seg in fish_rel_dirs {
+        fish_dropin_path.push(seg);
+    }
+    fish_dropin_path.push(FISH_DROPIN_FILENAME);
+    let norm_fish_dropin: PathBuf = fish_dropin_path.components().collect();
     let mut report = StripReport::default();
 
     for path in candidates {
+        if path.components().collect::<PathBuf>() == norm_fish_dropin {
+            match inspect_dir_chain(&fish_root, fish_rel_dirs) {
+                Ok(DirChainInspection::SafeDir) => {}
+                Ok(DirChainInspection::Missing)
+                | Ok(DirChainInspection::NotDirectory { .. })
+                | Err(_) => {
+                    continue;
+                }
+                Ok(DirChainInspection::Symlink { .. }) => {
+                    match inspect_symlinked_dir_chain_target(&fish_root, fish_rel_dirs) {
+                        Ok(DirTargetState::Ready) => match inspect_rc_file(&path) {
+                            Ok(RcInspection::Regular {
+                                markers: MarkerState::Valid { .. },
+                                ..
+                            })
+                            | Ok(RcInspection::Symlink {
+                                target:
+                                    SymlinkTargetKind::Regular {
+                                        markers: MarkerState::Valid { .. },
+                                        ..
+                                    },
+                                ..
+                            }) => {
+                                report.skipped_manual_files.push(path);
+                            }
+                            Ok(_) => {}
+                            Err(_) => {
+                                let check_path: PathBuf = path.components().collect();
+                                if fs::symlink_metadata(&check_path).is_ok() {
+                                    report.skipped_manual_files.push(path);
+                                }
+                            }
+                        },
+                        Ok(DirTargetState::Missing)
+                        | Ok(DirTargetState::NotDirectory { .. })
+                        | Err(_) => {}
+                    }
+                    continue;
+                }
+            }
+        }
+
         let inspection = match inspect_rc_file(&path) {
             Ok(inspection) => inspection,
             Err(_) => {
@@ -3885,5 +4414,1457 @@ mod tests {
         assert!(report.deleted_files.contains(&fish_dropin));
         assert!(report.skipped_manual_files.contains(&zshrc));
         assert!(report.skipped_manual_files.contains(&profile));
+    }
+
+    #[test]
+    fn parse_markers_fails_closed_on_custom_labeled_or_malformed_marker_prefixes() {
+        let path = Path::new("/tmp/test.zlogin");
+
+        // Unclosed begin marker with custom label (e.g. legacy or edited marker text).
+        let unclosed = vec![
+            "# user header",
+            "# >>> agy-companion (test) >>>",
+            "export FOO=1",
+        ];
+        let err = parse_markers(path, &unclosed).expect_err("must fail closed on unclosed begin");
+        let msg = err.to_string();
+        assert!(msg.contains("line 2"), "expected line 2 in error: {msg}");
+
+        // Orphan custom-labeled end marker.
+        let orphan_end = vec!["export FOO=1", "# <<< agy-companion (legacy) <<<"];
+        let err = parse_markers(path, &orphan_end).expect_err("must fail closed on orphan end");
+        let msg = err.to_string();
+        assert!(msg.contains("line 2"), "expected line 2 in error: {msg}");
+
+        // Reversed custom-labeled markers.
+        let reversed = vec![
+            "# <<< agy-companion (legacy) <<<",
+            "# >>> agy-companion (test) >>>",
+        ];
+        let err = parse_markers(path, &reversed).expect_err("must fail closed on reversed markers");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("line 1") && msg.contains("line 2"),
+            "expected lines 1 and 2 in error: {msg}"
+        );
+
+        // Duplicate begin markers with mixed labels.
+        let dup = vec![
+            HOOK_BEGIN_MARKER,
+            "# >>> agy-companion (test) >>>",
+            HOOK_END_MARKER,
+        ];
+        let err = parse_markers(path, &dup).expect_err("must fail closed on duplicate begin");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1") && msg.contains("2"),
+            "expected line numbers 1 and 2 in error: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_sh_and_fish_trim_whitespace_in_restore_vars_preserving_outer_backups() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let fake_bin = tmp.path().join("fake-agy-companion");
+        fs::write(
+            &fake_bin,
+            "#!/bin/sh\nprintf '%s\\n' \"${FAKE_HOOK_PORT:-}\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_sh = tmp.path().join("env.sh");
+        let rendered = render_env_sh(&fake_bin).unwrap();
+        fs::write(&env_sh, &rendered).unwrap();
+
+        let restore_vars = "FOO, CLOUD_CODE_URL,\tGOOGLE_GEMINI_BASE_URL, GEMINI_API_KEY";
+
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+
+            // 1. Pre-existing set OUTER_CLOUD_CODE_URL must never be overwritten, duplicated, or unset.
+            let set_case = Command::new(shell)
+                .arg("-c")
+                .arg(format!(
+                    "set -eu; . '{}'; \
+                    printf 'ACT_OUTER=%s|ACT_VARS=%s|ACT_ADDED=%s|ACT_CC=%s\\n' \
+                    \"${{OUTER_CLOUD_CODE_URL+SET:$OUTER_CLOUD_CODE_URL}}\" \
+                    \"${{JETSKI_MCP_ENV_RESTORE_VARS:-}}\" \
+                    \"${{AGY_COMPANION_ADDED_PREFIX_CLOUD_CODE:-}}\" \
+                    \"${{CLOUD_CODE_URL:-}}\"; \
+                    unset ANTIGRAVITY_RESOLVING_ENVIRONMENT; \
+                    . '{}'; \
+                    printf 'SCRUB_OUTER=%s|SCRUB_VARS=%s|SCRUB_CC=%s\\n' \
+                    \"${{OUTER_CLOUD_CODE_URL+SET:$OUTER_CLOUD_CODE_URL}}\" \
+                    \"${{JETSKI_MCP_ENV_RESTORE_VARS:-}}\" \
+                    \"${{CLOUD_CODE_URL:-}}\"",
+                    env_sh.display(),
+                    env_sh.display()
+                ))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("ANTIGRAVITY_RESOLVING_ENVIRONMENT", "1")
+                .env("FAKE_HOOK_PORT", "4321")
+                .env("JETSKI_MCP_ENV_RESTORE_PREFIX", "OUTER_")
+                .env("JETSKI_MCP_ENV_RESTORE_VARS", restore_vars)
+                .env("OUTER_CLOUD_CODE_URL", "https://precious-orig.example")
+                .env("CLOUD_CODE_URL", "https://outer-wrapper.example")
+                .output()
+                .unwrap();
+            assert!(
+                set_case.status.success(),
+                "{shell} set_case failed: {}",
+                String::from_utf8_lossy(&set_case.stderr)
+            );
+            let lines: Vec<String> = String::from_utf8(set_case.stdout)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(lines.len(), 2, "{shell} unexpected output: {lines:?}");
+            assert_eq!(
+                lines[0],
+                format!(
+                    "ACT_OUTER=SET:https://precious-orig.example|ACT_VARS={restore_vars}|ACT_ADDED=|ACT_CC=http://127.0.0.1:4321"
+                ),
+                "{shell} activation clobbered or duplicated spaced JETSKI_MCP_ENV_RESTORE_VARS"
+            );
+            assert_eq!(
+                lines[1],
+                format!(
+                    "SCRUB_OUTER=SET:https://precious-orig.example|SCRUB_VARS={restore_vars}|SCRUB_CC=https://outer-wrapper.example"
+                ),
+                "{shell} scrub deleted or corrupted outer backup var"
+            );
+
+            // 2. 3-state originally-unset OUTER_CLOUD_CODE_URL must remain unset across activation & scrub.
+            let unset_case = Command::new(shell)
+                .arg("-c")
+                .arg(format!(
+                    "set -eu; . '{}'; \
+                    printf 'ACT_OUTER=%s|ACT_VARS=%s|ACT_ADDED=%s\\n' \
+                    \"${{OUTER_CLOUD_CODE_URL+SET:$OUTER_CLOUD_CODE_URL}}\" \
+                    \"${{JETSKI_MCP_ENV_RESTORE_VARS:-}}\" \
+                    \"${{AGY_COMPANION_ADDED_PREFIX_CLOUD_CODE:-}}\"; \
+                    unset ANTIGRAVITY_RESOLVING_ENVIRONMENT; \
+                    . '{}'; \
+                    printf 'SCRUB_OUTER=%s|SCRUB_CC=%s\\n' \
+                    \"${{OUTER_CLOUD_CODE_URL+SET:$OUTER_CLOUD_CODE_URL}}\" \
+                    \"${{CLOUD_CODE_URL:-}}\"",
+                    env_sh.display(),
+                    env_sh.display()
+                ))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("ANTIGRAVITY_RESOLVING_ENVIRONMENT", "1")
+                .env("FAKE_HOOK_PORT", "4321")
+                .env("JETSKI_MCP_ENV_RESTORE_PREFIX", "OUTER_")
+                .env("JETSKI_MCP_ENV_RESTORE_VARS", restore_vars)
+                .env("CLOUD_CODE_URL", "https://outer-wrapper.example")
+                .output()
+                .unwrap();
+            assert!(
+                unset_case.status.success(),
+                "{shell} unset_case failed: {}",
+                String::from_utf8_lossy(&unset_case.stderr)
+            );
+            let unset_lines: Vec<String> = String::from_utf8(unset_case.stdout)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(
+                unset_lines.len(),
+                2,
+                "{shell} unexpected unset output: {unset_lines:?}"
+            );
+            assert_eq!(
+                unset_lines[0],
+                format!("ACT_OUTER=|ACT_VARS={restore_vars}|ACT_ADDED="),
+                "{shell} activation overwrote 3-state originally-unset OUTER_CLOUD_CODE_URL"
+            );
+            assert_eq!(
+                unset_lines[1], "SCRUB_OUTER=|SCRUB_CC=https://outer-wrapper.example",
+                "{shell} scrub corrupted 3-state unset OUTER_CLOUD_CODE_URL"
+            );
+        }
+
+        // 3. Fish drop-in normalizes spaces and tabs before checking membership.
+        let fish = render_fish_dropin(&fake_bin).unwrap();
+        assert!(
+            fish.contains(
+                r#"set -l _agy_orig_csv ","(string replace -ra '[ \t]+' '' -- "$_agy_vars")",""#
+            ),
+            "render_fish_dropin must strip spaces/tabs from _agy_vars before CSV matching:\n{fish}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fish_intermediate_symlink_dirs_require_manual_without_touching_target_and_allow_opt_in_follow()
+     {
+        use std::os::unix::fs::symlink;
+
+        // Helper exercising status/enable/disable on a symlinked Fish intermediate directory.
+        let check_symlink_case = |label: &str,
+                                  home: &Path,
+                                  xdg: Option<&Path>,
+                                  victim_dir: &Path,
+                                  victim_dropin: &Path| {
+            let data = home.parent().unwrap().join(format!("data_{label}"));
+            let bin = home.parent().unwrap().join("agy-companion");
+            let opts = make_opts(ShellKind::Fish, None, data.clone(), bin.clone(), false);
+
+            // 1. Absent drop-in inside symlinked dir: status & enable report manual_required, touch nothing.
+            let st = status_with_env(
+                &opts,
+                Some(home),
+                None,
+                xdg,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(!st.enabled, "{label}: status must not report enabled");
+            assert!(
+                st.manual_required,
+                "{label}: status must report manual_required for symlinked Fish dir"
+            );
+            assert!(
+                st.symlink_target.is_some(),
+                "{label}: status must report symlink_target"
+            );
+            assert!(
+                st.manual_snippet.is_some(),
+                "{label}: status must include manual_snippet"
+            );
+
+            let en = enable_with_env(
+                &opts,
+                Some(home),
+                None,
+                xdg,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(!en.enabled, "{label}: enable must not report enabled");
+            assert!(
+                en.manual_required,
+                "{label}: enable must report manual_required without --follow-rc-symlink"
+            );
+            assert!(
+                en.symlink_target.is_some(),
+                "{label}: enable must report symlink_target"
+            );
+            assert!(
+                en.manual_snippet.is_some(),
+                "{label}: enable must include manual_snippet"
+            );
+            assert!(
+                !victim_dropin.exists(),
+                "{label}: enable must NOT create agy-companion.fish inside symlink target"
+            );
+
+            // 2. Pre-existing drop-in with markers inside symlink target: disable (no follow) leaves untouched.
+            fs::create_dir_all(victim_dropin.parent().unwrap()).unwrap();
+            let existing =
+                format!("# stow user note\n{HOOK_BEGIN_MARKER}\n# old hook\n{HOOK_END_MARKER}\n");
+            fs::write(victim_dropin, &existing).unwrap();
+
+            let st_existing = status_with_env(
+                &opts,
+                Some(home),
+                None,
+                xdg,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(
+                st_existing.enabled,
+                "{label}: status should reflect existing valid markers read-only"
+            );
+            assert!(!st_existing.manual_required);
+
+            let en_stale = enable_with_env(
+                &opts,
+                Some(home),
+                None,
+                xdg,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(en_stale.enabled);
+            assert!(
+                en_stale.manual_required,
+                "{label}: stale fish hook behind symlinked dir must require manual update"
+            );
+            assert_eq!(
+                fs::read_to_string(victim_dropin).unwrap(),
+                existing,
+                "{label}: enable must NOT mutate existing hook inside symlink target"
+            );
+
+            let dis = disable_with_env(
+                &opts,
+                Some(home),
+                None,
+                xdg,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(dis.enabled, "{label}: fish hook still active until removed");
+            assert!(
+                dis.manual_required,
+                "{label}: disable must report manual_required without --follow-rc-symlink"
+            );
+            assert_eq!(
+                fs::read_to_string(victim_dropin).unwrap(),
+                existing,
+                "{label}: disable must NOT mutate or delete file inside symlink target"
+            );
+
+            // 3. Explicit opt-in follow_rc_symlink = true allows updating and disabling.
+            let follow_opts = make_opts(ShellKind::Fish, None, data, bin, true);
+            let en_follow = enable_with_env(
+                &follow_opts,
+                Some(home),
+                None,
+                xdg,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(en_follow.enabled, "{label}: follow enable must succeed");
+            assert!(!en_follow.manual_required);
+            let updated = fs::read_to_string(victim_dropin).unwrap();
+            assert!(updated.contains("# stow user note"));
+            assert!(updated.contains(HOOK_BEGIN_MARKER));
+            assert!(updated.contains("hook-env --ensure-running --print-port"));
+
+            let dis_follow = disable_with_env(
+                &follow_opts,
+                Some(home),
+                None,
+                xdg,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(!dis_follow.enabled, "{label}: follow disable must succeed");
+            assert!(!dis_follow.manual_required);
+            assert_eq!(
+                fs::read_to_string(victim_dropin).unwrap(),
+                "# stow user note\n"
+            );
+            let _ = victim_dir;
+        };
+
+        // Case (a): XDG_CONFIG_HOME unset, $HOME/.config -> victim_cfg
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let victim = tmp.path().join("victim_cfg");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&victim).unwrap();
+            symlink(&victim, home.join(".config")).unwrap();
+            check_symlink_case(
+                "dot_config",
+                &home,
+                None,
+                &victim,
+                &victim.join("fish/conf.d/agy-companion.fish"),
+            );
+        }
+
+        // Case (b): XDG_CONFIG_HOME unset, $HOME/.config/fish -> victim_fish (Stow tree-folding)
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let victim = tmp.path().join("victim_fish");
+            fs::create_dir_all(home.join(".config")).unwrap();
+            fs::create_dir_all(&victim).unwrap();
+            symlink(&victim, home.join(".config/fish")).unwrap();
+            check_symlink_case(
+                "dot_config_fish",
+                &home,
+                None,
+                &victim,
+                &victim.join("conf.d/agy-companion.fish"),
+            );
+        }
+
+        // Case (c): XDG_CONFIG_HOME unset, $HOME/.config/fish/conf.d -> victim_confd (Stow)
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let victim = tmp.path().join("victim_confd");
+            fs::create_dir_all(home.join(".config/fish")).unwrap();
+            fs::create_dir_all(&victim).unwrap();
+            symlink(&victim, home.join(".config/fish/conf.d")).unwrap();
+            check_symlink_case(
+                "dot_config_fish_confd",
+                &home,
+                None,
+                &victim,
+                &victim.join("agy-companion.fish"),
+            );
+        }
+
+        // Case (d): XDG_CONFIG_HOME set, $XDG_CONFIG_HOME/fish -> victim_xdg_fish
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let xdg = tmp.path().join("xdg");
+            let victim = tmp.path().join("victim_xdg_fish");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&xdg).unwrap();
+            fs::create_dir_all(&victim).unwrap();
+            symlink(&victim, xdg.join("fish")).unwrap();
+            check_symlink_case(
+                "xdg_fish",
+                &home,
+                Some(&xdg),
+                &victim,
+                &victim.join("conf.d/agy-companion.fish"),
+            );
+        }
+
+        // Case (e): XDG_CONFIG_HOME set, $XDG_CONFIG_HOME/fish/conf.d -> victim_xdg_confd
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let xdg = tmp.path().join("xdg");
+            let victim = tmp.path().join("victim_xdg_confd");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(xdg.join("fish")).unwrap();
+            fs::create_dir_all(&victim).unwrap();
+            symlink(&victim, xdg.join("fish/conf.d")).unwrap();
+            check_symlink_case(
+                "xdg_fish_confd",
+                &home,
+                Some(&xdg),
+                &victim,
+                &victim.join("agy-companion.fish"),
+            );
+        }
+
+        // Case (f): Non-directory intermediate regular file fails closed with CoreError::InvalidPath.
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let data = tmp.path().join("data");
+            let bin = tmp.path().join("agy-companion");
+            fs::create_dir_all(home.join(".config")).unwrap();
+            fs::write(home.join(".config/fish"), "not a dir\n").unwrap();
+            let opts = make_opts(ShellKind::Fish, None, data, bin, false);
+            assert!(matches!(
+                status_with_env(
+                    &opts,
+                    Some(&home),
+                    None,
+                    None,
+                    Some("/usr/bin/fish"),
+                    None,
+                    false,
+                    true
+                ),
+                Err(CoreError::InvalidPath { .. })
+            ));
+            assert!(matches!(
+                enable_with_env(
+                    &opts,
+                    Some(&home),
+                    None,
+                    None,
+                    Some("/usr/bin/fish"),
+                    None,
+                    false,
+                    true
+                ),
+                Err(CoreError::InvalidPath { .. })
+            ));
+            assert!(matches!(
+                disable_with_env(
+                    &opts,
+                    Some(&home),
+                    None,
+                    None,
+                    Some("/usr/bin/fish"),
+                    None,
+                    false,
+                    true
+                ),
+                Err(CoreError::InvalidPath { .. })
+            ));
+        }
+
+        // Case (g): Dangling Fish directory symlink ($HOME/.config/fish -> /nonexistent):
+        // manual_required when follow=false, InvalidPath when follow=true, no false-positive strip.
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let data = tmp.path().join("data");
+            let bin = tmp.path().join("agy-companion");
+            let missing_target = tmp.path().join("does_not_exist_fish");
+            fs::create_dir_all(home.join(".config")).unwrap();
+            symlink(&missing_target, home.join(".config/fish")).unwrap();
+
+            let opts = make_opts(ShellKind::Fish, None, data.clone(), bin.clone(), false);
+            let st = status_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(!st.enabled);
+            assert!(st.manual_required);
+            assert!(st.manual_snippet.is_some());
+
+            let en = enable_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(!en.enabled);
+            assert!(en.manual_required);
+            assert!(!missing_target.exists());
+
+            let dis = disable_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(!dis.enabled);
+            assert!(!dis.manual_required);
+
+            let follow_opts = make_opts(ShellKind::Fish, None, data, bin, true);
+            assert!(matches!(
+                enable_with_env(
+                    &follow_opts,
+                    Some(&home),
+                    None,
+                    None,
+                    Some("/usr/local/bin/fish"),
+                    None,
+                    false,
+                    true,
+                ),
+                Err(CoreError::InvalidPath { .. })
+            ));
+
+            let strip_rep = strip_all_known_rc_files(&home, None, None, false).unwrap();
+            assert!(strip_rep.skipped_manual_files.is_empty());
+        }
+
+        // Case (h): Fresh absent ~/.config/fish/conf.d still succeeds cleanly on enable.
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let data = tmp.path().join("data");
+            let bin = tmp.path().join("agy-companion");
+            fs::create_dir_all(&home).unwrap();
+            let opts = make_opts(ShellKind::Fish, None, data, bin, false);
+            let en = enable_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(en.enabled);
+            assert!(!en.manual_required);
+            assert!(
+                home.join(".config/fish/conf.d/agy-companion.fish")
+                    .is_file()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_all_known_rc_files_refuses_symlinked_fish_intermediate_dirs() {
+        use std::os::unix::fs::symlink;
+
+        // Subcase (a): $HOME/.config -> victim_cfg with markers-only agy-companion.fish
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let victim = tmp.path().join("victim_cfg");
+            let dropin = victim.join("fish/conf.d/agy-companion.fish");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(dropin.parent().unwrap()).unwrap();
+            let content = format!("{HOOK_BEGIN_MARKER}\n# managed\n{HOOK_END_MARKER}\n");
+            fs::write(&dropin, &content).unwrap();
+            symlink(&victim, home.join(".config")).unwrap();
+
+            let expected_rc = home.join(".config/fish/conf.d/agy-companion.fish");
+            for dry_run in [true, false] {
+                let rep = strip_all_known_rc_files(&home, None, None, dry_run).unwrap();
+                assert!(
+                    rep.deleted_files.is_empty() && rep.modified_files.is_empty(),
+                    "dry_run={dry_run}: must not delete or modify through symlinked ~/.config: {rep:?}"
+                );
+                assert_eq!(
+                    rep.skipped_manual_files,
+                    vec![expected_rc.clone()],
+                    "dry_run={dry_run}: must record fish drop-in in skipped_manual_files"
+                );
+                assert_eq!(
+                    fs::read_to_string(&dropin).unwrap(),
+                    content,
+                    "dry_run={dry_run}: victim fish drop-in must survive byte-for-byte"
+                );
+            }
+        }
+
+        // Subcase (b): $HOME/.config/fish -> victim_fish with user comment + markers
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let victim = tmp.path().join("victim_fish");
+            let dropin = victim.join("conf.d/agy-companion.fish");
+            fs::create_dir_all(home.join(".config")).unwrap();
+            fs::create_dir_all(dropin.parent().unwrap()).unwrap();
+            let content =
+                format!("# user note\n{HOOK_BEGIN_MARKER}\n# managed\n{HOOK_END_MARKER}\n");
+            fs::write(&dropin, &content).unwrap();
+            symlink(&victim, home.join(".config/fish")).unwrap();
+
+            let expected_rc = home.join(".config/fish/conf.d/agy-companion.fish");
+            for dry_run in [true, false] {
+                let rep = strip_all_known_rc_files(&home, None, None, dry_run).unwrap();
+                assert!(rep.deleted_files.is_empty() && rep.modified_files.is_empty());
+                assert_eq!(rep.skipped_manual_files, vec![expected_rc.clone()]);
+                assert_eq!(fs::read_to_string(&dropin).unwrap(), content);
+            }
+        }
+
+        // Subcase (c): $HOME/.config/fish/conf.d -> victim_confd with markers
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let victim = tmp.path().join("victim_confd");
+            let dropin = victim.join("agy-companion.fish");
+            fs::create_dir_all(home.join(".config/fish")).unwrap();
+            fs::create_dir_all(&victim).unwrap();
+            let content = format!("{HOOK_BEGIN_MARKER}\n# managed\n{HOOK_END_MARKER}\n");
+            fs::write(&dropin, &content).unwrap();
+            symlink(&victim, home.join(".config/fish/conf.d")).unwrap();
+
+            let expected_rc = home.join(".config/fish/conf.d/agy-companion.fish");
+            for dry_run in [true, false] {
+                let rep = strip_all_known_rc_files(&home, None, None, dry_run).unwrap();
+                assert!(rep.deleted_files.is_empty() && rep.modified_files.is_empty());
+                assert_eq!(rep.skipped_manual_files, vec![expected_rc.clone()]);
+                assert_eq!(fs::read_to_string(&dropin).unwrap(), content);
+            }
+        }
+
+        // Subcase (d): $HOME/.config -> victim_empty with NO agy-companion.fish inside (no false positive)
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let victim = tmp.path().join("victim_empty");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&victim).unwrap();
+            symlink(&victim, home.join(".config")).unwrap();
+
+            for dry_run in [true, false] {
+                let rep = strip_all_known_rc_files(&home, None, None, dry_run).unwrap();
+                assert!(rep.deleted_files.is_empty());
+                assert!(rep.modified_files.is_empty());
+                assert!(
+                    rep.skipped_manual_files.is_empty(),
+                    "dry_run={dry_run}: absent fish drop-in must not emit false-positive skipped_manual_files"
+                );
+            }
+        }
+
+        // Subcase (e): Non-directory intermediate file at $XDG_CONFIG_HOME/fish skips safely
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let xdg = tmp.path().join("xdg");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&xdg).unwrap();
+            fs::write(xdg.join("fish"), "regular file\n").unwrap();
+
+            let rep = strip_all_known_rc_files(&home, None, Some(&xdg), false).unwrap();
+            assert!(rep.deleted_files.is_empty());
+            assert!(rep.modified_files.is_empty());
+            assert!(rep.skipped_manual_files.is_empty());
+            assert_eq!(
+                fs::read_to_string(xdg.join("fish")).unwrap(),
+                "regular file\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_and_bash_integration_refuse_symlinked_or_non_dir_env_data_dir_chain() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let check_symlink_rejected = |label: &str,
+                                      shell: ShellKind,
+                                      home: &Path,
+                                      opts_data_dir: Option<PathBuf>,
+                                      default_data_override: Option<&Path>,
+                                      victim_dir: &Path,
+                                      victim_env: &Path| {
+            let shell_env = match shell {
+                ShellKind::Zsh => Some("/bin/zsh"),
+                ShellKind::Bash => Some("/bin/bash"),
+                ShellKind::Fish => unreachable!(),
+            };
+            let rc_path = match shell {
+                ShellKind::Zsh => home.join(".zlogin"),
+                ShellKind::Bash => home.join(".profile"),
+                ShellKind::Fish => unreachable!(),
+            };
+            let bin = home.parent().unwrap().join("agy-companion");
+            let opts = IntegrationOptions {
+                shell: Some(shell),
+                rc_file: None,
+                binary_path: Some(bin),
+                data_dir: opts_data_dir,
+                follow_rc_symlink: false,
+            };
+
+            // 1. Fresh state: enable must fail closed, never create env.sh, never chmod victim_dir,
+            //    and never create or mutate RC file.
+            fs::set_permissions(victim_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                !victim_env.exists(),
+                "{label} ({shell}): precondition no victim env"
+            );
+            assert!(
+                matches!(
+                    enable_with_env(
+                        &opts,
+                        Some(home),
+                        None,
+                        None,
+                        shell_env,
+                        default_data_override,
+                        false,
+                        true,
+                    ),
+                    Err(CoreError::InvalidPath { .. })
+                ),
+                "{label} ({shell}): enable must fail closed with InvalidPath"
+            );
+            assert!(
+                !victim_env.exists(),
+                "{label} ({shell}): enable must NOT create env.sh inside symlink target"
+            );
+            assert_eq!(
+                fs::metadata(victim_dir).unwrap().permissions().mode() & 0o777,
+                0o755,
+                "{label} ({shell}): enable must NOT chmod symlink target dir from 0755 to 0700"
+            );
+            assert!(
+                !rc_path.exists(),
+                "{label} ({shell}): enable must NOT create RC file when data dir is unsafe"
+            );
+
+            // 2. Populated state (pre-existing victim env.sh + RC file with valid markers):
+            //    status, enable, and disable must ALL fail closed, preserving victim env.sh,
+            //    victim_dir 0o755 permissions, and RC content byte-for-byte.
+            let sentinel_env = "# VICTIM_ENV_SENTINEL\n";
+            fs::write(victim_env, sentinel_env).unwrap();
+            let rc_before = format!(
+                "# user line\n{HOOK_BEGIN_MARKER}\n[ -r \"{PORTABLE_ENV_SCRIPT_EXPR}\" ] && . \"{PORTABLE_ENV_SCRIPT_EXPR}\"\n{HOOK_END_MARKER}\n"
+            );
+            fs::write(&rc_path, &rc_before).unwrap();
+
+            assert!(
+                matches!(
+                    status_with_env(
+                        &opts,
+                        Some(home),
+                        None,
+                        None,
+                        shell_env,
+                        default_data_override,
+                        false,
+                        true,
+                    ),
+                    Err(CoreError::InvalidPath { .. })
+                ),
+                "{label} ({shell}): status must fail closed with InvalidPath"
+            );
+            assert!(
+                matches!(
+                    enable_with_env(
+                        &opts,
+                        Some(home),
+                        None,
+                        None,
+                        shell_env,
+                        default_data_override,
+                        false,
+                        true,
+                    ),
+                    Err(CoreError::InvalidPath { .. })
+                ),
+                "{label} ({shell}): enable with existing files must fail closed with InvalidPath"
+            );
+            assert!(
+                matches!(
+                    disable_with_env(
+                        &opts,
+                        Some(home),
+                        None,
+                        None,
+                        shell_env,
+                        default_data_override,
+                        false,
+                        true,
+                    ),
+                    Err(CoreError::InvalidPath { .. })
+                ),
+                "{label} ({shell}): disable must fail closed with InvalidPath"
+            );
+            assert_eq!(
+                fs::read_to_string(victim_env).unwrap(),
+                sentinel_env,
+                "{label} ({shell}): disable must NOT delete or modify victim env.sh"
+            );
+            assert_eq!(
+                fs::metadata(victim_dir).unwrap().permissions().mode() & 0o777,
+                0o755,
+                "{label} ({shell}): victim dir mode must remain 0o755"
+            );
+            assert_eq!(
+                fs::read_to_string(&rc_path).unwrap(),
+                rc_before,
+                "{label} ({shell}): RC file must remain untouched on fail-closed disable/enable"
+            );
+        };
+
+        for shell in [ShellKind::Zsh, ShellKind::Bash] {
+            // Case (a): XDG_DATA_HOME unset, $HOME/.local -> victim_local
+            {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let victim_local = tmp.path().join("victim_local");
+                let victim_data = victim_local.join("share/agy-companion");
+                fs::create_dir_all(&home).unwrap();
+                fs::create_dir_all(&victim_data).unwrap();
+                symlink(&victim_local, home.join(".local")).unwrap();
+                let default_data = home.join(".local/share/agy-companion");
+                check_symlink_rejected(
+                    "dot_local",
+                    shell,
+                    &home,
+                    None,
+                    Some(&default_data),
+                    &victim_data,
+                    &victim_data.join("env.sh"),
+                );
+            }
+
+            // Case (b): XDG_DATA_HOME unset, $HOME/.local/share -> victim_share
+            {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let victim_share = tmp.path().join("victim_share");
+                let victim_data = victim_share.join("agy-companion");
+                fs::create_dir_all(home.join(".local")).unwrap();
+                fs::create_dir_all(&victim_data).unwrap();
+                symlink(&victim_share, home.join(".local/share")).unwrap();
+                let default_data = home.join(".local/share/agy-companion");
+                check_symlink_rejected(
+                    "dot_local_share",
+                    shell,
+                    &home,
+                    None,
+                    Some(&default_data),
+                    &victim_data,
+                    &victim_data.join("env.sh"),
+                );
+            }
+
+            // Case (c): XDG_DATA_HOME unset, $HOME/.local/share/agy-companion -> victim_data
+            {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let victim_data = tmp.path().join("victim_data");
+                fs::create_dir_all(home.join(".local/share")).unwrap();
+                fs::create_dir_all(&victim_data).unwrap();
+                symlink(&victim_data, home.join(".local/share/agy-companion")).unwrap();
+                let default_data = home.join(".local/share/agy-companion");
+                check_symlink_rejected(
+                    "dot_local_share_app",
+                    shell,
+                    &home,
+                    None,
+                    Some(&default_data),
+                    &victim_data,
+                    &victim_data.join("env.sh"),
+                );
+            }
+
+            // Case (d): Explicit XDG_DATA_HOME=$HOME/.local/share (with trailing slash) while $HOME/.local -> victim_local
+            {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let victim_local = tmp.path().join("victim_local");
+                let victim_data = victim_local.join("share/agy-companion");
+                fs::create_dir_all(&home).unwrap();
+                fs::create_dir_all(&victim_data).unwrap();
+                symlink(&victim_local, home.join(".local")).unwrap();
+                let explicit_default_with_slash = PathBuf::from(format!(
+                    "{}/",
+                    home.join(".local/share/agy-companion").display()
+                ));
+                check_symlink_rejected(
+                    "explicit_xdg_eq_default",
+                    shell,
+                    &home,
+                    Some(explicit_default_with_slash),
+                    None,
+                    &victim_data,
+                    &victim_data.join("env.sh"),
+                );
+            }
+
+            // Case (e): Custom XDG_DATA_HOME/agy-companion -> victim_data
+            {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let custom_xdg = tmp.path().join("custom_xdg");
+                let victim_data = tmp.path().join("victim_custom");
+                fs::create_dir_all(&home).unwrap();
+                fs::create_dir_all(&custom_xdg).unwrap();
+                fs::create_dir_all(&victim_data).unwrap();
+                let custom_data_link = custom_xdg.join("agy-companion");
+                symlink(&victim_data, &custom_data_link).unwrap();
+                check_symlink_rejected(
+                    "custom_xdg_data",
+                    shell,
+                    &home,
+                    Some(custom_data_link),
+                    None,
+                    &victim_data,
+                    &victim_data.join("env.sh"),
+                );
+            }
+
+            // Case (f): Non-directory regular file at $HOME/.local, $HOME/.local/share,
+            //           $HOME/.local/share/agy-companion, and custom data_dir all fail closed.
+            for non_dir_kind in [
+                "dot_local",
+                "dot_local_share",
+                "dot_local_share_app",
+                "custom",
+            ] {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let bin = tmp.path().join("agy-companion");
+                fs::create_dir_all(&home).unwrap();
+                let (opts_data_dir, default_override) = match non_dir_kind {
+                    "dot_local" => {
+                        fs::write(home.join(".local"), "not a dir\n").unwrap();
+                        (None, Some(home.join(".local/share/agy-companion")))
+                    }
+                    "dot_local_share" => {
+                        fs::create_dir_all(home.join(".local")).unwrap();
+                        fs::write(home.join(".local/share"), "not a dir\n").unwrap();
+                        (None, Some(home.join(".local/share/agy-companion")))
+                    }
+                    "dot_local_share_app" => {
+                        fs::create_dir_all(home.join(".local/share")).unwrap();
+                        fs::write(home.join(".local/share/agy-companion"), "not a dir\n").unwrap();
+                        (None, Some(home.join(".local/share/agy-companion")))
+                    }
+                    "custom" => {
+                        let custom_file = tmp.path().join("custom_file_as_data_dir");
+                        fs::write(&custom_file, "not a dir\n").unwrap();
+                        (Some(custom_file), None)
+                    }
+                    _ => unreachable!(),
+                };
+                let shell_env = match shell {
+                    ShellKind::Zsh => Some("/bin/zsh"),
+                    ShellKind::Bash => Some("/bin/bash"),
+                    ShellKind::Fish => unreachable!(),
+                };
+                let opts = IntegrationOptions {
+                    shell: Some(shell),
+                    rc_file: None,
+                    binary_path: Some(bin),
+                    data_dir: opts_data_dir,
+                    follow_rc_symlink: false,
+                };
+                assert!(
+                    matches!(
+                        enable_with_env(
+                            &opts,
+                            Some(&home),
+                            None,
+                            None,
+                            shell_env,
+                            default_override.as_deref(),
+                            false,
+                            true,
+                        ),
+                        Err(CoreError::InvalidPath { .. })
+                    ),
+                    "non_dir={non_dir_kind} ({shell}): enable must fail with InvalidPath"
+                );
+                assert!(
+                    matches!(
+                        status_with_env(
+                            &opts,
+                            Some(&home),
+                            None,
+                            None,
+                            shell_env,
+                            default_override.as_deref(),
+                            false,
+                            true,
+                        ),
+                        Err(CoreError::InvalidPath { .. })
+                    ),
+                    "non_dir={non_dir_kind} ({shell}): status must fail with InvalidPath"
+                );
+                assert!(
+                    matches!(
+                        disable_with_env(
+                            &opts,
+                            Some(&home),
+                            None,
+                            None,
+                            shell_env,
+                            default_override.as_deref(),
+                            false,
+                            true,
+                        ),
+                        Err(CoreError::InvalidPath { .. })
+                    ),
+                    "non_dir={non_dir_kind} ({shell}): disable must fail with InvalidPath"
+                );
+            }
+
+            // Case (g): Even when .zlogin/.profile is ALSO a symlink, symlinked $HOME/.local
+            //           must fail closed BEFORE creating env.sh inside victim_local.
+            {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let victim_local = tmp.path().join("victim_local");
+                let victim_rc = tmp.path().join("victim_rc");
+                let bin = tmp.path().join("agy-companion");
+                fs::create_dir_all(&home).unwrap();
+                fs::create_dir_all(&victim_local).unwrap();
+                fs::write(&victim_rc, "# existing rc\n").unwrap();
+                symlink(&victim_local, home.join(".local")).unwrap();
+                let rc_link = match shell {
+                    ShellKind::Zsh => home.join(".zlogin"),
+                    ShellKind::Bash => home.join(".profile"),
+                    ShellKind::Fish => unreachable!(),
+                };
+                symlink(&victim_rc, &rc_link).unwrap();
+                let default_data = home.join(".local/share/agy-companion");
+                let opts = IntegrationOptions {
+                    shell: Some(shell),
+                    rc_file: None,
+                    binary_path: Some(bin),
+                    data_dir: None,
+                    follow_rc_symlink: false,
+                };
+                assert!(matches!(
+                    enable_with_env(
+                        &opts,
+                        Some(&home),
+                        None,
+                        None,
+                        Some("/bin/zsh"),
+                        Some(&default_data),
+                        false,
+                        true,
+                    ),
+                    Err(CoreError::InvalidPath { .. })
+                ));
+                assert!(
+                    !victim_local.join("share/agy-companion/env.sh").exists(),
+                    "both_sym ({shell}): must not create env.sh in victim_local"
+                );
+                assert_eq!(fs::read_to_string(&victim_rc).unwrap(), "# existing rc\n");
+            }
+
+            // Case (h): Fresh absent ~/.local/share/agy-companion succeeds cleanly on enable -> status -> disable.
+            {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let bin = tmp.path().join("agy-companion");
+                fs::create_dir_all(&home).unwrap();
+                let default_data = home.join(".local/share/agy-companion");
+                let opts = IntegrationOptions {
+                    shell: Some(shell),
+                    rc_file: None,
+                    binary_path: Some(bin),
+                    data_dir: None,
+                    follow_rc_symlink: false,
+                };
+                let shell_env = match shell {
+                    ShellKind::Zsh => Some("/bin/zsh"),
+                    ShellKind::Bash => Some("/bin/bash"),
+                    ShellKind::Fish => unreachable!(),
+                };
+                let en = enable_with_env(
+                    &opts,
+                    Some(&home),
+                    None,
+                    None,
+                    shell_env,
+                    Some(&default_data),
+                    false,
+                    true,
+                )
+                .unwrap();
+                assert!(en.enabled, "fresh ({shell}): enable should succeed");
+                assert!(default_data.join("env.sh").is_file());
+
+                let st = status_with_env(
+                    &opts,
+                    Some(&home),
+                    None,
+                    None,
+                    shell_env,
+                    Some(&default_data),
+                    false,
+                    true,
+                )
+                .unwrap();
+                assert!(st.enabled, "fresh ({shell}): status should report enabled");
+
+                let dis = disable_with_env(
+                    &opts,
+                    Some(&home),
+                    None,
+                    None,
+                    shell_env,
+                    Some(&default_data),
+                    false,
+                    true,
+                )
+                .unwrap();
+                assert!(!dis.enabled, "fresh ({shell}): disable should succeed");
+                assert!(!default_data.join("env.sh").exists());
+            }
+        }
+
+        // Case (i): Fish does NOT use env.sh and must NOT be blocked when $HOME/.local is a symlink.
+        {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let victim_local = tmp.path().join("victim_local");
+            let bin = tmp.path().join("agy-companion");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&victim_local).unwrap();
+            symlink(&victim_local, home.join(".local")).unwrap();
+            let default_data = home.join(".local/share/agy-companion");
+            let opts = IntegrationOptions {
+                shell: Some(ShellKind::Fish),
+                rc_file: None,
+                binary_path: Some(bin),
+                data_dir: None,
+                follow_rc_symlink: false,
+            };
+            let en = enable_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                Some(&default_data),
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(en.enabled);
+            let st = status_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                Some(&default_data),
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(st.enabled);
+            let dis = disable_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                Some(&default_data),
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(!dis.enabled);
+            assert!(
+                !victim_local.join("share/agy-companion/env.sh").exists(),
+                "fish must never touch env.sh inside symlinked ~/.local"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaf_env_script_symlink_dir_and_fifo_fail_closed_before_rc_mutation_and_fish_unaffected() {
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for shell in [ShellKind::Zsh, ShellKind::Bash] {
+            let shell_env = match shell {
+                ShellKind::Zsh => Some("/bin/zsh"),
+                ShellKind::Bash => Some("/bin/bash"),
+                ShellKind::Fish => unreachable!(),
+            };
+            let rc_filename = match shell {
+                ShellKind::Zsh => ".zlogin",
+                ShellKind::Bash => ".profile",
+                ShellKind::Fish => unreachable!(),
+            };
+
+            for kind in ["symlink", "directory", "fifo"] {
+                let tmp = TempDir::new().unwrap();
+                let home = tmp.path().join("home");
+                let data_dir = tmp.path().join("data");
+                let bin = tmp.path().join("agy-companion");
+                fs::create_dir_all(&home).unwrap();
+                fs::create_dir_all(&data_dir).unwrap();
+
+                let env_path = data_dir.join(ENV_SCRIPT_FILENAME);
+                let victim_env = tmp.path().join("victim_env.sh");
+                let sentinel = "# VICTIM_LEAF_ENV\n";
+                match kind {
+                    "symlink" => {
+                        fs::write(&victim_env, sentinel).unwrap();
+                        symlink(&victim_env, &env_path).unwrap();
+                    }
+                    "directory" => {
+                        fs::create_dir_all(&env_path).unwrap();
+                    }
+                    "fifo" => {
+                        assert!(
+                            Command::new("mkfifo")
+                                .arg(&env_path)
+                                .status()
+                                .unwrap()
+                                .success()
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+
+                // Marker-only RC file: Zsh .zlogin would be deleted if disable mutated RC before
+                // validating leaf env.sh; Bash .profile would be stripped to empty.
+                let rc_path = home.join(rc_filename);
+                let snippet = render_rc_snippet(shell, &env_path).unwrap();
+                let rc_before = format!("{snippet}\n");
+                fs::write(&rc_path, &rc_before).unwrap();
+
+                let opts = make_opts(shell, None, data_dir.clone(), bin.clone(), false);
+
+                // Run on a worker thread with a bounded wait so a FIFO regression fails fast
+                // instead of hanging the test runner.
+                let (tx, rx) = mpsc::channel();
+                let home_c = home.clone();
+                let opts_c = opts.clone();
+                std::thread::spawn(move || {
+                    let st = status_with_env(
+                        &opts_c,
+                        Some(&home_c),
+                        None,
+                        None,
+                        shell_env,
+                        None,
+                        false,
+                        true,
+                    );
+                    let en = enable_with_env(
+                        &opts_c,
+                        Some(&home_c),
+                        None,
+                        None,
+                        shell_env,
+                        None,
+                        false,
+                        true,
+                    );
+                    let dis = disable_with_env(
+                        &opts_c,
+                        Some(&home_c),
+                        None,
+                        None,
+                        shell_env,
+                        None,
+                        false,
+                        true,
+                    );
+                    let _ = tx.send((st, en, dis));
+                });
+
+                let (st_res, en_res, dis_res) = rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap_or_else(|_| panic!("{kind} ({shell}): timed out (FIFO hang)"));
+
+                assert!(
+                    matches!(st_res, Err(CoreError::InvalidPath { .. })),
+                    "{kind} ({shell}): status must fail closed with InvalidPath, got: {st_res:?}"
+                );
+                assert!(
+                    matches!(en_res, Err(CoreError::InvalidPath { .. })),
+                    "{kind} ({shell}): enable must fail closed with InvalidPath, got: {en_res:?}"
+                );
+                assert!(
+                    matches!(dis_res, Err(CoreError::InvalidPath { .. })),
+                    "{kind} ({shell}): disable must fail closed with InvalidPath, got: {dis_res:?}"
+                );
+                assert!(
+                    rc_path.is_file(),
+                    "{kind} ({shell}): RC file must NOT be deleted when disable fails on leaf env.sh"
+                );
+                assert_eq!(
+                    fs::read_to_string(&rc_path).unwrap(),
+                    rc_before,
+                    "{kind} ({shell}): RC file must remain byte-for-byte intact on failed enable/disable"
+                );
+                if kind == "symlink" {
+                    assert_eq!(
+                        fs::read_to_string(&victim_env).unwrap(),
+                        sentinel,
+                        "{kind} ({shell}): symlink victim must remain untouched"
+                    );
+                }
+            }
+        }
+
+        // Fish does not use env.sh and must remain completely unaffected by symlink/dir/FIFO env.sh.
+        for kind in ["symlink", "directory", "fifo"] {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let data_dir = tmp.path().join("data");
+            let bin = tmp.path().join("agy-companion");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&data_dir).unwrap();
+
+            let env_path = data_dir.join(ENV_SCRIPT_FILENAME);
+            let victim_env = tmp.path().join("victim_fish_env.sh");
+            let sentinel = "# FISH_VICTIM_ENV\n";
+            match kind {
+                "symlink" => {
+                    fs::write(&victim_env, sentinel).unwrap();
+                    symlink(&victim_env, &env_path).unwrap();
+                }
+                "directory" => {
+                    fs::create_dir_all(&env_path).unwrap();
+                }
+                "fifo" => {
+                    assert!(
+                        Command::new("mkfifo")
+                            .arg(&env_path)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            let opts = make_opts(ShellKind::Fish, None, data_dir.clone(), bin.clone(), false);
+            let en = enable_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(en.enabled, "fish ({kind}): enable must succeed");
+            let st = status_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(st.enabled, "fish ({kind}): status must report enabled");
+            let dis = disable_with_env(
+                &opts,
+                Some(&home),
+                None,
+                None,
+                Some("/usr/local/bin/fish"),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(!dis.enabled, "fish ({kind}): disable must succeed");
+            if kind == "symlink" {
+                assert_eq!(fs::read_to_string(&victim_env).unwrap(), sentinel);
+            }
+        }
     }
 }
