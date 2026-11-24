@@ -1128,7 +1128,7 @@ class TestTier1F8McpServer(E2ETestCase):
         self.assertIn("<html", text.lower())
 
     def test_t1_f8_tools_list_exposes_four_tools_with_correct_meta(self) -> None:
-        """tools/list exposes exact 4 tools with required MCP App & Antigravity _meta."""
+        """tools/list exposes exact 5 tools with required MCP App & Antigravity _meta."""
         env = self.make_env()
         mcp = self.start_mcp(env, auto_initialize=False)
         init_res = mcp.initialize(protocol_version="2025-03-26")
@@ -1141,7 +1141,13 @@ class TestTier1F8McpServer(E2ETestCase):
         tools = {t["name"]: t for t in (res.get("tools") or []) if isinstance(t, dict) and "name" in t}
         self.assertEqual(
             set(tools.keys()),
-            {"open_settings", "get_settings", "save_settings", "test_connection"},
+            {
+                "open_settings",
+                "get_settings",
+                "save_settings",
+                "test_connection",
+                "set_launcher_integration",
+            },
         )
 
         open_meta = tools["open_settings"].get("_meta") or {}
@@ -1157,7 +1163,12 @@ class TestTier1F8McpServer(E2ETestCase):
                 f"Expected entrypoint title 'Antigravity Companion' in {ep!r}",
             )
 
-        for app_tool in ("get_settings", "save_settings", "test_connection"):
+        for app_tool in (
+            "get_settings",
+            "save_settings",
+            "test_connection",
+            "set_launcher_integration",
+        ):
             meta = tools[app_tool].get("_meta") or {}
             self.assertEqual((meta.get("ui") or {}).get("visibility"), ["app"], f"Bad _meta for {app_tool}: {meta!r}")
 

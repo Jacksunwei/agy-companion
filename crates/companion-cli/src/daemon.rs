@@ -13,6 +13,7 @@ pub const PROXY_PID_FILENAME: &str = "proxy.pid";
 pub const PROXY_LOG_FILENAME: &str = "proxy.log";
 pub const PROXY_LOG_ROTATED_FILENAME: &str = "proxy.log.1";
 pub const MAX_PROXY_LOG_BYTES: u64 = 5 * 1024 * 1024;
+pub const DEFAULT_IDLE_SHUTDOWN_SECS: u64 = 1800;
 const MAX_PID_FILE_BYTES: u64 = 64 * 1024;
 
 #[cfg(any(windows, test))]
@@ -538,6 +539,72 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ServeLogTarget {
             .clone();
         ServeLogWriter { file }
     }
+}
+
+/// Spawns a detached Managed On-Demand `agy-companion serve` daemon.
+///
+/// The child runs in its own process group (`process_group(0)` on Unix;
+/// `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows) with `stdin/stdout/stderr`
+/// redirected to `Stdio::null()`. `serve` itself opens and rotates `0600` `proxy.log`
+/// (5 MiB cap) and writes `0600` `proxy.pid` inside `resolve_runtime_data_dir(&config)`
+/// immediately upon binding its listener.
+pub fn spawn_detached_proxy_daemon(
+    port: u16,
+    config_path: &Path,
+    idle_shutdown_secs: u64,
+) -> Result<std::process::Child, CliError> {
+    let exe = std::env::current_exe()?;
+    spawn_detached_proxy_daemon_with_exe(&exe, port, config_path, idle_shutdown_secs)
+}
+
+pub(crate) fn spawn_detached_proxy_daemon_with_exe(
+    exe: &Path,
+    port: u16,
+    config_path: &Path,
+    idle_shutdown_secs: u64,
+) -> Result<std::process::Child, CliError> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("serve")
+        .arg("--adopt-running")
+        .arg("--idle-shutdown-secs")
+        .arg(idle_shutdown_secs.to_string())
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--config")
+        .arg(config_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    // Defensively scrub injected proxy routing vars so the daemon inherits clean
+    // HTTPS_PROXY / XDG_* / real GEMINI_API_KEY without echoing placeholder/loopback vars.
+    cmd.env_remove("CLOUD_CODE_URL")
+        .env_remove("GOOGLE_GEMINI_BASE_URL")
+        .env_remove("AGY_COMPANION_HOOK_ACTIVE")
+        .env_remove("AGY_COMPANION_INJECTED_URL")
+        .env_remove("JETSKI_MCP_ENV_RESTORE_PREFIX")
+        .env_remove("JETSKI_MCP_ENV_RESTORE_VARS");
+    if std::env::var("GEMINI_API_KEY")
+        .ok()
+        .is_some_and(|v| companion_core::is_placeholder_api_key(&v))
+    {
+        cmd.env_remove("GEMINI_API_KEY");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    Ok(cmd.spawn()?)
 }
 
 #[cfg(test)]

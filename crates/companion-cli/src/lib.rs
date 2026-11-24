@@ -3,6 +3,8 @@
 pub mod cli;
 pub mod daemon;
 pub mod doctor;
+pub mod hook_env;
+pub mod integration;
 pub mod launch;
 pub mod models;
 

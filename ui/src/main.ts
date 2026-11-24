@@ -6,6 +6,8 @@ import {
 } from "@modelcontextprotocol/ext-apps";
 import "./style.css";
 
+type HostPlatform = "macos" | "linux" | "windows";
+
 interface RedactedConfig {
   schema_version: number;
   listen_host: string;
@@ -33,6 +35,30 @@ interface ProxyStatsPayload {
   output_tokens: number;
   reasoning_tokens: number;
   cache_hit_ratio: number;
+  last_catalog_refresh_at_ms: number | null;
+  last_catalog_included_proxy_models: boolean | null;
+  cloudcode_mode: string | null;
+  cloudcode_resolved_upstream: string | null;
+}
+
+interface CloudCodeStatusPayload {
+  mode: string;
+  configured_upstream: string;
+  resolved_upstream: string | null;
+}
+
+interface LauncherIntegrationStatus {
+  supported: boolean;
+  enabled: boolean;
+  manual_required: boolean;
+  shell: string | null;
+  rc_path: string | null;
+  env_script_path: string | null;
+  binary_path: string | null;
+  symlink_target: string | null;
+  manual_snippet: string | null;
+  hybrid_active: boolean;
+  message: string | null;
 }
 
 interface SettingsSnapshot {
@@ -41,6 +67,9 @@ interface SettingsSnapshot {
   proxy: ProxyHealthPayload;
   version_skew: boolean;
   stats: ProxyStatsPayload | null;
+  launcher_integration: LauncherIntegrationStatus | null;
+  cloudcode: CloudCodeStatusPayload;
+  platform: HostPlatform;
 }
 
 interface SaveSettingsArgs {
@@ -65,6 +94,8 @@ interface ToolCallResultLike {
 }
 
 type BannerTone = "info" | "success" | "warning" | "danger";
+
+const CATALOG_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 const DEFAULT_CONFIG: RedactedConfig = {
   schema_version: 1,
@@ -105,6 +136,20 @@ function isSupportedGeminiModel(model: string): boolean {
   return /^gemini-(?:3|4)[-.].+/.test(model);
 }
 
+function detectClientPlatform(): HostPlatform {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent.toLowerCase() : "";
+  if (ua.includes("win")) return "windows";
+  if (ua.includes("mac")) return "macos";
+  return "linux";
+}
+
+function normalizeHostPlatform(raw: unknown): HostPlatform {
+  if (raw === "macos" || raw === "linux" || raw === "windows") {
+    return raw;
+  }
+  return detectClientPlatform();
+}
+
 interface AppState {
   connected: boolean;
   hydratedFromInitialResult: boolean;
@@ -118,6 +163,10 @@ interface AppState {
   saving: boolean;
   clearing: boolean;
   testing: boolean;
+  updatingIntegration: boolean;
+  launcherFeedbackFromSnapshot: boolean;
+  lastSaveVerified: boolean;
+  catalogTimerId: number | null;
 }
 
 const state: AppState = {
@@ -133,6 +182,10 @@ const state: AppState = {
   saving: false,
   clearing: false,
   testing: false,
+  updatingIntegration: false,
+  launcherFeedbackFromSnapshot: false,
+  lastSaveVerified: false,
+  catalogTimerId: null,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -158,6 +211,21 @@ function asNullableNumber(value: unknown): number | null | undefined {
 }
 
 function asBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function asOptionalNullableString(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" ? value : null;
+}
+
+function asOptionalNullableNumber(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asOptionalNullableBoolean(value: unknown): boolean | null {
+  if (value === undefined || value === null) return null;
   return typeof value === "boolean" ? value : null;
 }
 
@@ -254,6 +322,72 @@ function parseProxyStats(raw: unknown): ProxyStatsPayload | null {
     output_tokens: outputTokens,
     reasoning_tokens: reasoningTokens,
     cache_hit_ratio: cacheHitRatio,
+    last_catalog_refresh_at_ms: asOptionalNullableNumber(raw.last_catalog_refresh_at_ms),
+    last_catalog_included_proxy_models: asOptionalNullableBoolean(
+      raw.last_catalog_included_proxy_models,
+    ),
+    cloudcode_mode: asOptionalNullableString(raw.cloudcode_mode),
+    cloudcode_resolved_upstream: asOptionalNullableString(raw.cloudcode_resolved_upstream),
+  };
+}
+
+function parseCloudCodeStatus(
+  raw: unknown,
+  config: RedactedConfig,
+  stats: ProxyStatsPayload | null,
+): CloudCodeStatusPayload {
+  if (isRecord(raw)) {
+    const mode = asString(raw.mode);
+    const configured = asString(raw.configured_upstream);
+    const resolved = asOptionalNullableString(raw.resolved_upstream);
+    if (mode !== null && configured !== null) {
+      return {
+        mode,
+        configured_upstream: configured,
+        resolved_upstream: resolved,
+      };
+    }
+  }
+
+  const isAuto = config.cloudcode_upstream_url.toLowerCase() === "auto";
+  const mode = stats?.cloudcode_mode || (isAuto ? "auto" : "fixed");
+  const resolved =
+    stats?.cloudcode_resolved_upstream ||
+    (mode === "fixed" ? config.cloudcode_upstream_url : null);
+  return {
+    mode,
+    configured_upstream: config.cloudcode_upstream_url,
+    resolved_upstream: resolved,
+  };
+}
+
+function parseLauncherIntegration(raw: unknown): LauncherIntegrationStatus | null {
+  if (!isRecord(raw)) return null;
+  const supported = asBoolean(raw.supported);
+  const enabled = asBoolean(raw.enabled);
+  const manualRequired = asBoolean(raw.manual_required);
+  const hybridActive = asBoolean(raw.hybrid_active);
+  if (
+    supported === null ||
+    enabled === null ||
+    manualRequired === null ||
+    hybridActive === null
+  ) {
+    return null;
+  }
+
+  return {
+    supported,
+    enabled,
+    manual_required: manualRequired,
+    shell: asOptionalNullableString(raw.shell),
+    rc_path: asOptionalNullableString(raw.rc_path),
+    env_script_path: asOptionalNullableString(raw.env_script_path),
+    binary_path: asOptionalNullableString(raw.binary_path),
+    symlink_target: asOptionalNullableString(raw.symlink_target),
+    manual_snippet: asOptionalNullableString(raw.manual_snippet),
+    hybrid_active: hybridActive,
+    message: asOptionalNullableString(raw.message),
   };
 }
 
@@ -275,12 +409,22 @@ function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
     }
   }
 
+  const launcherIntegration =
+    raw.launcher_integration !== undefined && raw.launcher_integration !== null
+      ? parseLauncherIntegration(raw.launcher_integration)
+      : null;
+  const cloudcode = parseCloudCodeStatus(raw.cloudcode, config, stats);
+  const platform = normalizeHostPlatform(raw.platform);
+
   return {
     config,
     binary_version: binaryVersion,
     proxy,
     version_skew: versionSkew,
     stats,
+    launcher_integration: launcherIntegration,
+    cloudcode,
+    platform,
   };
 }
 
@@ -328,23 +472,58 @@ function formatRatioPercent(ratio: number): string {
   return `${(clamped * 100).toFixed(1)}%`;
 }
 
-function buildHybridLaunchSnippet(port: number): string {
-  const safePort = Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
+function formatCountdownMs(ms: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = totalSeconds % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+function quitGuidanceForPlatform(platform: HostPlatform): string {
+  if (platform === "macos") {
+    return "quit (⌘Q) & reopen Antigravity (closing the window is not enough)";
+  }
+  return "quit completely & reopen Antigravity (closing the window is not enough)";
+}
+
+function buildHybridLaunchSnippet(port: number, platform: HostPlatform): string {
+  const safePort =
+    Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
+  if (platform === "windows") {
+    return [
+      "# Keep all original Google AI Pro models (with thinking levels)",
+      "# AND add (Proxy) Gemini 4 / 3 models side-by-side:",
+      `agy-companion launch --port ${safePort}`,
+      "",
+      "# Or launch Antigravity from PowerShell (session-scoped, zero registry changes):",
+      `$env:CLOUD_CODE_URL = "http://127.0.0.1:${safePort}"`,
+      `$env:GOOGLE_GEMINI_BASE_URL = "http://127.0.0.1:${safePort}"`,
+      '$env:GEMINI_API_KEY = "agy-companion-local"',
+      '& "$env:LOCALAPPDATA\\Programs\\Antigravity\\Antigravity.exe"',
+    ].join("\n");
+  }
+
+  const appCmd =
+    platform === "macos"
+      ? "/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+      : "antigravity";
+
   return [
     "# Keep all original Google AI Pro models (with thinking levels)",
     "# AND add (Proxy) Gemini 4 / 3 models side-by-side:",
     `agy-companion launch --port ${safePort}`,
     "",
-    "# Or launch Antigravity.app directly with env vars:",
+    "# Or launch Antigravity directly with env vars:",
     `CLOUD_CODE_URL="http://127.0.0.1:${safePort}" \\`,
     `GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${safePort}" \\`,
     'GEMINI_API_KEY="agy-companion-local" \\',
-    "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+    appCmd,
   ].join("\n");
 }
 
 function buildCustomModelsSnippet(port: number, model: string): string {
-  const safePort = Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
+  const safePort =
+    Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
   const safeModel = model.trim() || DEFAULT_CONFIG.gemini_default_model;
   return JSON.stringify(
     {
@@ -361,6 +540,43 @@ function buildCustomModelsSnippet(port: number, model: string): string {
     null,
     2,
   );
+}
+
+function classifyCloudCodeIndicator(
+  cloudcode: CloudCodeStatusPayload,
+  proxyReachable: boolean,
+): { text: string; className: string } {
+  const resolved = cloudcode.resolved_upstream?.trim() ?? "";
+  const lowerResolved = resolved.toLowerCase();
+  const isDaily =
+    lowerResolved.includes("daily-cloudcode-pa.googleapis.com") || lowerResolved === "daily";
+  const isProd =
+    !isDaily && (lowerResolved.includes("cloudcode-pa.googleapis.com") || lowerResolved === "prod");
+
+  if (cloudcode.mode === "auto") {
+    if (isDaily) {
+      return { text: "Auto → Personal Google AI Pro", className: "badge badge-success" };
+    }
+    if (isProd) {
+      return { text: "Auto → PayGo / Enterprise", className: "badge badge-info" };
+    }
+    if (resolved.length > 0) {
+      return { text: `Auto → ${resolved}`, className: "badge badge-info" };
+    }
+    return {
+      text: proxyReachable ? "Auto (resolving)" : "Auto (proxy offline)",
+      className: "badge",
+    };
+  }
+
+  if (isDaily) {
+    return { text: "Fixed: Personal Google AI Pro", className: "badge badge-info" };
+  }
+  if (isProd) {
+    return { text: "Fixed: PayGo / Enterprise", className: "badge badge-info" };
+  }
+  const fixedUrl = resolved || cloudcode.configured_upstream;
+  return { text: `Fixed: ${fixedUrl}`, className: "badge badge-info" };
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -528,6 +744,7 @@ interface UiRefs {
   proxyVersionVal: HTMLSpanElement;
   binaryVersionVal: HTMLSpanElement;
   cacheHitVal: HTMLSpanElement;
+  cloudcodeBadge: HTMLSpanElement;
   skewBanner: HTMLDivElement;
   skewBody: HTMLDivElement;
 
@@ -548,6 +765,20 @@ interface UiRefs {
   saveBtn: HTMLButtonElement;
   testBtn: HTMLButtonElement;
   formFeedback: HTMLDivElement;
+  catalogRefreshBanner: HTMLDivElement;
+  catalogRefreshTitle: HTMLDivElement;
+  catalogRefreshBody: HTMLDivElement;
+
+  launcherBadge: HTMLSpanElement;
+  launcherSummary: HTMLParagraphElement;
+  launcherMetaRow: HTMLDivElement;
+  launcherToggleBtn: HTMLButtonElement;
+  launcherManualBox: HTMLDivElement;
+  launcherManualNote: HTMLParagraphElement;
+  launcherManualCode: HTMLElement;
+  launcherManualCopyBtn: HTMLButtonElement;
+  launcherManualCopyStatus: HTMLSpanElement;
+  launcherFeedback: HTMLDivElement;
 
   hybridSnippetCode: HTMLElement;
   hybridCopyBtn: HTMLButtonElement;
@@ -587,6 +818,7 @@ function mountUi(root: HTMLElement): UiRefs {
   const proxyVersionVal = el("span", { className: "meta-value", text: "—" });
   const binaryVersionVal = el("span", { className: "meta-value", text: "—" });
   const cacheHitVal = el("span", { className: "meta-value", text: "—" });
+  const cloudcodeBadge = el("span", { className: "badge", text: "Auto (resolving)" });
 
   const metaStrip = el(
     "div",
@@ -594,6 +826,7 @@ function mountUi(root: HTMLElement): UiRefs {
     el("span", { className: "meta-item" }, "Proxy: ", proxyVersionVal),
     el("span", { className: "meta-item" }, "Binary: ", binaryVersionVal),
     el("span", { className: "meta-item" }, "Cache Hit: ", cacheHitVal),
+    el("span", { className: "meta-item" }, "CloudCode: ", cloudcodeBadge),
   );
 
   const skewBody = el("div");
@@ -659,7 +892,10 @@ function mountUi(root: HTMLElement): UiRefs {
   });
   const clearConfirmRow = el(
     "div",
-    { className: "inline-confirm hidden", attrs: { role: "group", "aria-label": "Clear API key confirmation" } },
+    {
+      className: "inline-confirm hidden",
+      attrs: { role: "group", "aria-label": "Clear API key confirmation" },
+    },
     el("span", { text: "Remove saved API key from local config?" }),
     el("div", { className: "action-row" }, confirmClearBtn, cancelClearBtn),
   );
@@ -704,7 +940,11 @@ function mountUi(root: HTMLElement): UiRefs {
   const modelField = el(
     "div",
     { className: "field" },
-    el("label", { className: "field-label", text: "Default Model", attrs: { for: "default-model" } }),
+    el("label", {
+      className: "field-label",
+      text: "Default Model",
+      attrs: { for: "default-model" },
+    }),
     modelInput,
     el("div", { className: "chip-row" }, ...chipButtons),
   );
@@ -750,7 +990,11 @@ function mountUi(root: HTMLElement): UiRefs {
   const baseUrlField = el(
     "div",
     { className: "field" },
-    el("label", { className: "field-label", text: "Upstream Base URL", attrs: { for: "base-url" } }),
+    el("label", {
+      className: "field-label",
+      text: "Upstream Base URL",
+      attrs: { for: "base-url" },
+    }),
     baseUrlInput,
     el("p", {
       className: "field-help",
@@ -760,7 +1004,7 @@ function mountUi(root: HTMLElement): UiRefs {
 
   const cloudcodeUpstreamInput = el("input", {
     id: "cloudcode-upstream-input",
-    className: "input",
+    className: "text-input mono",
     attrs: {
       type: "text",
       value: DEFAULT_CONFIG.cloudcode_upstream_url,
@@ -806,6 +1050,15 @@ function mountUi(root: HTMLElement): UiRefs {
     attrs: { role: "status", "aria-live": "polite" },
   });
 
+  const catalogRefreshTitle = el("div", { className: "banner-title" });
+  const catalogRefreshBody = el("div");
+  const catalogRefreshBanner = el(
+    "div",
+    { className: "banner banner-info hidden", attrs: { role: "status", "aria-live": "polite" } },
+    catalogRefreshTitle,
+    catalogRefreshBody,
+  );
+
   const form = el(
     "form",
     { className: "settings-form", attrs: { novalidate: "true" } },
@@ -815,6 +1068,7 @@ function mountUi(root: HTMLElement): UiRefs {
     cloudcodeField,
     el("div", { className: "action-row" }, saveBtn, testBtn),
     formFeedback,
+    catalogRefreshBanner,
   );
 
   const settingsCard = el(
@@ -828,81 +1082,68 @@ function mountUi(root: HTMLElement): UiRefs {
     form,
   );
 
-  // Section 3: Copyable Antigravity App Hybrid Mode Launch Snippet
-  const hybridSnippetCode = el("code", {
-    id: "hybrid-snippet",
-    text: buildHybridLaunchSnippet(DEFAULT_CONFIG.listen_port),
-  });
-  const hybridCopyBtn = el("button", {
-    className: "btn btn-sm",
-    text: "Copy Command",
+  // Section 3: Dock / Launcher Auto-Start Card
+  const launcherBadge = el("span", { className: "badge", text: "Checking..." });
+  const launcherToggleBtn = el("button", {
+    className: "btn btn-primary btn-sm",
+    text: "Enable Dock Auto-Start",
     attrs: { type: "button" },
   });
-  const hybridCopyStatus = el("span", {
+  const launcherSummary = el("p", {
+    className: "section-subtitle",
+    text: "Starts the local proxy automatically when Antigravity launches from the Dock or app launcher, keeping integrated terminals clean.",
+  });
+  const launcherMetaRow = el("div", { className: "launcher-meta hidden" });
+
+  const launcherManualNote = el("p", { className: "launcher-manual-note" });
+  const launcherManualCode = el("code", { id: "launcher-manual-snippet" });
+  const launcherManualCopyBtn = el("button", {
+    className: "btn btn-sm",
+    text: "Copy Snippet",
+    attrs: { type: "button" },
+  });
+  const launcherManualCopyStatus = el("span", {
     className: "copy-status",
     attrs: { role: "status", "aria-live": "polite" },
   });
+  const launcherManualBox = el(
+    "div",
+    { className: "launcher-manual hidden" },
+    el(
+      "div",
+      { className: "card-header" },
+      launcherManualNote,
+      el("div", { className: "action-row" }, launcherManualCopyStatus, launcherManualCopyBtn),
+    ),
+    el("pre", { className: "code-block" }, launcherManualCode),
+  );
 
-  const hybridCard = el(
+  const launcherFeedback = el("div", {
+    className: "banner hidden",
+    attrs: { role: "status", "aria-live": "polite" },
+  });
+
+  const launcherCard = el(
     "section",
-    { className: "card", attrs: { "aria-label": "Antigravity App hybrid launch snippet" } },
+    { className: "card", attrs: { "aria-label": "Dock and launcher auto-start" } },
     el(
       "div",
       { className: "card-header" },
       el(
         "div",
-        {},
-        el("h2", { className: "section-title", text: "Antigravity App (Hybrid Mode)" }),
-        el("p", {
-          className: "section-subtitle",
-          text: "Keeps all original Google AI Pro models + thinking levels and adds (Proxy) models side-by-side",
-        }),
+        { className: "title-group" },
+        el("h2", { className: "section-title", text: "Dock / Launcher Auto-Start" }),
+        launcherBadge,
       ),
-      el("div", { className: "action-row" }, hybridCopyStatus, hybridCopyBtn),
+      launcherToggleBtn,
     ),
-    el("pre", { className: "code-block" }, hybridSnippetCode),
-    el("p", {
-      className: "footer-note",
-      text: "Original Google AI Pro models stay untouched. Selecting a (Proxy) model routes through this local proxy with your Gemini API key, implicit caching, and thinking effort submenu.",
-    }),
+    launcherSummary,
+    launcherMetaRow,
+    launcherManualBox,
+    launcherFeedback,
   );
 
-  // Section 4: Copyable customModelsConfig JSON Snippet (agy CLI)
-  const snippetCode = el("code", {
-    id: "config-snippet",
-    text: buildCustomModelsSnippet(DEFAULT_CONFIG.listen_port, DEFAULT_CONFIG.gemini_default_model),
-  });
-  const copyBtn = el("button", {
-    className: "btn btn-sm",
-    text: "Copy JSON",
-    attrs: { type: "button" },
-  });
-  const copyStatus = el("span", {
-    className: "copy-status",
-    attrs: { role: "status", "aria-live": "polite" },
-  });
-
-  const snippetCard = el(
-    "section",
-    { className: "card", attrs: { "aria-label": "Antigravity model config snippet" } },
-    el(
-      "div",
-      { className: "card-header" },
-      el(
-        "div",
-        {},
-        el("h2", { className: "section-title", text: "customModelsConfig Snippet" }),
-        el("p", {
-          className: "section-subtitle",
-          text: "Paste into ~/.gemini/antigravity-cli/settings.json",
-        }),
-      ),
-      el("div", { className: "action-row" }, copyStatus, copyBtn),
-    ),
-    el("pre", { className: "code-block" }, snippetCode),
-  );
-
-  // Section 5: Usage & Cost Telemetry
+  // Section 4: Usage & Cost Telemetry
   const statsBadge = el("span", { className: "badge", text: "Proxy offline" });
   const statsBody = el("div");
   const statsCard = el(
@@ -921,7 +1162,103 @@ function mountUi(root: HTMLElement): UiRefs {
     }),
   );
 
-  root.replaceChildren(globalBanner, statusCard, settingsCard, hybridCard, snippetCard, statsCard);
+  // Section 5: Collapsed Advanced / Manual CLI Setup
+  const initialPlatform = detectClientPlatform();
+  const hybridSnippetCode = el("code", {
+    id: "hybrid-snippet",
+    text: buildHybridLaunchSnippet(DEFAULT_CONFIG.listen_port, initialPlatform),
+  });
+  const hybridCopyBtn = el("button", {
+    className: "btn btn-sm",
+    text: "Copy Command",
+    attrs: { type: "button" },
+  });
+  const hybridCopyStatus = el("span", {
+    className: "copy-status",
+    attrs: { role: "status", "aria-live": "polite" },
+  });
+
+  const hybridSection = el(
+    "div",
+    { className: "advanced-section" },
+    el(
+      "div",
+      { className: "card-header" },
+      el(
+        "div",
+        {},
+        el("h3", { className: "section-title", text: "Manual Hybrid Mode Launch" }),
+        el("p", {
+          className: "section-subtitle",
+          text: "Keeps all original Google AI Pro models + thinking levels and adds (Proxy) models side-by-side",
+        }),
+      ),
+      el("div", { className: "action-row" }, hybridCopyStatus, hybridCopyBtn),
+    ),
+    el("pre", { className: "code-block" }, hybridSnippetCode),
+  );
+
+  const snippetCode = el("code", {
+    id: "config-snippet",
+    text: buildCustomModelsSnippet(DEFAULT_CONFIG.listen_port, DEFAULT_CONFIG.gemini_default_model),
+  });
+  const copyBtn = el("button", {
+    className: "btn btn-sm",
+    text: "Copy JSON",
+    attrs: { type: "button" },
+  });
+  const copyStatus = el("span", {
+    className: "copy-status",
+    attrs: { role: "status", "aria-live": "polite" },
+  });
+
+  const snippetSection = el(
+    "div",
+    { className: "advanced-section" },
+    el(
+      "div",
+      { className: "card-header" },
+      el(
+        "div",
+        {},
+        el("h3", { className: "section-title", text: "customModelsConfig Snippet (agy CLI)" }),
+        el("p", {
+          className: "section-subtitle",
+          text: "Paste into ~/.gemini/antigravity-cli/settings.json",
+        }),
+      ),
+      el("div", { className: "action-row" }, copyStatus, copyBtn),
+    ),
+    el("pre", { className: "code-block" }, snippetCode),
+  );
+
+  const advancedDetails = el(
+    "details",
+    { className: "card advanced-details", attrs: { "aria-label": "Advanced manual CLI setup" } },
+    el(
+      "summary",
+      { className: "advanced-summary" },
+      el(
+        "div",
+        {},
+        el("h2", { className: "section-title", text: "Advanced / Manual CLI Setup" }),
+        el("p", {
+          className: "section-subtitle",
+          text: "Manual launch commands and agy CLI customModelsConfig JSON snippet",
+        }),
+      ),
+    ),
+    el("div", { className: "advanced-body" }, hybridSection, snippetSection),
+  );
+
+  root.replaceChildren(
+    globalBanner,
+    statusCard,
+    settingsCard,
+    launcherCard,
+    statsCard,
+    advancedDetails,
+  );
 
   return {
     globalBanner,
@@ -933,6 +1270,7 @@ function mountUi(root: HTMLElement): UiRefs {
     proxyVersionVal,
     binaryVersionVal,
     cacheHitVal,
+    cloudcodeBadge,
     skewBanner,
     skewBody,
     form,
@@ -952,6 +1290,19 @@ function mountUi(root: HTMLElement): UiRefs {
     saveBtn,
     testBtn,
     formFeedback,
+    catalogRefreshBanner,
+    catalogRefreshTitle,
+    catalogRefreshBody,
+    launcherBadge,
+    launcherSummary,
+    launcherMetaRow,
+    launcherToggleBtn,
+    launcherManualBox,
+    launcherManualNote,
+    launcherManualCode,
+    launcherManualCopyBtn,
+    launcherManualCopyStatus,
+    launcherFeedback,
     hybridSnippetCode,
     hybridCopyBtn,
     hybridCopyStatus,
@@ -987,6 +1338,81 @@ function clearFormFeedback(refs: UiRefs): void {
   refs.formFeedback.textContent = "";
 }
 
+function showLauncherFeedback(
+  refs: UiRefs,
+  tone: BannerTone,
+  message: string,
+  fromSnapshot = false,
+): void {
+  state.launcherFeedbackFromSnapshot = fromSnapshot;
+  setBannerTone(refs.launcherFeedback, tone);
+  refs.launcherFeedback.textContent = message;
+}
+
+function clearLauncherFeedback(refs: UiRefs): void {
+  state.launcherFeedbackFromSnapshot = false;
+  refs.launcherFeedback.className = "banner hidden";
+  refs.launcherFeedback.textContent = "";
+}
+
+function stopCatalogCountdown(): void {
+  if (state.catalogTimerId !== null) {
+    window.clearInterval(state.catalogTimerId);
+    state.catalogTimerId = null;
+  }
+}
+
+function renderCatalogCountdown(refs: UiRefs): boolean {
+  const snapshot = state.snapshot;
+  const shouldShow =
+    snapshot !== null &&
+    snapshot.config.api_key_configured &&
+    snapshot.proxy.reachable &&
+    snapshot.stats !== null &&
+    snapshot.stats.last_catalog_included_proxy_models === false;
+
+  if (!shouldShow || !snapshot || !snapshot.stats) {
+    refs.catalogRefreshBanner.className = "banner banner-info hidden";
+    return false;
+  }
+
+  const verifiedPrefix = state.lastSaveVerified
+    ? "API key verified — "
+    : "API key saved — ";
+  const quitHint = quitGuidanceForPlatform(snapshot.platform);
+  const lastMs = snapshot.stats.last_catalog_refresh_at_ms;
+
+  if (lastMs === null) {
+    refs.catalogRefreshBanner.className = "banner banner-info";
+    refs.catalogRefreshTitle.textContent = `${verifiedPrefix}(Proxy) models will appear on the next catalog refresh`;
+    refs.catalogRefreshBody.textContent = `Antigravity refreshes its model list every 5 minutes, or you can ${quitHint} to load (Proxy) models immediately.`;
+    return false;
+  }
+
+  const remainingMs = Math.max(0, lastMs + CATALOG_REFRESH_INTERVAL_MS - Date.now());
+  refs.catalogRefreshBanner.className = "banner banner-info";
+  if (remainingMs > 0) {
+    refs.catalogRefreshTitle.textContent = `${verifiedPrefix}(Proxy) models will appear in ~${formatCountdownMs(remainingMs)}`;
+    refs.catalogRefreshBody.textContent = `Antigravity automatically refreshes its model catalog every 5 minutes. For immediate access, ${quitHint}.`;
+    return true;
+  }
+
+  refs.catalogRefreshTitle.textContent = `${verifiedPrefix}model catalog refresh due now`;
+  refs.catalogRefreshBody.textContent = `Click Refresh above to check status, or ${quitHint} if (Proxy) models have not appeared yet.`;
+  return false;
+}
+
+function syncCatalogCountdown(refs: UiRefs): void {
+  stopCatalogCountdown();
+  const needsTick = renderCatalogCountdown(refs);
+  if (!needsTick) return;
+  state.catalogTimerId = window.setInterval(() => {
+    if (!renderCatalogCountdown(refs)) {
+      stopCatalogCountdown();
+    }
+  }, 1000);
+}
+
 function updateSnippet(refs: UiRefs): void {
   const parsedPort = Number.parseInt(refs.listenPortInput.value.trim(), 10);
   const port =
@@ -994,16 +1420,20 @@ function updateSnippet(refs: UiRefs): void {
       ? parsedPort
       : state.savedPort;
   const model = refs.modelInput.value.trim() || DEFAULT_CONFIG.gemini_default_model;
-  refs.hybridSnippetCode.textContent = buildHybridLaunchSnippet(port);
+  const platform = state.snapshot?.platform ?? detectClientPlatform();
+  refs.hybridSnippetCode.textContent = buildHybridLaunchSnippet(port, platform);
   refs.snippetCode.textContent = buildCustomModelsSnippet(port, model);
 
   const editedPortDiffers =
-    Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535 && parsedPort !== state.savedPort;
+    Number.isInteger(parsedPort) &&
+    parsedPort >= 1 &&
+    parsedPort <= 65535 &&
+    parsedPort !== state.savedPort;
   refs.portRestartNote.classList.toggle("hidden", !(editedPortDiffers || state.portChangedSinceSave));
 }
 
 function updateBusyControls(refs: UiRefs): void {
-  const anyWrite = state.saving || state.clearing;
+  const anyWrite = state.saving || state.clearing || state.updatingIntegration;
   const canCall = state.connected && state.activeCalls < 4;
 
   refs.refreshBtn.disabled = !canCall || state.refreshing || anyWrite;
@@ -1018,6 +1448,148 @@ function updateBusyControls(refs: UiRefs): void {
   refs.clearKeyBtn.disabled = !canCall || anyWrite;
   refs.confirmClearBtn.disabled = !canCall || anyWrite;
   refs.cancelClearBtn.disabled = anyWrite;
+
+  const integration = state.snapshot?.launcher_integration ?? null;
+  const integrationSupported = integration ? integration.supported : true;
+  refs.launcherToggleBtn.disabled = !canCall || anyWrite || !integrationSupported;
+  if (state.updatingIntegration) {
+    refs.launcherToggleBtn.textContent = "Updating...";
+  }
+}
+
+function renderLauncherIntegration(
+  refs: UiRefs,
+  snapshot: SettingsSnapshot,
+  syncDegradedFeedback = true,
+): void {
+  const info = snapshot.launcher_integration;
+  if (syncDegradedFeedback) {
+    const isDegradedState4 =
+      info !== null &&
+      info.supported &&
+      !info.manual_required &&
+      !info.enabled &&
+      info.message !== null &&
+      info.message.trim().length > 0;
+    if (isDegradedState4 && info.message) {
+      showLauncherFeedback(refs, "warning", info.message, true);
+    } else if (state.launcherFeedbackFromSnapshot) {
+      clearLauncherFeedback(refs);
+    }
+  }
+
+  if (!info) {
+    refs.launcherBadge.className = "badge";
+    refs.launcherBadge.textContent = "Unavailable";
+    refs.launcherSummary.textContent =
+      "Launcher integration status was not returned by this companion version.";
+    refs.launcherMetaRow.classList.add("hidden");
+    refs.launcherManualBox.classList.add("hidden");
+    refs.launcherToggleBtn.classList.add("hidden");
+    return;
+  }
+
+  const metaItems: Node[] = [];
+  if (info.shell) {
+    metaItems.push(
+      el("span", { className: "meta-item" }, "Shell: ", el("span", { className: "meta-value", text: info.shell })),
+    );
+  }
+  if (info.rc_path) {
+    metaItems.push(
+      el("span", { className: "meta-item" }, "RC: ", el("span", { className: "meta-value", text: info.rc_path })),
+    );
+  }
+  if (metaItems.length > 0) {
+    refs.launcherMetaRow.replaceChildren(...metaItems);
+    refs.launcherMetaRow.classList.remove("hidden");
+  } else {
+    refs.launcherMetaRow.classList.add("hidden");
+  }
+
+  // State 5: Windows / unsupported login-shell hook
+  if (!info.supported) {
+    refs.launcherBadge.className = "badge badge-info";
+    refs.launcherBadge.textContent = "Windows";
+    refs.launcherSummary.textContent =
+      "On Windows, Antigravity Companion uses the Start Menu Antigravity (Companion) shortcut or `agy-companion launch` (zero global environment or registry mutations).";
+    refs.launcherManualBox.classList.add("hidden");
+    refs.launcherToggleBtn.classList.add("hidden");
+    return;
+  }
+
+  refs.launcherToggleBtn.classList.remove("hidden");
+
+  // State 3: Manual step needed (symlink / Nix / Stow / read-only RC)
+  if (info.manual_required) {
+    refs.launcherBadge.className = "badge badge-warning";
+    refs.launcherBadge.textContent = "Manual step needed";
+    const targetDetail = info.symlink_target
+      ? ` (${info.rc_path ?? "RC file"} -> ${info.symlink_target})`
+      : "";
+
+    if (info.manual_snippet) {
+      if (info.env_script_path !== null) {
+        refs.launcherSummary.textContent = `Managed dotfiles were left untouched${targetDetail}. Your 0600 env.sh helper is ready — paste the snippet below into your dotfile repository, then ${quitGuidanceForPlatform(snapshot.platform)}.`;
+      } else {
+        refs.launcherSummary.textContent = `Managed dotfiles were left untouched${targetDetail}. Paste the snippet below into your shell configuration, then ${quitGuidanceForPlatform(snapshot.platform)}.`;
+      }
+      refs.launcherManualNote.textContent =
+        "Paste into your managed login-shell dotfiles (zero eval, SSH-safe, terminal-scrubbing):";
+      refs.launcherManualCode.textContent = info.manual_snippet;
+      refs.launcherManualBox.classList.remove("hidden");
+    } else {
+      refs.launcherSummary.textContent =
+        info.message ??
+        `Managed dotfiles were left untouched${targetDetail}. Remove the managed agy-companion lines from your dotfile repository manually.`;
+      refs.launcherManualBox.classList.add("hidden");
+    }
+
+    if (info.enabled) {
+      refs.launcherToggleBtn.className = "btn btn-sm";
+      refs.launcherToggleBtn.textContent = "Disable Auto-Start";
+    } else {
+      refs.launcherToggleBtn.className = "btn btn-sm";
+      refs.launcherToggleBtn.textContent = "Re-check";
+    }
+    return;
+  }
+
+  refs.launcherManualBox.classList.add("hidden");
+
+  // State 1: Active
+  if (info.enabled && info.hybrid_active) {
+    refs.launcherBadge.className = "badge badge-success";
+    refs.launcherBadge.textContent = "Active";
+    refs.launcherSummary.textContent =
+      "Dock / Launcher auto-start is active. Antigravity is running in Hybrid Mode while keeping integrated terminals and SSH sessions clean.";
+    refs.launcherToggleBtn.className = "btn btn-sm";
+    refs.launcherToggleBtn.textContent = "Disable Auto-Start";
+    return;
+  }
+
+  // State 2: Enabled (pending full quit & reopen)
+  if (info.enabled) {
+    refs.launcherBadge.className = "badge badge-warning";
+    refs.launcherBadge.textContent =
+      snapshot.platform === "macos"
+        ? "Enabled — quit (⌘Q) & reopen Antigravity"
+        : "Enabled — quit completely & reopen Antigravity";
+    refs.launcherSummary.textContent = `Login-shell hook is installed. To activate Hybrid Mode for Dock launches, ${quitGuidanceForPlatform(snapshot.platform)}.`;
+    refs.launcherToggleBtn.className = "btn btn-sm";
+    refs.launcherToggleBtn.textContent = "Disable Auto-Start";
+    return;
+  }
+
+  // State 4: Not enabled
+  refs.launcherBadge.className = "badge";
+  refs.launcherBadge.textContent = "Not enabled";
+  refs.launcherSummary.textContent =
+    info.env_script_path === null
+      ? "Adds a guarded login-shell hook so launching Antigravity from the Dock automatically enables Hybrid Mode."
+      : "Adds a 1-line guarded login-shell hook pointing to a 0600 env.sh script so launching Antigravity from the Dock automatically enables Hybrid Mode.";
+  refs.launcherToggleBtn.className = "btn btn-primary btn-sm";
+  refs.launcherToggleBtn.textContent = "Enable Dock Auto-Start";
 }
 
 function renderStats(refs: UiRefs, snapshot: SettingsSnapshot | null): void {
@@ -1104,6 +1676,10 @@ function renderSnapshot(refs: UiRefs, snapshot: SettingsSnapshot, syncFormInputs
     refs.cacheHitVal.textContent = "—";
   }
 
+  const cloudcodeIndicator = classifyCloudCodeIndicator(snapshot.cloudcode, snapshot.proxy.reachable);
+  refs.cloudcodeBadge.className = cloudcodeIndicator.className;
+  refs.cloudcodeBadge.textContent = cloudcodeIndicator.text;
+
   if (snapshot.version_skew) {
     const runningVer = snapshot.proxy.version ?? "unknown";
     refs.skewBody.textContent =
@@ -1130,6 +1706,7 @@ function renderSnapshot(refs: UiRefs, snapshot: SettingsSnapshot, syncFormInputs
     refs.clearKeyBtn.classList.add("hidden");
     state.clearConfirmOpen = false;
     refs.clearConfirmRow.classList.add("hidden");
+    state.lastSaveVerified = false;
   }
 
   if (syncFormInputs) {
@@ -1139,8 +1716,11 @@ function renderSnapshot(refs: UiRefs, snapshot: SettingsSnapshot, syncFormInputs
     refs.listenPortInput.value = String(snapshot.config.listen_port);
   }
 
+  renderLauncherIntegration(refs, snapshot);
   updateSnippet(refs);
   renderStats(refs, snapshot);
+  syncCatalogCountdown(refs);
+  updateBusyControls(refs);
 }
 
 function applyHostContext(ctx: Partial<McpUiHostContext> | undefined): void {
@@ -1225,6 +1805,7 @@ async function main(): Promise<void> {
   const refs = mountUi(root);
   renderStats(refs, null);
   updateBusyControls(refs);
+  window.addEventListener("pagehide", stopCatalogCountdown);
 
   const app = new App({ name: "Antigravity Companion", version: "0.1.0" }, {});
 
@@ -1260,13 +1841,26 @@ async function main(): Promise<void> {
   }
 
   async function refreshSettings(syncFormInputs: boolean): Promise<void> {
-    if (!state.connected || state.refreshing || state.saving || state.clearing) return;
+    if (
+      !state.connected ||
+      state.refreshing ||
+      state.saving ||
+      state.clearing ||
+      state.updatingIntegration
+    ) {
+      return;
+    }
     const epoch = state.snapshotEpoch;
     state.refreshing = true;
     updateBusyControls(refs);
     try {
       const outcome = await callTool("get_settings", {}, parseSettingsSnapshot);
-      if (state.snapshotEpoch !== epoch || state.saving || state.clearing) {
+      if (
+        state.snapshotEpoch !== epoch ||
+        state.saving ||
+        state.clearing ||
+        state.updatingIntegration
+      ) {
         return;
       }
       if (!outcome.ok) {
@@ -1274,12 +1868,70 @@ async function main(): Promise<void> {
         return;
       }
       hideGlobalBanner(refs);
+      clearLauncherFeedback(refs);
       if (outcome.data.proxy.reachable) {
         state.portChangedSinceSave = false;
       }
       renderSnapshot(refs, outcome.data, syncFormInputs);
     } finally {
       state.refreshing = false;
+      updateBusyControls(refs);
+    }
+  }
+
+  async function toggleLauncherIntegration(nextEnabled: boolean): Promise<void> {
+    if (!state.connected || state.saving || state.clearing || state.updatingIntegration) {
+      return;
+    }
+    state.snapshotEpoch += 1;
+    state.updatingIntegration = true;
+    clearLauncherFeedback(refs);
+    updateBusyControls(refs);
+    try {
+      const outcome = await callTool(
+        "set_launcher_integration",
+        { enabled: nextEnabled },
+        parseSettingsSnapshot,
+      );
+      if (!outcome.ok) {
+        showLauncherFeedback(refs, "danger", outcome.error);
+        return;
+      }
+      renderSnapshot(refs, outcome.data, false);
+      const li = outcome.data.launcher_integration;
+      if (li && li.manual_required) {
+        if (nextEnabled && li.manual_snippet) {
+          showLauncherFeedback(
+            refs,
+            "warning",
+            li.env_script_path !== null
+              ? "0600 env.sh prepared; managed dotfiles were not modified. Copy the snippet above to finish."
+              : "Managed dotfiles were not modified. Copy the snippet above to finish.",
+          );
+        } else {
+          showLauncherFeedback(
+            refs,
+            "warning",
+            li.message ??
+              (li.enabled
+                ? "Hook could not be removed automatically; remove the managed lines from your shell configuration manually."
+                : "Hook neutralized; remove the managed lines from your dotfile repository manually."),
+          );
+        }
+      } else if (li && li.enabled) {
+        showLauncherFeedback(
+          refs,
+          "success",
+          `Dock / Launcher auto-start enabled. ${quitGuidanceForPlatform(outcome.data.platform)}.`,
+        );
+      } else {
+        showLauncherFeedback(refs, "success", "Dock / Launcher auto-start disabled.");
+      }
+    } finally {
+      state.updatingIntegration = false;
+      if (state.snapshot) {
+        renderLauncherIntegration(refs, state.snapshot, false);
+      }
       updateBusyControls(refs);
     }
   }
@@ -1320,6 +1972,24 @@ async function main(): Promise<void> {
     void refreshSettings(false);
   });
 
+  refs.launcherToggleBtn.addEventListener("click", () => {
+    const info = state.snapshot?.launcher_integration ?? null;
+    if (!info || !info.supported) return;
+    if (info.manual_required && !info.enabled) {
+      void refreshSettings(false);
+      return;
+    }
+    void toggleLauncherIntegration(!info.enabled);
+  });
+
+  refs.launcherManualCopyBtn.addEventListener("click", () => {
+    void copySnippetWithFallback(
+      refs.launcherManualCode,
+      refs.launcherManualCopyStatus,
+      refs.launcherManualCode.textContent ?? "",
+    );
+  });
+
   refs.modelInput.addEventListener("input", () => {
     updateSnippet(refs);
   });
@@ -1358,7 +2028,7 @@ async function main(): Promise<void> {
   });
 
   refs.confirmClearBtn.addEventListener("click", async () => {
-    if (!state.connected || state.clearing || state.saving) return;
+    if (!state.connected || state.clearing || state.saving || state.updatingIntegration) return;
     state.snapshotEpoch += 1;
     state.clearing = true;
     clearFormFeedback(refs);
@@ -1375,6 +2045,7 @@ async function main(): Promise<void> {
       }
       refs.apiKeyInput.value = "";
       state.clearConfirmOpen = false;
+      state.lastSaveVerified = false;
       refs.clearConfirmRow.classList.add("hidden");
       renderSnapshot(refs, outcome.data, false);
       showFormFeedback(refs, "success", "Saved API key cleared (config written at 0600).");
@@ -1386,7 +2057,7 @@ async function main(): Promise<void> {
 
   refs.form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!state.connected || state.saving || state.clearing) return;
+    if (!state.connected || state.saving || state.clearing || state.updatingIntegration) return;
 
     const rawPort = refs.listenPortInput.value.trim();
     const port = Number.parseInt(rawPort, 10);
@@ -1420,6 +2091,10 @@ async function main(): Promise<void> {
       showFormFeedback(refs, "danger", "CloudCode upstream URL cannot be empty.");
       return;
     }
+
+    const submittedNewKey = refs.apiKeyInput.value.trim().length > 0;
+    const hadKeyBefore = state.snapshot?.config.api_key_configured ?? false;
+    const prevBaseUrl = state.snapshot?.config.gemini_base_url ?? "";
 
     const args: SaveSettingsArgs = {
       default_model: defaultModel,
@@ -1458,7 +2133,40 @@ async function main(): Promise<void> {
       const portMsg = state.portChangedSinceSave
         ? " Restart the proxy sidecar to listen on the new port."
         : "";
-      showFormFeedback(refs, "success", `Settings saved (0600).${portMsg}`);
+
+      const shouldAutoVerify =
+        outcome.data.config.api_key_configured &&
+        (submittedNewKey || !hadKeyBefore || outcome.data.config.gemini_base_url !== prevBaseUrl);
+
+      if (shouldAutoVerify) {
+        state.testing = true;
+        updateBusyControls(refs);
+        showFormFeedback(refs, "info", "Settings saved (0600). Verifying Gemini API key...");
+        try {
+          const verify = await callTool("test_connection", {}, parseTestConnectionPayload);
+          if (verify.ok && verify.data.ok) {
+            state.lastSaveVerified = true;
+            showFormFeedback(refs, "success", `API key saved & verified (0600).${portMsg}`);
+            syncCatalogCountdown(refs);
+          } else {
+            state.lastSaveVerified = false;
+            const errMsg = verify.ok ? verify.data.message : verify.error;
+            showFormFeedback(
+              refs,
+              "warning",
+              `Settings saved (0600), but connection check failed: ${errMsg}${portMsg}`,
+            );
+          }
+        } finally {
+          state.testing = false;
+          updateBusyControls(refs);
+        }
+      } else if (!outcome.data.config.api_key_configured) {
+        state.lastSaveVerified = false;
+        showFormFeedback(refs, "success", `Settings saved (0600).${portMsg}`);
+      } else {
+        showFormFeedback(refs, "success", `Settings saved (0600).${portMsg}`);
+      }
     } finally {
       state.saving = false;
       updateBusyControls(refs);
@@ -1466,7 +2174,15 @@ async function main(): Promise<void> {
   });
 
   refs.testBtn.addEventListener("click", async () => {
-    if (!state.connected || state.testing || state.saving || state.clearing) return;
+    if (
+      !state.connected ||
+      state.testing ||
+      state.saving ||
+      state.clearing ||
+      state.updatingIntegration
+    ) {
+      return;
+    }
     state.testing = true;
     clearFormFeedback(refs);
     updateBusyControls(refs);
@@ -1483,7 +2199,11 @@ async function main(): Promise<void> {
       if (outcome.data.ok) {
         showFormFeedback(refs, "success", `Connection OK: ${outcome.data.message}${unsavedKeyTip}`);
       } else {
-        showFormFeedback(refs, "danger", `Connection failed: ${outcome.data.message}${unsavedKeyTip}`);
+        showFormFeedback(
+          refs,
+          "danger",
+          `Connection failed: ${outcome.data.message}${unsavedKeyTip}`,
+        );
       }
     } finally {
       state.testing = false;

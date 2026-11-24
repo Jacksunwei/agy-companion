@@ -58,6 +58,10 @@ pub enum CoreError {
     SerializeConfig { reason: String },
     #[error("failed to serialize usage event: {reason}")]
     SerializeUsage { reason: String },
+    #[error("corrupted integration markers in '{path}': {reason}")]
+    CorruptedMarkers { path: PathBuf, reason: String },
+    #[error("unsupported shell '{shell}': expected zsh, bash, or fish")]
+    InvalidShell { shell: String },
     #[error("I/O error at '{path}': {source}")]
     Io {
         path: PathBuf,
@@ -520,13 +524,13 @@ fn inspect_existing_config_file(path: &Path) -> Result<Option<fs::Metadata>, Cor
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-enum TargetPlatform {
+pub(crate) enum TargetPlatform {
     Unix,
     Windows,
 }
 
 impl TargetPlatform {
-    const fn current() -> Self {
+    pub(crate) const fn current() -> Self {
         #[cfg(windows)]
         {
             Self::Windows
@@ -623,7 +627,7 @@ fn validate_platform_dir(dir: &Path, platform: TargetPlatform) -> Result<(), Cor
     Ok(())
 }
 
-fn resolve_xdg_base(
+pub(crate) fn resolve_xdg_base(
     xdg_env: Option<&str>,
     platform: TargetPlatform,
 ) -> Result<Option<PathBuf>, CoreError> {
@@ -758,7 +762,7 @@ fn resolve_plugins_dir_for_platform(
     Ok(home_dir.join(".gemini").join("config").join("plugins"))
 }
 
-fn read_optional_env(var_name: &str) -> Result<Option<String>, CoreError> {
+pub(crate) fn read_optional_env(var_name: &str) -> Result<Option<String>, CoreError> {
     match std::env::var(var_name) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
@@ -1021,8 +1025,44 @@ impl Config {
 /// Atomically writes `payload` to `path` with mode `0600` (and `0700` parent dir on Unix),
 /// rejecting path traversal, NUL bytes, and symlink targets fail-closed.
 pub fn write_file_atomic_secure(path: &Path, payload: &[u8]) -> Result<(), CoreError> {
+    write_file_atomic_with_mode(path, payload, 0o600, 0o700, false, true, false)
+}
+
+/// Atomically writes `payload` to `path` using a sibling temp file + `sync_all()` + `fs::rename`,
+/// enforcing explicit Unix file/directory modes and rejecting symlink/non-regular target entries.
+pub(crate) fn write_file_atomic_with_mode(
+    path: &Path,
+    payload: &[u8],
+    file_mode: u32,
+    dir_mode: u32,
+    tighten_existing_parent: bool,
+    allow_symlink_parent: bool,
+    reject_non_regular_target: bool,
+) -> Result<(), CoreError> {
+    #[cfg(not(unix))]
+    let _ = (file_mode, dir_mode, tighten_existing_parent);
+
     validate_path(path)?;
     reject_symlink_target_file(path, "target files")?;
+
+    if reject_non_regular_target {
+        let check_path: PathBuf = path.components().collect();
+        match fs::symlink_metadata(&check_path) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(CoreError::InvalidPath {
+                    reason: "target path must be a regular file".to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CoreError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
 
     let file_name = path
         .file_name()
@@ -1036,18 +1076,61 @@ pub fn write_file_atomic_secure(path: &Path, payload: &[u8]) -> Result<(), CoreE
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
-    if !parent.exists() {
-        let mut dir_builder = fs::DirBuilder::new();
-        dir_builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            dir_builder.mode(0o700);
+    let parent_check: PathBuf = parent.components().collect();
+    match fs::symlink_metadata(&parent_check) {
+        Ok(meta) => {
+            if !allow_symlink_parent && meta.file_type().is_symlink() {
+                return Err(CoreError::InvalidPath {
+                    reason: "symbolic links are not allowed for parent directories".to_string(),
+                });
+            }
+            if !(meta.file_type().is_dir()
+                || (allow_symlink_parent && meta.file_type().is_symlink()))
+            {
+                return Err(CoreError::InvalidPath {
+                    reason: "parent path must be a directory".to_string(),
+                });
+            }
+            #[cfg(unix)]
+            if tighten_existing_parent {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&parent_check, fs::Permissions::from_mode(dir_mode)).map_err(
+                    |source| CoreError::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    },
+                )?;
+            }
         }
-        dir_builder.create(parent).map_err(|source| CoreError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let mut dir_builder = fs::DirBuilder::new();
+            dir_builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                dir_builder.mode(dir_mode);
+            }
+            dir_builder.create(parent).map_err(|source| CoreError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+            #[cfg(unix)]
+            if tighten_existing_parent {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&parent_check, fs::Permissions::from_mode(dir_mode)).map_err(
+                    |source| CoreError::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    },
+                )?;
+            }
+        }
+        Err(source) => {
+            return Err(CoreError::Io {
+                path: parent.to_path_buf(),
+                source,
+            });
+        }
     }
 
     let tmp_path = parent.join(format!(".{file_name}.tmp.{}", Uuid::new_v4()));
@@ -1057,7 +1140,7 @@ pub fn write_file_atomic_secure(path: &Path, payload: &[u8]) -> Result<(), CoreE
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
+        open_opts.mode(file_mode);
     }
 
     let mut file = open_opts.open(&tmp_path).map_err(|source| CoreError::Io {
@@ -1071,7 +1154,7 @@ pub fn write_file_atomic_secure(path: &Path, payload: &[u8]) -> Result<(), CoreE
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.set_permissions(fs::Permissions::from_mode(file_mode))?;
         }
         Ok(())
     })();

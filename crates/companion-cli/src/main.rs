@@ -6,6 +6,8 @@ use clap::Parser;
 use companion_cli::cli::{Cli, Commands};
 use companion_cli::daemon::ServeLogTarget;
 use companion_cli::doctor::execute_doctor;
+use companion_cli::hook_env::{HookEnvOptions, run_hook_env};
+use companion_cli::integration::run_integration;
 use companion_cli::launch::run_launch;
 use companion_cli::models::run_models;
 use companion_cli::{ServeOptions, run_serve_configured, run_ui_mcp};
@@ -108,6 +110,39 @@ async fn main() -> ExitCode {
             init_stderr_tracing("warn");
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_launch(port, config, app, print_env, &mut stdout).await {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::HookEnv {
+            ensure_running,
+            print_port,
+            port,
+            config,
+            plugins_dir,
+        } => {
+            init_stderr_tracing("warn");
+            let mut stdout = std::io::stdout().lock();
+            let mut stderr = std::io::stderr().lock();
+            run_hook_env(
+                HookEnvOptions {
+                    ensure_running,
+                    print_port,
+                    port_override: port,
+                    config_override: config,
+                    plugins_dir_override: plugins_dir,
+                },
+                &mut stdout,
+                &mut stderr,
+            )
+            .await;
+            ExitCode::SUCCESS
+        }
+        Commands::Integration { action } => {
+            init_stderr_tracing("warn");
+            let mut stdout = std::io::stdout().lock();
+            if let Err(err) = run_integration(action, &mut stdout) {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
