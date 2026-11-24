@@ -7,6 +7,7 @@ use companion_cli::cli::{Cli, Commands};
 use companion_cli::daemon::ServeLogTarget;
 use companion_cli::doctor::execute_doctor;
 use companion_cli::hook_env::{HookEnvOptions, run_hook_env};
+use companion_cli::install::{InstallOptions, UninstallOptions, run_install, run_uninstall};
 use companion_cli::integration::run_integration;
 use companion_cli::launch::run_launch;
 use companion_cli::models::run_models;
@@ -143,6 +144,56 @@ async fn main() -> ExitCode {
             init_stderr_tracing("warn");
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_integration(action, &mut stdout) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Install {
+            plugins_dir,
+            no_launcher_hook,
+            no_start_proxy,
+            force,
+            json,
+        } => {
+            init_stderr_tracing("warn");
+            let mut stdout = std::io::stdout().lock();
+            if let Err(err) = run_install(
+                InstallOptions {
+                    plugins_dir,
+                    no_launcher_hook,
+                    no_start_proxy,
+                    force,
+                    json,
+                },
+                &mut stdout,
+            )
+            .await
+            {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Uninstall {
+            plugins_dir,
+            purge,
+            dry_run,
+            json,
+        } => {
+            init_stderr_tracing("warn");
+            let mut stdout = std::io::stdout().lock();
+            if let Err(err) = run_uninstall(
+                UninstallOptions {
+                    plugins_dir,
+                    purge,
+                    dry_run,
+                    json,
+                },
+                &mut stdout,
+            )
+            .await
+            {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }

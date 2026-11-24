@@ -313,6 +313,7 @@ dependencies = [
  "companion-core",
  "companion-proxy",
  "companion-ui-mcp",
+ "dirs",
  "reqwest",
  "serde",
  "serde_json",
@@ -322,6 +323,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

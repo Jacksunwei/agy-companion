@@ -43,6 +43,49 @@ is_usable_binary() {
   is_executable_file "${candidate}" && ! [[ "${candidate}" -ef "${self_path}" ]]
 }
 
+scrub_injected_proxy_env() {
+  local prefix="${JETSKI_MCP_ENV_RESTORE_PREFIX:-}"
+  case "${prefix}" in
+    [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_]*)
+      case "${prefix}" in
+        *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*) prefix="" ;;
+      esac
+      ;;
+    *) prefix="" ;;
+  esac
+  if [[ -n "${prefix}" ]]; then
+    if [[ "${AGY_COMPANION_ADDED_PREFIX_CLOUD_CODE:-}" == "1" ]]; then
+      unset "${prefix}CLOUD_CODE_URL"
+    fi
+    if [[ "${AGY_COMPANION_ADDED_PREFIX_GEMINI_BASE:-}" == "1" ]]; then
+      unset "${prefix}GOOGLE_GEMINI_BASE_URL"
+    fi
+  fi
+
+  unset CLOUD_CODE_URL GOOGLE_GEMINI_BASE_URL \
+    AGY_COMPANION_HOOK_ACTIVE AGY_COMPANION_INJECTED_URL \
+    AGY_COMPANION_ORIG_CLOUD_CODE_URL AGY_COMPANION_ORIG_GOOGLE_GEMINI_BASE_URL \
+    AGY_COMPANION_ORIG_RESTORE_PREFIX AGY_COMPANION_ORIG_RESTORE_VARS \
+    AGY_COMPANION_ADDED_PREFIX_CLOUD_CODE AGY_COMPANION_ADDED_PREFIX_GEMINI_BASE \
+    JETSKI_MCP_ENV_RESTORE_PREFIX JETSKI_MCP_ENV_RESTORE_VARS
+
+  # Scrub GEMINI_API_KEY only when it equals the local placeholder sentinel;
+  # preserve any real user GEMINI_API_KEY and never touch GOOGLE_API_KEY.
+  local trimmed_key="${GEMINI_API_KEY:-}"
+  trimmed_key="${trimmed_key#"${trimmed_key%%[![:space:]]*}"}"
+  trimmed_key="${trimmed_key%"${trimmed_key##*[![:space:]]}"}"
+  if [[ "${trimmed_key}" == "agy-companion-local" ]]; then
+    unset GEMINI_API_KEY
+  fi
+}
+
+exec_clean() {
+  local target_bin="$1"
+  shift
+  scrub_injected_proxy_env
+  exec -- "${target_bin}" ${1+"$@"}
+}
+
 resolve_script_path() {
   local target="$1"
   local max_hops=40
@@ -500,25 +543,79 @@ download_and_install() {
   cleanup
 }
 
-resolve_cache_bin_dir() {
+resolve_xdg_cache_bin_dir() {
+  local xdg="${XDG_DATA_HOME:-}"
   local cache_root=""
-  if [[ -n "${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-}" ]]; then
-    cache_root="${ANTIGRAVITY_EXECUTABLE_DATA_DIR}"
-  elif [[ -n "${HOME:-}" ]]; then
-    cache_root="${HOME}/.local/share/${BINARY_NAME}"
-  else
-    log_err "cannot determine cache directory: neither ANTIGRAVITY_EXECUTABLE_DATA_DIR nor HOME is set"
-    return 1
+  if [[ -n "${xdg}" ]]; then
+    case "/${xdg}/" in
+      */../*)
+        log_err "XDG_DATA_HOME must not contain '..' traversal: ${xdg}"
+        return 1
+        ;;
+    esac
+    case "${xdg}" in
+      /*) cache_root="${xdg%/}/${BINARY_NAME}" ;;
+      *)  cache_root="" ;; # Relative XDG_DATA_HOME falls back to $HOME per S6.
+    esac
   fi
-  cache_root="${cache_root%/}"
+  if [[ -z "${cache_root}" ]]; then
+    if [[ -n "${HOME:-}" ]]; then
+      cache_root="${HOME%/}/.local/share/${BINARY_NAME}"
+    else
+      return 1
+    fi
+  fi
   case "${cache_root}" in
     -*) cache_root="./${cache_root}" ;;
   esac
-  if [[ -z "${cache_root}" ]]; then
-    printf '/bin\n'
-  else
-    printf '%s/bin\n' "${cache_root}"
+  printf '%s/bin\n' "${cache_root}"
+}
+
+resolve_cache_bin_dir() {
+  local cache_root=""
+  if [[ -n "${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-}" ]]; then
+    cache_root="${ANTIGRAVITY_EXECUTABLE_DATA_DIR%/}"
+    case "${cache_root}" in
+      -*) cache_root="./${cache_root}" ;;
+    esac
+    if [[ -z "${cache_root}" ]]; then
+      printf '/bin\n'
+    else
+      printf '%s/bin\n' "${cache_root}"
+    fi
+    return 0
   fi
+  if resolve_xdg_cache_bin_dir; then
+    return 0
+  fi
+  log_err "cannot determine cache directory: neither ANTIGRAVITY_EXECUTABLE_DATA_DIR, valid XDG_DATA_HOME, nor HOME is set"
+  return 1
+}
+
+try_exec_cached_bin() {
+  local candidate_dir="$1"
+  local plugin_dir="$2"
+  local self_path="$3"
+  shift 3
+
+  local cand_bin="${candidate_dir}/${BINARY_NAME}"
+  local cand_ver="${candidate_dir}/.version"
+
+  if ! is_usable_binary "${cand_bin}" "${self_path}"; then
+    return 1
+  fi
+  if [[ -L "${cand_ver}" || ! -f "${cand_ver}" || ! -r "${cand_ver}" ]]; then
+    log_info "cached version metadata missing, non-regular, or unreadable (${cand_ver}); skipping cache at ${candidate_dir}"
+    return 1
+  fi
+  local cached_version="" expected_version=""
+  cached_version="$(tr -d '\r\n[:space:]' < "${cand_ver}")"
+  expected_version="$(parse_plugin_version "${plugin_dir}/plugin.json")" || exit 1
+  if [[ "${cached_version}" == "${expected_version}" ]]; then
+    exec_clean "${cand_bin}" ${1+"$@"}
+  fi
+  log_info "cached binary version (${cached_version}) differs from plugin manifest (${expected_version}); skipping cache at ${candidate_dir}"
+  return 1
 }
 
 main() {
@@ -550,7 +647,7 @@ main() {
       log_err "AGY_COMPANION_BIN points to launcher script itself; refusing recursive exec"
       exit 1
     fi
-    exec -- "${override_bin}" ${1+"$@"}
+    exec_clean "${override_bin}" ${1+"$@"}
   fi
 
   # Step 2: Symlink-aware linked dev checkout auto-detection (target/{debug,release}).
@@ -566,47 +663,38 @@ main() {
   fi
   if [[ ${has_debug} -eq 1 && ${has_release} -eq 1 ]]; then
     if [[ "${release_bin}" -nt "${debug_bin}" ]]; then
-      exec -- "${release_bin}" ${1+"$@"}
+      exec_clean "${release_bin}" ${1+"$@"}
     else
-      exec -- "${debug_bin}" ${1+"$@"}
+      exec_clean "${debug_bin}" ${1+"$@"}
     fi
   elif [[ ${has_debug} -eq 1 ]]; then
-    exec -- "${debug_bin}" ${1+"$@"}
+    exec_clean "${debug_bin}" ${1+"$@"}
   elif [[ ${has_release} -eq 1 ]]; then
-    exec -- "${release_bin}" ${1+"$@"}
+    exec_clean "${release_bin}" ${1+"$@"}
   fi
 
-  # Step 3: Installed binary on $PATH (with self-exec guard).
+  # Step 3: Version-matched cached binary (checked BEFORE unversioned $PATH).
+  local cache_bin_dir cache_bin
+  cache_bin_dir="$(resolve_cache_bin_dir)" || exit 1
+  cache_bin="${cache_bin_dir}/${BINARY_NAME}"
+
+  try_exec_cached_bin "${cache_bin_dir}" "${plugin_dir}" "${script_path}" ${1+"$@"} || true
+  if [[ -n "${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-}" ]]; then
+    local xdg_bin_dir=""
+    xdg_bin_dir="$(resolve_xdg_cache_bin_dir 2>/dev/null || true)"
+    if [[ -n "${xdg_bin_dir}" && "${xdg_bin_dir}" != "${cache_bin_dir}" ]]; then
+      try_exec_cached_bin "${xdg_bin_dir}" "${plugin_dir}" "${script_path}" ${1+"$@"} || true
+    fi
+  fi
+
+  # Step 4: Installed binary on $PATH (with self-exec guard).
   local path_bin=""
   path_bin="$(command -v "${BINARY_NAME}" 2>/dev/null || true)"
   if [[ -n "${path_bin}" ]]; then
     if is_usable_binary "${path_bin}" "${script_path}"; then
-      exec -- "${path_bin}" ${1+"$@"}
+      exec_clean "${path_bin}" ${1+"$@"}
     elif [[ "${path_bin}" -ef "${script_path}" ]]; then
       log_info "skipping PATH entry '${path_bin}' because it resolves to launcher script itself"
-    fi
-  fi
-
-  # Step 4: Cached binary in ANTIGRAVITY_EXECUTABLE_DATA_DIR or ~/.local/share/agy-companion.
-  local cache_bin_dir cache_bin version_file
-  cache_bin_dir="$(resolve_cache_bin_dir)" || exit 1
-  cache_bin="${cache_bin_dir}/${BINARY_NAME}"
-  version_file="${cache_bin_dir}/.version"
-
-  if is_usable_binary "${cache_bin}" "${script_path}"; then
-    if [[ ! -f "${version_file}" ]]; then
-      exec -- "${cache_bin}" ${1+"$@"}
-    fi
-    if [[ -r "${version_file}" ]]; then
-      local cached_version="" expected_version=""
-      cached_version="$(tr -d '\r\n[:space:]' < "${version_file}")"
-      expected_version="$(parse_plugin_version "${plugin_dir}/plugin.json")" || exit 1
-      if [[ "${cached_version}" == "${expected_version}" ]]; then
-        exec -- "${cache_bin}" ${1+"$@"}
-      fi
-      log_info "cached binary version (${cached_version}) differs from plugin manifest (${expected_version}); refreshing cache"
-    else
-      log_info "cached version file is unreadable (${version_file}); refreshing cache"
     fi
   fi
 
@@ -618,7 +706,7 @@ main() {
     exit 1
   fi
   cleanup
-  exec -- "${cache_bin}" ${1+"$@"}
+  exec_clean "${cache_bin}" ${1+"$@"}
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

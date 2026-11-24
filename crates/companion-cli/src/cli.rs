@@ -105,6 +105,39 @@ pub enum Commands {
         #[command(subcommand)]
         action: IntegrationCommands,
     },
+    /// Install the embedded Antigravity plugin, stable binary, Dock/Launcher hook, and local proxy.
+    Install {
+        /// Override Antigravity plugins directory (defaults to ~/.gemini/config/plugins).
+        #[arg(long = "plugins-dir")]
+        plugins_dir: Option<PathBuf>,
+        /// Skip configuring the Dock / Launcher shell hook (and Windows Start Menu shortcut).
+        #[arg(long = "no-launcher-hook")]
+        no_launcher_hook: bool,
+        /// Skip starting or upgrading the background local proxy daemon.
+        #[arg(long = "no-start-proxy")]
+        no_start_proxy: bool,
+        /// Overwrite an existing symlinked plugin directory (e.g. from scripts/dev-install.sh).
+        #[arg(long)]
+        force: bool,
+        /// Emit machine-readable JSON install report to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Uninstall Antigravity Companion plugin, launcher hooks, proxy daemon, and managed binary.
+    Uninstall {
+        /// Override Antigravity plugins directory (defaults to ~/.gemini/config/plugins).
+        #[arg(long = "plugins-dir")]
+        plugins_dir: Option<PathBuf>,
+        /// Also delete config.json, usage/ logs, proxy.log, and sidecar_data/agy-companion.
+        #[arg(long)]
+        purge: bool,
+        /// Report what would be removed without modifying any files or stopping processes.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Emit machine-readable JSON uninstall report to stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +561,73 @@ mod tests {
         assert!(
             Cli::try_parse_from(["agy-companion", "integration"]).is_err(),
             "integration without action must fail"
+        );
+
+        let install = Cli::try_parse_from([
+            "agy-companion",
+            "install",
+            "--plugins-dir",
+            "/tmp/plugins",
+            "--no-launcher-hook",
+            "--no-start-proxy",
+            "--force",
+            "--json",
+        ])
+        .expect("install should parse");
+        assert_eq!(
+            install.command,
+            Commands::Install {
+                plugins_dir: Some(PathBuf::from("/tmp/plugins")),
+                no_launcher_hook: true,
+                no_start_proxy: true,
+                force: true,
+                json: true,
+            }
+        );
+
+        let install_defaults = Cli::try_parse_from(["agy-companion", "install"])
+            .expect("install defaults should parse");
+        assert_eq!(
+            install_defaults.command,
+            Commands::Install {
+                plugins_dir: None,
+                no_launcher_hook: false,
+                no_start_proxy: false,
+                force: false,
+                json: false,
+            }
+        );
+
+        let uninstall = Cli::try_parse_from([
+            "agy-companion",
+            "uninstall",
+            "--plugins-dir",
+            "/tmp/plugins",
+            "--purge",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("uninstall should parse");
+        assert_eq!(
+            uninstall.command,
+            Commands::Uninstall {
+                plugins_dir: Some(PathBuf::from("/tmp/plugins")),
+                purge: true,
+                dry_run: true,
+                json: true,
+            }
+        );
+
+        let uninstall_defaults = Cli::try_parse_from(["agy-companion", "uninstall"])
+            .expect("uninstall defaults should parse");
+        assert_eq!(
+            uninstall_defaults.command,
+            Commands::Uninstall {
+                plugins_dir: None,
+                purge: false,
+                dry_run: false,
+                json: false,
+            }
         );
     }
 }

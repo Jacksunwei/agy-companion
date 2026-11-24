@@ -1249,9 +1249,10 @@ mod tests {
         Config::default().save_secure(&cfg).expect("save");
 
         // 1. Secret in GEMINI_API_KEY + query key in GOOGLE_GEMINI_BASE_URL
+        // Use non-numeric suffixes (total length != 39 chars) so OS ephemeral ports never collide.
         let env = DoctorEnv::from_raw_values(
-            Some("AIzaSyEnvSecretNeverPrint1234"),
-            Some(&format!("http://127.0.0.1:{port}?key=AIzaSyUrlSecret5678")),
+            Some("AIzaSyEnvSecretNeverPrintAlpha"),
+            Some(&format!("http://127.0.0.1:{port}?key=AIzaSyUrlSecretBeta")),
         );
         let rep = run_doctor(
             DoctorOptions {
@@ -1271,11 +1272,11 @@ mod tests {
         let json = format_doctor_json(&rep).expect("json");
         let human = format_doctor_human(&rep);
         for forbidden in [
-            "AIzaSyEnvSecretNeverPrint1234",
+            "AIzaSyEnvSecretNeverPrintAlpha",
             "AIza",
-            "1234",
-            "AIzaSyUrlSecret5678",
-            "5678",
+            "NeverPrintAlpha",
+            "AIzaSyUrlSecretBeta",
+            "SecretBeta",
             "?key=",
         ] {
             assert!(!json.contains(forbidden), "JSON leaked '{forbidden}'");

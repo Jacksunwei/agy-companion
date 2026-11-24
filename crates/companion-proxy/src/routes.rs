@@ -94,6 +94,11 @@ async fn track_request_activity(
     req: Request,
     next: Next,
 ) -> Response {
+    // Passive liveness/telemetry probes (including `serve --adopt-running`'s 500ms `/health` poll)
+    // must not reset `idle_duration()` or starve `--idle-shutdown-secs`.
+    if matches!(req.uri().path(), "/health" | "/api/stats") {
+        return next.run(req).await;
+    }
     let _guard = state.enter_request();
     next.run(req).await
 }
