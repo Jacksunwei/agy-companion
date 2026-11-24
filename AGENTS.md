@@ -33,7 +33,7 @@ This repository uses **Antigravity customization conventions** as the default ag
 #   [3/7] Zero AI attribution in commits
 #   [4/7] Shell syntax (bash -n & /bin/bash -n), executable bit (-x) on scripts/*.sh + plugin/scripts/*.sh, and dev-install safety
 #   [5/7] 4-way version sync (Cargo.toml, plugin.json, npm package.json + 5 optionalDeps, pyproject.toml), generate-platform-pkgs.mjs dry-run, JS/Python shim checks, temp-dir e2e/*.py py_compile (zero __pycache__) & e2e/run_e2e.py --self-test (21 self-tests)
-#   [6/7] Rust workspace (fmt, clippy -D warnings, cargo test — 144 tests) & unified full S5 sink + whitespace-aware external-tag scanning across ui/src/ & ui/dist/index.html (< 512,000 bytes / 500 KiB, currently 269,026 bytes)
+#   [6/7] Rust workspace (fmt, clippy -D warnings, cargo test — 145 tests) & unified full S5 sink + whitespace-aware external-tag scanning across ui/src/ & ui/dist/index.html (< 512,000 bytes / 500 KiB, currently 269,026 bytes)
 #   [7/7] Plugin JSON manifests, bundled logo asset validation (canonical relative path, non-symlink regular file, strict static SVG allowlist) & agy plugin validate --strict ./plugin (clean skip if agy absent)
 ./scripts/agent_check.sh
 
