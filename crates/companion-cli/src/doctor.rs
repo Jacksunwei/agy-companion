@@ -4,7 +4,7 @@ use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use companion_core::{Config, DEFAULT_LISTEN_PORT};
+use companion_core::{Config, DEFAULT_LISTEN_PORT, is_placeholder_api_key};
 use companion_proxy::HealthResponse;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -20,6 +20,7 @@ pub const DEFAULT_HEALTH_CONNECT_TIMEOUT_SECS: u64 = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvKeyState {
     Unset,
+    Placeholder,
     Set,
     SetInvalidUtf8,
 }
@@ -43,6 +44,7 @@ impl DoctorEnv {
             None => EnvKeyState::Unset,
             Some(os_val) => match os_val.to_str() {
                 Some(s) if s.trim().is_empty() => EnvKeyState::Unset,
+                Some(s) if is_placeholder_api_key(s) => EnvKeyState::Placeholder,
                 Some(_) => EnvKeyState::Set,
                 None => EnvKeyState::SetInvalidUtf8,
             },
@@ -65,8 +67,10 @@ impl DoctorEnv {
 
     pub fn from_raw_values(api_key: Option<&str>, base_url: Option<&str>) -> Self {
         let gemini_api_key = match api_key {
-            Some(val) if !val.trim().is_empty() => EnvKeyState::Set,
-            _ => EnvKeyState::Unset,
+            Some(val) if val.trim().is_empty() => EnvKeyState::Unset,
+            Some(val) if is_placeholder_api_key(val) => EnvKeyState::Placeholder,
+            Some(_) => EnvKeyState::Set,
+            None => EnvKeyState::Unset,
         };
         let google_gemini_base_url = match base_url {
             Some(val) if !val.trim().is_empty() => EnvUrlState::Set(val.trim().to_string()),
@@ -566,12 +570,25 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
         .map(|cfg| cfg.redacted().api_key_configured)
         .unwrap_or(false);
 
-    let gemini_api_key_set = !matches!(env.gemini_api_key, EnvKeyState::Unset);
+    let gemini_api_key_set = matches!(
+        env.gemini_api_key,
+        EnvKeyState::Set | EnvKeyState::SetInvalidUtf8
+    );
     let (api_key_status, api_key_message) = match env.gemini_api_key {
         EnvKeyState::Set => (CheckStatus::Pass, "GEMINI_API_KEY is set".to_string()),
         EnvKeyState::SetInvalidUtf8 => (
             CheckStatus::Warn,
             "GEMINI_API_KEY is set (invalid UTF-8)".to_string(),
+        ),
+        EnvKeyState::Placeholder if config_has_api_key => (
+            CheckStatus::Pass,
+            "GEMINI_API_KEY is set to the local proxy placeholder (using API key saved in config file)"
+                .to_string(),
+        ),
+        EnvKeyState::Placeholder => (
+            CheckStatus::Warn,
+            "GEMINI_API_KEY is set to the local proxy placeholder and no API key is saved in config file"
+                .to_string(),
         ),
         EnvKeyState::Unset if config_has_api_key => (
             CheckStatus::Pass,
@@ -1513,6 +1530,98 @@ mod tests {
             assert!(!json.contains("AIzaSy"), "{label}: JSON leaked secret");
             assert!(!human.contains("AIzaSy"), "{label}: human leaked secret");
         }
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doctor_quarantines_placeholder_gemini_api_key_in_env_and_config() {
+        let (port, handle) = spawn_mock_health_router(healthy_router()).await;
+        let temp = TempDir::new().expect("tempdir");
+
+        // 1. Placeholder in env (exact & padded) with no config key -> WARN, gemini_api_key_set == false.
+        let cfg_empty = temp.path().join("empty.json");
+        Config::default().save_secure(&cfg_empty).expect("save");
+        for raw_env in [
+            companion_core::PROXY_PLACEHOLDER_API_KEY,
+            "  agy-companion-local  ",
+        ] {
+            let env = DoctorEnv::from_raw_values(Some(raw_env), None);
+            assert_eq!(env.gemini_api_key, EnvKeyState::Placeholder);
+            let rep = run_doctor(
+                DoctorOptions {
+                    config_override: Some(cfg_empty.clone()),
+                    port_override: Some(port),
+                    ..DoctorOptions::default()
+                },
+                env,
+            )
+            .await
+            .expect("doctor report");
+            assert!(rep.ok, "advisory placeholder warning must not fail doctor");
+            assert!(!rep.env.gemini_api_key_set);
+            let check = rep
+                .checks
+                .iter()
+                .find(|c| c.name == "env_gemini_api_key")
+                .expect("env_gemini_api_key check");
+            assert_eq!(check.status, CheckStatus::Warn);
+            assert!(check.message.contains("local proxy placeholder"));
+        }
+
+        // 2. Placeholder in BOTH env and legacy config.json -> still WARN, not PASS.
+        let cfg_legacy = temp.path().join("legacy_placeholder.json");
+        let mut legacy = Config::default();
+        legacy.gemini.api_key = Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string());
+        legacy.save_secure(&cfg_legacy).expect("save legacy");
+        let rep_legacy = run_doctor(
+            DoctorOptions {
+                config_override: Some(cfg_legacy),
+                port_override: Some(port),
+                ..DoctorOptions::default()
+            },
+            DoctorEnv::from_raw_values(Some(companion_core::PROXY_PLACEHOLDER_API_KEY), None),
+        )
+        .await
+        .expect("doctor legacy report");
+        assert!(rep_legacy.ok);
+        assert!(!rep_legacy.env.gemini_api_key_set);
+        let check_legacy = rep_legacy
+            .checks
+            .iter()
+            .find(|c| c.name == "env_gemini_api_key")
+            .expect("env_gemini_api_key check");
+        assert_eq!(check_legacy.status, CheckStatus::Warn);
+
+        // 3. Placeholder in env with a REAL saved key in config.json -> PASS, gemini_api_key_set == false, no leak.
+        let cfg_real = temp.path().join("real_key.json");
+        let mut real = Config::default();
+        real.gemini.api_key = Some("AIzaSyRealSavedKey1234".to_string());
+        real.save_secure(&cfg_real).expect("save real");
+        let rep_real = run_doctor(
+            DoctorOptions {
+                config_override: Some(cfg_real),
+                port_override: Some(port),
+                ..DoctorOptions::default()
+            },
+            DoctorEnv::from_raw_values(Some(companion_core::PROXY_PLACEHOLDER_API_KEY), None),
+        )
+        .await
+        .expect("doctor real report");
+        assert!(rep_real.ok);
+        assert!(!rep_real.env.gemini_api_key_set);
+        let check_real = rep_real
+            .checks
+            .iter()
+            .find(|c| c.name == "env_gemini_api_key")
+            .expect("env_gemini_api_key check");
+        assert_eq!(check_real.status, CheckStatus::Pass);
+        assert!(check_real.message.contains("local proxy placeholder"));
+        assert!(check_real.message.contains("config file"));
+        let json = format_doctor_json(&rep_real).expect("json");
+        let human = format_doctor_human(&rep_real);
+        assert!(!json.contains("AIzaSyRealSavedKey1234"));
+        assert!(!human.contains("AIzaSyRealSavedKey1234"));
 
         handle.abort();
     }

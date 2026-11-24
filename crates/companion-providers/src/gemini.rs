@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use companion_core::{GeminiConfig, api_key_hint, validate_upstream_url};
+use companion_core::{GeminiConfig, api_key_hint, is_placeholder_api_key, validate_upstream_url};
 use futures_util::TryStreamExt;
 use http::header::{self, HeaderName, HeaderValue};
 use url::Url;
@@ -680,7 +680,7 @@ fn validate_api_key_string(raw: &str) -> Result<Option<String>, ProviderError> {
     }
 
     let trimmed = raw.trim_matches(' ');
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || is_placeholder_api_key(trimmed) {
         return Ok(None);
     }
 
@@ -2568,5 +2568,172 @@ mod tests {
             no_key.list_models(None).await,
             Err(ProviderError::MissingApiKey)
         ));
+    }
+
+    #[tokio::test]
+    async fn quarantines_placeholder_api_key_across_config_override_and_env() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen_key = Arc::new(Mutex::new(None::<String>));
+        let hits_models = Arc::clone(&hits);
+        let seen_models = Arc::clone(&seen_key);
+        let hits_gen = Arc::clone(&hits);
+        let seen_gen = Arc::clone(&seen_key);
+
+        let router = Router::new()
+            .route(
+                "/v1beta/models",
+                get(move |headers: HeaderMap| {
+                    let hits_models = Arc::clone(&hits_models);
+                    let seen_models = Arc::clone(&seen_models);
+                    async move {
+                        hits_models.fetch_add(1, Ordering::SeqCst);
+                        *seen_models.lock().await = headers
+                            .get("x-goog-api-key")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"models":[{"name":"models/gemini-4-hydrogen","supportedGenerationMethods":["generateContent"]}]}"#,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1beta/models/{*rest}",
+                post(move |headers: HeaderMap| {
+                    let hits_gen = Arc::clone(&hits_gen);
+                    let seen_gen = Arc::clone(&seen_gen);
+                    async move {
+                        hits_gen.fetch_add(1, Ordering::SeqCst);
+                        *seen_gen.lock().await = headers
+                            .get("x-goog-api-key")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"candidates":[]}"#,
+                        )
+                    }
+                }),
+            );
+        let server = spawn_mock_server(router).await;
+
+        let make_req = |override_key: Option<&str>| ForwardRequest {
+            path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),
+            body: Bytes::from_static(b"{}"),
+            content_type: Some("application/json".to_string()),
+            api_key_override: override_key.map(str::to_owned),
+        };
+
+        // 1. Placeholder in config -> api_key_hint() == None, MissingApiKey across all 3 RPCs, 0 hits.
+        for placeholder in [
+            companion_core::PROXY_PLACEHOLDER_API_KEY,
+            "  agy-companion-local  ",
+        ] {
+            let p = provider_for(&server.base_url, Some(placeholder), None);
+            assert_eq!(p.api_key_hint(), None);
+            assert!(matches!(
+                p.forward_gemini(make_req(None)).await,
+                Err(ProviderError::MissingApiKey)
+            ));
+            assert!(matches!(
+                p.health_check().await,
+                Err(ProviderError::MissingApiKey)
+            ));
+            assert!(matches!(
+                p.list_models(None).await,
+                Err(ProviderError::MissingApiKey)
+            ));
+        }
+
+        // 2. Placeholder in env -> MissingApiKey across all 3 RPCs, 0 hits.
+        for placeholder in [
+            companion_core::PROXY_PLACEHOLDER_API_KEY,
+            "  agy-companion-local  ",
+        ] {
+            let p = provider_for(&server.base_url, None, Some(placeholder));
+            assert!(matches!(
+                p.forward_gemini(make_req(None)).await,
+                Err(ProviderError::MissingApiKey)
+            ));
+            assert!(matches!(
+                p.health_check().await,
+                Err(ProviderError::MissingApiKey)
+            ));
+            assert!(matches!(
+                p.list_models(None).await,
+                Err(ProviderError::MissingApiKey)
+            ));
+        }
+
+        // 3. Placeholder in override -> MissingApiKey, 0 hits.
+        for placeholder in [
+            companion_core::PROXY_PLACEHOLDER_API_KEY,
+            "  agy-companion-local  ",
+        ] {
+            let p = provider_for(&server.base_url, None, None);
+            assert!(matches!(
+                p.forward_gemini(make_req(Some(placeholder))).await,
+                Err(ProviderError::MissingApiKey)
+            ));
+            assert!(matches!(
+                p.list_models(Some(placeholder.to_string())).await,
+                Err(ProviderError::MissingApiKey)
+            ));
+        }
+
+        // 4. Control-char / non-ASCII padded placeholder -> fail-closed InvalidConfig, 0 hits.
+        for bad_placeholder in ["\tagy-companion-local\n", "\u{00A0}agy-companion-local"] {
+            assert!(matches!(
+                GeminiProvider::build(
+                    server.base_url.clone(),
+                    Some(bad_placeholder.to_string()),
+                    30,
+                    EnvKeySource::Disabled,
+                ),
+                Err(ProviderError::InvalidConfig(_))
+            ));
+            let p_override = provider_for(&server.base_url, None, None);
+            assert!(matches!(
+                p_override
+                    .forward_gemini(make_req(Some(bad_placeholder)))
+                    .await,
+                Err(ProviderError::InvalidConfig(_))
+            ));
+            let p_env = provider_for(&server.base_url, None, Some(bad_placeholder));
+            assert!(matches!(
+                p_env.health_check().await,
+                Err(ProviderError::InvalidConfig(_))
+            ));
+        }
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "placeholder sentinel must never reach upstream"
+        );
+
+        // 5. Real configured key is used when override is the placeholder.
+        let p_cfg = provider_for(&server.base_url, Some("AIzaSyRealCfg12345"), None);
+        p_cfg
+            .forward_gemini(make_req(Some("agy-companion-local")))
+            .await
+            .expect("falls back from placeholder override to real config key");
+        assert_eq!(seen_key.lock().await.as_deref(), Some("AIzaSyRealCfg12345"));
+
+        // 6. Real env key is used when config holds a legacy placeholder.
+        let p_env = provider_for(
+            &server.base_url,
+            Some("agy-companion-local"),
+            Some("AIzaSyRealEnv12345"),
+        );
+        p_env
+            .health_check()
+            .await
+            .expect("falls back from placeholder config to real env key");
+        assert_eq!(seen_key.lock().await.as_deref(), Some("AIzaSyRealEnv12345"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }

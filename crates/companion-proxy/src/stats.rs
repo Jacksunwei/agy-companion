@@ -10,9 +10,11 @@ struct StatsCounters {
     cached_tokens: u64,
     output_tokens: u64,
     reasoning_tokens: u64,
+    last_catalog_refresh_at_ms: Option<u64>,
+    last_catalog_included_proxy_models: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub requests: u64,
     pub prompt_tokens: u64,
@@ -20,6 +22,14 @@ pub struct StatsSnapshot {
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub cache_hit_ratio: f64,
+    #[serde(default)]
+    pub last_catalog_refresh_at_ms: Option<u64>,
+    #[serde(default)]
+    pub last_catalog_included_proxy_models: Option<bool>,
+    #[serde(default)]
+    pub cloudcode_mode: String,
+    #[serde(default)]
+    pub cloudcode_resolved_upstream: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -45,7 +55,21 @@ impl ProxyStats {
             .saturating_add(usage.thoughts_token_count);
     }
 
+    pub fn record_catalog_refresh(&self, timestamp_ms: u64, included_proxy_models: bool) {
+        let mut c = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        c.last_catalog_refresh_at_ms = Some(timestamp_ms);
+        c.last_catalog_included_proxy_models = Some(included_proxy_models);
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
+        self.snapshot_with_cloudcode("auto", None)
+    }
+
+    pub fn snapshot_with_cloudcode(
+        &self,
+        cloudcode_mode: &str,
+        cloudcode_resolved_upstream: Option<String>,
+    ) -> StatsSnapshot {
         let c = *self.counters.lock().unwrap_or_else(|e| e.into_inner());
         let cache_hit_ratio = if c.prompt_tokens > 0 {
             c.cached_tokens as f64 / c.prompt_tokens as f64
@@ -59,6 +83,10 @@ impl ProxyStats {
             output_tokens: c.output_tokens,
             reasoning_tokens: c.reasoning_tokens,
             cache_hit_ratio,
+            last_catalog_refresh_at_ms: c.last_catalog_refresh_at_ms,
+            last_catalog_included_proxy_models: c.last_catalog_included_proxy_models,
+            cloudcode_mode: cloudcode_mode.to_string(),
+            cloudcode_resolved_upstream,
         }
     }
 }
@@ -97,13 +125,71 @@ mod tests {
         // Verify exact serialized JSON keys.
         let value = serde_json::to_value(snap).expect("serialize snapshot");
         let obj = value.as_object().expect("json object");
-        assert_eq!(obj.len(), 6);
+        assert_eq!(obj.len(), 10);
         assert!(obj.contains_key("requests"));
         assert!(obj.contains_key("prompt_tokens"));
         assert!(obj.contains_key("cached_tokens"));
         assert!(obj.contains_key("output_tokens"));
         assert!(obj.contains_key("reasoning_tokens"));
         assert!(obj.contains_key("cache_hit_ratio"));
+        assert!(obj.contains_key("last_catalog_refresh_at_ms"));
+        assert!(obj.contains_key("last_catalog_included_proxy_models"));
+        assert!(obj.contains_key("cloudcode_mode"));
+        assert!(obj.contains_key("cloudcode_resolved_upstream"));
+    }
+
+    #[test]
+    fn records_catalog_refresh_and_deserializes_legacy_six_field_snapshot() {
+        let stats = ProxyStats::new();
+        let initial = stats.snapshot_with_cloudcode("auto", None);
+        assert_eq!(initial.last_catalog_refresh_at_ms, None);
+        assert_eq!(initial.last_catalog_included_proxy_models, None);
+        assert_eq!(initial.cloudcode_mode, "auto");
+        assert_eq!(initial.cloudcode_resolved_upstream, None);
+
+        stats.record_catalog_refresh(1_700_000_000_123, false);
+        let day0 = stats.snapshot_with_cloudcode(
+            "auto",
+            Some("https://daily-cloudcode-pa.googleapis.com".to_string()),
+        );
+        assert_eq!(day0.last_catalog_refresh_at_ms, Some(1_700_000_000_123));
+        assert_eq!(day0.last_catalog_included_proxy_models, Some(false));
+        assert_eq!(day0.cloudcode_mode, "auto");
+        assert_eq!(
+            day0.cloudcode_resolved_upstream.as_deref(),
+            Some("https://daily-cloudcode-pa.googleapis.com")
+        );
+
+        stats.record_catalog_refresh(1_700_000_005_000, true);
+        let merged = stats.snapshot_with_cloudcode(
+            "fixed",
+            Some("https://cloudcode-pa.googleapis.com".to_string()),
+        );
+        assert_eq!(merged.last_catalog_refresh_at_ms, Some(1_700_000_005_000));
+        assert_eq!(merged.last_catalog_included_proxy_models, Some(true));
+        assert_eq!(merged.cloudcode_mode, "fixed");
+        assert_eq!(
+            merged.cloudcode_resolved_upstream.as_deref(),
+            Some("https://cloudcode-pa.googleapis.com")
+        );
+
+        // Legacy 6-field JSON payload must deserialize cleanly via #[serde(default)].
+        let legacy: StatsSnapshot = serde_json::from_str(
+            r#"{
+                "requests": 3,
+                "prompt_tokens": 300,
+                "cached_tokens": 150,
+                "output_tokens": 45,
+                "reasoning_tokens": 10,
+                "cache_hit_ratio": 0.5
+            }"#,
+        )
+        .expect("legacy 6-field snapshot must deserialize");
+        assert_eq!(legacy.requests, 3);
+        assert_eq!(legacy.last_catalog_refresh_at_ms, None);
+        assert_eq!(legacy.last_catalog_included_proxy_models, None);
+        assert_eq!(legacy.cloudcode_mode, "");
+        assert_eq!(legacy.cloudcode_resolved_upstream, None);
     }
 
     #[test]

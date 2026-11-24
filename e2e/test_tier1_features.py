@@ -2007,47 +2007,55 @@ class TestTier1F16XdgPaths(E2ETestCase):
         proxy.stop()
 
     def test_t1_cloudcode_hybrid_fetch_available_models_and_v1internal_passthrough(self) -> None:
-        """CloudCode /v1internal:fetchAvailableModels merges proxy models with thinking levels and streams other /v1internal:* RPCs."""
+        """CloudCode /v1internal:fetchAvailableModels merges proxy models with deterministic slots + XHigh and streams other /v1internal:* RPCs."""
         env = self.make_env()
         mock_ccpa = self.start_mock_gemini()
-        mock_ccpa.enqueue(
-            JsonAction(
-                status=200,
-                payload={
-                    "models": {
-                        "gemini-4-carbon-high": {
-                            "model": "MODEL_PLACEHOLDER_M427",
-                            "displayName": "Gemini 4 Carbon (High)",
-                            "thinkingLevel": 3,
-                        },
-                        "existing-m334": {
-                            "model": "MODEL_PLACEHOLDER_M334",
-                            "displayName": "Existing Custom",
-                        },
-                    },
-                    "defaultAgentModelId": "gemini-4-carbon-high",
-                    "agentModelSorts": [
+        mock_gemini = self.start_mock_gemini()
+        ccpa_catalog = {
+            "models": {
+                "gemini-4-carbon-high": {
+                    "model": "MODEL_PLACEHOLDER_M427",
+                    "displayName": "Gemini 4 Carbon (High)",
+                    "thinkingLevel": 3,
+                },
+                "existing-m334": {
+                    "model": "MODEL_PLACEHOLDER_M334",
+                    "displayName": "Existing Custom",
+                },
+            },
+            "defaultAgentModelId": "gemini-4-carbon-high",
+            "agentModelSorts": [
+                {
+                    "displayName": "Recommended",
+                    "groups": [
                         {
-                            "displayName": "Recommended",
-                            "groups": [
-                                {
-                                    "displayName": "Google AI Pro",
-                                    "modelIds": ["gemini-4-carbon-high"],
-                                }
-                            ],
+                            "displayName": "Google AI Pro",
+                            "modelIds": ["gemini-4-carbon-high"],
                         }
                     ],
-                    "groupedModels": {
-                        "gemini-4-carbon": {
-                            "displayName": "Gemini 4 Carbon",
-                            "supportedThinkingLevels": [
-                                {"thinkingSuffix": "high", "thinkingDisplayName": "High"}
-                            ],
-                        }
-                    },
-                },
-            )
-        )
+                }
+            ],
+            "groupedModels": {
+                "gemini-4-carbon": {
+                    "displayName": "Gemini 4 Carbon",
+                    "supportedThinkingLevels": [
+                        {"thinkingSuffix": "high", "thinkingDisplayName": "High"}
+                    ],
+                }
+            },
+        }
+        gemini_models_payload = {
+            "models": [
+                {"name": "models/gemini-4-hydrogen"},
+                {"name": "models/gemini-4-argon"},
+                {"name": "models/gemini-4-neon"},
+                {"name": "models/gemini-4-carbon"},
+            ]
+        }
+        mock_gemini.enqueue(JsonAction(status=200, payload=gemini_models_payload))
+        mock_gemini.enqueue(JsonAction(status=200, payload=gemini_models_payload))
+        mock_ccpa.enqueue(JsonAction(status=200, payload=ccpa_catalog))
+        mock_ccpa.enqueue(JsonAction(status=200, payload=ccpa_catalog))
         mock_ccpa.enqueue(
             SseStreamAction(
                 chunks=[b'data: {"response":{"text":"hello-ccpa"}}\n\n'],
@@ -2055,7 +2063,11 @@ class TestTier1F16XdgPaths(E2ETestCase):
             )
         )
 
-        cfg_dict = env.make_config_dict(default_model="gemini-4-hydrogen")
+        cfg_dict = env.make_config_dict(
+            base_url=mock_gemini.base_url,
+            api_key="AIzaSyCloudCodeHybrid12",
+            default_model="gemini-4-hydrogen",
+        )
         cfg_dict["cloudcode_upstream_url"] = mock_ccpa.base_url
         cfg = env.write_config(cfg_dict)
         proxy = self.start_proxy(env, config_path=cfg)
@@ -2087,11 +2099,14 @@ class TestTier1F16XdgPaths(E2ETestCase):
         # Injected proxy model avoids M334 collision and carries gemini-api:// URL + thinking effort labels.
         h_low = merged["models"]["companion/gemini-4-hydrogen-low"]
         h_xhigh = merged["models"]["companion/gemini-4-hydrogen-xhigh"]
+        n_xhigh = merged["models"]["companion/gemini-4-neon-xhigh"]
         self.assertEqual(h_low["model"], "MODEL_PLACEHOLDER_M335")
         self.assertEqual(h_low["modelUrl"], "gemini-api://gemini-4-hydrogen")
         self.assertEqual(h_low["displayName"], "Gemini 4 Hydrogen (Proxy) (Low)")
         self.assertEqual(h_xhigh["thinkingLevel"], 7)
         self.assertEqual(h_xhigh["displayName"], "Gemini 4 Hydrogen (Proxy) (XHigh)")
+        self.assertEqual(n_xhigh["thinkingLevel"], 7)
+        self.assertEqual(n_xhigh["displayName"], "Gemini 4 Neon (Proxy) (XHigh)")
         self.assertEqual(
             merged["groupedModels"]["companion/gemini-4-hydrogen"]["displayName"],
             "Gemini 4 Hydrogen (Proxy)",
@@ -2103,11 +2118,48 @@ class TestTier1F16XdgPaths(E2ETestCase):
             ]
         ]
         self.assertEqual(suffixes, ["low", "medium", "high", "xhigh"])
+        neon_suffixes = [
+            lvl["thinkingSuffix"]
+            for lvl in merged["groupedModels"]["companion/gemini-4-neon"][
+                "supportedThinkingLevels"
+            ]
+        ]
+        self.assertEqual(neon_suffixes, ["low", "medium", "high", "xhigh"])
         # Appended directly into Recommended groups[0] right after original models.
         group0_ids = merged["agentModelSorts"][0]["groups"][0]["modelIds"]
         self.assertEqual(group0_ids[0], "gemini-4-carbon-high")
         self.assertIn("companion/gemini-4-hydrogen-low", group0_ids)
         self.assertIn("companion/gemini-4-hydrogen-xhigh", group0_ids)
+        self.assertIn("companion/gemini-4-neon-xhigh", group0_ids)
+
+        # 1b. Changing default_model hot-reloads without shifting deterministic placeholder enum slots.
+        slots_before = {
+            k: v["model"] for k, v in merged["models"].items() if k.startswith("companion/")
+        }
+        cfg_dict["gemini"]["default_model"] = "gemini-4-neon"
+        env.write_config(cfg_dict, path=cfg)
+        env.bump_mtime(cfg)
+        fetch_resp2 = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1internal:fetchAvailableModels",
+            headers={
+                "Authorization": "Bearer google-ai-pro-test-token",
+                "Content-Type": "application/json",
+            },
+            body=b'{"project":"personal"}',
+        )
+        self.assertEqual(fetch_resp2.status, 200, fetch_resp2.text)
+        merged2 = json.loads(fetch_resp2.text)
+        slots_after = {
+            k: v["model"] for k, v in merged2["models"].items() if k.startswith("companion/")
+        }
+        self.assertEqual(slots_before, slots_after)
+        self.assertEqual(
+            merged2["models"]["companion/gemini-4-hydrogen-low"]["model"],
+            "MODEL_PLACEHOLDER_M335",
+        )
 
         # 2. Other /v1internal:* RPCs (including alt=sse streaming) pass through transparently.
         stream_resp = http_raw_request(
@@ -2123,13 +2175,13 @@ class TestTier1F16XdgPaths(E2ETestCase):
         )
         self.assertEqual(stream_resp.status, 200, stream_resp.text)
         self.assertEqual(stream_resp.body, b'data: {"response":{"text":"hello-ccpa"}}\n\n')
-        self.assertEqual(len(mock_ccpa.requests), 2)
+        self.assertEqual(len(mock_ccpa.requests), 3)
         self.assertEqual(
             mock_ccpa.requests[0].headers.get("authorization"),
             "Bearer google-ai-pro-test-token",
         )
         self.assertEqual(
-            mock_ccpa.requests[1].headers.get("authorization"),
+            mock_ccpa.requests[2].headers.get("authorization"),
             "Bearer google-ai-pro-test-token",
         )
 
@@ -2195,3 +2247,196 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 adopter.kill()
                 adopter.wait(timeout=3)
             proxy.stop()
+
+    def test_t1_pr1_day0_untouched_fetch_available_models_and_extended_stats(self) -> None:
+        """Day-0 (no key or placeholder key) returns upstream fetchAvailableModels untouched and exposes all 10 /api/stats fields."""
+        upstream_catalog = {
+            "models": {
+                "gemini-4-carbon-high": {
+                    "model": "MODEL_PLACEHOLDER_M427",
+                    "displayName": "Gemini 4 Carbon (High)",
+                }
+            },
+            "defaultAgentModelId": "gemini-4-carbon-high",
+        }
+        for label, api_key in (("none", None), ("placeholder", "agy-companion-local")):
+            with self.subTest(api_key_case=label):
+                env = self.make_env()
+                mock_ccpa = self.start_mock_gemini()
+                mock_ccpa.enqueue(JsonAction(status=200, payload=upstream_catalog))
+
+                cfg_dict = env.make_config_dict(api_key=api_key)
+                cfg_dict["cloudcode_upstream_url"] = mock_ccpa.base_url
+                cfg = env.write_config(cfg_dict)
+                proxy = self.start_proxy(env, config_path=cfg)
+
+                fetch_resp = http_raw_request(
+                    "127.0.0.1",
+                    proxy.port,
+                    "POST",
+                    "/v1internal:fetchAvailableModels",
+                    headers={
+                        "Authorization": "Bearer day0-pro-token",
+                        "Content-Type": "application/json",
+                    },
+                    body=b'{"project":"personal"}',
+                )
+                self.assertEqual(fetch_resp.status, 200, fetch_resp.text)
+                body = json.loads(fetch_resp.text)
+                self.assertEqual(body, upstream_catalog)
+                self.assertFalse(
+                    any(k.startswith("companion/") for k in body.get("models", {})),
+                    f"Day-0 case '{label}' must not inject proxy models: {body!r}",
+                )
+
+                stats_resp = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats")
+                self.assertEqual(stats_resp.status, 200, stats_resp.text)
+                stats = json.loads(stats_resp.text)
+                expected_keys = {
+                    "requests",
+                    "prompt_tokens",
+                    "cached_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "cache_hit_ratio",
+                    "last_catalog_refresh_at_ms",
+                    "last_catalog_included_proxy_models",
+                    "cloudcode_mode",
+                    "cloudcode_resolved_upstream",
+                }
+                self.assertTrue(
+                    expected_keys.issubset(stats.keys()),
+                    f"Missing /api/stats fields: {expected_keys - set(stats.keys())}",
+                )
+                self.assertIsInstance(stats["last_catalog_refresh_at_ms"], int)
+                self.assertGreater(stats["last_catalog_refresh_at_ms"], 0)
+                self.assertIs(stats["last_catalog_included_proxy_models"], False)
+                self.assertEqual(stats["cloudcode_mode"], "fixed")
+                self.assertEqual(stats["cloudcode_resolved_upstream"], mock_ccpa.base_url)
+                proxy.stop()
+
+    def test_t1_pr1_placeholder_sentinel_quarantine_in_doctor_and_ui_mcp(self) -> None:
+        """Placeholder sentinel 'agy-companion-local' never false-passes doctor and is rejected by ui-mcp save_settings."""
+        binary = self.require_binary()
+        env = self.make_env()
+        cfg = env.write_config(env.make_config_dict(api_key=None))
+        proxy = self.start_proxy(env, config_path=cfg)
+
+        # 1. doctor with GEMINI_API_KEY="agy-companion-local" and no config key -> WARN (not PASS).
+        doc_env = env.build_env(extra={"GEMINI_API_KEY": "agy-companion-local"})
+        res_json = run_cli(
+            [str(binary), "doctor", "--config", str(cfg), "--port", str(proxy.port), "--json"],
+            env=doc_env,
+        )
+        self.assertEqual(res_json.returncode, 0, res_json.stderr)
+        parsed = json.loads(res_json.stdout)
+        self.assertIs(parsed["ok"], True)
+        self.assertIs(parsed["env"]["gemini_api_key_set"], False)
+        key_checks = [c for c in parsed["checks"] if c["name"] == "env_gemini_api_key"]
+        self.assertEqual(len(key_checks), 1)
+        self.assertEqual(key_checks[0]["status"], "warn")
+        self.assertNotEqual(key_checks[0]["status"], "pass")
+
+        res_human = run_cli(
+            [str(binary), "doctor", "--config", str(cfg), "--port", str(proxy.port)],
+            env=doc_env,
+        )
+        self.assertEqual(res_human.returncode, 0, res_human.stderr)
+        self.assertIn("[WARN] env_gemini_api_key:", res_human.stdout)
+        self.assertNotIn("[PASS] env_gemini_api_key:", res_human.stdout)
+        proxy.stop()
+
+        # 2. ui-mcp save_settings rejects "agy-companion-local".
+        mcp = self.start_mcp(env, config_path=cfg)
+        save_res = mcp.call_tool("save_settings", {"api_key": "agy-companion-local"})
+        mcp.assert_clean_stdout()
+        self.assertIs(save_res.get("isError"), True, save_res)
+        self.assertIn("placeholder", _text_blocks(save_res).lower())
+        saved_cfg = json.loads(cfg.read_text(encoding="utf-8"))
+        self.assertIsNone(saved_cfg["gemini"]["api_key"])
+
+    def test_t1_pr1_unsupported_model_400_includes_unset_base_url_hint(self) -> None:
+        """Non-Gemini-3/4 400 error explains both model support and unsetting GOOGLE_GEMINI_BASE_URL."""
+        env = self.make_env()
+        mock_gemini = self.start_mock_gemini()
+        cfg = env.write_config(
+            env.make_config_dict(base_url=mock_gemini.base_url, api_key="AIzaSyUnsupported400Key")
+        )
+        proxy = self.start_proxy(env, config_path=cfg)
+
+        resp = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            headers={"Content-Type": "application/json"},
+            body=b'{"contents":[{"parts":[{"text":"hi"}]}]}',
+        )
+        self.assertEqual(resp.status, 400, resp.text)
+        self.assertIn("Gemini 3 and Gemini 4", resp.text)
+        self.assertIn("unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly", resp.text)
+        self.assertEqual(len(mock_gemini.requests), 0)
+        proxy.stop()
+
+    def test_t1_pr1_serve_idle_shutdown_writes_0600_pid_and_log_and_cleans_up(self) -> None:
+        """serve --idle-shutdown-secs 1 writes 0600 proxy.pid & proxy.log in env.data_dir, exits 0 cleanly, and cleans up proxy.pid."""
+        import subprocess
+        import time
+
+        binary = self.require_binary()
+        env = self.make_env()
+        port = find_free_port()
+        cfg = env.write_config(env.make_config_dict(listen_port=port))
+
+        proc = subprocess.Popen(
+            [
+                str(binary),
+                "serve",
+                "--port",
+                str(port),
+                "--config",
+                str(cfg),
+                "--idle-shutdown-secs",
+                "1",
+            ],
+            env=env.build_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10.0
+            while True:
+                try:
+                    resp = http_raw_request("127.0.0.1", port, "GET", "/health", timeout=1.0)
+                    if resp.status == 200:
+                        break
+                except OSError:
+                    pass
+                self.assertLess(time.monotonic(), deadline, "idle-shutdown proxy never became healthy")
+                time.sleep(0.05)
+
+            pid_path = env.data_dir / "proxy.pid"
+            log_path = env.data_dir / "proxy.log"
+            self.assertTrue(pid_path.is_file(), f"Missing {pid_path}")
+            self.assertTrue(log_path.is_file(), f"Missing {log_path}")
+
+            self.assertEqual(stat.S_IMODE(os.stat(pid_path).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(log_path).st_mode), 0o600)
+
+            pid_info = json.loads(pid_path.read_text(encoding="utf-8"))
+            self.assertEqual(pid_info["pid"], proc.pid)
+            self.assertEqual(pid_info["port"], port)
+            self.assertTrue(pid_info["version"])
+            self.assertGreater(pid_info["started_at_ms"], 0)
+            self.assertTrue(pid_info["binary_path"])
+
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("agy-companion proxy listening", log_text)
+
+            rc = proc.wait(timeout=6)
+            self.assertEqual(rc, 0, f"Expected clean exit 0 on idle shutdown, got {rc}")
+            self.assertFalse(pid_path.exists(), "proxy.pid must be removed after clean idle shutdown")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)

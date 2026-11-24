@@ -4,10 +4,11 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use companion_cli::cli::{Cli, Commands};
+use companion_cli::daemon::ServeLogTarget;
 use companion_cli::doctor::execute_doctor;
 use companion_cli::launch::run_launch;
 use companion_cli::models::run_models;
-use companion_cli::{run_serve_with_options, run_ui_mcp};
+use companion_cli::{ServeOptions, run_serve_configured, run_ui_mcp};
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -31,6 +32,17 @@ fn init_stderr_tracing(default_level: &str) {
     let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
 }
 
+fn init_serve_tracing(default_level: &str, log_target: ServeLogTarget) {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    let rmcp_ceiling = filter_fn(|meta| rmcp_ceiling_allows(meta.target(), meta.level()));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(log_target)
+        .with_ansi(false)
+        .with_filter(env_filter.and(rmcp_ceiling));
+    let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -40,9 +52,19 @@ async fn main() -> ExitCode {
             port,
             config,
             adopt_running,
+            idle_shutdown_secs,
         } => {
-            init_stderr_tracing("info");
-            if let Err(err) = run_serve_with_options(port, config, adopt_running).await {
+            let log_target = ServeLogTarget::default();
+            init_serve_tracing("info", log_target.clone());
+            if let Err(err) = run_serve_configured(ServeOptions {
+                port_override: port,
+                config_override: config,
+                adopt_running,
+                idle_shutdown_secs,
+                log_target: Some(log_target),
+            })
+            .await
+            {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }

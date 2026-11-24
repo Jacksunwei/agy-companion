@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use companion_core::{
-    Config, RedactedConfig, api_key_hint, validate_listen_host, validate_path,
-    validate_upstream_url,
+    Config, RedactedConfig, api_key_hint, is_placeholder_api_key, validate_listen_host,
+    validate_path, validate_upstream_url,
 };
 use companion_providers::{GeminiProvider, ProviderAdapter};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -64,6 +64,14 @@ pub struct ProxyStatsPayload {
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub cache_hit_ratio: f64,
+    #[serde(default)]
+    pub last_catalog_refresh_at_ms: Option<u64>,
+    #[serde(default)]
+    pub last_catalog_included_proxy_models: Option<bool>,
+    #[serde(default)]
+    pub cloudcode_mode: Option<String>,
+    #[serde(default)]
+    pub cloudcode_resolved_upstream: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -500,6 +508,12 @@ fn validate_api_key_input(raw: &str) -> Result<Option<String>, &'static str> {
         return Err("api_key contains invalid header characters");
     }
 
+    if is_placeholder_api_key(trimmed) {
+        return Err(
+            "api_key cannot be set to the internal proxy placeholder ('agy-companion-local'); enter a real Gemini API key",
+        );
+    }
+
     Ok(Some(trimmed.to_string()))
 }
 
@@ -636,6 +650,14 @@ impl CompanionUiServer {
                 cfg.gemini.api_key = None;
             } else if let Some(new_key) = validated_api_key {
                 cfg.gemini.api_key = Some(new_key);
+            } else if cfg
+                .gemini
+                .api_key
+                .as_deref()
+                .is_some_and(is_placeholder_api_key)
+            {
+                // Defensively scrub any pre-existing legacy placeholder saved on disk.
+                cfg.gemini.api_key = None;
             }
 
             if let Some(raw_model) = args.default_model.as_deref() {
@@ -2197,5 +2219,246 @@ mod tests {
         .expect("read_ui_resource hung on FIFO override")
         .expect_err("FIFO override must fail");
         assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn proxy_stats_payload_deserializes_both_legacy_6_field_and_extended_10_field_json() {
+        let legacy: ProxyStatsPayload = serde_json::from_value(json!({
+            "requests": 3,
+            "prompt_tokens": 100,
+            "cached_tokens": 50,
+            "output_tokens": 20,
+            "reasoning_tokens": 5,
+            "cache_hit_ratio": 0.5
+        }))
+        .expect("legacy 6-field stats should deserialize");
+        assert_eq!(legacy.requests, 3);
+        assert_eq!(legacy.last_catalog_refresh_at_ms, None);
+        assert_eq!(legacy.last_catalog_included_proxy_models, None);
+        assert_eq!(legacy.cloudcode_mode, None);
+        assert_eq!(legacy.cloudcode_resolved_upstream, None);
+
+        let extended_router = Router::new()
+            .route(
+                "/health",
+                get(|| async {
+                    axum::Json(json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "protocol_version": 1
+                    }))
+                }),
+            )
+            .route(
+                "/api/stats",
+                get(|| async {
+                    axum::Json(json!({
+                        "requests": 9,
+                        "prompt_tokens": 2000,
+                        "cached_tokens": 1200,
+                        "output_tokens": 400,
+                        "reasoning_tokens": 80,
+                        "cache_hit_ratio": 0.6,
+                        "last_catalog_refresh_at_ms": 1735689600123u64,
+                        "last_catalog_included_proxy_models": true,
+                        "cloudcode_mode": "auto",
+                        "cloudcode_resolved_upstream": "https://daily-cloudcode-pa.googleapis.com"
+                    }))
+                }),
+            );
+        let (port, handle) = spawn_mock_http(extended_router).await;
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let cfg = Config {
+            listen_port: port,
+            ..Default::default()
+        };
+        cfg.save_secure(&cfg_path).expect("save");
+
+        let server = CompanionUiServer::new(cfg_path, None).expect("server");
+        let res = server.get_settings().await.expect("get_settings");
+        assert_eq!(res.is_error, Some(false));
+        let snap: SettingsSnapshot =
+            serde_json::from_value(res.structured_content.expect("structured")).expect("parse");
+        let stats = snap.stats.expect("extended stats");
+        assert_eq!(stats.requests, 9);
+        assert_eq!(stats.last_catalog_refresh_at_ms, Some(1735689600123));
+        assert_eq!(stats.last_catalog_included_proxy_models, Some(true));
+        assert_eq!(stats.cloudcode_mode.as_deref(), Some("auto"));
+        assert_eq!(
+            stats.cloudcode_resolved_upstream.as_deref(),
+            Some("https://daily-cloudcode-pa.googleapis.com")
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn save_settings_rejects_placeholder_api_key_and_heals_legacy_disk_placeholder() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let closed_port = free_closed_port().await;
+
+        let server = CompanionUiServer::new(cfg_path.clone(), None)
+            .expect("server")
+            .with_env_api_key_fallback(false);
+
+        for args in [
+            SaveSettingsArgs {
+                api_key: Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string()),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                api_key: Some(format!("  {}  ", companion_core::PROXY_PLACEHOLDER_API_KEY)),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                api_key: Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string()),
+                clear_api_key: Some(true),
+                ..Default::default()
+            },
+        ] {
+            let res = server
+                .save_settings(Parameters(args))
+                .await
+                .expect("save_settings error result");
+            assert_eq!(res.is_error, Some(true));
+            let text = serde_json::to_string(&res).expect("serialize");
+            assert!(
+                text.contains("placeholder"),
+                "expected placeholder rejection message, got: {text}"
+            );
+        }
+        assert!(
+            !cfg_path.exists(),
+            "rejected placeholder saves must not create config.json"
+        );
+
+        // Seed legacy config.json on disk containing the placeholder sentinel.
+        let mut legacy_cfg = Config {
+            listen_port: closed_port,
+            ..Default::default()
+        };
+        legacy_cfg.gemini.api_key = Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string());
+        legacy_cfg.save_secure(&cfg_path).expect("save legacy");
+
+        let get_res = server.get_settings().await.expect("get_settings");
+        assert_eq!(get_res.is_error, Some(false));
+        let get_snap: SettingsSnapshot =
+            serde_json::from_value(get_res.structured_content.expect("structured")).expect("parse");
+        assert!(!get_snap.config.api_key_configured);
+        assert_eq!(get_snap.config.api_key_hint, None);
+
+        // Saving an unrelated field must scrub the legacy placeholder on disk.
+        let heal_res = server
+            .save_settings(Parameters(SaveSettingsArgs {
+                default_model: Some("gemini-4-neon".to_string()),
+                ..Default::default()
+            }))
+            .await
+            .expect("heal save");
+        assert_eq!(heal_res.is_error, Some(false));
+
+        let reloaded = Config::load_or_default(&cfg_path).expect("reload");
+        assert_eq!(reloaded.gemini.default_model, "gemini-4-neon");
+        assert_eq!(
+            reloaded.gemini.api_key, None,
+            "legacy on-disk placeholder must be scrubbed on save"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_never_sends_placeholder_api_key_from_config_or_env() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        if std::env::var_os("AGY_COMPANION_PLACEHOLDER_ENV_CHILD").is_some() {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_clone = Arc::clone(&hits);
+            let router = Router::new().route(
+                "/v1beta/models",
+                get(move || {
+                    let hits = Arc::clone(&hits_clone);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, axum::Json(json!({ "models": [] })))
+                    }
+                }),
+            );
+            let (port, handle) = spawn_mock_http(router).await;
+            let tmp = TempDir::new().expect("tempdir");
+            let cfg_path = tmp.path().join("config.json");
+            let mut cfg = Config::default();
+            cfg.gemini.base_url = format!("http://127.0.0.1:{port}");
+            cfg.gemini.api_key = None;
+            cfg.save_secure(&cfg_path).expect("save");
+
+            let server = CompanionUiServer::new(cfg_path, None).expect("server");
+            let res = server.test_connection().await.expect("test_connection");
+            assert_eq!(res.is_error, Some(false));
+            let payload: TestConnectionPayload =
+                serde_json::from_value(res.structured_content.expect("structured")).expect("parse");
+            assert!(!payload.ok, "placeholder env key must not pass connection");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "placeholder env key must never hit upstream"
+            );
+            handle.abort();
+            return;
+        }
+
+        // Case 1: Legacy placeholder stored in config.json (env fallback disabled) -> 0 upstream hits.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        let router = Router::new().route(
+            "/v1beta/models",
+            get(move || {
+                let hits = Arc::clone(&hits_clone);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, axum::Json(json!({ "models": [] })))
+                }
+            }),
+        );
+        let (port, handle) = spawn_mock_http(router).await;
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let mut cfg = Config::default();
+        cfg.gemini.base_url = format!("http://127.0.0.1:{port}");
+        cfg.gemini.api_key = Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string());
+        cfg.save_secure(&cfg_path).expect("save");
+
+        let server = CompanionUiServer::new(cfg_path, None)
+            .expect("server")
+            .with_env_api_key_fallback(false);
+        let res = server.test_connection().await.expect("test_connection");
+        assert_eq!(res.is_error, Some(false));
+        let payload: TestConnectionPayload =
+            serde_json::from_value(res.structured_content.expect("structured")).expect("parse");
+        assert!(!payload.ok);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "placeholder config key must never hit upstream"
+        );
+        handle.abort();
+
+        // Case 2: Child-process re-exec (zero unsafe) with GEMINI_API_KEY=agy-companion-local.
+        let exe = std::env::current_exe().expect("current_exe");
+        let output = Command::new(exe)
+            .arg("--exact")
+            .arg(
+                "server::tests::test_connection_never_sends_placeholder_api_key_from_config_or_env",
+            )
+            .arg("--nocapture")
+            .env("AGY_COMPANION_PLACEHOLDER_ENV_CHILD", "1")
+            .env("GEMINI_API_KEY", companion_core::PROXY_PLACEHOLDER_API_KEY)
+            .output()
+            .expect("spawn child test");
+        assert!(
+            output.status.success(),
+            "placeholder env child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

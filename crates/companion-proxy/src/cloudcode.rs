@@ -1,6 +1,7 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,19 +16,26 @@ use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use url::{Host, Url};
 
 pub const MAX_CLOUDCODE_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const CLOUDCODE_CONNECT_TIMEOUT_SECS: u64 = 15;
+const ROUTING_CACHE_CAPACITY: usize = 8;
+const BUFFERED_REQUEST_TIMEOUT_SECS: u64 = 60;
+const MIN_STREAM_READ_TIMEOUT_SECS: u64 = 600;
 
 // Dedicated custom placeholder enum range in Antigravity (MODEL_PLACEHOLDER_M334..=M365).
 const PLACEHOLDER_ENUM_START: u32 = 334;
 const PLACEHOLDER_ENUM_END: u32 = 365;
+const PLACEHOLDER_ENUM_COUNT: u32 = PLACEHOLDER_ENUM_END - PLACEHOLDER_ENUM_START + 1;
 
 const ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "authorization",
     "content-type",
+    "content-encoding",
     "user-agent",
     "x-goog-user-project",
+    "x-goog-request-reason",
     "x-goog-api-client",
     "x-client-data",
     "x-cloudaicompanion-trace-id",
@@ -69,20 +77,99 @@ pub struct CloudCodeBufferedResponse {
     pub body: Bytes,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AccountRoute {
+    use_prod: bool,
+    strip_user_project: bool,
+}
+
+#[derive(Default)]
+struct RoutingCacheInner {
+    entries: VecDeque<((u64, u64), AccountRoute)>,
+    last_resolved_prod: Option<bool>,
+}
+
+struct CloudCodeRoutingCache {
+    hasher_a: RandomState,
+    hasher_b: RandomState,
+    inner: Mutex<RoutingCacheInner>,
+}
+
+impl CloudCodeRoutingCache {
+    fn new() -> Self {
+        Self {
+            hasher_a: RandomState::new(),
+            hasher_b: RandomState::new(),
+            inner: Mutex::new(RoutingCacheInner::default()),
+        }
+    }
+
+    fn auth_fingerprint(&self, headers: &HeaderMap) -> Option<(u64, u64)> {
+        let raw = headers.get(header::AUTHORIZATION)?;
+        let trimmed = raw.as_bytes().trim_ascii();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some((
+            self.hasher_a.hash_one(trimmed),
+            self.hasher_b.hash_one(trimmed),
+        ))
+    }
+
+    fn get(&self, key: (u64, u64)) -> Option<AccountRoute> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = inner.entries.iter().position(|(k, _)| *k == key)?;
+        let (_, route) = inner.entries.remove(pos)?;
+        inner.entries.push_back((key, route));
+        Some(route)
+    }
+
+    fn put(&self, key: (u64, u64), route: AccountRoute) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = inner.entries.iter().position(|(k, _)| *k == key) {
+            inner.entries.remove(pos);
+        }
+        while inner.entries.len() >= ROUTING_CACHE_CAPACITY {
+            inner.entries.pop_front();
+        }
+        inner.entries.push_back((key, route));
+        inner.last_resolved_prod = Some(route.use_prod);
+    }
+
+    fn record_without_key(&self, use_prod: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.last_resolved_prod = Some(use_prod);
+    }
+
+    fn last_resolved_prod(&self) -> Option<bool> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_resolved_prod
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BufferedRequestOptions {
+    force_identity_encoding: bool,
+    strip_user_project: bool,
+}
+
 enum CloudCodeTarget {
     Fixed(String),
-    Auto {
-        daily_url: String,
-        prod_url: String,
-        resolved_prod: AtomicBool,
-        has_resolved: AtomicBool,
-    },
+    Auto { daily_url: String, prod_url: String },
+}
+
+struct CloudCodeClientInner {
+    target: CloudCodeTarget,
+    cache: CloudCodeRoutingCache,
 }
 
 #[derive(Clone)]
 pub struct CloudCodeClient {
-    target: Arc<CloudCodeTarget>,
+    inner: Arc<CloudCodeClientInner>,
     http: reqwest::Client,
+    buffered_timeout: Duration,
 }
 
 impl CloudCodeClient {
@@ -95,12 +182,15 @@ impl CloudCodeClient {
                 timeout_secs,
             );
         }
-        let http = build_http_client(timeout_secs)?;
+        let no_proxy = is_loopback_url(base_url);
+        let http = build_http_client(timeout_secs, no_proxy)?;
         Ok(Self {
-            target: Arc::new(CloudCodeTarget::Fixed(
-                base_url.trim_end_matches('/').to_string(),
-            )),
+            inner: Arc::new(CloudCodeClientInner {
+                target: CloudCodeTarget::Fixed(base_url.trim_end_matches('/').to_string()),
+                cache: CloudCodeRoutingCache::new(),
+            }),
             http,
+            buffered_timeout: Duration::from_secs(BUFFERED_REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -111,28 +201,35 @@ impl CloudCodeClient {
     ) -> Result<Self, CloudCodeError> {
         validate_upstream_url(daily_url)?;
         validate_upstream_url(prod_url)?;
-        let http = build_http_client(timeout_secs)?;
+        let no_proxy = is_loopback_url(daily_url) && is_loopback_url(prod_url);
+        let http = build_http_client(timeout_secs, no_proxy)?;
         Ok(Self {
-            target: Arc::new(CloudCodeTarget::Auto {
-                daily_url: daily_url.trim_end_matches('/').to_string(),
-                prod_url: prod_url.trim_end_matches('/').to_string(),
-                resolved_prod: AtomicBool::new(false),
-                has_resolved: AtomicBool::new(false),
+            inner: Arc::new(CloudCodeClientInner {
+                target: CloudCodeTarget::Auto {
+                    daily_url: daily_url.trim_end_matches('/').to_string(),
+                    prod_url: prod_url.trim_end_matches('/').to_string(),
+                },
+                cache: CloudCodeRoutingCache::new(),
             }),
             http,
+            buffered_timeout: Duration::from_secs(BUFFERED_REQUEST_TIMEOUT_SECS),
         })
     }
 
+    #[cfg(test)]
+    fn with_buffered_timeout(mut self, timeout: Duration) -> Self {
+        self.buffered_timeout = timeout;
+        self
+    }
+
     pub fn base_url(&self) -> &str {
-        match self.target.as_ref() {
+        match &self.inner.target {
             CloudCodeTarget::Fixed(url) => url,
             CloudCodeTarget::Auto {
                 daily_url,
                 prod_url,
-                resolved_prod,
-                ..
             } => {
-                if resolved_prod.load(Ordering::Relaxed) {
+                if self.inner.cache.last_resolved_prod() == Some(true) {
                     prod_url
                 } else {
                     daily_url
@@ -141,15 +238,43 @@ impl CloudCodeClient {
         }
     }
 
-    fn record_auto_choice(&self, use_prod: bool) {
-        if let CloudCodeTarget::Auto {
-            resolved_prod,
-            has_resolved,
-            ..
-        } = self.target.as_ref()
-        {
-            resolved_prod.store(use_prod, Ordering::Relaxed);
-            has_resolved.store(true, Ordering::Relaxed);
+    pub fn mode_label(&self) -> &'static str {
+        match &self.inner.target {
+            CloudCodeTarget::Fixed(_) => "fixed",
+            CloudCodeTarget::Auto { .. } => "auto",
+        }
+    }
+
+    pub fn resolved_upstream_url(&self) -> Option<String> {
+        match &self.inner.target {
+            CloudCodeTarget::Fixed(url) => Some(url.clone()),
+            CloudCodeTarget::Auto {
+                daily_url,
+                prod_url,
+            } => self
+                .inner
+                .cache
+                .last_resolved_prod()
+                .map(|use_prod| if use_prod { prod_url } else { daily_url }.clone()),
+        }
+    }
+
+    fn record_account_route(
+        &self,
+        auth_key: Option<(u64, u64)>,
+        use_prod: bool,
+        strip_user_project: bool,
+    ) {
+        if let Some(key) = auth_key {
+            self.inner.cache.put(
+                key,
+                AccountRoute {
+                    use_prod,
+                    strip_user_project,
+                },
+            );
+        } else {
+            self.inner.cache.record_without_key(use_prod);
         }
     }
 
@@ -162,33 +287,128 @@ impl CloudCodeClient {
     ) -> Result<CloudCodeStreamResponse, CloudCodeError> {
         validate_cloudcode_path(path_and_query)?;
 
-        // In "auto" mode, mirror Antigravity's own UpdateEndpointURL bootstrap:
-        // send loadCodeAssist to prod first and detect Business/PayGo (usesGcpTos)
-        // vs Personal Google AI Pro (daily) without mutating the response.
+        let auth_key = self.inner.cache.auth_fingerprint(inbound_headers);
+        let cached = auth_key.and_then(|key| self.inner.cache.get(key));
+
+        // Mirror Antigravity's own UpdateEndpointURL bootstrap for loadCodeAssist:
+        // probe prod first (with prod -> daily fallback and metadata-only 403 retry)
+        // and detect Business/PayGo/Enterprise (usesGcpTos / gcp-*) vs Personal Google AI Pro.
         let path_only = path_and_query
             .split_once('?')
             .map_or(path_and_query, |(p, _)| p);
-        if method == Method::POST
-            && path_only == "/v1internal:loadCodeAssist"
-            && let CloudCodeTarget::Auto { prod_url, .. } = self.target.as_ref()
-        {
-            let buffered = self
-                .send_buffered(
+        if method == Method::POST && path_only == "/v1internal:loadCodeAssist" {
+            let initial_strip = cached.is_some_and(|route| route.strip_user_project);
+            let buffered = match &self.inner.target {
+                CloudCodeTarget::Fixed(url) => {
+                    let (resp, used_strip) = self
+                        .send_buffered_metadata_with_403_retry(
+                            url,
+                            Method::POST,
+                            path_and_query,
+                            inbound_headers,
+                            body,
+                            BufferedRequestOptions {
+                                force_identity_encoding: true,
+                                strip_user_project: initial_strip,
+                            },
+                        )
+                        .await?;
+                    if resp.status.is_success()
+                        && used_strip
+                        && let Some(key) = auth_key
+                    {
+                        self.inner.cache.put(
+                            key,
+                            AccountRoute {
+                                use_prod: true,
+                                strip_user_project: true,
+                            },
+                        );
+                    }
+                    resp
+                }
+                CloudCodeTarget::Auto {
+                    daily_url,
                     prod_url,
-                    Method::POST,
-                    path_and_query,
-                    inbound_headers,
-                    body,
-                    true,
-                )
-                .await?;
-            if buffered.status == StatusCode::OK
-                && let Some(use_prod) = detect_prod_from_load_code_assist(&buffered.body)
-            {
-                self.record_auto_choice(use_prod);
-            }
-            let mut headers = buffered.headers;
-            headers.remove(header::CONTENT_ENCODING);
+                } => {
+                    let prod_res = self
+                        .send_buffered_metadata_with_403_retry(
+                            prod_url,
+                            Method::POST,
+                            path_and_query,
+                            inbound_headers,
+                            body.clone(),
+                            BufferedRequestOptions {
+                                force_identity_encoding: true,
+                                strip_user_project: initial_strip,
+                            },
+                        )
+                        .await;
+
+                    match prod_res {
+                        Ok((resp, used_strip)) if resp.status.is_success() => {
+                            if let Some(use_prod) = detect_prod_from_load_code_assist(&resp.body) {
+                                self.record_account_route(auth_key, use_prod, used_strip);
+                            }
+                            resp
+                        }
+                        Ok((prod_resp, _)) => {
+                            match self
+                                .send_buffered_metadata_with_403_retry(
+                                    daily_url,
+                                    Method::POST,
+                                    path_and_query,
+                                    inbound_headers,
+                                    body,
+                                    BufferedRequestOptions {
+                                        force_identity_encoding: true,
+                                        strip_user_project: false,
+                                    },
+                                )
+                                .await
+                            {
+                                Ok((daily_resp, daily_strip)) if daily_resp.status.is_success() => {
+                                    let use_prod =
+                                        detect_prod_from_load_code_assist(&daily_resp.body)
+                                            .unwrap_or(false);
+                                    self.record_account_route(auth_key, use_prod, daily_strip);
+                                    daily_resp
+                                }
+                                _ => prod_resp,
+                            }
+                        }
+                        Err(prod_err) => {
+                            match self
+                                .send_buffered_metadata_with_403_retry(
+                                    daily_url,
+                                    Method::POST,
+                                    path_and_query,
+                                    inbound_headers,
+                                    body,
+                                    BufferedRequestOptions {
+                                        force_identity_encoding: true,
+                                        strip_user_project: false,
+                                    },
+                                )
+                                .await
+                            {
+                                Ok((daily_resp, daily_strip)) => {
+                                    if daily_resp.status.is_success() {
+                                        let use_prod =
+                                            detect_prod_from_load_code_assist(&daily_resp.body)
+                                                .unwrap_or(false);
+                                        self.record_account_route(auth_key, use_prod, daily_strip);
+                                    }
+                                    daily_resp
+                                }
+                                Err(_) => return Err(prod_err),
+                            }
+                        }
+                    }
+                }
+            };
+
+            let headers = buffered.headers;
             let stream: ByteStream =
                 Box::pin(futures_util::stream::once(async move { Ok(buffered.body) }));
             return Ok(CloudCodeStreamResponse {
@@ -198,9 +418,53 @@ impl CloudCodeClient {
             });
         }
 
-        let target_url = format!("{}{path_and_query}", self.base_url());
+        // Non-metadata RPCs (generation/streaming): strictly single-attempt pass-through
+        // with zero retries and zero host fallback.
+        let (target_base, strip_user_project) = match &self.inner.target {
+            CloudCodeTarget::Fixed(url) => (
+                url.as_str(),
+                cached.is_some_and(|route| route.strip_user_project),
+            ),
+            CloudCodeTarget::Auto {
+                daily_url,
+                prod_url,
+            } => {
+                if let Some(route) = cached {
+                    (
+                        if route.use_prod {
+                            prod_url.as_str()
+                        } else {
+                            daily_url.as_str()
+                        },
+                        route.strip_user_project,
+                    )
+                } else if let Some(ua_prod) = detect_auth_method_from_headers(inbound_headers) {
+                    (
+                        if ua_prod {
+                            prod_url.as_str()
+                        } else {
+                            daily_url.as_str()
+                        },
+                        false,
+                    )
+                } else if let Some(last_prod) = self.inner.cache.last_resolved_prod() {
+                    (
+                        if last_prod {
+                            prod_url.as_str()
+                        } else {
+                            daily_url.as_str()
+                        },
+                        false,
+                    )
+                } else {
+                    (daily_url.as_str(), false)
+                }
+            }
+        };
+
+        let target_url = format!("{target_base}{path_and_query}");
         let mut req_builder = self.http.request(method, target_url);
-        for (name, value) in copy_safe_request_headers(inbound_headers, false) {
+        for (name, value) in copy_safe_request_headers(inbound_headers, false, strip_user_project) {
             req_builder = req_builder.header(name, value);
         }
         if !body.is_empty() {
@@ -232,28 +496,55 @@ impl CloudCodeClient {
     ) -> Result<CloudCodeBufferedResponse, CloudCodeError> {
         validate_cloudcode_path(path_and_query)?;
 
-        match self.target.as_ref() {
+        let auth_key = self.inner.cache.auth_fingerprint(inbound_headers);
+        let cached = auth_key.and_then(|key| self.inner.cache.get(key));
+        let body_hints_enterprise = detect_enterprise_from_fetch_body(&body);
+
+        match &self.inner.target {
             CloudCodeTarget::Fixed(base) => {
-                self.send_buffered(
-                    base,
-                    Method::POST,
-                    path_and_query,
-                    inbound_headers,
-                    body,
-                    true,
-                )
-                .await
+                let initial_strip =
+                    body_hints_enterprise || cached.is_some_and(|route| route.strip_user_project);
+                let (resp, used_strip) = self
+                    .send_buffered_metadata_with_403_retry(
+                        base,
+                        Method::POST,
+                        path_and_query,
+                        inbound_headers,
+                        body,
+                        BufferedRequestOptions {
+                            force_identity_encoding: true,
+                            strip_user_project: initial_strip,
+                        },
+                    )
+                    .await?;
+                if resp.status == StatusCode::OK
+                    && (body_hints_enterprise || used_strip)
+                    && let Some(key) = auth_key
+                {
+                    self.inner.cache.put(
+                        key,
+                        AccountRoute {
+                            use_prod: true,
+                            strip_user_project: true,
+                        },
+                    );
+                }
+                Ok(resp)
             }
             CloudCodeTarget::Auto {
                 daily_url,
                 prod_url,
-                resolved_prod,
-                has_resolved,
             } => {
-                let prefer_prod = if has_resolved.load(Ordering::Relaxed) {
-                    resolved_prod.load(Ordering::Relaxed)
+                // Precedence: Enterprise entitlement -> per-account LRU -> User-Agent auth_method
+                // -> default daily first (matching Google AI Pro / LS_CLOUD_CODE_ENDPOINT).
+                let (prefer_prod, initial_strip) = if body_hints_enterprise {
+                    (true, true)
+                } else if let Some(route) = cached {
+                    (route.use_prod, route.strip_user_project)
+                } else if let Some(ua_prod) = detect_auth_method_from_headers(inbound_headers) {
+                    (ua_prod, false)
                 } else {
-                    request_hints_business_project(&body)
+                    (false, false)
                 };
 
                 let (primary_url, primary_is_prod, fallback_url, fallback_is_prod) = if prefer_prod
@@ -264,54 +555,119 @@ impl CloudCodeClient {
                 };
 
                 let primary_res = self
-                    .send_buffered(
+                    .send_buffered_metadata_with_403_retry(
                         primary_url,
                         Method::POST,
                         path_and_query,
                         inbound_headers,
                         body.clone(),
-                        true,
+                        BufferedRequestOptions {
+                            force_identity_encoding: true,
+                            strip_user_project: initial_strip,
+                        },
                     )
                     .await;
 
-                if let Ok(ref resp) = primary_res
+                if let Ok((ref resp, used_strip)) = primary_res
                     && resp.status == StatusCode::OK
                     && response_has_non_empty_models(&resp.body)
                 {
-                    self.record_auto_choice(primary_is_prod);
-                    return primary_res;
+                    self.record_account_route(
+                        auth_key,
+                        primary_is_prod,
+                        used_strip || body_hints_enterprise,
+                    );
+                    return primary_res.map(|(resp, _)| resp);
                 }
 
-                // Fallback to the alternate CloudCode host (e.g. PayGo account hitting daily
-                // or personal AI Pro account hitting prod) so original models are never lost.
+                // Metadata-only fallback to the alternate CloudCode host (e.g. PayGo account
+                // hitting daily or personal AI Pro account hitting prod) so original models
+                // are never lost.
                 let fallback_res = self
-                    .send_buffered(
+                    .send_buffered_metadata_with_403_retry(
                         fallback_url,
                         Method::POST,
                         path_and_query,
                         inbound_headers,
                         body,
-                        true,
+                        BufferedRequestOptions {
+                            force_identity_encoding: true,
+                            strip_user_project: body_hints_enterprise,
+                        },
                     )
                     .await;
 
-                if let Ok(ref resp) = fallback_res
+                if let Ok((ref resp, used_strip)) = fallback_res
                     && resp.status == StatusCode::OK
                     && response_has_non_empty_models(&resp.body)
                 {
-                    self.record_auto_choice(fallback_is_prod);
-                    return fallback_res;
+                    self.record_account_route(
+                        auth_key,
+                        fallback_is_prod,
+                        used_strip || body_hints_enterprise,
+                    );
+                    return fallback_res.map(|(resp, _)| resp);
                 }
 
                 match (primary_res, fallback_res) {
-                    (Ok(p), _) if p.status == StatusCode::OK => Ok(p),
-                    (_, Ok(f)) if f.status == StatusCode::OK => Ok(f),
-                    (Ok(p), _) => Ok(p),
-                    (Err(_), Ok(f)) => Ok(f),
+                    (Ok((p, _)), _) if p.status == StatusCode::OK => Ok(p),
+                    (_, Ok((f, _))) if f.status == StatusCode::OK => Ok(f),
+                    (Ok((p, _)), _) => Ok(p),
+                    (Err(_), Ok((f, _))) => Ok(f),
                     (Err(e), Err(_)) => Err(e),
                 }
             }
         }
+    }
+
+    async fn send_buffered_metadata_with_403_retry(
+        &self,
+        base_url: &str,
+        method: Method,
+        path_and_query: &str,
+        inbound_headers: &HeaderMap,
+        body: Bytes,
+        opts: BufferedRequestOptions,
+    ) -> Result<(CloudCodeBufferedResponse, bool), CloudCodeError> {
+        let first = self
+            .send_buffered(
+                base_url,
+                method.clone(),
+                path_and_query,
+                inbound_headers,
+                body.clone(),
+                opts,
+            )
+            .await?;
+
+        if first.status == StatusCode::FORBIDDEN
+            && !opts.strip_user_project
+            && inbound_headers.contains_key("x-goog-user-project")
+        {
+            let retry_opts = BufferedRequestOptions {
+                strip_user_project: true,
+                ..opts
+            };
+            match self
+                .send_buffered(
+                    base_url,
+                    method,
+                    path_and_query,
+                    inbound_headers,
+                    body,
+                    retry_opts,
+                )
+                .await
+            {
+                Ok(retry_resp) => {
+                    let strip_succeeded = retry_resp.status.is_success();
+                    return Ok((retry_resp, strip_succeeded));
+                }
+                Err(_) => return Ok((first, false)),
+            }
+        }
+
+        Ok((first, opts.strip_user_project))
     }
 
     async fn send_buffered(
@@ -321,55 +677,87 @@ impl CloudCodeClient {
         path_and_query: &str,
         inbound_headers: &HeaderMap,
         body: Bytes,
-        force_identity_encoding: bool,
+        opts: BufferedRequestOptions,
     ) -> Result<CloudCodeBufferedResponse, CloudCodeError> {
         let target_url = format!("{base_url}{path_and_query}");
         let mut req_builder = self.http.request(method, target_url);
-        for (name, value) in copy_safe_request_headers(inbound_headers, force_identity_encoding) {
+        for (name, value) in copy_safe_request_headers(
+            inbound_headers,
+            opts.force_identity_encoding,
+            opts.strip_user_project,
+        ) {
             req_builder = req_builder.header(name, value);
         }
         if !body.is_empty() {
             req_builder = req_builder.body(body);
         }
 
-        let mut resp = req_builder
-            .send()
-            .await
-            .map_err(|err| CloudCodeError::Upstream(err.to_string()))?;
-        let status = resp.status();
-        let headers = copy_safe_response_headers(resp.headers());
+        let timeout = self.buffered_timeout;
+        tokio::time::timeout(timeout, async move {
+            let mut resp = req_builder
+                .send()
+                .await
+                .map_err(|err| CloudCodeError::Upstream(err.to_string()))?;
+            let status = resp.status();
+            let headers = copy_safe_response_headers(resp.headers());
 
-        let mut collected = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|err| CloudCodeError::Upstream(err.to_string()))?
-        {
-            if collected.len().saturating_add(chunk.len()) > MAX_CLOUDCODE_CATALOG_BYTES {
-                return Err(CloudCodeError::ResponseTooLarge);
+            let mut collected = Vec::new();
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .map_err(|err| CloudCodeError::Upstream(err.to_string()))?
+            {
+                if collected.len().saturating_add(chunk.len()) > MAX_CLOUDCODE_CATALOG_BYTES {
+                    return Err(CloudCodeError::ResponseTooLarge);
+                }
+                collected.extend_from_slice(&chunk);
             }
-            collected.extend_from_slice(&chunk);
-        }
 
-        Ok(CloudCodeBufferedResponse {
-            status,
-            headers,
-            body: Bytes::from(collected),
+            Ok(CloudCodeBufferedResponse {
+                status,
+                headers,
+                body: Bytes::from(collected),
+            })
         })
+        .await
+        .map_err(|_| {
+            CloudCodeError::Upstream(format!(
+                "cloudcode metadata request timed out after {}ms",
+                timeout.as_millis()
+            ))
+        })?
     }
 }
 
-fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client, CloudCodeError> {
+fn is_loopback_url(raw: &str) -> bool {
+    let Ok(parsed) = Url::parse(raw) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+fn build_http_client(timeout_secs: u64, no_proxy: bool) -> Result<reqwest::Client, CloudCodeError> {
     let effective_timeout = if timeout_secs == 0 {
         DEFAULT_TIMEOUT_SECS
     } else {
         timeout_secs
     };
-    reqwest::Client::builder()
-        .no_proxy()
+    let mut builder = reqwest::Client::builder()
+        .http1_only()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(CLOUDCODE_CONNECT_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(effective_timeout))
+        .read_timeout(Duration::from_secs(
+            effective_timeout.max(MIN_STREAM_READ_TIMEOUT_SECS),
+        ));
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .map_err(|err| CloudCodeError::Upstream(err.to_string()))
 }
@@ -377,13 +765,15 @@ fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client, CloudCodeErro
 fn detect_prod_from_load_code_assist(body: &[u8]) -> Option<bool> {
     let parsed: Value = serde_json::from_slice(body).ok()?;
     let obj = parsed.as_object()?;
-    if obj
-        .get("paidTier")
-        .and_then(|t| t.get("usesGcpTos"))
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        return Some(true);
+    for key in ["paidTier", "currentTier"] {
+        if obj
+            .get(key)
+            .and_then(|t| t.get("usesGcpTos"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Some(true);
+        }
     }
     for key in ["currentTier", "paidTier"] {
         if let Some(id) = obj
@@ -392,7 +782,8 @@ fn detect_prod_from_load_code_assist(body: &[u8]) -> Option<bool> {
             .and_then(Value::as_str)
         {
             let lower = id.to_ascii_lowercase();
-            if lower.contains("paygo")
+            if lower.starts_with("gcp-")
+                || lower.contains("paygo")
                 || lower.contains("business")
                 || lower.contains("enterprise")
                 || lower.contains("workspace")
@@ -404,14 +795,48 @@ fn detect_prod_from_load_code_assist(body: &[u8]) -> Option<bool> {
     Some(false)
 }
 
-fn request_hints_business_project(body: &[u8]) -> bool {
+fn detect_enterprise_from_fetch_body(body: &[u8]) -> bool {
     let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
-    parsed
-        .get("project")
-        .and_then(Value::as_str)
-        .is_some_and(|p| !p.trim().is_empty())
+    match parsed.get("entitlement").and_then(|e| e.get("userTier")) {
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("USER_TIER_UNSPECIFIED")
+                && !trimmed.eq_ignore_ascii_case("UNSPECIFIED")
+        }
+        Some(Value::Number(n)) => n.as_i64() != Some(0) && n.as_u64() != Some(0),
+        Some(Value::Bool(true) | Value::Object(_) | Value::Array(_)) => true,
+        _ => false,
+    }
+}
+
+fn detect_auth_method_from_headers(headers: &HeaderMap) -> Option<bool> {
+    let ua = headers.get(header::USER_AGENT)?.to_str().ok()?;
+    let lower = ua.to_ascii_lowercase();
+    let needle = "auth_method=";
+    let mut search_start = 0;
+    while let Some(rel_idx) = lower[search_start..].find(needle) {
+        let start = search_start + rel_idx;
+        let boundary_before = start == 0
+            || (!lower.as_bytes()[start - 1].is_ascii_alphanumeric()
+                && lower.as_bytes()[start - 1] != b'_');
+        let val_start = start + needle.len();
+        if boundary_before {
+            let rest = &lower[val_start..];
+            let val_end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+                .unwrap_or(rest.len());
+            match &rest[..val_end] {
+                "gcp" | "adc" => return Some(true),
+                "consumer" => return Some(false),
+                _ => {}
+            }
+        }
+        search_start = val_start;
+    }
+    None
 }
 
 fn response_has_non_empty_models(body: &[u8]) -> bool {
@@ -476,10 +901,14 @@ pub fn validate_cloudcode_path(path_and_query: &str) -> Result<(), CloudCodeErro
 fn copy_safe_request_headers(
     inbound: &HeaderMap,
     force_identity_encoding: bool,
+    strip_user_project: bool,
 ) -> Vec<(HeaderName, HeaderValue)> {
     let mut out = Vec::new();
     for &allowed in ALLOWED_REQUEST_HEADERS {
         if force_identity_encoding && allowed == "accept-encoding" {
+            continue;
+        }
+        if strip_user_project && allowed == "x-goog-user-project" {
             continue;
         }
         let Ok(name) = HeaderName::from_bytes(allowed.as_bytes()) else {
@@ -549,7 +978,7 @@ const STANDARD_GEMINI_LEVELS: &[ThinkingVariant] = &[
     },
 ];
 
-const HYDROGEN_GEMINI_LEVELS: &[ThinkingVariant] = &[
+const XHIGH_GEMINI_LEVELS: &[ThinkingVariant] = &[
     ThinkingVariant {
         suffix: "low",
         label_effort: "Low",
@@ -576,11 +1005,33 @@ const HYDROGEN_GEMINI_LEVELS: &[ThinkingVariant] = &[
     },
 ];
 
+// Canonical collision-free preferred offsets (0..=16 -> M334..=M350) for the 17 curated variants.
+// Allocated in fixed canonical order independent of `default_model` so changing the default
+// model never shifts persisted chat model enum bindings.
+const CURATED_SLOT_TABLE: &[(&str, u32)] = &[
+    ("gemini-4-hydrogen-low", 0),
+    ("gemini-4-hydrogen-medium", 1),
+    ("gemini-4-hydrogen-high", 2),
+    ("gemini-4-hydrogen-xhigh", 3),
+    ("gemini-4-argon-low", 4),
+    ("gemini-4-argon-medium", 5),
+    ("gemini-4-argon-high", 6),
+    ("gemini-4-neon-low", 7),
+    ("gemini-4-neon-medium", 8),
+    ("gemini-4-neon-high", 9),
+    ("gemini-4-neon-xhigh", 10),
+    ("gemini-4-carbon-low", 11),
+    ("gemini-4-carbon-medium", 12),
+    ("gemini-4-carbon-high", 13),
+    ("gemini-3.8-flash-low", 14),
+    ("gemini-3.8-flash-medium", 15),
+    ("gemini-3.8-flash-high", 16),
+];
+
 fn variants_for_model(model_id: &str) -> &'static [ThinkingVariant] {
-    if model_id == "gemini-4-hydrogen" {
-        HYDROGEN_GEMINI_LEVELS
-    } else {
-        STANDARD_GEMINI_LEVELS
+    match model_id {
+        "gemini-4-hydrogen" | "gemini-4-neon" => XHIGH_GEMINI_LEVELS,
+        _ => STANDARD_GEMINI_LEVELS,
     }
 }
 
@@ -640,11 +1091,71 @@ fn collect_used_model_enums(models_obj: &Map<String, Value>) -> HashSet<String> 
     used
 }
 
-fn available_placeholder_enums(used: &HashSet<String>) -> Vec<String> {
-    (PLACEHOLDER_ENUM_START..=PLACEHOLDER_ENUM_END)
-        .map(|n| format!("MODEL_PLACEHOLDER_M{n}"))
-        .filter(|name| !used.contains(name))
-        .collect()
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn claim_placeholder_slot(preferred_offset: u32, used: &mut HashSet<String>) -> Option<String> {
+    let start = preferred_offset % PLACEHOLDER_ENUM_COUNT;
+    for delta in 0..PLACEHOLDER_ENUM_COUNT {
+        let offset = (start + delta) % PLACEHOLDER_ENUM_COUNT;
+        let name = format!("MODEL_PLACEHOLDER_M{}", PLACEHOLDER_ENUM_START + offset);
+        if used.insert(name.clone()) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn assign_deterministic_placeholder_enums(
+    selected_models: &[String],
+    used_enums: &HashSet<String>,
+) -> HashMap<String, String> {
+    let mut used = used_enums.clone();
+    let mut needed: HashSet<String> = HashSet::new();
+    for raw_id in selected_models {
+        for variant in variants_for_model(raw_id) {
+            needed.insert(format!("{raw_id}-{}", variant.suffix));
+        }
+    }
+
+    let mut assigned = HashMap::with_capacity(needed.len());
+
+    // Pass 1: Curated variants in fixed canonical order (independent of `default_model`).
+    for &(variant_key, preferred_offset) in CURATED_SLOT_TABLE {
+        if needed.remove(variant_key)
+            && let Some(slot) = claim_placeholder_slot(preferred_offset, &mut used)
+        {
+            assigned.insert(variant_key.to_string(), slot);
+        }
+    }
+
+    // Pass 2: Discovered non-curated models in canonical lexicographical order.
+    let mut remaining_models: Vec<&String> = selected_models.iter().collect();
+    remaining_models.sort();
+    for raw_id in remaining_models {
+        for variant in variants_for_model(raw_id) {
+            let variant_key = format!("{raw_id}-{}", variant.suffix);
+            if needed.remove(&variant_key) {
+                let curated_count = CURATED_SLOT_TABLE.len() as u32;
+                let dynamic_span = PLACEHOLDER_ENUM_COUNT - curated_count;
+                let preferred = curated_count
+                    + (fnv1a_64(variant_key.as_bytes()) % u64::from(dynamic_span)) as u32;
+                if let Some(slot) = claim_placeholder_slot(preferred, &mut used) {
+                    assigned.insert(variant_key, slot);
+                }
+            }
+        }
+    }
+
+    assigned
 }
 
 /// Merge proxy-backed Gemini 3/4 models into an upstream Cloud Code
@@ -710,28 +1221,44 @@ pub fn merge_available_models(
         .and_then(Value::as_object)
         .map(collect_used_model_enums)
         .unwrap_or_default();
-    let mut enum_pool = available_placeholder_enums(&used_enums).into_iter();
-    let mut remaining_slots = enum_pool.len();
+    let used_in_range = (PLACEHOLDER_ENUM_START..=PLACEHOLDER_ENUM_END)
+        .filter(|n| used_enums.contains(&format!("MODEL_PLACEHOLDER_M{n}")))
+        .count();
+    let mut remaining_slots = (PLACEHOLDER_ENUM_COUNT as usize).saturating_sub(used_in_range);
 
-    let mut injected_model_ids: Vec<String> = Vec::new();
-    let mut injected_details: Vec<(String, Value)> = Vec::new();
-    let mut injected_groups: Vec<(String, Value)> = Vec::new();
-
+    // Select which models fit in the available placeholder pool using `ordered_models`
+    // priority (default_model and curated models first), then assign slots deterministically.
+    let mut selected_models: Vec<String> = Vec::new();
     for raw_id in &ordered_models {
         let variants = variants_for_model(raw_id);
         if remaining_slots < variants.len() {
             break;
         }
+        remaining_slots = remaining_slots.saturating_sub(variants.len());
+        selected_models.push(raw_id.clone());
+    }
 
+    if selected_models.is_empty() {
+        return serde_json::to_vec(&root);
+    }
+
+    let slot_map = assign_deterministic_placeholder_enums(&selected_models, &used_enums);
+
+    let mut injected_model_ids: Vec<String> = Vec::new();
+    let mut injected_details: Vec<(String, Value)> = Vec::new();
+    let mut injected_groups: Vec<(String, Value)> = Vec::new();
+
+    for raw_id in &selected_models {
+        let variants = variants_for_model(raw_id);
         let base_id = format!("companion/{raw_id}");
         let display_base = format!("{} (Proxy)", pretty_model_name(raw_id));
         let mut level_entries = Vec::with_capacity(variants.len());
 
         for variant in variants {
-            let Some(enum_name) = enum_pool.next() else {
+            let variant_key = format!("{raw_id}-{}", variant.suffix);
+            let Some(enum_name) = slot_map.get(&variant_key) else {
                 break;
             };
-            remaining_slots = remaining_slots.saturating_sub(1);
 
             let variant_id = format!("{base_id}-{}", variant.suffix);
             let display_name = format!("{display_base} ({})", variant.label_effort);
@@ -1183,5 +1710,1071 @@ mod tests {
                     .any(|v| v == "companion/gemini-4-hydrogen-xhigh")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_available_models_defaults_to_daily_even_with_non_empty_project_field() {
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let daily_hits = Arc::new(AtomicUsize::new(0));
+        let prod_hits = Arc::new(AtomicUsize::new(0));
+
+        let daily_hits_c = Arc::clone(&daily_hits);
+        let mock_daily = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(move || {
+                let daily_hits = Arc::clone(&daily_hits_c);
+                async move {
+                    daily_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":{"gemini-4-carbon-high":{"displayName":"Gemini 4 Carbon (High)"}}}"#,
+                    )
+                }
+            }),
+        );
+        let daily_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_srv = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, mock_daily).await;
+        });
+
+        let prod_hits_c = Arc::clone(&prod_hits);
+        let mock_prod = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(move || {
+                let prod_hits = Arc::clone(&prod_hits_c);
+                async move {
+                    prod_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":{"prod-only":{"displayName":"Prod Only"}}}"#,
+                    )
+                }
+            }),
+        );
+        let prod_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_srv = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, mock_prod).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .expect("auto client");
+        assert_eq!(client.mode_label(), "auto");
+        assert_eq!(client.resolved_upstream_url(), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ai-pro-consumer-token"),
+        );
+
+        // Consumer Google AI Pro accounts send a non-empty managed `project` field;
+        // unresolved auto must still try daily first and never touch prod.
+        let resp = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &headers,
+                Bytes::from_static(br#"{"project":"managed-caic-123"}"#),
+            )
+            .await
+            .expect("daily request succeeds");
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(daily_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(prod_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            client.resolved_upstream_url().as_deref(),
+            Some(format!("http://{daily_addr}").as_str())
+        );
+
+        daily_srv.abort();
+        prod_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_available_models_routes_enterprise_entitlement_and_strips_user_project() {
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let daily_hits = Arc::new(AtomicUsize::new(0));
+        let prod_hits = Arc::new(AtomicUsize::new(0));
+        let saw_user_project = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+
+        let daily_hits_c = Arc::clone(&daily_hits);
+        let mock_daily = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(move || {
+                let daily_hits = Arc::clone(&daily_hits_c);
+                async move {
+                    daily_hits.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "unexpected daily hit")
+                }
+            }),
+        );
+        let daily_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_srv = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, mock_daily).await;
+        });
+
+        let prod_hits_c = Arc::clone(&prod_hits);
+        let saw_up_c = Arc::clone(&saw_user_project);
+        let mock_prod = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(move |headers: HeaderMap| {
+                let prod_hits = Arc::clone(&prod_hits_c);
+                let saw_up = Arc::clone(&saw_up_c);
+                async move {
+                    prod_hits.fetch_add(1, Ordering::SeqCst);
+                    let up = headers
+                        .get("x-goog-user-project")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    saw_up.lock().unwrap().push(up);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":{"enterprise-model":{"displayName":"Enterprise Model"}}}"#,
+                    )
+                }
+            }),
+        );
+        let prod_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_srv = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, mock_prod).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .expect("auto client");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer enterprise-token"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-goog-user-project"),
+            HeaderValue::from_static("corp-project-1"),
+        );
+
+        let resp = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &headers,
+                Bytes::from_static(br#"{"entitlement":{"userTier":"ENTERPRISE"}}"#),
+            )
+            .await
+            .expect("enterprise request succeeds");
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(daily_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(prod_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(*saw_user_project.lock().unwrap(), vec![None]);
+        assert_eq!(
+            client.resolved_upstream_url().as_deref(),
+            Some(format!("http://{prod_addr}").as_str())
+        );
+
+        daily_srv.abort();
+        prod_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_available_models_honors_user_agent_auth_method_gcp_adc_and_consumer() {
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        // Unit check boundary parsing first.
+        let check_ua = |ua: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::USER_AGENT, HeaderValue::from_str(ua).unwrap());
+            detect_auth_method_from_headers(&h)
+        };
+        assert_eq!(check_ua("antigravity/2.34.0 auth_method=gcp"), Some(true));
+        assert_eq!(
+            check_ua("antigravity/2.34.0 (auth_method=ADC; macos)"),
+            Some(true)
+        );
+        assert_eq!(
+            check_ua("antigravity/2.34.0 auth_method=consumer"),
+            Some(false)
+        );
+        assert_eq!(check_ua("antigravity/2.34.0 custom_auth_method=gcp"), None);
+        assert_eq!(check_ua("antigravity/2.34.0 auth_method=gcpx"), None);
+
+        let daily_hits = Arc::new(AtomicUsize::new(0));
+        let prod_hits = Arc::new(AtomicUsize::new(0));
+
+        let daily_hits_c = Arc::clone(&daily_hits);
+        let mock_daily = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(move || {
+                let daily_hits = Arc::clone(&daily_hits_c);
+                async move {
+                    daily_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":{"daily-model":{"displayName":"Daily"}}}"#,
+                    )
+                }
+            }),
+        );
+        let daily_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_srv = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, mock_daily).await;
+        });
+
+        let prod_hits_c = Arc::clone(&prod_hits);
+        let mock_prod = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(move || {
+                let prod_hits = Arc::clone(&prod_hits_c);
+                async move {
+                    prod_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":{"prod-model":{"displayName":"Prod"}}}"#,
+                    )
+                }
+            }),
+        );
+        let prod_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_srv = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, mock_prod).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .expect("auto client");
+
+        // auth_method=gcp -> prod directly (0 daily hits).
+        let mut gcp_headers = HeaderMap::new();
+        gcp_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer gcp-acct"),
+        );
+        gcp_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("antigravity/2.34.0 auth_method=gcp"),
+        );
+        let r_gcp = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &gcp_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&r_gcp.body).contains("prod-model"));
+        assert_eq!(prod_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(daily_hits.load(Ordering::SeqCst), 0);
+
+        // auth_method=adc -> prod directly.
+        let mut adc_headers = HeaderMap::new();
+        adc_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer adc-acct"),
+        );
+        adc_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("antigravity/2.34.0 auth_method=adc"),
+        );
+        let r_adc = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &adc_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&r_adc.body).contains("prod-model"));
+        assert_eq!(prod_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(daily_hits.load(Ordering::SeqCst), 0);
+
+        // auth_method=consumer -> daily directly (even though last_resolved_prod is true!).
+        let mut consumer_headers = HeaderMap::new();
+        consumer_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer consumer-acct"),
+        );
+        consumer_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("antigravity/2.34.0 auth_method=consumer"),
+        );
+        let r_consumer = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &consumer_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&r_consumer.body).contains("daily-model"));
+        assert_eq!(daily_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(prod_hits.load(Ordering::SeqCst), 2);
+
+        daily_srv.abort();
+        prod_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn load_code_assist_detects_current_tier_uses_gcp_tos_and_gcp_prefix_and_falls_back_prod_to_daily()
+     {
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        // Pure detection checks for currentTier.usesGcpTos and gcp-* prefixes.
+        assert_eq!(
+            detect_prod_from_load_code_assist(br#"{"currentTier":{"usesGcpTos":true}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            detect_prod_from_load_code_assist(br#"{"currentTier":{"id":"gcp-standard-tier"}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            detect_prod_from_load_code_assist(br#"{"paidTier":{"id":"gcp-ge-1"}}"#),
+            Some(true)
+        );
+
+        // Prod returns 500 -> loadCodeAssist must fall back to daily and preserve Content-Encoding.
+        let mock_prod = Router::new().route(
+            "/v1internal:loadCodeAssist",
+            axum::routing::post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "prod down") }),
+        );
+        let prod_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_srv = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, mock_prod).await;
+        });
+
+        let mock_daily = Router::new().route(
+            "/v1internal:loadCodeAssist",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/json"),
+                        (header::CONTENT_ENCODING, "gzip"),
+                    ],
+                    r#"{"currentTier":{"id":"free-tier"}}"#,
+                )
+            }),
+        );
+        let daily_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_srv = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, mock_daily).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .expect("auto client");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer fallback-acct"),
+        );
+
+        let resp = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:loadCodeAssist",
+                &headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .expect("prod -> daily fallback succeeds");
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(
+            resp.headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "Content-Encoding must be preserved verbatim on loadCodeAssist pass-through"
+        );
+        assert_eq!(
+            client.resolved_upstream_url().as_deref(),
+            Some(format!("http://{daily_addr}").as_str())
+        );
+
+        daily_srv.abort();
+        prod_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn enterprise_403_retries_once_without_user_project_on_metadata_rpcs_only_and_caches_per_account()
+     {
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let fetch_attempts = Arc::new(AtomicUsize::new(0));
+        let lca_attempts = Arc::new(AtomicUsize::new(0));
+        let stream_attempts = Arc::new(AtomicUsize::new(0));
+        let stream_seen_user_projects = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let daily_stream_hits = Arc::new(AtomicUsize::new(0));
+
+        let daily_stream_c = Arc::clone(&daily_stream_hits);
+        let mock_daily = Router::new()
+            .route(
+                "/v1internal:fetchAvailableModels",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":{}}"#,
+                    )
+                }),
+            )
+            .route(
+                "/v1internal:streamGenerateContent",
+                axum::routing::post(move || {
+                    let daily_stream = Arc::clone(&daily_stream_c);
+                    async move {
+                        daily_stream.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, "daily-stream")
+                    }
+                }),
+            );
+        let daily_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_srv = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, mock_daily).await;
+        });
+
+        let fetch_attempts_c = Arc::clone(&fetch_attempts);
+        let lca_attempts_c = Arc::clone(&lca_attempts);
+        let stream_attempts_c = Arc::clone(&stream_attempts);
+        let stream_up_c = Arc::clone(&stream_seen_user_projects);
+        let mock_prod = Router::new()
+            .route(
+                "/v1internal:loadCodeAssist",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let lca_attempts = Arc::clone(&lca_attempts_c);
+                    async move {
+                        lca_attempts.fetch_add(1, Ordering::SeqCst);
+                        if headers.contains_key("x-goog-user-project") {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                r#"{"error":{"status":"PERMISSION_DENIED"}}"#,
+                            );
+                        }
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"currentTier":{"id":"gcp-ge-enterprise","usesGcpTos":true}}"#,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:fetchAvailableModels",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let fetch_attempts = Arc::clone(&fetch_attempts_c);
+                    async move {
+                        fetch_attempts.fetch_add(1, Ordering::SeqCst);
+                        let auth = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let has_up = headers.contains_key("x-goog-user-project");
+                        // Enterprise account gets 403 whenever x-goog-user-project is present.
+                        if auth == "Bearer ent-403-acct" && has_up {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                r#"{"error":{"status":"PERMISSION_DENIED"}}"#,
+                            );
+                        }
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"models":{"prod-model":{"displayName":"Prod Model"}}}"#,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:streamGenerateContent",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let stream_attempts = Arc::clone(&stream_attempts_c);
+                    let stream_up = Arc::clone(&stream_up_c);
+                    async move {
+                        stream_attempts.fetch_add(1, Ordering::SeqCst);
+                        let up = headers
+                            .get("x-goog-user-project")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        stream_up.lock().unwrap().push(up.clone());
+                        let auth = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        if auth == "Bearer uncached-403-acct" {
+                            // Even on 403 with x-goog-user-project present, generation RPC must NEVER retry!
+                            return (StatusCode::FORBIDDEN, "no retry on generation");
+                        }
+                        (StatusCode::OK, "ok-stream")
+                    }
+                }),
+            );
+        let prod_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_srv = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, mock_prod).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .expect("auto client");
+
+        // 1. Enterprise account hits prod -> 403 -> retries ONCE without x-goog-user-project -> 200.
+        let mut ent_headers = HeaderMap::new();
+        ent_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ent-403-acct"),
+        );
+        ent_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("antigravity/2.34.0 auth_method=gcp"),
+        );
+        ent_headers.insert(
+            HeaderName::from_static("x-goog-user-project"),
+            HeaderValue::from_static("billing-proj"),
+        );
+        let resp = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &ent_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .expect("403 retry succeeds");
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(fetch_attempts.load(Ordering::SeqCst), 2);
+
+        // 2. Subsequent forward_raw for ent-403-acct strips x-goog-user-project on attempt 1!
+        let stream_resp = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:streamGenerateContent?alt=sse",
+                &ent_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .expect("cached enterprise stream succeeds");
+        assert_eq!(stream_resp.status, StatusCode::OK);
+        assert_eq!(stream_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(*stream_seen_user_projects.lock().unwrap(), vec![None]);
+
+        // 3. Separate Workspace account keeps x-goog-user-project intact (per-account isolation!).
+        let mut ws_headers = HeaderMap::new();
+        ws_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer workspace-acct"),
+        );
+        ws_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("antigravity/2.34.0 auth_method=gcp"),
+        );
+        ws_headers.insert(
+            HeaderName::from_static("x-goog-user-project"),
+            HeaderValue::from_static("ws-proj"),
+        );
+        let ws_fetch = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &ws_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ws_fetch.status, StatusCode::OK);
+        let ws_stream = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:streamGenerateContent?alt=sse",
+                &ws_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ws_stream.status, StatusCode::OK);
+        assert_eq!(
+            *stream_seen_user_projects.lock().unwrap(),
+            vec![None, Some("ws-proj".to_string())]
+        );
+
+        // 4. Uncached account getting 403 on streamGenerateContent must NEVER retry or fall back to daily!
+        let mut no_retry_headers = HeaderMap::new();
+        no_retry_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer uncached-403-acct"),
+        );
+        no_retry_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("antigravity/2.34.0 auth_method=gcp"),
+        );
+        no_retry_headers.insert(
+            HeaderName::from_static("x-goog-user-project"),
+            HeaderValue::from_static("some-proj"),
+        );
+        let before = stream_attempts.load(Ordering::SeqCst);
+        let err_stream = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:streamGenerateContent?alt=sse",
+                &no_retry_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(err_stream.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            stream_attempts.load(Ordering::SeqCst),
+            before + 1,
+            "generation RPC must execute at most once (zero retries)"
+        );
+        assert_eq!(
+            daily_stream_hits.load(Ordering::SeqCst),
+            0,
+            "generation RPC must never fall back across hosts"
+        );
+
+        // 5. loadCodeAssist also retries ONCE on 403 without x-goog-user-project and caches strip_user_project!
+        let mut lca_headers = HeaderMap::new();
+        lca_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ent-lca-acct"),
+        );
+        lca_headers.insert(
+            HeaderName::from_static("x-goog-user-project"),
+            HeaderValue::from_static("corp-lca-proj"),
+        );
+        let lca_resp = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:loadCodeAssist",
+                &lca_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .expect("loadCodeAssist 403 retry succeeds");
+        assert_eq!(lca_resp.status, StatusCode::OK);
+        assert_eq!(lca_attempts.load(Ordering::SeqCst), 2);
+        let lca_stream = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:streamGenerateContent?alt=sse",
+                &lca_headers,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .expect("cached loadCodeAssist enterprise stream succeeds");
+        assert_eq!(lca_stream.status, StatusCode::OK);
+        assert_eq!(
+            stream_seen_user_projects.lock().unwrap().last().cloned(),
+            Some(None),
+            "loadCodeAssist 403 retry must cache strip_user_project for subsequent forward_raw"
+        );
+
+        daily_srv.abort();
+        prod_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn per_account_lru_evicts_after_8_entries_and_preserves_last_resolved_prod_on_oauth_refresh()
+     {
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        // Direct LRU capacity test (8 entries max, evicts least-recently-used).
+        let cache = CloudCodeRoutingCache::new();
+        let fp = |tok: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::AUTHORIZATION, HeaderValue::from_str(tok).unwrap());
+            cache.auth_fingerprint(&h).unwrap()
+        };
+        for i in 0..8 {
+            cache.put(
+                fp(&format!("Bearer tok-{i}")),
+                AccountRoute {
+                    use_prod: i % 2 == 0,
+                    strip_user_project: false,
+                },
+            );
+        }
+        // Touch tok-0 so tok-1 becomes LRU.
+        assert!(cache.get(fp("Bearer tok-0")).is_some());
+        cache.put(
+            fp("Bearer tok-8"),
+            AccountRoute {
+                use_prod: true,
+                strip_user_project: true,
+            },
+        );
+        assert!(cache.get(fp("Bearer tok-0")).is_some());
+        assert!(
+            cache.get(fp("Bearer tok-1")).is_none(),
+            "tok-1 should be evicted"
+        );
+        assert!(cache.get(fp("Bearer tok-8")).is_some());
+
+        // End-to-end OAuth token refresh check:
+        // PayGo resolves to prod -> hourly OAuth token rotates -> forward_raw still routes to prod via last_resolved_prod,
+        // while a new account's fetchAvailableModels still probes daily first.
+        let daily_fetch_hits = Arc::new(AtomicUsize::new(0));
+        let daily_stream_hits = Arc::new(AtomicUsize::new(0));
+        let prod_stream_hits = Arc::new(AtomicUsize::new(0));
+
+        let df_c = Arc::clone(&daily_fetch_hits);
+        let ds_c = Arc::clone(&daily_stream_hits);
+        let mock_daily = Router::new()
+            .route(
+                "/v1internal:fetchAvailableModels",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let df = Arc::clone(&df_c);
+                    async move {
+                        df.fetch_add(1, Ordering::SeqCst);
+                        let auth = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        if auth == "Bearer personal-pro-new" {
+                            (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                r#"{"models":{"pro-model":{"displayName":"Pro"}}}"#,
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                r#"{"models":{}}"#,
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:streamGenerateContent",
+                axum::routing::post(move || {
+                    let ds = Arc::clone(&ds_c);
+                    async move {
+                        ds.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, "daily")
+                    }
+                }),
+            );
+        let daily_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_srv = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, mock_daily).await;
+        });
+
+        let ps_c = Arc::clone(&prod_stream_hits);
+        let mock_prod = Router::new()
+            .route(
+                "/v1internal:fetchAvailableModels",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":{"paygo-model":{"displayName":"PayGo"}}}"#,
+                    )
+                }),
+            )
+            .route(
+                "/v1internal:streamGenerateContent",
+                axum::routing::post(move || {
+                    let ps = Arc::clone(&ps_c);
+                    async move {
+                        ps.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, "prod")
+                    }
+                }),
+            );
+        let prod_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_srv = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, mock_prod).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .expect("auto client");
+
+        // PayGo resolves to prod.
+        let mut h1 = HeaderMap::new();
+        h1.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer paygo-hour-1"),
+        );
+        client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &h1,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.resolved_upstream_url().as_deref(),
+            Some(format!("http://{prod_addr}").as_str())
+        );
+
+        // OAuth token rotates -> forward_raw with new token (no UA auth_method) hits prod via last_resolved_prod.
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer paygo-hour-2"),
+        );
+        let r = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:streamGenerateContent?alt=sse",
+                &h2,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(prod_stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(daily_stream_hits.load(Ordering::SeqCst), 0);
+
+        // New personal account fetchAvailableModels still probes daily first (does NOT get stuck on last_resolved_prod).
+        let mut h3 = HeaderMap::new();
+        h3.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer personal-pro-new"),
+        );
+        let r3 = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &h3,
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&r3.body).contains("pro-model"));
+        assert_eq!(
+            client.resolved_upstream_url().as_deref(),
+            Some(format!("http://{daily_addr}").as_str())
+        );
+        assert_eq!(daily_fetch_hits.load(Ordering::SeqCst), 2);
+
+        daily_srv.abort();
+        prod_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn allowed_request_headers_forwards_request_reason_and_content_encoding() {
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let seen = Arc::new(Mutex::new((None::<String>, None::<String>)));
+        let seen_c = Arc::clone(&seen);
+        let mock = Router::new().route(
+            "/v1internal:streamGenerateContent",
+            axum::routing::post(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen_c);
+                async move {
+                    let reason = headers
+                        .get("x-goog-request-reason")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    let ce = headers
+                        .get(header::CONTENT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    *seen.lock().unwrap() = (reason, ce);
+                    (StatusCode::OK, "ok")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+
+        let client = CloudCodeClient::new(&format!("http://{addr}"), 30).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-goog-request-reason"),
+            HeaderValue::from_static("ide-chat"),
+        );
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let resp = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:streamGenerateContent",
+                &headers,
+                Bytes::from_static(b"raw-compressed"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            (Some("ide-chat".to_string()), Some("gzip".to_string()))
+        );
+
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn send_buffered_enforces_metadata_timeout() {
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let mock = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                (StatusCode::OK, r#"{"models":{}}"#)
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+
+        let client = CloudCodeClient::new(&format!("http://{addr}"), 30)
+            .unwrap()
+            .with_buffered_timeout(Duration::from_millis(100));
+
+        let err = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .err()
+            .expect("slowloris metadata call must time out");
+        assert!(
+            matches!(err, CloudCodeError::Upstream(ref msg) if msg.contains("timed out")),
+            "unexpected error: {err:?}"
+        );
+
+        srv.abort();
+    }
+
+    #[test]
+    fn is_loopback_url_distinguishes_loopback_from_remote_https() {
+        assert!(is_loopback_url("http://127.0.0.1:4141"));
+        assert!(is_loopback_url("http://localhost:4141"));
+        assert!(is_loopback_url("http://LOCALHOST:4141"));
+        assert!(is_loopback_url("http://[::1]:4141"));
+        assert!(!is_loopback_url("https://cloudcode-pa.googleapis.com"));
+        assert!(!is_loopback_url(
+            "https://daily-cloudcode-pa.googleapis.com"
+        ));
+        assert!(!is_loopback_url("not-a-url"));
+    }
+
+    #[test]
+    fn merge_available_models_assigns_deterministic_slots_independent_of_default_model_and_adds_neon_xhigh()
+     {
+        let upstream = json!({
+            "models": {
+                "custom-existing": {
+                    "model": "MODEL_PLACEHOLDER_M334",
+                    "displayName": "Existing Custom"
+                }
+            },
+            "agentModelSorts": [{
+                "displayName": "Recommended",
+                "groups": [{ "displayName": "Models", "modelIds": [] }]
+            }]
+        });
+        let upstream_bytes = serde_json::to_vec(&upstream).unwrap();
+        let proxy_models = vec![
+            "gemini-4-hydrogen".to_string(),
+            "gemini-4-argon".to_string(),
+            "gemini-4-neon".to_string(),
+            "gemini-4-carbon".to_string(),
+            "gemini-3.8-flash".to_string(),
+            "gemini-4-discovered-zeta".to_string(),
+        ];
+
+        let extract_slots = |default_model: &str| -> (Value, HashMap<String, String>) {
+            let merged_bytes =
+                merge_available_models(&upstream_bytes, &proxy_models, default_model)
+                    .expect("merge succeeds");
+            let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+            let mut map = HashMap::new();
+            for (k, v) in merged["models"].as_object().unwrap() {
+                if k.starts_with("companion/") {
+                    map.insert(k.clone(), v["model"].as_str().unwrap().to_string());
+                }
+            }
+            (merged, map)
+        };
+
+        let (m_hydrogen, slots_hydrogen) = extract_slots("gemini-4-hydrogen");
+        let (_, slots_neon) = extract_slots("gemini-4-neon");
+        let (_, slots_flash) = extract_slots("gemini-3.8-flash");
+        let (_, slots_discovered) = extract_slots("gemini-4-discovered-zeta");
+
+        // All slots must remain 100% identical regardless of default_model ordering!
+        assert_eq!(slots_hydrogen, slots_neon);
+        assert_eq!(slots_hydrogen, slots_flash);
+        assert_eq!(slots_hydrogen, slots_discovered);
+
+        // Every assigned slot must be unique and never reuse upstream M334.
+        let unique: HashSet<&String> = slots_hydrogen.values().collect();
+        assert_eq!(unique.len(), slots_hydrogen.len());
+        assert!(!unique.contains(&"MODEL_PLACEHOLDER_M334".to_string()));
+        assert_eq!(
+            slots_hydrogen
+                .get("companion/gemini-4-hydrogen-low")
+                .map(String::as_str),
+            Some("MODEL_PLACEHOLDER_M335")
+        );
+
+        // gemini-4-neon must include XHigh (thinkingLevel: 7).
+        let neon_xhigh = &m_hydrogen["models"]["companion/gemini-4-neon-xhigh"];
+        assert_eq!(neon_xhigh["thinkingLevel"], 7);
+        assert_eq!(neon_xhigh["displayName"], "Gemini 4 Neon (Proxy) (XHigh)");
+        assert_eq!(neon_xhigh["modelUrl"], "gemini-api://gemini-4-neon");
     }
 }

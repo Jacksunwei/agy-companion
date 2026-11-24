@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::config::is_placeholder_api_key;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactedConfig {
     pub schema_version: u32,
@@ -29,7 +31,7 @@ pub fn mask_api_key(key: &str) -> String {
 
 pub fn api_key_hint(key: Option<&str>) -> Option<String> {
     key.map(str::trim)
-        .filter(|trimmed| !trimmed.is_empty())
+        .filter(|trimmed| !trimmed.is_empty() && !is_placeholder_api_key(trimmed))
         .map(mask_api_key)
 }
 
@@ -82,5 +84,37 @@ mod tests {
         let blank_redacted = cfg.redacted();
         assert!(!blank_redacted.api_key_configured);
         assert_eq!(blank_redacted.api_key_hint, None);
+    }
+
+    #[test]
+    fn api_key_hint_and_redacted_quarantine_proxy_placeholder_sentinel() {
+        use crate::PROXY_PLACEHOLDER_API_KEY;
+
+        for raw in [
+            PROXY_PLACEHOLDER_API_KEY,
+            "  agy-companion-local  ",
+            "\tagy-companion-local\n",
+        ] {
+            assert_eq!(
+                api_key_hint(Some(raw)),
+                None,
+                "expected None hint for placeholder '{raw}'"
+            );
+        }
+
+        for raw in [PROXY_PLACEHOLDER_API_KEY, "  agy-companion-local  "] {
+            let mut cfg = Config::default();
+            cfg.gemini.api_key = Some(raw.to_string());
+
+            let redacted = cfg.redacted();
+            assert!(!redacted.api_key_configured);
+            assert_eq!(redacted.api_key_hint, None);
+
+            let debug = format!("{:?}", cfg.gemini);
+            assert!(
+                debug.contains("api_key: None"),
+                "expected GeminiConfig Debug to treat placeholder as None, got {debug}"
+            );
+        }
     }
 }
