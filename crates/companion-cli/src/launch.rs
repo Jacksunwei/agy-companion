@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use companion_core::integration::{DEFAULT_RESTORE_PREFIX, is_valid_restore_prefix};
 use companion_proxy::HealthResponse;
 
+use crate::daemon::{DEFAULT_IDLE_SHUTDOWN_SECS, spawn_detached_proxy_daemon};
 use crate::{CliError, load_config_checked, resolve_cli_config_path};
 
 pub use companion_core::PROXY_PLACEHOLDER_API_KEY;
@@ -16,6 +18,162 @@ const DEFAULT_APP_BIN: &str = "/Applications/Antigravity.app/Contents/MacOS/Anti
 const DEFAULT_APP_BIN: &str = "antigravity";
 const HEALTH_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchEnvSnapshot {
+    pub existing_restore_prefix: Option<String>,
+    pub existing_restore_vars: Option<String>,
+    pub existing_cloud_code_url: Option<String>,
+    pub existing_google_gemini_base_url: Option<String>,
+    /// True only if the resolved restore prefix already had `<prefix>CLOUD_CODE_URL` set.
+    pub has_existing_prefixed_cloud_code_url: bool,
+    /// True only if the resolved restore prefix already had `<prefix>GOOGLE_GEMINI_BASE_URL` set.
+    pub has_existing_prefixed_google_gemini_base_url: bool,
+    /// True if `CLOUD_CODE_URL` was already tracked in `JETSKI_MCP_ENV_RESTORE_VARS`.
+    pub vars_already_has_cloud_code_url: bool,
+    /// True if `GOOGLE_GEMINI_BASE_URL` was already tracked in `JETSKI_MCP_ENV_RESTORE_VARS`.
+    pub vars_already_has_google_gemini_base_url: bool,
+    /// True only if the resolved restore prefix already had `<prefix>GEMINI_API_KEY` set
+    /// AND `GEMINI_API_KEY` was already tracked in `JETSKI_MCP_ENV_RESTORE_VARS`.
+    pub preserve_existing_prefixed_gemini_api_key: bool,
+    /// True iff `GEMINI_API_KEY` is set, non-empty/non-whitespace, and NOT `PROXY_PLACEHOLDER_API_KEY`.
+    /// Deliberately stores only a `bool` (never plaintext secret) per S2.
+    pub has_real_gemini_api_key: bool,
+}
+
+impl LaunchEnvSnapshot {
+    pub fn from_process() -> Self {
+        let existing_restore_prefix = std::env::var("JETSKI_MCP_ENV_RESTORE_PREFIX").ok();
+        let existing_restore_vars = std::env::var("JETSKI_MCP_ENV_RESTORE_VARS").ok();
+        let effective_prefix = existing_restore_prefix
+            .as_deref()
+            .filter(|p| is_valid_restore_prefix(p))
+            .unwrap_or(DEFAULT_RESTORE_PREFIX);
+
+        let existing_cloud_code_url = std::env::var("CLOUD_CODE_URL").ok();
+        let existing_google_gemini_base_url = std::env::var("GOOGLE_GEMINI_BASE_URL").ok();
+        let has_existing_prefixed_cloud_code_url =
+            std::env::var_os(format!("{effective_prefix}CLOUD_CODE_URL")).is_some();
+        let has_existing_prefixed_google_gemini_base_url =
+            std::env::var_os(format!("{effective_prefix}GOOGLE_GEMINI_BASE_URL")).is_some();
+        let vars_already_has = |name: &str| {
+            existing_restore_vars
+                .as_deref()
+                .is_some_and(|raw| raw.split(',').any(|tok| tok.trim() == name))
+        };
+        let vars_already_has_cloud_code_url = vars_already_has("CLOUD_CODE_URL");
+        let vars_already_has_google_gemini_base_url = vars_already_has("GOOGLE_GEMINI_BASE_URL");
+        let vars_already_has_gemini_key = vars_already_has("GEMINI_API_KEY");
+        let preserve_existing_prefixed_gemini_api_key = vars_already_has_gemini_key
+            && std::env::var_os(format!("{effective_prefix}GEMINI_API_KEY")).is_some();
+        let has_real_gemini_api_key = std::env::var("GEMINI_API_KEY").ok().is_some_and(|v| {
+            let trimmed = v.trim();
+            !trimmed.is_empty() && !companion_core::is_placeholder_api_key(trimmed)
+        });
+
+        Self {
+            existing_restore_prefix,
+            existing_restore_vars,
+            existing_cloud_code_url,
+            existing_google_gemini_base_url,
+            has_existing_prefixed_cloud_code_url,
+            has_existing_prefixed_google_gemini_base_url,
+            vars_already_has_cloud_code_url,
+            vars_already_has_google_gemini_base_url,
+            preserve_existing_prefixed_gemini_api_key,
+            has_real_gemini_api_key,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HybridLaunchEnv {
+    pub set: Vec<(String, String)>,
+    pub unset: Vec<String>,
+}
+
+pub fn build_hybrid_launch_env(port: u16, snapshot: &LaunchEnvSnapshot) -> HybridLaunchEnv {
+    let prefix = snapshot
+        .existing_restore_prefix
+        .as_deref()
+        .filter(|p| is_valid_restore_prefix(p))
+        .unwrap_or(DEFAULT_RESTORE_PREFIX)
+        .to_string();
+
+    let mut vars: Vec<String> = Vec::new();
+    if let Some(ref existing) = snapshot.existing_restore_vars {
+        for raw in existing.split(',') {
+            let tok = raw.trim();
+            if !tok.is_empty() && !vars.iter().any(|v| v == tok) {
+                vars.push(tok.to_string());
+            }
+        }
+    }
+
+    let mut push_unique = |name: &str| {
+        if !vars.iter().any(|v| v == name) {
+            vars.push(name.to_string());
+        }
+    };
+    push_unique("CLOUD_CODE_URL");
+    push_unique("GOOGLE_GEMINI_BASE_URL");
+    if !snapshot.has_real_gemini_api_key {
+        push_unique("GEMINI_API_KEY");
+    }
+
+    let mut set = Vec::new();
+    let mut unset = Vec::new();
+    let proxy_url = format!("http://127.0.0.1:{port}");
+
+    set.push(("CLOUD_CODE_URL".to_string(), proxy_url.clone()));
+    set.push(("GOOGLE_GEMINI_BASE_URL".to_string(), proxy_url));
+
+    if !snapshot.has_real_gemini_api_key {
+        set.push((
+            "GEMINI_API_KEY".to_string(),
+            PROXY_PLACEHOLDER_API_KEY.to_string(),
+        ));
+    }
+
+    set.push(("JETSKI_MCP_ENV_RESTORE_PREFIX".to_string(), prefix.clone()));
+    set.push(("JETSKI_MCP_ENV_RESTORE_VARS".to_string(), vars.join(",")));
+
+    let existing_vars_has = |name: &str| {
+        snapshot
+            .existing_restore_vars
+            .as_deref()
+            .is_some_and(|raw| raw.split(',').any(|tok| tok.trim() == name))
+    };
+    let preserve_cloud_code_backup = snapshot.has_existing_prefixed_cloud_code_url
+        || snapshot.vars_already_has_cloud_code_url
+        || existing_vars_has("CLOUD_CODE_URL");
+    if !preserve_cloud_code_backup {
+        let backup_key = format!("{prefix}CLOUD_CODE_URL");
+        if let Some(ref orig) = snapshot.existing_cloud_code_url {
+            set.push((backup_key, orig.clone()));
+        } else {
+            unset.push(backup_key);
+        }
+    }
+
+    let preserve_google_gemini_base_backup = snapshot.has_existing_prefixed_google_gemini_base_url
+        || snapshot.vars_already_has_google_gemini_base_url
+        || existing_vars_has("GOOGLE_GEMINI_BASE_URL");
+    if !preserve_google_gemini_base_backup {
+        let backup_key = format!("{prefix}GOOGLE_GEMINI_BASE_URL");
+        if let Some(ref orig) = snapshot.existing_google_gemini_base_url {
+            set.push((backup_key, orig.clone()));
+        } else {
+            unset.push(backup_key);
+        }
+    }
+
+    if !snapshot.has_real_gemini_api_key && !snapshot.preserve_existing_prefixed_gemini_api_key {
+        unset.push(format!("{prefix}GEMINI_API_KEY"));
+    }
+
+    HybridLaunchEnv { set, unset }
+}
 
 pub async fn probe_running_companion_proxy_with_timeout(
     port: u16,
@@ -69,10 +227,37 @@ pub fn default_antigravity_app_path() -> PathBuf {
 }
 
 pub fn format_hybrid_launch_command(port: u16, app_path: &Path) -> String {
-    let app_display = shell_quote(&app_path.display().to_string());
-    format!(
-        "CLOUD_CODE_URL=\"http://127.0.0.1:{port}\" \\\nGOOGLE_GEMINI_BASE_URL=\"http://127.0.0.1:{port}\" \\\nGEMINI_API_KEY=\"{PROXY_PLACEHOLDER_API_KEY}\" \\\n{app_display}"
-    )
+    format_hybrid_launch_command_with_env(port, app_path, &LaunchEnvSnapshot::default())
+}
+
+pub fn format_hybrid_launch_command_with_env(
+    port: u16,
+    app_path: &Path,
+    snapshot: &LaunchEnvSnapshot,
+) -> String {
+    let env = build_hybrid_launch_env(port, snapshot);
+    let mut lines: Vec<String> = Vec::with_capacity(env.set.len() + 1);
+    for (key, value) in &env.set {
+        let is_backup_var = key.ends_with("CLOUD_CODE_URL") && key != "CLOUD_CODE_URL"
+            || key.ends_with("GOOGLE_GEMINI_BASE_URL") && key != "GOOGLE_GEMINI_BASE_URL";
+        let formatted_val = if is_backup_var || !is_safe_double_quoted_value(value) {
+            shell_quote_single(value)
+        } else {
+            format!("\"{value}\"")
+        };
+        lines.push(format!("{key}={formatted_val} \\"));
+    }
+    lines.push(shell_quote(&app_path.display().to_string()));
+    lines.join("\n")
+}
+
+fn is_safe_double_quoted_value(raw: &str) -> bool {
+    raw.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'.' | b'_' | b'-' | b','))
+}
+
+fn shell_quote_single(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
 fn shell_quote(raw: &str) -> String {
@@ -82,7 +267,7 @@ fn shell_quote(raw: &str) -> String {
     {
         raw.to_string()
     } else {
-        format!("'{}'", raw.replace('\'', "'\\''"))
+        shell_quote_single(raw)
     }
 }
 
@@ -91,6 +276,26 @@ pub async fn run_launch<W: Write>(
     config_override: Option<PathBuf>,
     app_override: Option<PathBuf>,
     print_env: bool,
+    out: &mut W,
+) -> Result<(), CliError> {
+    let snapshot = LaunchEnvSnapshot::from_process();
+    run_launch_with_env(
+        port_override,
+        config_override,
+        app_override,
+        print_env,
+        &snapshot,
+        out,
+    )
+    .await
+}
+
+pub async fn run_launch_with_env<W: Write>(
+    port_override: Option<u16>,
+    config_override: Option<PathBuf>,
+    app_override: Option<PathBuf>,
+    print_env: bool,
+    snapshot: &LaunchEnvSnapshot,
     out: &mut W,
 ) -> Result<(), CliError> {
     if port_override == Some(0) {
@@ -114,23 +319,17 @@ pub async fn run_launch<W: Write>(
 
     let port = config.listen_port;
     if print_env {
-        writeln!(out, "{}", format_hybrid_launch_command(port, &app_path))?;
+        writeln!(
+            out,
+            "{}",
+            format_hybrid_launch_command_with_env(port, &app_path, snapshot)
+        )?;
         return Ok(());
     }
 
     if probe_running_companion_proxy(port).await.is_none() {
-        let exe = std::env::current_exe()?;
-        let mut serve_cmd = Command::new(exe);
-        serve_cmd
-            .arg("serve")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--config")
-            .arg(&config_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        serve_cmd.spawn()?;
+        let mut serve_child =
+            spawn_detached_proxy_daemon(port, &config_path, DEFAULT_IDLE_SHUTDOWN_SECS)?;
 
         let deadline = Instant::now() + HEALTH_POLL_TIMEOUT;
         let mut ready = false;
@@ -138,6 +337,15 @@ pub async fn run_launch<W: Write>(
             if probe_running_companion_proxy(port).await.is_some() {
                 ready = true;
                 break;
+            }
+            if let Ok(Some(status)) = serve_child.try_wait() {
+                if probe_running_companion_proxy(port).await.is_some() {
+                    ready = true;
+                    break;
+                }
+                return Err(CliError::Io(std::io::Error::other(format!(
+                    "agy-companion proxy exited early ({status}) before becoming healthy on 127.0.0.1:{port}"
+                ))));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
@@ -150,11 +358,15 @@ pub async fn run_launch<W: Write>(
     }
 
     let proxy_url = format!("http://127.0.0.1:{port}");
+    let hybrid_env = build_hybrid_launch_env(port, snapshot);
     let mut app_cmd = Command::new(&app_path);
+    for var in &hybrid_env.unset {
+        app_cmd.env_remove(var);
+    }
+    for (key, val) in &hybrid_env.set {
+        app_cmd.env(key, val);
+    }
     app_cmd
-        .env("CLOUD_CODE_URL", &proxy_url)
-        .env("GOOGLE_GEMINI_BASE_URL", &proxy_url)
-        .env("GEMINI_API_KEY", PROXY_PLACEHOLDER_API_KEY)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -184,10 +396,118 @@ mod tests {
         assert!(rendered.contains("CLOUD_CODE_URL=\"http://127.0.0.1:4141\""));
         assert!(rendered.contains("GOOGLE_GEMINI_BASE_URL=\"http://127.0.0.1:4141\""));
         assert!(rendered.contains("GEMINI_API_KEY=\"agy-companion-local\""));
+        assert!(rendered.contains("JETSKI_MCP_ENV_RESTORE_PREFIX=\"AGY_COMPANION_ORIG_\""));
+        assert!(rendered.contains(
+            "JETSKI_MCP_ENV_RESTORE_VARS=\"CLOUD_CODE_URL,GOOGLE_GEMINI_BASE_URL,GEMINI_API_KEY\""
+        ));
         assert!(rendered.contains("/Applications/Antigravity.app/Contents/MacOS/Antigravity"));
 
         let quoted = format_hybrid_launch_command(4242, Path::new("/tmp/My App/Antigravity"));
         assert!(quoted.contains("'/tmp/My App/Antigravity'"));
+    }
+
+    #[test]
+    fn build_hybrid_launch_env_respects_real_gemini_key_and_never_touches_google_api_key() {
+        let snap = LaunchEnvSnapshot {
+            has_real_gemini_api_key: true,
+            ..Default::default()
+        };
+        let env = build_hybrid_launch_env(4141, &snap);
+        assert!(!env.set.iter().any(|(k, _)| k == "GEMINI_API_KEY"));
+        assert!(!env.set.iter().any(|(k, _)| k.contains("GOOGLE_API_KEY")));
+        assert!(!env.unset.iter().any(|k| k.contains("GOOGLE_API_KEY")));
+        assert!(!env.unset.iter().any(|k| k.ends_with("GEMINI_API_KEY")));
+
+        let vars = env
+            .set
+            .iter()
+            .find(|(k, _)| k == "JETSKI_MCP_ENV_RESTORE_VARS")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(vars, "CLOUD_CODE_URL,GOOGLE_GEMINI_BASE_URL");
+    }
+
+    #[test]
+    fn build_hybrid_launch_env_merges_valid_custom_prefix_and_sanitizes_invalid_prefix() {
+        let custom = LaunchEnvSnapshot {
+            existing_restore_prefix: Some("CUSTOM_".to_string()),
+            existing_restore_vars: Some("FOO, BAR".to_string()),
+            existing_cloud_code_url: Some("https://orig.example/$(id)".to_string()),
+            existing_google_gemini_base_url: Some("https://gen.example".to_string()),
+            ..Default::default()
+        };
+        let env = build_hybrid_launch_env(4242, &custom);
+        assert!(env.set.contains(&(
+            "JETSKI_MCP_ENV_RESTORE_PREFIX".to_string(),
+            "CUSTOM_".to_string()
+        )));
+        assert!(env.set.contains(&(
+            "JETSKI_MCP_ENV_RESTORE_VARS".to_string(),
+            "FOO,BAR,CLOUD_CODE_URL,GOOGLE_GEMINI_BASE_URL,GEMINI_API_KEY".to_string()
+        )));
+        assert!(env.set.contains(&(
+            "CUSTOM_CLOUD_CODE_URL".to_string(),
+            "https://orig.example/$(id)".to_string()
+        )));
+        assert!(env.set.contains(&(
+            "CUSTOM_GOOGLE_GEMINI_BASE_URL".to_string(),
+            "https://gen.example".to_string()
+        )));
+
+        // Single-quoted backup value in --print-env prevents shell expansion
+        let rendered = format_hybrid_launch_command_with_env(4242, Path::new("/opt/agy"), &custom);
+        assert!(rendered.contains("CUSTOM_CLOUD_CODE_URL='https://orig.example/$(id)'"));
+        assert!(rendered.contains("CUSTOM_GOOGLE_GEMINI_BASE_URL='https://gen.example'"));
+
+        // Invalid prefix falls back to AGY_COMPANION_ORIG_
+        for bad_prefix in ["$(evil)", "123BAD", "BAD-PREFIX", ""] {
+            let bad = LaunchEnvSnapshot {
+                existing_restore_prefix: Some(bad_prefix.to_string()),
+                ..Default::default()
+            };
+            let env_bad = build_hybrid_launch_env(4141, &bad);
+            assert!(env_bad.set.contains(&(
+                "JETSKI_MCP_ENV_RESTORE_PREFIX".to_string(),
+                DEFAULT_RESTORE_PREFIX.to_string()
+            )));
+        }
+    }
+
+    #[test]
+    fn build_hybrid_launch_env_preserves_three_state_unset_backup_when_already_tracked_in_restore_vars()
+     {
+        let snap = LaunchEnvSnapshot {
+            existing_restore_prefix: Some("OUTER_".to_string()),
+            existing_restore_vars: Some("FOO, CLOUD_CODE_URL, GOOGLE_GEMINI_BASE_URL".to_string()),
+            existing_cloud_code_url: Some("https://wrapper-cc.example".to_string()),
+            existing_google_gemini_base_url: Some("https://wrapper-gem.example".to_string()),
+            has_existing_prefixed_cloud_code_url: false,
+            has_existing_prefixed_google_gemini_base_url: false,
+            ..Default::default()
+        };
+        let env = build_hybrid_launch_env(4242, &snap);
+        assert!(env.set.contains(&(
+            "JETSKI_MCP_ENV_RESTORE_PREFIX".to_string(),
+            "OUTER_".to_string()
+        )));
+        assert!(env.set.contains(&(
+            "JETSKI_MCP_ENV_RESTORE_VARS".to_string(),
+            "FOO,CLOUD_CODE_URL,GOOGLE_GEMINI_BASE_URL,GEMINI_API_KEY".to_string()
+        )));
+        // Neither backup var may be overwritten or explicitly unset — outer wrapper's 3-state
+        // originally-unset sentinel must be preserved untouched.
+        assert!(!env.set.iter().any(|(k, _)| k == "OUTER_CLOUD_CODE_URL"));
+        assert!(!env.unset.iter().any(|k| k == "OUTER_CLOUD_CODE_URL"));
+        assert!(
+            !env.set
+                .iter()
+                .any(|(k, _)| k == "OUTER_GOOGLE_GEMINI_BASE_URL")
+        );
+        assert!(
+            !env.unset
+                .iter()
+                .any(|k| k == "OUTER_GOOGLE_GEMINI_BASE_URL")
+        );
     }
 
     #[tokio::test]
@@ -195,11 +515,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
         let mut buf = Vec::new();
-        run_launch(
+        run_launch_with_env(
             Some(4321),
             Some(cfg_path),
             Some(PathBuf::from("/opt/antigravity")),
             true,
+            &LaunchEnvSnapshot::default(),
             &mut buf,
         )
         .await
@@ -208,6 +529,7 @@ mod tests {
         assert!(out.contains("CLOUD_CODE_URL=\"http://127.0.0.1:4321\""));
         assert!(out.contains("GOOGLE_GEMINI_BASE_URL=\"http://127.0.0.1:4321\""));
         assert!(out.contains("GEMINI_API_KEY=\"agy-companion-local\""));
+        assert!(out.contains("JETSKI_MCP_ENV_RESTORE_PREFIX=\"AGY_COMPANION_ORIG_\""));
         assert!(out.contains("/opt/antigravity"));
     }
 

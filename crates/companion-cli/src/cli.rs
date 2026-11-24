@@ -81,6 +81,96 @@ pub enum Commands {
         #[arg(long = "print-env")]
         print_env: bool,
     },
+    /// Ensure the local proxy daemon is running for login-shell hooks and print its port (fail-open).
+    #[command(name = "hook-env")]
+    HookEnv {
+        /// Spawn the detached Managed On-Demand Daemon if the proxy is not already healthy.
+        #[arg(long = "ensure-running")]
+        ensure_running: bool,
+        /// Print ONLY the validated loopback port (`<port>\n`) when healthy.
+        #[arg(long = "print-port")]
+        print_port: bool,
+        /// Proxy port (1-65535; overrides config.listen_port).
+        #[arg(long, value_parser = parse_nonzero_port)]
+        port: Option<u16>,
+        /// Path to config.json (overrides AGY_COMPANION_CONFIG).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override Antigravity plugins directory (defaults to ~/.gemini/config/plugins).
+        #[arg(long = "plugins-dir")]
+        plugins_dir: Option<PathBuf>,
+    },
+    /// Manage Antigravity Dock / Launcher login-shell integration.
+    Integration {
+        #[command(subcommand)]
+        action: IntegrationCommands,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliShell {
+    Zsh,
+    Bash,
+    Fish,
+}
+
+impl From<CliShell> for companion_core::integration::ShellKind {
+    fn from(value: CliShell) -> Self {
+        match value {
+            CliShell::Zsh => Self::Zsh,
+            CliShell::Bash => Self::Bash,
+            CliShell::Fish => Self::Fish,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum IntegrationCommands {
+    /// Enable Dock / Launcher auto-start by writing 0600 env.sh and a 1-line RC hook.
+    Enable {
+        /// Target shell (auto-detected from $SHELL when omitted).
+        #[arg(long, value_enum)]
+        shell: Option<CliShell>,
+        /// Override shell RC file path.
+        #[arg(long = "rc-file")]
+        rc_file: Option<PathBuf>,
+        /// Override agy-companion binary path embedded in env.sh.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Follow a symlinked RC file and edit its regular-file target.
+        #[arg(long = "follow-rc-symlink")]
+        follow_rc_symlink: bool,
+        /// Emit machine-readable JSON status to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable Dock / Launcher auto-start by stripping the managed RC hook and deleting env.sh.
+    Disable {
+        /// Target shell (auto-detected from $SHELL when omitted).
+        #[arg(long, value_enum)]
+        shell: Option<CliShell>,
+        /// Override shell RC file path.
+        #[arg(long = "rc-file")]
+        rc_file: Option<PathBuf>,
+        /// Follow a symlinked RC file and edit its regular-file target.
+        #[arg(long = "follow-rc-symlink")]
+        follow_rc_symlink: bool,
+        /// Emit machine-readable JSON status to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect Dock / Launcher integration status without modifying files.
+    Status {
+        /// Target shell (auto-detected from $SHELL when omitted).
+        #[arg(long, value_enum)]
+        shell: Option<CliShell>,
+        /// Override shell RC file path.
+        #[arg(long = "rc-file")]
+        rc_file: Option<PathBuf>,
+        /// Emit machine-readable JSON status to stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn parse_nonzero_port(raw: &str) -> Result<u16, String> {
@@ -324,6 +414,120 @@ mod tests {
         assert!(
             Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs", "-1"]).is_err(),
             "negative --idle-shutdown-secs must fail"
+        );
+    }
+
+    #[test]
+    fn parses_hook_env_and_integration_subcommands_and_rejects_invalid_args() {
+        use super::{CliShell, IntegrationCommands};
+
+        let hook_env = Cli::try_parse_from([
+            "agy-companion",
+            "hook-env",
+            "--ensure-running",
+            "--print-port",
+            "--port",
+            "4242",
+            "--config",
+            "/tmp/c.json",
+            "--plugins-dir",
+            "/tmp/p",
+        ])
+        .expect("hook-env args should parse");
+        assert_eq!(
+            hook_env.command,
+            Commands::HookEnv {
+                ensure_running: true,
+                print_port: true,
+                port: Some(4242),
+                config: Some(PathBuf::from("/tmp/c.json")),
+                plugins_dir: Some(PathBuf::from("/tmp/p")),
+            }
+        );
+
+        let enable = Cli::try_parse_from([
+            "agy-companion",
+            "integration",
+            "enable",
+            "--shell",
+            "zsh",
+            "--rc-file",
+            "/tmp/.zlogin",
+            "--binary",
+            "/tmp/bin/agy-companion",
+            "--follow-rc-symlink",
+            "--json",
+        ])
+        .expect("integration enable should parse");
+        assert_eq!(
+            enable.command,
+            Commands::Integration {
+                action: IntegrationCommands::Enable {
+                    shell: Some(CliShell::Zsh),
+                    rc_file: Some(PathBuf::from("/tmp/.zlogin")),
+                    binary: Some(PathBuf::from("/tmp/bin/agy-companion")),
+                    follow_rc_symlink: true,
+                    json: true,
+                },
+            }
+        );
+
+        let disable = Cli::try_parse_from([
+            "agy-companion",
+            "integration",
+            "disable",
+            "--shell",
+            "bash",
+            "--follow-rc-symlink",
+            "--json",
+        ])
+        .expect("integration disable should parse");
+        assert_eq!(
+            disable.command,
+            Commands::Integration {
+                action: IntegrationCommands::Disable {
+                    shell: Some(CliShell::Bash),
+                    rc_file: None,
+                    follow_rc_symlink: true,
+                    json: true,
+                },
+            }
+        );
+
+        let status = Cli::try_parse_from([
+            "agy-companion",
+            "integration",
+            "status",
+            "--shell",
+            "fish",
+            "--rc-file",
+            "/tmp/fish.fish",
+            "--json",
+        ])
+        .expect("integration status should parse");
+        assert_eq!(
+            status.command,
+            Commands::Integration {
+                action: IntegrationCommands::Status {
+                    shell: Some(CliShell::Fish),
+                    rc_file: Some(PathBuf::from("/tmp/fish.fish")),
+                    json: true,
+                },
+            }
+        );
+
+        assert!(
+            Cli::try_parse_from(["agy-companion", "hook-env", "--port", "0"]).is_err(),
+            "hook-env --port 0 must fail"
+        );
+        assert!(
+            Cli::try_parse_from(["agy-companion", "integration", "enable", "--shell", "tcsh"])
+                .is_err(),
+            "unsupported --shell must fail"
+        );
+        assert!(
+            Cli::try_parse_from(["agy-companion", "integration"]).is_err(),
+            "integration without action must fail"
         );
     }
 }

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::{
     Config, RedactedConfig, api_key_hint, is_placeholder_api_key, validate_listen_host,
     validate_path, validate_upstream_url,
@@ -74,6 +75,51 @@ pub struct ProxyStatsPayload {
     pub cloudcode_resolved_upstream: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudCodeStatusPayload {
+    pub mode: String,
+    pub configured_upstream: String,
+    pub resolved_upstream: Option<String>,
+}
+
+fn default_host_platform() -> String {
+    std::env::consts::OS.to_string()
+}
+
+fn build_cloudcode_status(
+    cfg: &Config,
+    stats: Option<&ProxyStatsPayload>,
+) -> CloudCodeStatusPayload {
+    let is_auto = cfg.cloudcode_upstream_url.eq_ignore_ascii_case("auto");
+    let mode = stats
+        .and_then(|s| s.cloudcode_mode.as_deref())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if is_auto {
+                "auto".to_string()
+            } else {
+                "fixed".to_string()
+            }
+        });
+    let resolved_upstream = stats
+        .and_then(|s| s.cloudcode_resolved_upstream.as_deref())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if mode == "fixed" {
+                Some(cfg.cloudcode_upstream_url.clone())
+            } else {
+                None
+            }
+        });
+    CloudCodeStatusPayload {
+        mode,
+        configured_upstream: cfg.cloudcode_upstream_url.clone(),
+        resolved_upstream,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SettingsSnapshot {
     pub config: RedactedConfig,
@@ -81,6 +127,16 @@ pub struct SettingsSnapshot {
     pub proxy: ProxyHealthPayload,
     pub version_skew: bool,
     pub stats: Option<ProxyStatsPayload>,
+    pub launcher_integration: IntegrationStatus,
+    pub cloudcode: CloudCodeStatusPayload,
+    #[serde(default = "default_host_platform")]
+    pub platform: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetLauncherIntegrationArgs {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Default, Deserialize, JsonSchema)]
@@ -135,12 +191,15 @@ pub struct CompanionUiServer {
     data_dir: Option<PathBuf>,
     proxy_client: reqwest::Client,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    integration_write_lock: Arc<tokio::sync::Mutex<()>>,
     tool_router: ToolRouter<Self>,
     ui_html_source: UiHtmlSource,
     #[cfg(test)]
     env_api_key_fallback: bool,
     #[cfg(test)]
     test_connection_timeout_override: Option<u64>,
+    #[cfg(test)]
+    integration_options_override: Option<IntegrationOptions>,
 }
 
 impl CompanionUiServer {
@@ -159,12 +218,15 @@ impl CompanionUiServer {
             data_dir,
             proxy_client,
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            integration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             tool_router: Self::tool_router(),
             ui_html_source: UiHtmlSource::ProcessEnv,
             #[cfg(test)]
             env_api_key_fallback: true,
             #[cfg(test)]
             test_connection_timeout_override: None,
+            #[cfg(test)]
+            integration_options_override: None,
         })
     }
 
@@ -294,15 +356,94 @@ impl CompanionUiServer {
         }
     }
 
+    fn integration_options(&self) -> IntegrationOptions {
+        #[cfg(test)]
+        if let Some(ref override_opts) = self.integration_options_override {
+            return override_opts.clone();
+        }
+        // MUST keep data_dir = None (never self.data_dir / --data-dir=${PLUGIN_DATA}) so
+        // env.sh always resolves to default_data_dir() (${XDG_DATA_HOME:-~/.local/share}/agy-companion/env.sh).
+        IntegrationOptions {
+            shell: None,
+            rc_file: None,
+            binary_path: None,
+            data_dir: None,
+            follow_rc_symlink: false,
+        }
+    }
+
     async fn build_snapshot(&self, cfg: &Config) -> SettingsSnapshot {
+        self.build_snapshot_with_integration(cfg, None).await
+    }
+
+    async fn build_snapshot_with_integration(
+        &self,
+        cfg: &Config,
+        integration_override: Option<IntegrationStatus>,
+    ) -> SettingsSnapshot {
         let binary_version = env!("CARGO_PKG_VERSION").to_string();
         let (proxy, version_skew, stats) = self.probe_proxy(cfg.listen_port, &binary_version).await;
+        let cloudcode = build_cloudcode_status(cfg, stats.as_ref());
+
+        let mut launcher_integration = match integration_override {
+            Some(status) => status,
+            None => {
+                let opts = self.integration_options();
+                match tokio::task::spawn_blocking(move || {
+                    companion_core::integration::status(&opts)
+                })
+                .await
+                {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(err)) => IntegrationStatus {
+                        supported: !cfg!(windows),
+                        enabled: false,
+                        manual_required: false,
+                        shell: None,
+                        rc_path: None,
+                        env_script_path: None,
+                        binary_path: None,
+                        symlink_target: None,
+                        manual_snippet: None,
+                        hybrid_active: companion_core::integration::detect_hybrid_active(),
+                        message: Some(err.to_string()),
+                    },
+                    Err(err) => IntegrationStatus {
+                        supported: !cfg!(windows),
+                        enabled: false,
+                        manual_required: false,
+                        shell: None,
+                        rc_path: None,
+                        env_script_path: None,
+                        binary_path: None,
+                        symlink_target: None,
+                        manual_snippet: None,
+                        hybrid_active: companion_core::integration::detect_hybrid_active(),
+                        message: Some(format!("launcher integration check failed: {err}")),
+                    },
+                }
+            }
+        };
+
+        // Antigravity's mcp.restoreEnv() strips CLOUD_CODE_URL from MCP children, so a recorded
+        // fetchAvailableModels refresh on our local proxy is authoritative proof of live Hybrid Mode.
+        if stats
+            .as_ref()
+            .and_then(|s| s.last_catalog_refresh_at_ms)
+            .is_some()
+        {
+            launcher_integration.hybrid_active = true;
+        }
+
         SettingsSnapshot {
             config: cfg.redacted(),
             binary_version,
             proxy,
             version_skew,
             stats,
+            launcher_integration,
+            cloudcode,
+            platform: default_host_platform(),
         }
     }
 
@@ -322,6 +463,12 @@ impl CompanionUiServer {
     #[cfg(test)]
     fn with_test_connection_timeout_secs(mut self, secs: u64) -> Self {
         self.test_connection_timeout_override = Some(secs);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_integration_options(mut self, opts: IntegrationOptions) -> Self {
+        self.integration_options_override = Some(opts);
         self
     }
 }
@@ -773,6 +920,73 @@ impl CompanionUiServer {
 
         test_connection_result(&payload)
     }
+
+    #[tool(
+        name = "set_launcher_integration",
+        title = "Configure Dock / Launcher Auto-Start",
+        description = "Enable or disable the guarded login-shell hook for Antigravity Dock/Launcher Hybrid Mode auto-start (never follows RC symlinks).",
+        meta = app_only_meta()
+    )]
+    pub async fn set_launcher_integration(
+        &self,
+        Parameters(args): Parameters<SetLauncherIntegrationArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let write_guard = self.integration_write_lock.lock().await;
+        let mut opts = self.integration_options();
+        // Hard invariant: MCP tool NEVER follows RC symlinks.
+        opts.follow_rc_symlink = false;
+        let enabled = args.enabled;
+        let outcome = tokio::task::spawn_blocking(move || {
+            if enabled {
+                companion_core::integration::enable(&opts)
+            } else {
+                companion_core::integration::disable(&opts)
+            }
+        })
+        .await
+        .map_err(|err| {
+            ErrorData::internal_error(format!("set_launcher_integration task failed: {err}"), None)
+        })?;
+        // Release write lock before config reads & loopback HTTP probes.
+        drop(write_guard);
+
+        let status = match outcome {
+            Ok(status) => status,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
+
+        let cfg = match Config::load_or_default(&self.config_path) {
+            Ok(cfg) => cfg,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
+
+        let snapshot = self
+            .build_snapshot_with_integration(&cfg, Some(status))
+            .await;
+        let prefix = if !snapshot.launcher_integration.supported {
+            "Dock / Launcher hook is not supported on this platform."
+        } else if snapshot.launcher_integration.manual_required {
+            if enabled {
+                if snapshot.launcher_integration.env_script_path.is_some() {
+                    "Dock / Launcher env.sh prepared; manual 1-line RC step required."
+                } else {
+                    "Dock / Launcher integration requires a manual shell config step."
+                }
+            } else if snapshot.launcher_integration.enabled {
+                "Dock / Launcher hook could not be removed automatically; remove the managed shell config lines manually."
+            } else {
+                "Dock / Launcher hook neutralized; remove the managed RC lines manually."
+            }
+        } else if enabled {
+            "Dock / Launcher auto-start enabled."
+        } else {
+            "Dock / Launcher auto-start disabled."
+        };
+        snapshot_tool_result(
+            format!("{prefix} {}", format_snapshot_summary(&snapshot)),
+            &snapshot,
+        )
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -983,6 +1197,10 @@ mod tests {
             ("get_settings", "Get Antigravity Companion Settings"),
             ("save_settings", "Save Antigravity Companion Settings"),
             ("test_connection", "Test Gemini Upstream Connection"),
+            (
+                "set_launcher_integration",
+                "Configure Dock / Launcher Auto-Start",
+            ),
         ];
         for (app_only, expected_title) in expected_titles {
             let tool = tools
@@ -998,6 +1216,21 @@ mod tests {
                 tool_meta.0.get("ui").and_then(|v| v.get("visibility")),
                 Some(&json!(["app"]))
             );
+            if app_only == "set_launcher_integration" {
+                assert_eq!(
+                    tool.input_schema.get("additionalProperties"),
+                    Some(&json!(false)),
+                    "set_launcher_integration schema must deny unknown fields: {:?}",
+                    tool.input_schema
+                );
+                assert_eq!(
+                    tool.input_schema
+                        .get("properties")
+                        .and_then(|p| p.get("enabled"))
+                        .and_then(|e| e.get("type")),
+                    Some(&json!("boolean"))
+                );
+            }
         }
     }
 
@@ -1846,7 +2079,42 @@ mod tests {
         let tools = tools_resp["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name") == Some(&json!("set_launcher_integration")))
+        );
+
+        // 3b. Verify set_launcher_integration rejects unknown fields at the JSON-RPC boundary
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_launcher_integration",
+                    "arguments": {
+                        "enabled": true,
+                        "rc_file": "/etc/passwd"
+                    }
+                }
+            }),
+        )
+        .await;
+        let bad_integration_resp = recv_msg(&mut reader).await;
+        let rejected = bad_integration_resp.get("error").is_some()
+            || bad_integration_resp["result"]["isError"] == json!(true);
+        assert!(
+            rejected,
+            "set_launcher_integration with unknown field must be rejected before handler: {bad_integration_resp:?}"
+        );
+        let err_blob = serde_json::to_string(&bad_integration_resp).expect("serialize");
+        assert!(
+            err_blob.contains("unknown field") && err_blob.contains("rc_file"),
+            "expected unknown field error message, got: {err_blob}"
+        );
 
         // 4. resources/list
         send_msg(
@@ -2459,6 +2727,363 @@ mod tests {
             "placeholder env child failed:\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_launcher_integration_enables_disables_and_never_follows_rc_symlink() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let cfg = Config {
+            listen_port: free_closed_port().await,
+            ..Default::default()
+        };
+        cfg.save_secure(&cfg_path).expect("save config");
+
+        let rc_path = tmp.path().join(".zlogin");
+        let data_dir = tmp.path().join("data");
+        let fake_bin = tmp.path().join("agy-companion");
+        fs::write(&fake_bin, "#!/bin/sh\n").expect("write bin");
+
+        let opts = IntegrationOptions {
+            shell: Some(companion_core::ShellKind::Zsh),
+            rc_file: Some(rc_path.clone()),
+            binary_path: Some(fake_bin.clone()),
+            data_dir: Some(data_dir.clone()),
+            follow_rc_symlink: false,
+        };
+        let server = CompanionUiServer::new(cfg_path.clone(), None)
+            .expect("server")
+            .with_integration_options(opts);
+
+        // Enable on regular RC file
+        let enabled_res = server
+            .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: true }))
+            .await
+            .expect("enable");
+        assert_eq!(enabled_res.is_error, Some(false));
+        let snap: SettingsSnapshot =
+            serde_json::from_value(enabled_res.structured_content.expect("sc")).expect("parse");
+        if cfg!(windows) {
+            assert!(!snap.launcher_integration.supported);
+            return;
+        }
+        assert!(snap.launcher_integration.enabled);
+        assert!(!snap.launcher_integration.manual_required);
+        assert!(rc_path.is_file());
+        assert!(data_dir.join("env.sh").is_file());
+
+        // Disable removes empty .zlogin and env.sh
+        let disabled_res = server
+            .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: false }))
+            .await
+            .expect("disable");
+        assert_eq!(disabled_res.is_error, Some(false));
+        let snap_off: SettingsSnapshot =
+            serde_json::from_value(disabled_res.structured_content.expect("sc")).expect("parse");
+        assert!(!snap_off.launcher_integration.enabled);
+        assert!(!rc_path.exists());
+        assert!(!data_dir.join("env.sh").exists());
+
+        // Symlinked RC file: NEVER followed even if override tried follow_rc_symlink = true
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let managed_target = tmp.path().join("managed-dotfiles-zlogin");
+            fs::write(&managed_target, "# nix managed\n").expect("write target");
+            symlink(&managed_target, &rc_path).expect("symlink");
+
+            let server_force = CompanionUiServer::new(cfg_path, None)
+                .expect("server")
+                .with_integration_options(IntegrationOptions {
+                    shell: Some(companion_core::ShellKind::Zsh),
+                    rc_file: Some(rc_path.clone()),
+                    binary_path: Some(fake_bin),
+                    data_dir: Some(data_dir.clone()),
+                    follow_rc_symlink: true, // MUST be overridden to false inside tool!
+                });
+            let sym_res = server_force
+                .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: true }))
+                .await
+                .expect("enable symlink");
+            assert_eq!(sym_res.is_error, Some(false));
+            let sym_snap: SettingsSnapshot =
+                serde_json::from_value(sym_res.structured_content.expect("sc")).expect("parse");
+            assert!(!sym_snap.launcher_integration.enabled);
+            assert!(sym_snap.launcher_integration.manual_required);
+            assert!(sym_snap.launcher_integration.manual_snippet.is_some());
+            assert_eq!(
+                sym_snap.launcher_integration.symlink_target.as_deref(),
+                Some(managed_target.as_path())
+            );
+            assert_eq!(
+                fs::read_to_string(&managed_target).expect("read target"),
+                "# nix managed\n"
+            );
+            assert!(data_dir.join("env.sh").is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_snapshot_populates_cloudcode_status_and_marks_hybrid_active_from_catalog_refresh()
+     {
+        let router = Router::new()
+            .route(
+                "/health",
+                get(|| async {
+                    axum::Json(json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "protocol_version": 1
+                    }))
+                }),
+            )
+            .route(
+                "/api/stats",
+                get(|| async {
+                    axum::Json(json!({
+                        "requests": 3,
+                        "prompt_tokens": 100,
+                        "cached_tokens": 50,
+                        "output_tokens": 25,
+                        "reasoning_tokens": 0,
+                        "cache_hit_ratio": 0.5,
+                        "last_catalog_refresh_at_ms": 1735689600123_u64,
+                        "last_catalog_included_proxy_models": true,
+                        "cloudcode_mode": "auto",
+                        "cloudcode_resolved_upstream": "https://daily-cloudcode-pa.googleapis.com"
+                    }))
+                }),
+            );
+        let (port, handle) = spawn_mock_http(router).await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let cfg = Config {
+            listen_port: port,
+            ..Default::default()
+        };
+        cfg.save_secure(&cfg_path).expect("save config");
+
+        let server = CompanionUiServer::new(cfg_path, None)
+            .expect("server")
+            .with_integration_options(IntegrationOptions {
+                shell: Some(companion_core::ShellKind::Zsh),
+                rc_file: Some(tmp.path().join(".zlogin")),
+                binary_path: Some(tmp.path().join("agy-companion")),
+                data_dir: Some(tmp.path().join("data")),
+                follow_rc_symlink: false,
+            });
+        let res = server.get_settings().await.expect("get_settings");
+        assert_eq!(res.is_error, Some(false));
+        let snap: SettingsSnapshot =
+            serde_json::from_value(res.structured_content.expect("sc")).expect("parse");
+
+        assert_eq!(
+            snap.cloudcode,
+            CloudCodeStatusPayload {
+                mode: "auto".to_string(),
+                configured_upstream: "auto".to_string(),
+                resolved_upstream: Some("https://daily-cloudcode-pa.googleapis.com".to_string()),
+            }
+        );
+        assert!(snap.launcher_integration.hybrid_active);
+        assert_eq!(snap.platform, std::env::consts::OS);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_set_launcher_integration_calls_are_serialized_without_corruption() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let cfg = Config {
+            listen_port: free_closed_port().await,
+            ..Default::default()
+        };
+        cfg.save_secure(&cfg_path).expect("save config");
+
+        let rc_path = tmp.path().join(".zlogin");
+        fs::write(&rc_path, "# user line\n").expect("seed rc");
+        let data_dir = tmp.path().join("data");
+        let fake_bin = tmp.path().join("agy-companion");
+        fs::write(&fake_bin, "#!/bin/sh\n").expect("write bin");
+
+        let server = Arc::new(
+            CompanionUiServer::new(cfg_path, None)
+                .expect("server")
+                .with_integration_options(IntegrationOptions {
+                    shell: Some(companion_core::ShellKind::Zsh),
+                    rc_file: Some(rc_path.clone()),
+                    binary_path: Some(fake_bin),
+                    data_dir: Some(data_dir),
+                    follow_rc_symlink: false,
+                }),
+        );
+
+        let mut tasks = Vec::new();
+        for idx in 0..8 {
+            let srv = Arc::clone(&server);
+            let enable_flag = idx % 2 == 0;
+            tasks.push(tokio::spawn(async move {
+                srv.set_launcher_integration(Parameters(SetLauncherIntegrationArgs {
+                    enabled: enable_flag,
+                }))
+                .await
+            }));
+        }
+
+        for task in tasks {
+            let res = task.await.expect("join").expect("tool call");
+            assert_eq!(res.is_error, Some(false));
+        }
+
+        // Final RC file must remain valid UTF-8 with user line preserved and zero corrupted markers.
+        let final_content = fs::read_to_string(&rc_path).expect("read rc");
+        assert!(final_content.contains("# user line"));
+        let final_status = server.get_settings().await.expect("get_settings");
+        assert_eq!(final_status.is_error, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_launcher_integration_disable_on_symlink_and_fish_manual_required_copy_is_accurate()
+    {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let cfg = Config {
+            listen_port: free_closed_port().await,
+            ..Default::default()
+        };
+        cfg.save_secure(&cfg_path).expect("save config");
+
+        let data_dir = tmp.path().join("data");
+        let fake_bin = tmp.path().join("agy-companion");
+        fs::write(&fake_bin, "#!/bin/sh\n").expect("write bin");
+
+        // 1. Zsh symlink already containing valid markers: enable -> disable neutralizes env.sh
+        let managed_zlogin = tmp.path().join("nix-zlogin");
+        let snippet = companion_core::integration::render_rc_snippet(
+            companion_core::ShellKind::Zsh,
+            &data_dir.join("env.sh"),
+        )
+        .expect("snippet");
+        fs::write(&managed_zlogin, format!("# nix\n{snippet}\n")).expect("write target");
+        let rc_path = tmp.path().join(".zlogin");
+        symlink(&managed_zlogin, &rc_path).expect("symlink");
+
+        let server = CompanionUiServer::new(cfg_path.clone(), None)
+            .expect("server")
+            .with_integration_options(IntegrationOptions {
+                shell: Some(companion_core::ShellKind::Zsh),
+                rc_file: Some(rc_path),
+                binary_path: Some(fake_bin.clone()),
+                data_dir: Some(data_dir.clone()),
+                follow_rc_symlink: false,
+            });
+
+        let en_res = server
+            .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: true }))
+            .await
+            .expect("enable");
+        assert_eq!(en_res.is_error, Some(false));
+        assert!(data_dir.join("env.sh").is_file());
+
+        let dis_res = server
+            .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: false }))
+            .await
+            .expect("disable");
+        assert_eq!(dis_res.is_error, Some(false));
+        assert!(!data_dir.join("env.sh").exists());
+        let dis_snap: SettingsSnapshot =
+            serde_json::from_value(dis_res.structured_content.expect("sc")).expect("parse");
+        assert!(!dis_snap.launcher_integration.enabled);
+        assert!(dis_snap.launcher_integration.manual_required);
+        assert!(dis_snap.launcher_integration.manual_snippet.is_none());
+        let dis_text = dis_res
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(
+            !dis_text.contains("env.sh prepared"),
+            "disable summary must not claim env.sh prepared: {dis_text}"
+        );
+        assert!(
+            dis_text.contains("neutralized") && dis_text.contains("manually"),
+            "disable summary should mention neutralized and manual removal: {dis_text}"
+        );
+
+        // 2. Fish symlink without markers: enable must not claim env.sh prepared
+        let managed_fish = tmp.path().join("nix-fish");
+        fs::write(&managed_fish, "# nix fish\n").expect("write fish target");
+        let fish_rc = tmp.path().join("agy-companion.fish");
+        symlink(&managed_fish, &fish_rc).expect("fish symlink");
+
+        let fish_server = CompanionUiServer::new(cfg_path, None)
+            .expect("fish server")
+            .with_integration_options(IntegrationOptions {
+                shell: Some(companion_core::ShellKind::Fish),
+                rc_file: Some(fish_rc),
+                binary_path: Some(fake_bin.clone()),
+                data_dir: Some(data_dir),
+                follow_rc_symlink: false,
+            });
+        let fish_res = fish_server
+            .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: true }))
+            .await
+            .expect("fish enable");
+        assert_eq!(fish_res.is_error, Some(false));
+        let fish_text = fish_res
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(
+            !fish_text.contains("env.sh prepared"),
+            "Fish enable summary must not mention env.sh prepared: {fish_text}"
+        );
+        assert!(
+            fish_text.contains("manual shell config step"),
+            "Fish enable summary should mention manual shell config step: {fish_text}"
+        );
+
+        // 3. Fish symlink with valid markers: disable leaves hook enabled & must not claim neutralized
+        let fish_snippet = companion_core::integration::render_rc_snippet(
+            companion_core::ShellKind::Fish,
+            &fake_bin,
+        )
+        .expect("fish snippet");
+        fs::write(&managed_fish, format!("# nix fish\n{fish_snippet}\n"))
+            .expect("write fish target with markers");
+        let fish_dis_res = fish_server
+            .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: false }))
+            .await
+            .expect("fish disable");
+        assert_eq!(fish_dis_res.is_error, Some(false));
+        let fish_dis_snap: SettingsSnapshot =
+            serde_json::from_value(fish_dis_res.structured_content.expect("sc")).expect("parse");
+        assert!(
+            fish_dis_snap.launcher_integration.enabled,
+            "Fish symlink disable leaves hook active because Fish has no env.sh"
+        );
+        assert!(fish_dis_snap.launcher_integration.manual_required);
+        let fish_dis_text = fish_dis_res
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
+        assert!(
+            !fish_dis_text.contains("neutralized"),
+            "Fish symlink disable summary must not claim hook neutralized: {fish_dis_text}"
+        );
+        assert!(
+            fish_dis_text.contains("could not be removed automatically"),
+            "Fish symlink disable summary should explain automatic removal could not occur: {fish_dis_text}"
         );
     }
 }
