@@ -1339,10 +1339,10 @@ class TestTier1F10PluginBundle(E2ETestCase):
         self.assertTrue(mc_path.is_file(), f"Missing {mc_path}")
         mc = json.loads(mc_path.read_text(encoding="utf-8"))
         servers = mc.get("mcpServers") or {}
-        self.assertIn("companion", servers)
-        comp = servers["companion"]
-        self.assertEqual(comp.get("command"), "bash")
-        args = comp.get("args") or []
+        self.assertIn("hub", servers)
+        hub = servers["hub"]
+        self.assertEqual(hub.get("command"), "bash")
+        args = hub.get("args") or []
         self.assertIn("${PLUGIN_ROOT}/scripts/run-companion.sh", args)
         self.assertIn("ui-mcp", args)
         self.assertTrue(

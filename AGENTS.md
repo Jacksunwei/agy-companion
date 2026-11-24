@@ -82,7 +82,7 @@ See [`.agents/skills/local-dev/SKILL.md`](.agents/skills/local-dev/SKILL.md) for
 
 - **Build & link plugin:** Run `./scripts/dev-install.sh` (builds `ui/` + `cargo build -p companion-cli` and symlinks `./plugin` into `~/.gemini/config/plugins/agy-companion` without modifying user Antigravity settings). `plugin/scripts/run-companion.sh` resolves symlinks on `$0` and automatically runs `<repo_root>/target/{debug,release}/agy-companion` so local dev never downloads from GitHub Releases.
 - **Instant UI iteration (zero Rust rebuild):** From the repo root, export `AGY_COMPANION_UI_HTML="$(pwd)/ui/dist/index.html"`, run `npm --prefix ui run build`, and close/reopen the **Antigravity Companion** aux pane.
-- **Live MCP reload (no App restart):** Restart **`agy-companion_companion`** via **Settings > MCP Servers > Restart** or invoke the `RefreshMcpServers` RPC with `{"serverName": "agy-companion_companion"}`.
+- **Live MCP reload (no App restart):** Restart **`agy-companion_hub`** via **Settings > MCP Servers > Restart** or invoke the `RefreshMcpServers` RPC with `{"serverName": "agy-companion_hub"}`.
 - **Logs & live E2E:** Inspect sidecar logs at `~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/`, run standalone `cargo run -p companion-cli -- serve`, or run isolated `agy` CLI E2E with `GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4141"`, `agy-companion doctor`, `agy-companion models --json`, and isolated `XDG_CONFIG_HOME` / `XDG_DATA_HOME`.
 - **Deterministic opaque-box E2E:** See [`e2e/README.md`](e2e/README.md) and run `python3 -B e2e/run_e2e.py --tier all --binary target/debug/agy-companion --repo-root . -v` (`328` tests across Tiers 1–4; `--self-test -v` runs `25` harness self-tests).
 

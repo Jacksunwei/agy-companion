@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "companion": {
+    "hub": {
       "command": "bash",
       "args": [
         "${PLUGIN_ROOT}/scripts/run-companion.sh",
