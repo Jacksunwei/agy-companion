@@ -2084,15 +2084,17 @@ class TestTier1F16XdgPaths(E2ETestCase):
         self.assertEqual(
             merged["groupedModels"]["gemini-4-carbon"]["displayName"], "Gemini 4 Carbon"
         )
-        # Injected proxy model avoids M334 collision and carries gemini-api:// URL + thinking levels.
+        # Injected proxy model avoids M334 collision and carries gemini-api:// URL + thinking effort labels.
         h_low = merged["models"]["companion/gemini-4-hydrogen-low"]
         h_xhigh = merged["models"]["companion/gemini-4-hydrogen-xhigh"]
         self.assertEqual(h_low["model"], "MODEL_PLACEHOLDER_M335")
         self.assertEqual(h_low["modelUrl"], "gemini-api://gemini-4-hydrogen")
+        self.assertEqual(h_low["displayName"], "Gemini 4 Hydrogen (Proxy) (Low)")
         self.assertEqual(h_xhigh["thinkingLevel"], 7)
+        self.assertEqual(h_xhigh["displayName"], "Gemini 4 Hydrogen (Proxy) (XHigh)")
         self.assertEqual(
             merged["groupedModels"]["companion/gemini-4-hydrogen"]["displayName"],
-            "Gemini 4 Hydrogen [Proxy]",
+            "Gemini 4 Hydrogen (Proxy)",
         )
         suffixes = [
             lvl["thinkingSuffix"]
@@ -2101,10 +2103,11 @@ class TestTier1F16XdgPaths(E2ETestCase):
             ]
         ]
         self.assertEqual(suffixes, ["low", "medium", "high", "xhigh"])
-        self.assertEqual(
-            merged["agentModelSorts"][0]["groups"][1]["displayName"],
-            "Antigravity Companion (Proxy)",
-        )
+        # Appended directly into Recommended groups[0] right after original models.
+        group0_ids = merged["agentModelSorts"][0]["groups"][0]["modelIds"]
+        self.assertEqual(group0_ids[0], "gemini-4-carbon-high")
+        self.assertIn("companion/gemini-4-hydrogen-low", group0_ids)
+        self.assertIn("companion/gemini-4-hydrogen-xhigh", group0_ids)
 
         # 2. Other /v1internal:* RPCs (including alt=sse streaming) pass through transparently.
         stream_resp = http_raw_request(

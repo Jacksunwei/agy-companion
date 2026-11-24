@@ -79,7 +79,7 @@ GEMINI_API_KEY="agy-companion-local" \
 /Applications/Antigravity.app/Contents/MacOS/Antigravity
 ```
 
-> **How Hybrid Mode works:** Antigravity stays signed in with your personal Google AI Pro (or Workspace/PayGo) account. `agy-companion` passes `/v1internal:*` calls transparently to `cloudcode_upstream_url` (default `https://daily-cloudcode-pa.googleapis.com` for Personal Google AI Pro; set `https://cloudcode-pa.googleapis.com` for Workspace/PayGo), merges `[Proxy]` models (with `modelUrl: "gemini-api://..."` and `groupedModels` thinking levels) into `v1internal:fetchAvailableModels`, and routes only `[Proxy]` model calls through your local Gemini API key + telemetry tee. Original Google AI Pro models stay 100% untouched.
+> **How Hybrid Mode works:** Antigravity stays signed in with your personal Google AI Pro (or Workspace/PayGo) account. `agy-companion` auto-detects `cloudcode_upstream_url` (`"auto"` routes Personal Google AI Pro to `https://daily-cloudcode-pa.googleapis.com` and Workspace/PayGo to `https://cloudcode-pa.googleapis.com`), keeps all original Google models untouched in `Recommended`, appends `(Proxy)` Gemini 4/3 models with native secondary **Thinking effort** menus (`Low` / `Medium` / `High` / `Extra`), and routes only `(Proxy)` model calls through your local Gemini API key + telemetry tee.
 
 *(Alternative — Gateway Mode)* If you prefer routing all Antigravity App calls exclusively through the proxy without Google OAuth, add `"gateway": {"url": "http://127.0.0.1:4141", "wireProtocol": "genai"}` to `~/.gemini/config/config.json` (`GET /v1beta/models` discovery).
 

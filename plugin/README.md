@@ -45,7 +45,7 @@ GEMINI_API_KEY="agy-companion-local" \
 /Applications/Antigravity.app/Contents/MacOS/Antigravity
 ```
 
-> **Note:** Hybrid Mode passes `/v1internal:*` through to `cloudcode_upstream_url` (default `https://daily-cloudcode-pa.googleapis.com` for Personal Google AI Pro; set `https://cloudcode-pa.googleapis.com` for Workspace/PayGo in Settings), preserving all original Google models and injecting `[Proxy]` models alongside them.
+> **Note:** Hybrid Mode defaults `cloudcode_upstream_url` to `"auto"` (auto-detecting `https://daily-cloudcode-pa.googleapis.com` for Personal Google AI Pro vs `https://cloudcode-pa.googleapis.com` for Workspace/PayGo), preserving all original Google models and appending `(Proxy)` models with native **Thinking effort** submenus alongside them.
 
 ### 3. Connect Antigravity CLI (`agy`)
 

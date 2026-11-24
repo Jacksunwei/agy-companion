@@ -15,7 +15,9 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
 pub const DEFAULT_LISTEN_PORT: u16 = 4141;
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
-pub const DEFAULT_CLOUDCODE_UPSTREAM_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+pub const CLOUDCODE_DAILY_UPSTREAM_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+pub const CLOUDCODE_PROD_UPSTREAM_URL: &str = "https://cloudcode-pa.googleapis.com";
+pub const DEFAULT_CLOUDCODE_UPSTREAM_URL: &str = "auto";
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
@@ -413,6 +415,13 @@ pub fn validate_upstream_url(raw: &str) -> Result<(), CoreError> {
             reason: format!("unsupported URL scheme '{scheme}'"),
         }),
     }
+}
+
+pub fn validate_cloudcode_upstream_url(raw: &str) -> Result<(), CoreError> {
+    if raw == DEFAULT_CLOUDCODE_UPSTREAM_URL {
+        return Ok(());
+    }
+    validate_upstream_url(raw)
 }
 
 pub fn validate_path(path: &Path) -> Result<(), CoreError> {
@@ -838,7 +847,7 @@ impl Config {
         validate_gemini_model(&self.gemini.default_model)?;
 
         validate_upstream_url(&self.gemini.base_url)?;
-        validate_upstream_url(&self.cloudcode_upstream_url)?;
+        validate_cloudcode_upstream_url(&self.cloudcode_upstream_url)?;
         if let Some(ref key) = self.gemini.api_key
             && (!key.bytes().all(|b| (0x20..=0x7E).contains(&b))
                 || !key
@@ -2951,8 +2960,9 @@ mod tests {
         );
         legacy.validate().expect("legacy config must validate");
 
-        // Loopback http and https prod URLs are accepted.
+        // "auto", loopback http, and https prod URLs are accepted.
         for ok_url in [
+            "auto",
             "https://daily-cloudcode-pa.googleapis.com",
             "https://cloudcode-pa.googleapis.com",
             "http://127.0.0.1:49999",

@@ -1,9 +1,13 @@
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use companion_core::{
-    CoreError, DEFAULT_TIMEOUT_SECS, is_supported_gemini_model, validate_upstream_url,
+    CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CoreError,
+    DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_TIMEOUT_SECS, is_supported_gemini_model,
+    validate_cloudcode_upstream_url, validate_upstream_url,
 };
 use companion_providers::ByteStream;
 use futures_util::TryStreamExt;
@@ -65,36 +69,88 @@ pub struct CloudCodeBufferedResponse {
     pub body: Bytes,
 }
 
+enum CloudCodeTarget {
+    Fixed(String),
+    Auto {
+        daily_url: String,
+        prod_url: String,
+        resolved_prod: AtomicBool,
+        has_resolved: AtomicBool,
+    },
+}
+
 #[derive(Clone)]
 pub struct CloudCodeClient {
-    base_url: String,
+    target: Arc<CloudCodeTarget>,
     http: reqwest::Client,
 }
 
 impl CloudCodeClient {
     pub fn new(base_url: &str, timeout_secs: u64) -> Result<Self, CloudCodeError> {
-        validate_upstream_url(base_url)?;
-        let effective_timeout = if timeout_secs == 0 {
-            DEFAULT_TIMEOUT_SECS
-        } else {
-            timeout_secs
-        };
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(CLOUDCODE_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(effective_timeout))
-            .build()
-            .map_err(|err| CloudCodeError::Upstream(err.to_string()))?;
-
+        validate_cloudcode_upstream_url(base_url)?;
+        if base_url == DEFAULT_CLOUDCODE_UPSTREAM_URL {
+            return Self::new_auto_with_urls(
+                CLOUDCODE_DAILY_UPSTREAM_URL,
+                CLOUDCODE_PROD_UPSTREAM_URL,
+                timeout_secs,
+            );
+        }
+        let http = build_http_client(timeout_secs)?;
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            target: Arc::new(CloudCodeTarget::Fixed(
+                base_url.trim_end_matches('/').to_string(),
+            )),
+            http,
+        })
+    }
+
+    pub fn new_auto_with_urls(
+        daily_url: &str,
+        prod_url: &str,
+        timeout_secs: u64,
+    ) -> Result<Self, CloudCodeError> {
+        validate_upstream_url(daily_url)?;
+        validate_upstream_url(prod_url)?;
+        let http = build_http_client(timeout_secs)?;
+        Ok(Self {
+            target: Arc::new(CloudCodeTarget::Auto {
+                daily_url: daily_url.trim_end_matches('/').to_string(),
+                prod_url: prod_url.trim_end_matches('/').to_string(),
+                resolved_prod: AtomicBool::new(false),
+                has_resolved: AtomicBool::new(false),
+            }),
             http,
         })
     }
 
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        match self.target.as_ref() {
+            CloudCodeTarget::Fixed(url) => url,
+            CloudCodeTarget::Auto {
+                daily_url,
+                prod_url,
+                resolved_prod,
+                ..
+            } => {
+                if resolved_prod.load(Ordering::Relaxed) {
+                    prod_url
+                } else {
+                    daily_url
+                }
+            }
+        }
+    }
+
+    fn record_auto_choice(&self, use_prod: bool) {
+        if let CloudCodeTarget::Auto {
+            resolved_prod,
+            has_resolved,
+            ..
+        } = self.target.as_ref()
+        {
+            resolved_prod.store(use_prod, Ordering::Relaxed);
+            has_resolved.store(true, Ordering::Relaxed);
+        }
     }
 
     pub async fn forward_raw(
@@ -104,7 +160,45 @@ impl CloudCodeClient {
         inbound_headers: &HeaderMap,
         body: Bytes,
     ) -> Result<CloudCodeStreamResponse, CloudCodeError> {
-        let target_url = self.build_target_url(path_and_query)?;
+        validate_cloudcode_path(path_and_query)?;
+
+        // In "auto" mode, mirror Antigravity's own UpdateEndpointURL bootstrap:
+        // send loadCodeAssist to prod first and detect Business/PayGo (usesGcpTos)
+        // vs Personal Google AI Pro (daily) without mutating the response.
+        let path_only = path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(p, _)| p);
+        if method == Method::POST
+            && path_only == "/v1internal:loadCodeAssist"
+            && let CloudCodeTarget::Auto { prod_url, .. } = self.target.as_ref()
+        {
+            let buffered = self
+                .send_buffered(
+                    prod_url,
+                    Method::POST,
+                    path_and_query,
+                    inbound_headers,
+                    body,
+                    true,
+                )
+                .await?;
+            if buffered.status == StatusCode::OK
+                && let Some(use_prod) = detect_prod_from_load_code_assist(&buffered.body)
+            {
+                self.record_auto_choice(use_prod);
+            }
+            let mut headers = buffered.headers;
+            headers.remove(header::CONTENT_ENCODING);
+            let stream: ByteStream =
+                Box::pin(futures_util::stream::once(async move { Ok(buffered.body) }));
+            return Ok(CloudCodeStreamResponse {
+                status: buffered.status,
+                headers,
+                stream,
+            });
+        }
+
+        let target_url = format!("{}{path_and_query}", self.base_url());
         let mut req_builder = self.http.request(method, target_url);
         for (name, value) in copy_safe_request_headers(inbound_headers, false) {
             req_builder = req_builder.header(name, value);
@@ -136,9 +230,102 @@ impl CloudCodeClient {
         inbound_headers: &HeaderMap,
         body: Bytes,
     ) -> Result<CloudCodeBufferedResponse, CloudCodeError> {
-        let target_url = self.build_target_url(path_and_query)?;
-        let mut req_builder = self.http.request(Method::POST, target_url);
-        for (name, value) in copy_safe_request_headers(inbound_headers, true) {
+        validate_cloudcode_path(path_and_query)?;
+
+        match self.target.as_ref() {
+            CloudCodeTarget::Fixed(base) => {
+                self.send_buffered(
+                    base,
+                    Method::POST,
+                    path_and_query,
+                    inbound_headers,
+                    body,
+                    true,
+                )
+                .await
+            }
+            CloudCodeTarget::Auto {
+                daily_url,
+                prod_url,
+                resolved_prod,
+                has_resolved,
+            } => {
+                let prefer_prod = if has_resolved.load(Ordering::Relaxed) {
+                    resolved_prod.load(Ordering::Relaxed)
+                } else {
+                    request_hints_business_project(&body)
+                };
+
+                let (primary_url, primary_is_prod, fallback_url, fallback_is_prod) = if prefer_prod
+                {
+                    (prod_url.as_str(), true, daily_url.as_str(), false)
+                } else {
+                    (daily_url.as_str(), false, prod_url.as_str(), true)
+                };
+
+                let primary_res = self
+                    .send_buffered(
+                        primary_url,
+                        Method::POST,
+                        path_and_query,
+                        inbound_headers,
+                        body.clone(),
+                        true,
+                    )
+                    .await;
+
+                if let Ok(ref resp) = primary_res
+                    && resp.status == StatusCode::OK
+                    && response_has_non_empty_models(&resp.body)
+                {
+                    self.record_auto_choice(primary_is_prod);
+                    return primary_res;
+                }
+
+                // Fallback to the alternate CloudCode host (e.g. PayGo account hitting daily
+                // or personal AI Pro account hitting prod) so original models are never lost.
+                let fallback_res = self
+                    .send_buffered(
+                        fallback_url,
+                        Method::POST,
+                        path_and_query,
+                        inbound_headers,
+                        body,
+                        true,
+                    )
+                    .await;
+
+                if let Ok(ref resp) = fallback_res
+                    && resp.status == StatusCode::OK
+                    && response_has_non_empty_models(&resp.body)
+                {
+                    self.record_auto_choice(fallback_is_prod);
+                    return fallback_res;
+                }
+
+                match (primary_res, fallback_res) {
+                    (Ok(p), _) if p.status == StatusCode::OK => Ok(p),
+                    (_, Ok(f)) if f.status == StatusCode::OK => Ok(f),
+                    (Ok(p), _) => Ok(p),
+                    (Err(_), Ok(f)) => Ok(f),
+                    (Err(e), Err(_)) => Err(e),
+                }
+            }
+        }
+    }
+
+    async fn send_buffered(
+        &self,
+        base_url: &str,
+        method: Method,
+        path_and_query: &str,
+        inbound_headers: &HeaderMap,
+        body: Bytes,
+        force_identity_encoding: bool,
+    ) -> Result<CloudCodeBufferedResponse, CloudCodeError> {
+        let target_url = format!("{base_url}{path_and_query}");
+        let mut req_builder = self.http.request(method, target_url);
+        for (name, value) in copy_safe_request_headers(inbound_headers, force_identity_encoding) {
             req_builder = req_builder.header(name, value);
         }
         if !body.is_empty() {
@@ -170,11 +357,71 @@ impl CloudCodeClient {
             body: Bytes::from(collected),
         })
     }
+}
 
-    fn build_target_url(&self, path_and_query: &str) -> Result<String, CloudCodeError> {
-        validate_cloudcode_path(path_and_query)?;
-        Ok(format!("{}{path_and_query}", self.base_url))
+fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client, CloudCodeError> {
+    let effective_timeout = if timeout_secs == 0 {
+        DEFAULT_TIMEOUT_SECS
+    } else {
+        timeout_secs
+    };
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(CLOUDCODE_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(effective_timeout))
+        .build()
+        .map_err(|err| CloudCodeError::Upstream(err.to_string()))
+}
+
+fn detect_prod_from_load_code_assist(body: &[u8]) -> Option<bool> {
+    let parsed: Value = serde_json::from_slice(body).ok()?;
+    let obj = parsed.as_object()?;
+    if obj
+        .get("paidTier")
+        .and_then(|t| t.get("usesGcpTos"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Some(true);
     }
+    for key in ["currentTier", "paidTier"] {
+        if let Some(id) = obj
+            .get(key)
+            .and_then(|t| t.get("id"))
+            .and_then(Value::as_str)
+        {
+            let lower = id.to_ascii_lowercase();
+            if lower.contains("paygo")
+                || lower.contains("business")
+                || lower.contains("enterprise")
+                || lower.contains("workspace")
+            {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+fn request_hints_business_project(body: &[u8]) -> bool {
+    let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    parsed
+        .get("project")
+        .and_then(Value::as_str)
+        .is_some_and(|p| !p.trim().is_empty())
+}
+
+fn response_has_non_empty_models(body: &[u8]) -> bool {
+    let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    parsed
+        .get("models")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty())
 }
 
 pub fn is_cloudcode_path(path: &str) -> bool {
@@ -271,7 +518,11 @@ fn copy_safe_response_headers(upstream: &HeaderMap) -> HeaderMap {
 #[derive(Debug, Clone, Copy)]
 struct ThinkingVariant {
     suffix: &'static str,
-    display_name: &'static str,
+    // Must match Antigravity UI EFFORT_LABEL_RE: low|medium|high|xhigh|max (case-insensitive)
+    // so variants collapse into a single row with the native "Thinking effort" secondary menu.
+    label_effort: &'static str,
+    // Matches Antigravity EFFORT_LABELS for groupedModels metadata.
+    grouped_display_name: &'static str,
     thinking_level: i32,
 }
 
@@ -280,17 +531,20 @@ struct ThinkingVariant {
 const STANDARD_GEMINI_LEVELS: &[ThinkingVariant] = &[
     ThinkingVariant {
         suffix: "low",
-        display_name: "Low",
+        label_effort: "Low",
+        grouped_display_name: "Low",
         thinking_level: 1,
     },
     ThinkingVariant {
         suffix: "medium",
-        display_name: "Medium",
+        label_effort: "Medium",
+        grouped_display_name: "Medium",
         thinking_level: 2,
     },
     ThinkingVariant {
         suffix: "high",
-        display_name: "High",
+        label_effort: "High",
+        grouped_display_name: "High",
         thinking_level: 3,
     },
 ];
@@ -298,22 +552,26 @@ const STANDARD_GEMINI_LEVELS: &[ThinkingVariant] = &[
 const HYDROGEN_GEMINI_LEVELS: &[ThinkingVariant] = &[
     ThinkingVariant {
         suffix: "low",
-        display_name: "Low",
+        label_effort: "Low",
+        grouped_display_name: "Low",
         thinking_level: 1,
     },
     ThinkingVariant {
         suffix: "medium",
-        display_name: "Medium",
+        label_effort: "Medium",
+        grouped_display_name: "Medium",
         thinking_level: 2,
     },
     ThinkingVariant {
         suffix: "high",
-        display_name: "High",
+        label_effort: "High",
+        grouped_display_name: "High",
         thinking_level: 3,
     },
     ThinkingVariant {
         suffix: "xhigh",
-        display_name: "Extra High",
+        label_effort: "XHigh",
+        grouped_display_name: "Extra",
         thinking_level: 7,
     },
 ];
@@ -391,11 +649,19 @@ fn available_placeholder_enums(used: &HashSet<String>) -> Vec<String> {
 
 /// Merge proxy-backed Gemini 3/4 models into an upstream Cloud Code
 /// `FetchAvailableModelsResponse` JSON payload while preserving every original
-/// Google AI Pro / Workspace model, sort group, and `groupedModels` entry intact.
+/// Google AI Pro / Workspace model, sort order, and `groupedModels` entry intact.
 ///
-/// Each injected variant sets `modelUrl: "gemini-api://<model>"` so Antigravity's
-/// `RoutingClient` routes ONLY the injected `[Proxy]` models to `GOOGLE_GEMINI_BASE_URL`
-/// (`http://127.0.0.1:<port>`) while original Google models continue routing untouched.
+/// Key Antigravity App UI contracts satisfied here:
+/// 1. `useModelGroups` renders only `Recommended` sort's `groups[0]`, so injected
+///    proxy model IDs are appended directly to the end of `groups[0].modelIds`
+///    immediately after all original models.
+/// 2. `parseLabelSlug` collapses variants into the native secondary "Thinking effort"
+///    flyout when `displayName` ends with `(Low|Medium|High|XHigh|Max)`. Using
+///    `"<Model> (Proxy) (<Effort>)"` gives base label `"<Model> (Proxy)"` with a
+///    working Low / Medium / High / Extra submenu.
+/// 3. Each injected variant sets `modelUrl: "gemini-api://<model>"` so Antigravity's
+///    `RoutingClient` routes only `(Proxy)` models to `GOOGLE_GEMINI_BASE_URL`
+///    (`http://127.0.0.1:<port>`) while original Google models route untouched.
 pub fn merge_available_models(
     upstream_body: &[u8],
     proxy_models: &[String],
@@ -454,7 +720,7 @@ pub fn merge_available_models(
         }
 
         let base_id = format!("companion/{raw_id}");
-        let display_base = format!("{} [Proxy]", pretty_model_name(raw_id));
+        let display_base = format!("{} (Proxy)", pretty_model_name(raw_id));
         let mut level_entries = Vec::with_capacity(variants.len());
 
         for variant in variants {
@@ -464,7 +730,7 @@ pub fn merge_available_models(
             remaining_slots = remaining_slots.saturating_sub(1);
 
             let variant_id = format!("{base_id}-{}", variant.suffix);
-            let display_name = format!("{display_base} ({})", variant.display_name);
+            let display_name = format!("{display_base} ({})", variant.label_effort);
 
             let details = json!({
                 "model": enum_name,
@@ -490,7 +756,7 @@ pub fn merge_available_models(
             injected_details.push((variant_id, details));
             level_entries.push(json!({
                 "thinkingSuffix": variant.suffix,
-                "thinkingDisplayName": variant.display_name
+                "thinkingDisplayName": variant.grouped_display_name
             }));
         }
 
@@ -522,11 +788,6 @@ pub fn merge_available_models(
         }
     }
 
-    let proxy_group = json!({
-        "displayName": "Antigravity Companion (Proxy)",
-        "modelIds": injected_model_ids
-    });
-
     let sorts = root_obj
         .entry("agentModelSorts".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -537,16 +798,49 @@ pub fn merge_available_models(
         if sorts_arr.is_empty() {
             sorts_arr.push(json!({
                 "displayName": "Recommended",
-                "groups": [proxy_group]
+                "groups": [{
+                    "displayName": "Models",
+                    "modelIds": injected_model_ids
+                }]
             }));
-        } else if let Some(first_sort) = sorts_arr[0].as_object_mut() {
-            let groups = first_sort
-                .entry("groups".to_string())
-                .or_insert_with(|| Value::Array(Vec::new()));
-            if let Some(groups_arr) = groups.as_array_mut() {
-                groups_arr.push(proxy_group);
-            } else {
-                *groups = Value::Array(vec![proxy_group]);
+        } else {
+            // Antigravity UI reads Recommended sort's groups[0] exclusively.
+            let target_idx = sorts_arr
+                .iter()
+                .position(|s| {
+                    s.get("displayName")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("recommended"))
+                })
+                .unwrap_or(0);
+
+            if let Some(target_sort) = sorts_arr[target_idx].as_object_mut() {
+                let groups = target_sort
+                    .entry("groups".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if !groups.is_array() {
+                    *groups = Value::Array(Vec::new());
+                }
+                if let Some(groups_arr) = groups.as_array_mut() {
+                    if groups_arr.is_empty() {
+                        groups_arr.push(json!({
+                            "displayName": "Models",
+                            "modelIds": injected_model_ids
+                        }));
+                    } else if let Some(first_group) = groups_arr[0].as_object_mut() {
+                        let model_ids = first_group
+                            .entry("modelIds".to_string())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        if !model_ids.is_array() {
+                            *model_ids = Value::Array(Vec::new());
+                        }
+                        if let Some(ids_arr) = model_ids.as_array_mut() {
+                            for id in injected_model_ids {
+                                ids_arr.push(Value::String(id));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -593,7 +887,31 @@ mod tests {
     }
 
     #[test]
-    fn merge_available_models_preserves_originals_and_injects_grouped_proxy_models() {
+    fn detects_prod_vs_daily_from_load_code_assist_response() {
+        assert_eq!(
+            detect_prod_from_load_code_assist(br#"{"paidTier":{"usesGcpTos":true}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            detect_prod_from_load_code_assist(
+                br#"{"currentTier":{"id":"agy-business-paygo-tier"}}"#
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            detect_prod_from_load_code_assist(
+                br#"{"paidTier":{"id":"g1-pro-tier","usesGcpTos":false}}"#
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            detect_prod_from_load_code_assist(br#"{"currentTier":{"id":"free-tier"}}"#),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn merge_available_models_appends_to_recommended_group0_with_proxy_suffix_and_effort_labels() {
         let upstream = json!({
             "models": {
                 "gemini-4-carbon-low": {
@@ -648,7 +966,7 @@ mod tests {
         .expect("merge succeeds");
         let merged: Value = serde_json::from_slice(&merged_bytes).expect("parse merged");
 
-        // Original fields, models, sorts, and groupedModels remain intact.
+        // Original fields, models, and groupedModels remain intact.
         assert_eq!(merged["defaultAgentModelId"], "gemini-4-carbon-high");
         assert_eq!(
             merged["models"]["gemini-4-carbon-high"]["displayName"],
@@ -658,24 +976,19 @@ mod tests {
             merged["groupedModels"]["gemini-4-carbon"]["displayName"],
             "Gemini 4 Carbon"
         );
-        assert_eq!(
-            merged["agentModelSorts"][0]["groups"][0]["displayName"],
-            "Google AI Pro"
-        );
 
-        // Proxy models are injected with default_model first, gemini-api:// URLs, and distinct enums.
+        // Proxy models use "(Proxy) (Low|Medium|High|XHigh)" labels so Antigravity's
+        // parseLabelSlug collapses them into one "(Proxy)" row with Thinking effort submenu.
         let h_low = &merged["models"]["companion/gemini-4-hydrogen-low"];
         let h_xhigh = &merged["models"]["companion/gemini-4-hydrogen-xhigh"];
         assert_eq!(h_low["modelUrl"], "gemini-api://gemini-4-hydrogen");
         assert_eq!(h_low["thinkingLevel"], 1);
+        assert_eq!(h_low["displayName"], "Gemini 4 Hydrogen (Proxy) (Low)");
         assert_eq!(h_xhigh["modelUrl"], "gemini-api://gemini-4-hydrogen");
         assert_eq!(h_xhigh["thinkingLevel"], 7);
-        assert_eq!(
-            h_xhigh["displayName"],
-            "Gemini 4 Hydrogen [Proxy] (Extra High)"
-        );
+        assert_eq!(h_xhigh["displayName"], "Gemini 4 Hydrogen (Proxy) (XHigh)");
 
-        // Existing MODEL_PLACEHOLDER_M334 in upstream must NOT be reused!
+        // Existing MODEL_PLACEHOLDER_M334 in upstream must NOT be reused.
         assert_eq!(h_low["model"], "MODEL_PLACEHOLDER_M335");
 
         // Legacy 2.5 model must not be injected.
@@ -685,9 +998,9 @@ mod tests {
                 .is_none()
         );
 
-        // groupedModels has thinking levels WITHOUT leading dash on thinkingSuffix.
+        // groupedModels stays in sync with "(Proxy)" base name and "Extra" display label.
         let h_group = &merged["groupedModels"]["companion/gemini-4-hydrogen"];
-        assert_eq!(h_group["displayName"], "Gemini 4 Hydrogen [Proxy]");
+        assert_eq!(h_group["displayName"], "Gemini 4 Hydrogen (Proxy)");
         assert_eq!(
             h_group["supportedThinkingLevels"][0]["thinkingSuffix"],
             "low"
@@ -696,18 +1009,27 @@ mod tests {
             h_group["supportedThinkingLevels"][3]["thinkingSuffix"],
             "xhigh"
         );
+        assert_eq!(
+            h_group["supportedThinkingLevels"][3]["thinkingDisplayName"],
+            "Extra"
+        );
 
         let f_group = &merged["groupedModels"]["companion/gemini-3.8-flash"];
-        assert_eq!(f_group["displayName"], "Gemini 3.8 Flash [Proxy]");
+        assert_eq!(f_group["displayName"], "Gemini 3.8 Flash (Proxy)");
         assert_eq!(
             f_group["supportedThinkingLevels"].as_array().unwrap().len(),
             3
         );
 
-        // Second sort group carries the proxy model IDs, default model first.
-        let proxy_group = &merged["agentModelSorts"][0]["groups"][1];
-        assert_eq!(proxy_group["displayName"], "Antigravity Companion (Proxy)");
-        let ids: Vec<&str> = proxy_group["modelIds"]
+        // Injected model IDs are appended directly to Recommended groups[0] right after originals!
+        assert_eq!(
+            merged["agentModelSorts"][0]["groups"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let ids: Vec<&str> = merged["agentModelSorts"][0]["groups"][0]["modelIds"]
             .as_array()
             .unwrap()
             .iter()
@@ -716,6 +1038,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gemini-4-carbon-low",
+                "gemini-4-carbon-high",
                 "companion/gemini-4-hydrogen-low",
                 "companion/gemini-4-hydrogen-medium",
                 "companion/gemini-4-hydrogen-high",
@@ -725,5 +1049,72 @@ mod tests {
                 "companion/gemini-3.8-flash-high",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_falls_back_between_daily_and_prod_to_preserve_original_models() {
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        // Mock daily returns empty models (simulating a PayGo/Business token hitting daily).
+        let mock_daily = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"models":{}}"#,
+                )
+            }),
+        );
+        let daily_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_srv = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, mock_daily).await;
+        });
+
+        // Mock prod returns real original models.
+        let mock_prod = Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"models":{"gemini-4-neon-high":{"displayName":"Gemini 4 Neon (High)"}}}"#,
+                )
+            }),
+        );
+        let prod_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_srv = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, mock_prod).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .expect("auto client");
+
+        // Request without project tries daily first, sees empty models, and automatically falls back to prod!
+        let resp = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .expect("auto fallback succeeds");
+        assert_eq!(resp.status, StatusCode::OK);
+        let parsed: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(
+            parsed["models"]["gemini-4-neon-high"]["displayName"],
+            "Gemini 4 Neon (High)"
+        );
+        assert_eq!(client.base_url(), format!("http://{prod_addr}"));
+
+        daily_srv.abort();
+        prod_srv.abort();
     }
 }

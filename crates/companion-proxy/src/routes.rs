@@ -2400,13 +2400,25 @@ mod tests {
             7
         );
         assert_eq!(
+            parsed["models"]["companion/gemini-4-hydrogen-xhigh"]["displayName"],
+            "Gemini 4 Hydrogen (Proxy) (XHigh)"
+        );
+        assert_eq!(
             parsed["groupedModels"]["gemini-4-carbon"]["displayName"],
             "Gemini 4 Carbon"
         );
         assert_eq!(
             parsed["groupedModels"]["companion/gemini-4-hydrogen"]["displayName"],
-            "Gemini 4 Hydrogen [Proxy]"
+            "Gemini 4 Hydrogen (Proxy)"
         );
+        let group0_ids: Vec<&str> = parsed["agentModelSorts"][0]["groups"][0]["modelIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(group0_ids[0], "gemini-4-carbon-high");
+        assert!(group0_ids.contains(&"companion/gemini-4-hydrogen-xhigh"));
 
         // 2. POST /v1internal:streamGenerateContent?alt=sse passes through byte-for-byte.
         let stream_resp = app

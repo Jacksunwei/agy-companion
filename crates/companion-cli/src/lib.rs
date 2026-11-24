@@ -206,6 +206,7 @@ pub async fn run_serve_with_options(
             }
         });
 
+    let mut logged_adopt = false;
     let listener = loop {
         match companion_proxy::bind_loopback_listener(&config).await {
             Ok(listener) => break listener,
@@ -215,11 +216,14 @@ pub async fn run_serve_with_options(
                 if let Some(health) =
                     launch::probe_running_companion_proxy(config.listen_port).await
                 {
-                    tracing::info!(
-                        addr = %addr,
-                        running_version = %health.version,
-                        "detected running agy-companion proxy; monitoring until shutdown or takeover"
-                    );
+                    if !logged_adopt {
+                        tracing::info!(
+                            addr = %addr,
+                            running_version = %health.version,
+                            "detected running agy-companion proxy; monitoring until shutdown or takeover"
+                        );
+                        logged_adopt = true;
+                    }
                     tokio::select! {
                         _ = &mut shutdown_fut => {
                             return Ok(());
