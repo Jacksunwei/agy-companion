@@ -221,8 +221,8 @@ export AGY_COMPANION_UI_HTML="$(pwd)/ui/dist/index.html"
 npm --prefix ui run build
 
 # 3. Live MCP server reload in Antigravity App (no App restart):
-#    Settings > MCP Servers > agy-companion_companion > Restart
-#    or RefreshMcpServers RPC with {"serverName": "agy-companion_companion"}
+#    Settings > MCP Servers > agy-companion_hub > Restart
+#    or RefreshMcpServers RPC with {"serverName": "agy-companion_hub"}
 
 # 4. Inspect daemon & sidecar logs:
 ls -la ~/.local/share/agy-companion/proxy.log ~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/

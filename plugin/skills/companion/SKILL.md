@@ -9,11 +9,11 @@ Use this skill when the user wants to install or uninstall Antigravity Companion
 
 ## 1. Open the Settings Panel (MCP App UI)
 
-Invoke the bundled MCP tool **`open_settings`** (on server `agy-companion_companion`, serving `ui://companion/settings.html` in the `aux_pane` and `global` entrypoints).
+Invoke the bundled MCP tool **`open_settings`** (on server `agy-companion_hub`, serving `ui://companion/settings.html` in the `aux_pane` and `global` entrypoints).
 
 - **Do not ask the user to paste plaintext API keys into chat** when the Settings UI is available. Direct them to enter the key in the write-only API key field inside the Settings panel (saved atomically — Unix mode `0600` / parent dir `0700`, Windows user-profile ACLs with bounded `3`-attempt rename retry) or export `GEMINI_API_KEY` in their environment.
 - **Day-0 behavior:** Until a real Gemini API key is saved, `agy-companion` leaves Antigravity's native `fetchAvailableModels` catalog completely untouched (no `(Proxy)` models appear, and `"agy-companion-local"` is quarantined so it never leaks upstream). After saving a key, the UI auto-verifies via `test_connection` and displays a live 5-minute model-refresh countdown (or quit Antigravity with `Cmd+Q` and reopen to load `(Proxy)` models immediately).
-- Available MCP tools on `agy-companion_companion` (5 tools):
+- Available MCP tools on `agy-companion_hub` (5 tools):
   - `open_settings` — launches the Settings & Proxy Telemetry panel (`aux_pane` + `global`) and returns a redacted status summary.
   - `get_settings` *(app-only)* — returns redacted config (`api_key_configured`, masked `api_key_hint`), `launcher_integration` status, `cloudcode` active-upstream status, proxy `/health`, version skew status, and `/api/stats` telemetry. Never returns plaintext keys.
   - `save_settings` *(app-only)* — validates `api_key`, `clear_api_key`, `default_model`, `base_url`, `listen_port`, and `listen_host` (loopback only), then persists `config.json` atomically (Unix `0600` / Windows ACLs). Leaving `api_key` blank preserves the existing key unless `clear_api_key: true` is passed.

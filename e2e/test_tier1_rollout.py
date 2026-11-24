@@ -2228,7 +2228,7 @@ class TestTier1RolloutR24WindowsParity(E2ETestCase):
             )
             self.assertEqual(res.returncode, 0, res.stderr)
             mcp_cfg = json.loads((plugins_dir / "agy-companion" / "mcp_config.json").read_text(encoding="utf-8"))
-            cmd = mcp_cfg["mcpServers"]["companion"]["command"]
+            cmd = mcp_cfg["mcpServers"]["hub"]["command"]
             self.assertTrue(cmd.lower().endswith("agy-companion.exe"), cmd)
 
     def test_t1_r24_windows_zero_setx_and_zero_hkcu_environment_mutations(self) -> None:

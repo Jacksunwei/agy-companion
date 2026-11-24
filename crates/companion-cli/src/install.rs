@@ -447,7 +447,7 @@ pub(crate) async fn select_fresh_install_port(
 pub(crate) fn render_windows_mcp_config(binary_path: &Path) -> Result<String, CliError> {
     let payload = serde_json::json!({
         "mcpServers": {
-            "companion": {
+            "hub": {
                 "command": binary_path.to_string_lossy(),
                 "args": ["ui-mcp", "--data-dir=${PLUGIN_DATA}"]
             }
@@ -2642,11 +2642,11 @@ mod tests {
         );
         let mcp_json: serde_json::Value = serde_json::from_str(&mcp_raw).expect("parse mcp json");
         assert_eq!(
-            mcp_json["mcpServers"]["companion"]["command"],
+            mcp_json["mcpServers"]["hub"]["command"],
             bin_path.to_string_lossy().as_ref()
         );
         assert_eq!(
-            mcp_json["mcpServers"]["companion"]["args"],
+            mcp_json["mcpServers"]["hub"]["args"],
             serde_json::json!(["ui-mcp", "--data-dir=${PLUGIN_DATA}"])
         );
 

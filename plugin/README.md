@@ -162,7 +162,7 @@ When developing from a local checkout:
    ```
 6. **Inspect logs:** Check `~/.local/share/agy-companion/proxy.log` (Managed On-Demand Daemon) and `~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/` (Antigravity sidecar).
 7. **Port changes & version skew:** Changes to `api_key`, `base_url`, and `default_model` hot-reload automatically via config mtime. Changing `listen_port` or upgrading requires restarting the proxy sidecar (or quitting Antigravity with `Cmd+Q` and reopening).
-8. **Reload the MCP App UI:** In Antigravity App, restart the `agy-companion_companion` server under **Settings > MCP Servers > Restart**.
+8. **Reload the MCP App UI:** In Antigravity App, restart the `agy-companion_hub` server under **Settings > MCP Servers > Restart**.
 
 ## Security & Privacy
 

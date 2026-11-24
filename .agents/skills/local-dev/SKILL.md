@@ -65,12 +65,12 @@ Close and reopen the **Antigravity Companion** aux pane to load the rebuilt bund
 
 ## 4. Live Reload MCP App Server Without Restarting Antigravity App
 
-The plugin `"agy-companion"` combined with server key `"companion"` in `plugin/mcp_config.json` registers in Antigravity App as MCP server **`agy-companion_companion`**.
+The plugin `"agy-companion"` combined with server key `"hub"` in `plugin/mcp_config.json` registers in Antigravity App as MCP server **`agy-companion_hub`**.
 
-- **UI method (recommended):** Open **Settings > MCP Servers > `agy-companion_companion` > Restart**.
+- **UI method (recommended):** Open **Settings > MCP Servers > `agy-companion_hub` > Restart**.
 - **RPC method:** Invoke the `RefreshMcpServers` RPC with payload:
   ```json
-  {"serverName": "agy-companion_companion"}
+  {"serverName": "agy-companion_hub"}
   ```
 - **What reloads when:**
   - Rust binary changes take effect on MCP server restart (via `run-companion.sh` Step 2).
