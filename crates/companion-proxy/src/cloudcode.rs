@@ -675,9 +675,13 @@ pub fn merge_available_models(
     if !root_obj.get("models").is_some_and(Value::is_object) {
         root_obj.insert("models".to_string(), Value::Object(Map::new()));
     }
-    if !root_obj.get("groupedModels").is_some_and(Value::is_object) {
-        root_obj.insert("groupedModels".to_string(), Value::Object(Map::new()));
-    }
+    // Only populate `groupedModels` when upstream already returned a non-empty map.
+    // Creating a partial `groupedModels` when upstream omitted it disables Antigravity's
+    // legacy label parser and flattens all original models that are not in `groupedModels`.
+    let upstream_has_grouped_models = root_obj
+        .get("groupedModels")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
 
     // Deduplicate and order proxy models with default_model first.
     let mut ordered_models: Vec<String> = Vec::new();
@@ -779,9 +783,10 @@ pub fn merge_available_models(
         }
     }
 
-    if let Some(grouped_obj) = root_obj
-        .get_mut("groupedModels")
-        .and_then(Value::as_object_mut)
+    if upstream_has_grouped_models
+        && let Some(grouped_obj) = root_obj
+            .get_mut("groupedModels")
+            .and_then(Value::as_object_mut)
     {
         for (base_id, group_val) in injected_groups {
             grouped_obj.insert(base_id, group_val);
@@ -1116,5 +1121,67 @@ mod tests {
 
         daily_srv.abort();
         prod_srv.abort();
+    }
+
+    #[test]
+    fn merge_available_models_omits_grouped_models_when_upstream_omits_or_empties_it() {
+        for upstream in [
+            json!({
+                "models": {
+                    "gemini-4-neon-low": { "model": "MODEL_PLACEHOLDER_M400", "displayName": "Gemini 4 Neon (Low)" },
+                    "gemini-4-neon-high": { "model": "MODEL_PLACEHOLDER_M401", "displayName": "Gemini 4 Neon (High)" }
+                },
+                "agentModelSorts": [{
+                    "displayName": "Recommended",
+                    "groups": [{ "displayName": "Models", "modelIds": ["gemini-4-neon-low", "gemini-4-neon-high"] }]
+                }]
+            }),
+            json!({
+                "models": {
+                    "gemini-4-neon-low": { "model": "MODEL_PLACEHOLDER_M400", "displayName": "Gemini 4 Neon (Low)" },
+                    "gemini-4-neon-high": { "model": "MODEL_PLACEHOLDER_M401", "displayName": "Gemini 4 Neon (High)" }
+                },
+                "agentModelSorts": [{
+                    "displayName": "Recommended",
+                    "groups": [{ "displayName": "Models", "modelIds": ["gemini-4-neon-low", "gemini-4-neon-high"] }]
+                }],
+                "groupedModels": {}
+            }),
+        ] {
+            let merged_bytes = merge_available_models(
+                &serde_json::to_vec(&upstream).unwrap(),
+                &["gemini-4-hydrogen".to_string()],
+                "gemini-4-hydrogen",
+            )
+            .expect("merge succeeds");
+            let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+
+            // Must NOT synthesize a non-empty groupedModels map when upstream had none,
+            // otherwise Antigravity disables its label parser and flattens all original models.
+            let grouped_is_empty_or_absent = merged
+                .get("groupedModels")
+                .and_then(Value::as_object)
+                .is_none_or(Map::is_empty);
+            assert!(
+                grouped_is_empty_or_absent,
+                "expected absent/empty groupedModels, got: {:?}",
+                merged.get("groupedModels")
+            );
+
+            // Proxy variants are still present in models & groups[0] with label-parser-compatible names.
+            assert_eq!(
+                merged["models"]["companion/gemini-4-hydrogen-xhigh"]["displayName"],
+                "Gemini 4 Hydrogen (Proxy) (XHigh)"
+            );
+            let group0 = merged["agentModelSorts"][0]["groups"][0]["modelIds"]
+                .as_array()
+                .unwrap();
+            assert_eq!(group0[0], "gemini-4-neon-low");
+            assert!(
+                group0
+                    .iter()
+                    .any(|v| v == "companion/gemini-4-hydrogen-xhigh")
+            );
+        }
     }
 }
