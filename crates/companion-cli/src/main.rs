@@ -5,8 +5,9 @@ use std::process::ExitCode;
 use clap::Parser;
 use companion_cli::cli::{Cli, Commands};
 use companion_cli::doctor::execute_doctor;
+use companion_cli::launch::run_launch;
 use companion_cli::models::run_models;
-use companion_cli::{run_serve, run_ui_mcp};
+use companion_cli::{run_serve_with_options, run_ui_mcp};
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -35,9 +36,13 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { port, config } => {
+        Commands::Serve {
+            port,
+            config,
+            adopt_running,
+        } => {
             init_stderr_tracing("info");
-            if let Err(err) = run_serve(port, config).await {
+            if let Err(err) = run_serve_with_options(port, config, adopt_running).await {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
@@ -67,6 +72,20 @@ async fn main() -> ExitCode {
             init_stderr_tracing("warn");
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_models(json, port, config, &mut stdout) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Launch {
+            port,
+            config,
+            app,
+            print_env,
+        } => {
+            init_stderr_tracing("warn");
+            let mut stdout = std::io::stdout().lock();
+            if let Err(err) = run_launch(port, config, app, print_env, &mut stdout).await {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }

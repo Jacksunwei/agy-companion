@@ -2,7 +2,8 @@
   "command": "bash",
   "args": [
     "../../scripts/run-companion.sh",
-    "serve"
+    "serve",
+    "--adopt-running"
   ],
   "restart_policy": "on-failure",
   "display_name": "Antigravity Companion Proxy",

@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod doctor;
+pub mod launch;
 pub mod models;
 
 use std::fs;
@@ -132,6 +133,14 @@ pub async fn run_serve(
     port_override: Option<u16>,
     config_override: Option<PathBuf>,
 ) -> Result<(), CliError> {
+    run_serve_with_options(port_override, config_override, false).await
+}
+
+pub async fn run_serve_with_options(
+    port_override: Option<u16>,
+    config_override: Option<PathBuf>,
+    adopt_running: bool,
+) -> Result<(), CliError> {
     if port_override == Some(0) {
         return Err(CliError::InvalidPort(0));
     }
@@ -154,7 +163,77 @@ pub async fn run_serve(
     #[cfg(unix)]
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
 
-    let listener = companion_proxy::bind_loopback_listener(&config).await?;
+    let mut shutdown_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(async move {
+            let ctrl_c = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+
+            #[cfg(unix)]
+            let terminate = async {
+                if let Some(ref mut stream) = sigterm {
+                    let _ = stream.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+
+            #[cfg(not(unix))]
+            let terminate = std::future::pending::<()>();
+
+            #[cfg(unix)]
+            let hangup = async {
+                if let Some(ref mut stream) = sighup {
+                    let _ = stream.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+
+            #[cfg(not(unix))]
+            let hangup = std::future::pending::<()>();
+
+            tokio::select! {
+                _ = ctrl_c => {
+                    tracing::info!("received Ctrl-C, shutting down proxy");
+                }
+                _ = terminate => {
+                    tracing::info!("received SIGTERM, shutting down proxy");
+                }
+                _ = hangup => {
+                    tracing::info!("received SIGHUP, shutting down proxy");
+                }
+            }
+        });
+
+    let listener = loop {
+        match companion_proxy::bind_loopback_listener(&config).await {
+            Ok(listener) => break listener,
+            Err(ProxyError::Bind { addr, source })
+                if adopt_running && source.kind() == ErrorKind::AddrInUse =>
+            {
+                if let Some(health) =
+                    launch::probe_running_companion_proxy(config.listen_port).await
+                {
+                    tracing::info!(
+                        addr = %addr,
+                        running_version = %health.version,
+                        "detected running agy-companion proxy; monitoring until shutdown or takeover"
+                    );
+                    tokio::select! {
+                        _ = &mut shutdown_fut => {
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
+                    continue;
+                }
+                return Err(CliError::Proxy(ProxyError::Bind { addr, source }));
+            }
+            Err(err) => return Err(CliError::Proxy(err)),
+        }
+    };
+
     let bound_addr = listener.local_addr().map_err(ProxyError::Serve)?;
     let state = ProxyState::from_config(config, Some(config_path), usage_sink)?;
 
@@ -164,49 +243,7 @@ pub async fn run_serve(
         "agy-companion proxy listening"
     );
 
-    let shutdown = async move {
-        let ctrl_c = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
-
-        #[cfg(unix)]
-        let terminate = async {
-            if let Some(ref mut stream) = sigterm {
-                let _ = stream.recv().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        #[cfg(unix)]
-        let hangup = async {
-            if let Some(ref mut stream) = sighup {
-                let _ = stream.recv().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-
-        #[cfg(not(unix))]
-        let hangup = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => {
-                tracing::info!("received Ctrl-C, shutting down proxy");
-            }
-            _ = terminate => {
-                tracing::info!("received SIGTERM, shutting down proxy");
-            }
-            _ = hangup => {
-                tracing::info!("received SIGHUP, shutting down proxy");
-            }
-        }
-    };
-
-    companion_proxy::serve_on_listener(listener, state, shutdown).await?;
+    companion_proxy::serve_on_listener(listener, state, shutdown_fut).await?;
     Ok(())
 }
 

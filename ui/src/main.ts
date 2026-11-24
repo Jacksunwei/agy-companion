@@ -13,6 +13,7 @@ interface RedactedConfig {
   gemini_base_url: string;
   gemini_default_model: string;
   gemini_timeout_secs: number;
+  cloudcode_upstream_url: string;
   api_key_configured: boolean;
   api_key_hint: string | null;
 }
@@ -47,6 +48,7 @@ interface SaveSettingsArgs {
   clear_api_key?: boolean;
   default_model?: string;
   base_url?: string;
+  cloudcode_upstream_url?: string;
   listen_port?: number;
   listen_host?: string;
 }
@@ -71,9 +73,21 @@ const DEFAULT_CONFIG: RedactedConfig = {
   gemini_base_url: "https://generativelanguage.googleapis.com",
   gemini_default_model: "gemini-4-hydrogen",
   gemini_timeout_secs: 900,
+  cloudcode_upstream_url: "https://daily-cloudcode-pa.googleapis.com",
   api_key_configured: false,
   api_key_hint: null,
 };
+
+const QUICK_CLOUDCODE_UPSTREAMS = [
+  {
+    label: "Personal Google AI Pro",
+    url: "https://daily-cloudcode-pa.googleapis.com",
+  },
+  {
+    label: "Workspace / PayGo",
+    url: "https://cloudcode-pa.googleapis.com",
+  },
+] as const;
 
 const QUICK_MODELS = [
   "gemini-4-hydrogen",
@@ -151,6 +165,8 @@ function parseRedactedConfig(raw: unknown): RedactedConfig | null {
   const baseUrl = asString(raw.gemini_base_url);
   const defaultModel = asString(raw.gemini_default_model);
   const timeoutSecs = asNumber(raw.gemini_timeout_secs);
+  const cloudcodeUpstreamUrl =
+    asString(raw.cloudcode_upstream_url) ?? DEFAULT_CONFIG.cloudcode_upstream_url;
   const apiKeyConfigured = asBoolean(raw.api_key_configured);
   const apiKeyHint = asNullableString(raw.api_key_hint);
 
@@ -174,6 +190,7 @@ function parseRedactedConfig(raw: unknown): RedactedConfig | null {
     gemini_base_url: baseUrl,
     gemini_default_model: defaultModel,
     gemini_timeout_secs: timeoutSecs,
+    cloudcode_upstream_url: cloudcodeUpstreamUrl,
     api_key_configured: apiKeyConfigured,
     api_key_hint: apiKeyHint,
   };
@@ -307,18 +324,19 @@ function formatRatioPercent(ratio: number): string {
   return `${(clamped * 100).toFixed(1)}%`;
 }
 
-function buildGatewaySnippet(port: number): string {
+function buildHybridLaunchSnippet(port: number): string {
   const safePort = Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
-  return JSON.stringify(
-    {
-      gateway: {
-        url: `http://127.0.0.1:${safePort}`,
-        wireProtocol: "genai",
-      },
-    },
-    null,
-    2,
-  );
+  return [
+    "# Keep all original Google AI Pro models (with thinking levels)",
+    "# AND add [Proxy] Gemini 4 / 3 models side-by-side:",
+    `agy-companion launch --port ${safePort}`,
+    "",
+    "# Or launch Antigravity.app directly with env vars:",
+    `CLOUD_CODE_URL="http://127.0.0.1:${safePort}" \\`,
+    `GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${safePort}" \\`,
+    'GEMINI_API_KEY="agy-companion-local" \\',
+    "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+  ].join("\n");
 }
 
 function buildCustomModelsSnippet(port: number, model: string): string {
@@ -519,15 +537,17 @@ interface UiRefs {
   modelInput: HTMLInputElement;
   chipButtons: HTMLButtonElement[];
   baseUrlInput: HTMLInputElement;
+  cloudcodeUpstreamInput: HTMLInputElement;
+  cloudcodeChipButtons: HTMLButtonElement[];
   listenPortInput: HTMLInputElement;
   portRestartNote: HTMLParagraphElement;
   saveBtn: HTMLButtonElement;
   testBtn: HTMLButtonElement;
   formFeedback: HTMLDivElement;
 
-  gatewaySnippetCode: HTMLElement;
-  gatewayCopyBtn: HTMLButtonElement;
-  gatewayCopyStatus: HTMLSpanElement;
+  hybridSnippetCode: HTMLElement;
+  hybridCopyBtn: HTMLButtonElement;
+  hybridCopyStatus: HTMLSpanElement;
 
   snippetCode: HTMLElement;
   copyBtn: HTMLButtonElement;
@@ -734,6 +754,39 @@ function mountUi(root: HTMLElement): UiRefs {
     }),
   );
 
+  const cloudcodeUpstreamInput = el("input", {
+    id: "cloudcode-upstream-input",
+    className: "input",
+    attrs: {
+      type: "url",
+      value: DEFAULT_CONFIG.cloudcode_upstream_url,
+      placeholder: DEFAULT_CONFIG.cloudcode_upstream_url,
+      spellcheck: "false",
+    },
+  });
+  const cloudcodeChipButtons = QUICK_CLOUDCODE_UPSTREAMS.map((preset) =>
+    el("button", {
+      className: "chip",
+      text: preset.label,
+      attrs: { type: "button", "data-cloudcode-url": preset.url },
+    }),
+  );
+  const cloudcodeField = el(
+    "div",
+    { className: "field" },
+    el("label", {
+      className: "field-label",
+      text: "CloudCode Upstream URL (Hybrid Mode)",
+      attrs: { for: "cloudcode-upstream-input" },
+    }),
+    cloudcodeUpstreamInput,
+    el("div", { className: "chip-row" }, ...cloudcodeChipButtons),
+    el("p", {
+      className: "field-help",
+      text: "Passes through original Antigravity OAuth calls while merging [Proxy] models with thinking levels. Use daily-cloudcode-pa for Personal Google AI Pro.",
+    }),
+  );
+
   const saveBtn = el("button", {
     className: "btn btn-primary",
     text: "Save Settings",
@@ -755,6 +808,7 @@ function mountUi(root: HTMLElement): UiRefs {
     apiKeyField,
     el("div", { className: "field-grid field-grid-two" }, modelField, portField),
     baseUrlField,
+    cloudcodeField,
     el("div", { className: "action-row" }, saveBtn, testBtn),
     formFeedback,
   );
@@ -770,42 +824,42 @@ function mountUi(root: HTMLElement): UiRefs {
     form,
   );
 
-  // Section 3: Copyable Antigravity App Gateway Snippet
-  const gatewaySnippetCode = el("code", {
-    id: "gateway-snippet",
-    text: buildGatewaySnippet(DEFAULT_CONFIG.listen_port),
+  // Section 3: Copyable Antigravity App Hybrid Mode Launch Snippet
+  const hybridSnippetCode = el("code", {
+    id: "hybrid-snippet",
+    text: buildHybridLaunchSnippet(DEFAULT_CONFIG.listen_port),
   });
-  const gatewayCopyBtn = el("button", {
+  const hybridCopyBtn = el("button", {
     className: "btn btn-sm",
-    text: "Copy JSON",
+    text: "Copy Command",
     attrs: { type: "button" },
   });
-  const gatewayCopyStatus = el("span", {
+  const hybridCopyStatus = el("span", {
     className: "copy-status",
     attrs: { role: "status", "aria-live": "polite" },
   });
 
-  const gatewayCard = el(
+  const hybridCard = el(
     "section",
-    { className: "card", attrs: { "aria-label": "Antigravity App gateway snippet" } },
+    { className: "card", attrs: { "aria-label": "Antigravity App hybrid launch snippet" } },
     el(
       "div",
       { className: "card-header" },
       el(
         "div",
         {},
-        el("h2", { className: "section-title", text: "Antigravity App (Gateway Mode)" }),
+        el("h2", { className: "section-title", text: "Antigravity App (Hybrid Mode)" }),
         el("p", {
           className: "section-subtitle",
-          text: "Add to ~/.gemini/config/config.json and restart Antigravity App to discover models from /v1beta/models",
+          text: "Keeps all original Google AI Pro models + thinking levels and adds [Proxy] models side-by-side",
         }),
       ),
-      el("div", { className: "action-row" }, gatewayCopyStatus, gatewayCopyBtn),
+      el("div", { className: "action-row" }, hybridCopyStatus, hybridCopyBtn),
     ),
-    el("pre", { className: "code-block" }, gatewaySnippetCode),
+    el("pre", { className: "code-block" }, hybridSnippetCode),
     el("p", {
       className: "footer-note",
-      text: "Gateway Mode routes all Antigravity App model calls through this proxy (replacing Google OAuth / AI Pro models). Remove the gateway key and restart to switch back.",
+      text: "Original Google AI Pro models stay untouched. Selecting a [Proxy] model routes through this local proxy with your Gemini API key, implicit caching, and thinking levels.",
     }),
   );
 
@@ -863,7 +917,7 @@ function mountUi(root: HTMLElement): UiRefs {
     }),
   );
 
-  root.replaceChildren(globalBanner, statusCard, settingsCard, gatewayCard, snippetCard, statsCard);
+  root.replaceChildren(globalBanner, statusCard, settingsCard, hybridCard, snippetCard, statsCard);
 
   return {
     globalBanner,
@@ -887,14 +941,16 @@ function mountUi(root: HTMLElement): UiRefs {
     modelInput,
     chipButtons,
     baseUrlInput,
+    cloudcodeUpstreamInput,
+    cloudcodeChipButtons,
     listenPortInput,
     portRestartNote,
     saveBtn,
     testBtn,
     formFeedback,
-    gatewaySnippetCode,
-    gatewayCopyBtn,
-    gatewayCopyStatus,
+    hybridSnippetCode,
+    hybridCopyBtn,
+    hybridCopyStatus,
     snippetCode,
     copyBtn,
     copyStatus,
@@ -934,7 +990,7 @@ function updateSnippet(refs: UiRefs): void {
       ? parsedPort
       : state.savedPort;
   const model = refs.modelInput.value.trim() || DEFAULT_CONFIG.gemini_default_model;
-  refs.gatewaySnippetCode.textContent = buildGatewaySnippet(port);
+  refs.hybridSnippetCode.textContent = buildHybridLaunchSnippet(port);
   refs.snippetCode.textContent = buildCustomModelsSnippet(port, model);
 
   const editedPortDiffers =
@@ -1075,6 +1131,7 @@ function renderSnapshot(refs: UiRefs, snapshot: SettingsSnapshot, syncFormInputs
   if (syncFormInputs) {
     refs.modelInput.value = snapshot.config.gemini_default_model;
     refs.baseUrlInput.value = snapshot.config.gemini_base_url;
+    refs.cloudcodeUpstreamInput.value = snapshot.config.cloudcode_upstream_url;
     refs.listenPortInput.value = String(snapshot.config.listen_port);
   }
 
@@ -1277,6 +1334,15 @@ async function main(): Promise<void> {
     });
   }
 
+  for (const chip of refs.cloudcodeChipButtons) {
+    chip.addEventListener("click", () => {
+      const chosen = chip.getAttribute("data-cloudcode-url");
+      if (chosen) {
+        refs.cloudcodeUpstreamInput.value = chosen;
+      }
+    });
+  }
+
   refs.clearKeyBtn.addEventListener("click", () => {
     state.clearConfirmOpen = !state.clearConfirmOpen;
     refs.clearConfirmRow.classList.toggle("hidden", !state.clearConfirmOpen);
@@ -1345,9 +1411,16 @@ async function main(): Promise<void> {
       return;
     }
 
+    const cloudcodeUpstreamUrl = refs.cloudcodeUpstreamInput.value.trim();
+    if (!cloudcodeUpstreamUrl) {
+      showFormFeedback(refs, "danger", "CloudCode upstream URL cannot be empty.");
+      return;
+    }
+
     const args: SaveSettingsArgs = {
       default_model: defaultModel,
       base_url: baseUrl,
+      cloudcode_upstream_url: cloudcodeUpstreamUrl,
       listen_port: port,
     };
 
@@ -1414,11 +1487,11 @@ async function main(): Promise<void> {
     }
   });
 
-  refs.gatewayCopyBtn.addEventListener("click", () => {
+  refs.hybridCopyBtn.addEventListener("click", () => {
     void copySnippetWithFallback(
-      refs.gatewaySnippetCode,
-      refs.gatewayCopyStatus,
-      refs.gatewaySnippetCode.textContent ?? "",
+      refs.hybridSnippetCode,
+      refs.hybridCopyStatus,
+      refs.hybridSnippetCode.textContent ?? "",
     );
   });
 

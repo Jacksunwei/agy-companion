@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::rejection::BytesRejection;
@@ -21,12 +21,16 @@ use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use tower_http::set_header::SetResponseHeaderLayer;
 
+use crate::cloudcode::{
+    CloudCodeError, is_cloudcode_path, merge_available_models, validate_cloudcode_path,
+};
 use crate::sse::SseUsageTracker;
 use crate::stats::ProxyStats;
-use crate::{PROTOCOL_VERSION, ProxyState};
+use crate::{ActiveProvider, PROTOCOL_VERSION, ProxyState};
 
 pub const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_JSON_TEE_BYTES: usize = 8 * 1024 * 1024;
+const CLOUDCODE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 const GEMINI_MODELS_PREFIX: &str = "/v1beta/models/";
 static X_GOOG_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-goog-api-key");
@@ -69,51 +73,53 @@ pub fn build_router(state: ProxyState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_PROXY_BODY_BYTES))
                 .layer(middleware::from_fn(enforce_content_length_limit)),
         )
+        .route(
+            "/v1internal:fetchAvailableModels",
+            on(MethodFilter::POST, fetch_available_models_handler)
+                .layer(DefaultBodyLimit::max(MAX_PROXY_BODY_BYTES))
+                .layer(middleware::from_fn(enforce_content_length_limit)),
+        )
         .method_not_allowed_fallback(method_not_allowed_handler)
         .route_layer(middleware::from_fn(enforce_get_post_only))
-        .fallback(not_found_handler)
+        .fallback(cloudcode_or_not_found_handler)
         .with_state(state)
 }
 
-async fn enforce_content_length_limit(req: Request, next: Next) -> Response {
-    if *req.method() != Method::POST {
-        return next.run(req).await;
-    }
-
+fn validate_content_length_headers(headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
     let mut expected_len: Option<u64> = None;
     let mut saw_overflow = false;
-    for value in req.headers().get_all(header::CONTENT_LENGTH) {
+    for value in headers.get_all(header::CONTENT_LENGTH) {
         let raw_bytes = value.as_bytes();
         if raw_bytes.is_empty() || !raw_bytes.iter().all(u8::is_ascii_digit) {
-            return json_error_response(StatusCode::BAD_REQUEST, "invalid Content-Length header");
+            return Err((StatusCode::BAD_REQUEST, "invalid Content-Length header"));
         }
         let Ok(raw_str) = std::str::from_utf8(raw_bytes) else {
-            return json_error_response(StatusCode::BAD_REQUEST, "invalid Content-Length header");
+            return Err((StatusCode::BAD_REQUEST, "invalid Content-Length header"));
         };
         match raw_str.parse::<u64>() {
             Ok(parsed) => {
                 if saw_overflow {
-                    return json_error_response(
+                    return Err((
                         StatusCode::BAD_REQUEST,
                         "conflicting Content-Length headers",
-                    );
+                    ));
                 }
                 if let Some(prev) = expected_len
                     && prev != parsed
                 {
-                    return json_error_response(
+                    return Err((
                         StatusCode::BAD_REQUEST,
                         "conflicting Content-Length headers",
-                    );
+                    ));
                 }
                 expected_len = Some(parsed);
             }
             Err(_) => {
                 if expected_len.is_some() {
-                    return json_error_response(
+                    return Err((
                         StatusCode::BAD_REQUEST,
                         "conflicting Content-Length headers",
-                    );
+                    ));
                 }
                 saw_overflow = true;
             }
@@ -121,12 +127,22 @@ async fn enforce_content_length_limit(req: Request, next: Next) -> Response {
     }
 
     if saw_overflow || expected_len.is_some_and(|len| len > MAX_PROXY_BODY_BYTES as u64) {
-        return json_error_response(
+        return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             "request body exceeds maximum allowed size",
-        );
+        ));
     }
 
+    Ok(())
+}
+
+async fn enforce_content_length_limit(req: Request, next: Next) -> Response {
+    if *req.method() != Method::POST {
+        return next.run(req).await;
+    }
+    if let Err((status, message)) = validate_content_length_headers(req.headers()) {
+        return json_error_response(status, message);
+    }
     next.run(req).await
 }
 
@@ -143,6 +159,210 @@ async fn method_not_allowed_handler() -> Response {
 
 async fn not_found_handler() -> Response {
     json_error_response(StatusCode::NOT_FOUND, "not found")
+}
+
+async fn resolve_proxy_model_ids(active: &ActiveProvider) -> Vec<String> {
+    let curated = curated_gemini_models(Some(&active.default_model));
+    let mut ids: Vec<String> = curated.models.into_iter().map(|m| m.name).collect();
+
+    if active.has_configured_api_key
+        && let Ok(Ok(list)) = tokio::time::timeout(
+            CLOUDCODE_MODEL_DISCOVERY_TIMEOUT,
+            active.provider.list_models(None),
+        )
+        .await
+    {
+        let ordered = filter_and_order_models(list.models, Some(&active.default_model));
+        if !ordered.models.is_empty() {
+            // Keep default_model and curated Gemini 4/3.8 models prioritized ahead of
+            // additional discovered models so the 32-slot placeholder pool always carries
+            // the primary models first.
+            for model in ordered.models {
+                if !ids.contains(&model.name) {
+                    ids.push(model.name);
+                }
+            }
+        }
+    }
+
+    ids
+}
+
+async fn fetch_available_models_handler(
+    State(state): State<ProxyState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match body {
+        Ok(bytes) => bytes,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return json_error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds maximum allowed size",
+            );
+        }
+        Err(_) => {
+            return json_error_response(StatusCode::BAD_REQUEST, "failed to read request body");
+        }
+    };
+
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    if validate_cloudcode_path(path_and_query).is_err() {
+        return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
+    }
+
+    let active = state.active_provider();
+    let upstream = match active
+        .cloudcode
+        .forward_fetch_available_models(path_and_query, &headers, body)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(CloudCodeError::InvalidPath(_)) => {
+            return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
+        }
+        Err(CloudCodeError::InvalidConfig(_)) => {
+            return json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "provider configuration error",
+            );
+        }
+        Err(CloudCodeError::ResponseTooLarge | CloudCodeError::Upstream(_)) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream cloudcode request failed",
+            );
+        }
+    };
+
+    if upstream.status != StatusCode::OK {
+        let mut builder = Response::builder().status(upstream.status);
+        for (name, value) in &upstream.headers {
+            builder = builder.header(name, value);
+        }
+        return builder.body(Body::from(upstream.body)).unwrap_or_else(|_| {
+            json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build proxy response",
+            )
+        });
+    }
+
+    let proxy_model_ids = resolve_proxy_model_ids(&active).await;
+    let final_body = match merge_available_models(
+        &upstream.body,
+        &proxy_model_ids,
+        &active.default_model,
+    ) {
+        Ok(merged) => Bytes::from(merged),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to merge proxy models into fetchAvailableModels; returning upstream response untouched"
+            );
+            upstream.body
+        }
+    };
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "no-store");
+    for (name, value) in &upstream.headers {
+        if *name != header::CONTENT_TYPE && *name != header::CONTENT_ENCODING {
+            builder = builder.header(name, value);
+        }
+    }
+    builder.body(Body::from(final_body)).unwrap_or_else(|_| {
+        json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build proxy response",
+        )
+    })
+}
+
+async fn cloudcode_or_not_found_handler(State(state): State<ProxyState>, req: Request) -> Response {
+    let uri = req.uri().clone();
+    if !is_cloudcode_path(uri.path()) {
+        return not_found_handler().await;
+    }
+
+    let method = req.method().clone();
+    if method != Method::GET && method != Method::POST {
+        return json_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path())
+        .to_string();
+    if validate_cloudcode_path(&path_and_query).is_err() {
+        return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
+    }
+
+    let headers = req.headers().clone();
+    if method == Method::POST
+        && let Err((status, message)) = validate_content_length_headers(&headers)
+    {
+        return json_error_response(status, message);
+    }
+
+    let body_bytes = if method == Method::POST {
+        match axum::body::to_bytes(req.into_body(), MAX_PROXY_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return json_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds maximum allowed size",
+                );
+            }
+        }
+    } else {
+        Bytes::new()
+    };
+
+    let active = state.active_provider();
+    let upstream = match active
+        .cloudcode
+        .forward_raw(method, &path_and_query, &headers, body_bytes)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(CloudCodeError::InvalidPath(_)) => {
+            return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
+        }
+        Err(CloudCodeError::InvalidConfig(_)) => {
+            return json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "provider configuration error",
+            );
+        }
+        Err(CloudCodeError::ResponseTooLarge | CloudCodeError::Upstream(_)) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream cloudcode request failed",
+            );
+        }
+    };
+
+    let mut builder = Response::builder().status(upstream.status);
+    for (name, value) in &upstream.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from_stream(upstream.stream))
+        .unwrap_or_else(|_| {
+            json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build proxy response",
+            )
+        })
 }
 
 async fn health_handler() -> Json<HealthResponse> {
@@ -2046,5 +2266,222 @@ mod tests {
         );
 
         upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn cloudcode_fetch_available_models_merges_and_v1internal_streams_passthrough() {
+        let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_auth_clone = Arc::clone(&seen_auth);
+
+        let mock_ccpa = Router::new()
+            .route(
+                "/v1internal:fetchAvailableModels",
+                axum::routing::post({
+                    let seen_auth = Arc::clone(&seen_auth_clone);
+                    move |headers: HeaderMap, body: Bytes| {
+                        let seen_auth = Arc::clone(&seen_auth);
+                        async move {
+                            if let Some(auth) =
+                                headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+                            {
+                                seen_auth.lock().unwrap().push(auth.to_string());
+                            }
+                            assert_eq!(
+                                headers
+                                    .get(header::ACCEPT_ENCODING)
+                                    .and_then(|v| v.to_str().ok()),
+                                Some("identity")
+                            );
+                            let _ = body;
+                            (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                serde_json::json!({
+                                    "models": {
+                                        "gemini-4-carbon-high": {
+                                            "model": "MODEL_PLACEHOLDER_M427",
+                                            "displayName": "Gemini 4 Carbon (High)",
+                                            "thinkingLevel": 3
+                                        }
+                                    },
+                                    "defaultAgentModelId": "gemini-4-carbon-high",
+                                    "agentModelSorts": [{
+                                        "displayName": "Recommended",
+                                        "groups": [{
+                                            "displayName": "Google AI Pro",
+                                            "modelIds": ["gemini-4-carbon-high"]
+                                        }]
+                                    }],
+                                    "groupedModels": {
+                                        "gemini-4-carbon": {
+                                            "displayName": "Gemini 4 Carbon",
+                                            "supportedThinkingLevels": [
+                                                { "thinkingSuffix": "high", "thinkingDisplayName": "High" }
+                                            ]
+                                        }
+                                    }
+                                })
+                                .to_string(),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:streamGenerateContent",
+                axum::routing::post({
+                    let seen_auth = Arc::clone(&seen_auth_clone);
+                    move |headers: HeaderMap, OriginalUri(uri): OriginalUri, body: Bytes| {
+                        let seen_auth = Arc::clone(&seen_auth);
+                        async move {
+                            if let Some(auth) =
+                                headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+                            {
+                                seen_auth.lock().unwrap().push(auth.to_string());
+                            }
+                            assert_eq!(uri.query(), Some("alt=sse"));
+                            assert_eq!(body.as_ref(), br#"{"model":"gemini-4-carbon-high"}"#);
+                            (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                "data: {\"response\":{\"text\":\"ok\"}}\n\n",
+                            )
+                        }
+                    }
+                }),
+            );
+
+        let ccpa_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ccpa_addr = ccpa_listener.local_addr().unwrap();
+        let ccpa_server = tokio::spawn(async move {
+            let _ = axum::serve(ccpa_listener, mock_ccpa).await;
+        });
+
+        let mut cfg = companion_core::Config {
+            cloudcode_upstream_url: format!("http://{ccpa_addr}"),
+            ..Default::default()
+        };
+        cfg.gemini.default_model = "gemini-4-hydrogen".to_string();
+        let state =
+            ProxyState::from_config_with_env_fallback(cfg, None, Arc::new(NoopUsageSink), false)
+                .unwrap();
+        let app = build_router(state);
+
+        // 1. POST /v1internal:fetchAvailableModels preserves originals & injects proxy models.
+        let fetch_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1internal:fetchAvailableModels")
+                    .header(header::AUTHORIZATION, "Bearer google-ai-pro-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"project":"personal"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetch_resp.status(), StatusCode::OK);
+        assert_security_headers(fetch_resp.headers());
+        let fetch_body = axum::body::to_bytes(fetch_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fetch_body).unwrap();
+        assert_eq!(
+            parsed["models"]["gemini-4-carbon-high"]["displayName"],
+            "Gemini 4 Carbon (High)"
+        );
+        assert_eq!(
+            parsed["models"]["companion/gemini-4-hydrogen-xhigh"]["modelUrl"],
+            "gemini-api://gemini-4-hydrogen"
+        );
+        assert_eq!(
+            parsed["models"]["companion/gemini-4-hydrogen-xhigh"]["thinkingLevel"],
+            7
+        );
+        assert_eq!(
+            parsed["groupedModels"]["gemini-4-carbon"]["displayName"],
+            "Gemini 4 Carbon"
+        );
+        assert_eq!(
+            parsed["groupedModels"]["companion/gemini-4-hydrogen"]["displayName"],
+            "Gemini 4 Hydrogen [Proxy]"
+        );
+
+        // 2. POST /v1internal:streamGenerateContent?alt=sse passes through byte-for-byte.
+        let stream_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1internal:streamGenerateContent?alt=sse")
+                    .header(header::AUTHORIZATION, "Bearer google-ai-pro-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"gemini-4-carbon-high"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream_resp.status(), StatusCode::OK);
+        let stream_body = axum::body::to_bytes(stream_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream_body.as_ref(),
+            b"data: {\"response\":{\"text\":\"ok\"}}\n\n"
+        );
+
+        // 3. S3/S7 rejections on /v1internal paths.
+        let put_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1internal:loadCodeAssist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let traversal_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1internal/foo/../secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(traversal_resp.status(), StatusCode::BAD_REQUEST);
+
+        let big_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1internal:loadCodeAssist")
+                    .header(
+                        header::CONTENT_LENGTH,
+                        (MAX_PROXY_BODY_BYTES + 1).to_string(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(big_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        assert_eq!(
+            *seen_auth.lock().unwrap(),
+            vec![
+                "Bearer google-ai-pro-token".to_string(),
+                "Bearer google-ai-pro-token".to_string(),
+            ]
+        );
+
+        ccpa_server.abort();
     }
 }

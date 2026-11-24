@@ -2005,3 +2005,190 @@ class TestTier1F16XdgPaths(E2ETestCase):
         post_resp = http_raw_request("127.0.0.1", proxy.port, "POST", "/v1beta/models", body=b"{}")
         self.assertEqual(post_resp.status, 405, post_resp.text)
         proxy.stop()
+
+    def test_t1_cloudcode_hybrid_fetch_available_models_and_v1internal_passthrough(self) -> None:
+        """CloudCode /v1internal:fetchAvailableModels merges proxy models with thinking levels and streams other /v1internal:* RPCs."""
+        env = self.make_env()
+        mock_ccpa = self.start_mock_gemini()
+        mock_ccpa.enqueue(
+            JsonAction(
+                status=200,
+                payload={
+                    "models": {
+                        "gemini-4-carbon-high": {
+                            "model": "MODEL_PLACEHOLDER_M427",
+                            "displayName": "Gemini 4 Carbon (High)",
+                            "thinkingLevel": 3,
+                        },
+                        "existing-m334": {
+                            "model": "MODEL_PLACEHOLDER_M334",
+                            "displayName": "Existing Custom",
+                        },
+                    },
+                    "defaultAgentModelId": "gemini-4-carbon-high",
+                    "agentModelSorts": [
+                        {
+                            "displayName": "Recommended",
+                            "groups": [
+                                {
+                                    "displayName": "Google AI Pro",
+                                    "modelIds": ["gemini-4-carbon-high"],
+                                }
+                            ],
+                        }
+                    ],
+                    "groupedModels": {
+                        "gemini-4-carbon": {
+                            "displayName": "Gemini 4 Carbon",
+                            "supportedThinkingLevels": [
+                                {"thinkingSuffix": "high", "thinkingDisplayName": "High"}
+                            ],
+                        }
+                    },
+                },
+            )
+        )
+        mock_ccpa.enqueue(
+            SseStreamAction(
+                chunks=[b'data: {"response":{"text":"hello-ccpa"}}\n\n'],
+                status=200,
+            )
+        )
+
+        cfg_dict = env.make_config_dict(default_model="gemini-4-hydrogen")
+        cfg_dict["cloudcode_upstream_url"] = mock_ccpa.base_url
+        cfg = env.write_config(cfg_dict)
+        proxy = self.start_proxy(env, config_path=cfg)
+
+        # 1. fetchAvailableModels preserves original models + groupedModels and injects [Proxy] models.
+        fetch_resp = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1internal:fetchAvailableModels",
+            headers={
+                "Authorization": "Bearer google-ai-pro-test-token",
+                "Content-Type": "application/json",
+            },
+            body=b'{"project":"personal"}',
+        )
+        self.assertEqual(fetch_resp.status, 200, fetch_resp.text)
+        self.assertEqual(fetch_resp.header("x-content-type-options"), "nosniff")
+        self.assertIn("no-store", fetch_resp.header("cache-control"))
+        merged = json.loads(fetch_resp.text)
+
+        self.assertEqual(merged["defaultAgentModelId"], "gemini-4-carbon-high")
+        self.assertEqual(
+            merged["models"]["gemini-4-carbon-high"]["displayName"], "Gemini 4 Carbon (High)"
+        )
+        self.assertEqual(
+            merged["groupedModels"]["gemini-4-carbon"]["displayName"], "Gemini 4 Carbon"
+        )
+        # Injected proxy model avoids M334 collision and carries gemini-api:// URL + thinking levels.
+        h_low = merged["models"]["companion/gemini-4-hydrogen-low"]
+        h_xhigh = merged["models"]["companion/gemini-4-hydrogen-xhigh"]
+        self.assertEqual(h_low["model"], "MODEL_PLACEHOLDER_M335")
+        self.assertEqual(h_low["modelUrl"], "gemini-api://gemini-4-hydrogen")
+        self.assertEqual(h_xhigh["thinkingLevel"], 7)
+        self.assertEqual(
+            merged["groupedModels"]["companion/gemini-4-hydrogen"]["displayName"],
+            "Gemini 4 Hydrogen [Proxy]",
+        )
+        suffixes = [
+            lvl["thinkingSuffix"]
+            for lvl in merged["groupedModels"]["companion/gemini-4-hydrogen"][
+                "supportedThinkingLevels"
+            ]
+        ]
+        self.assertEqual(suffixes, ["low", "medium", "high", "xhigh"])
+        self.assertEqual(
+            merged["agentModelSorts"][0]["groups"][1]["displayName"],
+            "Antigravity Companion (Proxy)",
+        )
+
+        # 2. Other /v1internal:* RPCs (including alt=sse streaming) pass through transparently.
+        stream_resp = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1internal:streamGenerateContent?alt=sse",
+            headers={
+                "Authorization": "Bearer google-ai-pro-test-token",
+                "Content-Type": "application/json",
+            },
+            body=b'{"model":"gemini-4-carbon-high"}',
+        )
+        self.assertEqual(stream_resp.status, 200, stream_resp.text)
+        self.assertEqual(stream_resp.body, b'data: {"response":{"text":"hello-ccpa"}}\n\n')
+        self.assertEqual(len(mock_ccpa.requests), 2)
+        self.assertEqual(
+            mock_ccpa.requests[0].headers.get("authorization"),
+            "Bearer google-ai-pro-test-token",
+        )
+        self.assertEqual(
+            mock_ccpa.requests[1].headers.get("authorization"),
+            "Bearer google-ai-pro-test-token",
+        )
+
+        # 3. S3/S7 rejections on /v1internal routes.
+        self.assertEqual(
+            http_raw_request("127.0.0.1", proxy.port, "PUT", "/v1internal:loadCodeAssist").status,
+            405,
+        )
+        self.assertEqual(
+            http_raw_request(
+                "127.0.0.1", proxy.port, "POST", "/v1internal/foo/../secret", body=b"{}"
+            ).status,
+            400,
+        )
+        proxy.stop()
+
+    def test_t1_launch_print_env_and_serve_adopt_running(self) -> None:
+        """launch --print-env emits Hybrid Mode env vars and serve --adopt-running parks cleanly on an occupied companion port."""
+        import subprocess
+        import time
+
+        binary = self.require_binary()
+        env = self.make_env()
+        cfg = env.write_config(env.make_config_dict())
+
+        # 1. launch --print-env prints exact Hybrid Mode command.
+        res = run_cli(
+            [
+                str(binary),
+                "launch",
+                "--port",
+                "4321",
+                "--config",
+                str(cfg),
+                "--app",
+                "/opt/antigravity",
+                "--print-env",
+            ],
+            env=env.build_env(),
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('CLOUD_CODE_URL="http://127.0.0.1:4321"', res.stdout)
+        self.assertIn('GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4321"', res.stdout)
+        self.assertIn('GEMINI_API_KEY="agy-companion-local"', res.stdout)
+        self.assertIn("/opt/antigravity", res.stdout)
+
+        # 2. serve --adopt-running stays alive cleanly when a healthy companion proxy already owns the port.
+        proxy = self.start_proxy(env, config_path=cfg)
+        adopter = subprocess.Popen(
+            [str(binary), "serve", "--port", str(proxy.port), "--config", str(cfg), "--adopt-running"],
+            env=env.build_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            time.sleep(0.5)
+            self.assertIsNone(adopter.poll(), "adopter should stay alive monitoring existing proxy")
+            adopter.send_signal(signal.SIGTERM)
+            rc = adopter.wait(timeout=5)
+            self.assertEqual(rc, 0)
+        finally:
+            if adopter.poll() is None:
+                adopter.kill()
+                adopter.wait(timeout=3)
+            proxy.stop()

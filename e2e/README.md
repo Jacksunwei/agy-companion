@@ -13,7 +13,7 @@ Pure Python 3 standard-library opaque-box E2E test suite verifying all Milestone
 | `harness.py` | `E2ETestCase`, `TestRuntimeConfig`, `IsolatedEnv`, `CompanionProcess`, `run_cli`, `http_raw_request`, `http_stream_request`, `poll_usage_events`, `poll_stats`, `find_key_recursive`, `resolve_binary` |
 | `mock_gemini.py` | Ephemeral HTTP/1.1 `MockGeminiServer` (exact request capture, chunked SSE, split UTF-8/CRLF, FIFO fault queues, `SO_LINGER` TCP RST, `EchoChecksumAction`) & `MockHealthServer` |
 | `mcp_client.py` | Strict newline-delimited JSON-RPC 2.0 `McpStdioClient` (stdout purity auditing, fast EOF detection, thread-safe stdin writes, `save_settings_smart` schema introspection) |
-| `test_tier1_features.py` | **Tier 1** — Core happy-path feature coverage (83 tests: 6–7 per F1–F12 + 9 for F14/F15/F16 & Gateway discovery) |
+| `test_tier1_features.py` | **Tier 1** — Core happy-path feature coverage (85 tests: 6–7 per F1–F12 + 11 for F14/F15/F16, Gateway & CloudCode Hybrid mode) |
 | `test_tier2_boundaries.py` | **Tier 2** — Boundaries, corner cases, negative inputs & S1–S8 security tests (94 tests: 6–9 per F1–F12 + 6 for F14/F15/F16) |
 | `test_tier3_combinations.py` | **Tier 3** — Pairwise cross-feature combinations (16 tests, including F15 live UI reload, symlink-aware launcher & F16 XDG coordination) |
 | `test_tier4_scenarios.py` | **Tier 4** — Multi-step real-world end-to-end application workloads (7 tests) |
