@@ -496,24 +496,29 @@ class IsolatedEnv:
         schema_version: int = 1,
         cloudcode_upstream_url: str | None = None,
     ) -> dict[str, Any]:
-        """Build a schema_version=1 config dict pointing at isolated usage_dir by default."""
+        """Build a nested schema_version=1 config dict pointing at isolated usage_dir by default."""
         cfg: dict[str, Any] = {
             "schema_version": schema_version,
-            "listen_host": listen_host,
-            "listen_port": listen_port,
-            "gemini": {
-                "base_url": base_url,
-                "api_key": api_key,
-                "default_model": default_model,
-                "timeout_secs": timeout_secs,
+            "proxy": {
+                "host": listen_host,
+                "port": listen_port,
+            },
+            "cloudcode": {
+                "upstream": cloudcode_upstream_url if cloudcode_upstream_url is not None else "auto",
+            },
+            "providers": {
+                "gemini": {
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "default_model": default_model,
+                    "timeout_secs": timeout_secs,
+                },
             },
         }
         if usage_dir is not None:
             cfg["usage_dir"] = str(usage_dir)
         elif include_usage_dir:
             cfg["usage_dir"] = str(self.usage_dir)
-        if cloudcode_upstream_url is not None:
-            cfg["cloudcode_upstream_url"] = cloudcode_upstream_url
         return cfg
 
     def write_config(
@@ -695,7 +700,8 @@ def poll_stats(
                 data = resp.json()
                 if isinstance(data, dict):
                     last_stats = data
-                    reqs = data.get("requests")
+                    usage = data.get("usage")
+                    reqs = usage.get("requests") if isinstance(usage, dict) else None
                     if isinstance(reqs, int) and not isinstance(reqs, bool) and reqs >= min_requests:
                         return data
         except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):

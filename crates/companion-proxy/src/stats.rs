@@ -1,7 +1,8 @@
 use std::sync::Mutex;
 
-use companion_core::GeminiUsageMetadata;
-use serde::{Deserialize, Serialize};
+use companion_core::{
+    CloudCodeStatsSnapshot, GeminiUsageMetadata, StatsSnapshot, UsageStatsSnapshot,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 struct StatsCounters {
@@ -12,24 +13,6 @@ struct StatsCounters {
     reasoning_tokens: u64,
     last_catalog_refresh_at_ms: Option<u64>,
     last_catalog_included_proxy_models: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StatsSnapshot {
-    pub requests: u64,
-    pub prompt_tokens: u64,
-    pub cached_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub cache_hit_ratio: f64,
-    #[serde(default)]
-    pub last_catalog_refresh_at_ms: Option<u64>,
-    #[serde(default)]
-    pub last_catalog_included_proxy_models: Option<bool>,
-    #[serde(default)]
-    pub cloudcode_mode: String,
-    #[serde(default)]
-    pub cloudcode_resolved_upstream: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -77,16 +60,20 @@ impl ProxyStats {
             0.0
         };
         StatsSnapshot {
-            requests: c.requests,
-            prompt_tokens: c.prompt_tokens,
-            cached_tokens: c.cached_tokens,
-            output_tokens: c.output_tokens,
-            reasoning_tokens: c.reasoning_tokens,
-            cache_hit_ratio,
-            last_catalog_refresh_at_ms: c.last_catalog_refresh_at_ms,
-            last_catalog_included_proxy_models: c.last_catalog_included_proxy_models,
-            cloudcode_mode: cloudcode_mode.to_string(),
-            cloudcode_resolved_upstream,
+            usage: UsageStatsSnapshot {
+                requests: c.requests,
+                prompt_tokens: c.prompt_tokens,
+                cached_tokens: c.cached_tokens,
+                output_tokens: c.output_tokens,
+                reasoning_tokens: c.reasoning_tokens,
+                cache_hit_ratio,
+            },
+            cloudcode: CloudCodeStatsSnapshot {
+                mode: cloudcode_mode.to_string(),
+                resolved_upstream: cloudcode_resolved_upstream,
+                last_catalog_refresh_at_ms: c.last_catalog_refresh_at_ms,
+                last_catalog_included_proxy_models: c.last_catalog_included_proxy_models,
+            },
         }
     }
 }
@@ -115,48 +102,64 @@ mod tests {
         });
 
         let snap = stats.snapshot();
-        assert_eq!(snap.requests, 2);
-        assert_eq!(snap.prompt_tokens, 2000);
-        assert_eq!(snap.cached_tokens, 1000);
-        assert_eq!(snap.output_tokens, 300);
-        assert_eq!(snap.reasoning_tokens, 75);
-        assert!((snap.cache_hit_ratio - 0.5).abs() < 1e-12);
+        assert_eq!(snap.usage.requests, 2);
+        assert_eq!(snap.usage.prompt_tokens, 2000);
+        assert_eq!(snap.usage.cached_tokens, 1000);
+        assert_eq!(snap.usage.output_tokens, 300);
+        assert_eq!(snap.usage.reasoning_tokens, 75);
+        assert!((snap.usage.cache_hit_ratio - 0.5).abs() < 1e-12);
 
-        // Verify exact serialized JSON keys.
+        // Verify exact serialized JSON structure.
         let value = serde_json::to_value(snap).expect("serialize snapshot");
         let obj = value.as_object().expect("json object");
-        assert_eq!(obj.len(), 10);
-        assert!(obj.contains_key("requests"));
-        assert!(obj.contains_key("prompt_tokens"));
-        assert!(obj.contains_key("cached_tokens"));
-        assert!(obj.contains_key("output_tokens"));
-        assert!(obj.contains_key("reasoning_tokens"));
-        assert!(obj.contains_key("cache_hit_ratio"));
-        assert!(obj.contains_key("last_catalog_refresh_at_ms"));
-        assert!(obj.contains_key("last_catalog_included_proxy_models"));
-        assert!(obj.contains_key("cloudcode_mode"));
-        assert!(obj.contains_key("cloudcode_resolved_upstream"));
+        assert_eq!(obj.len(), 2);
+        let usage = obj
+            .get("usage")
+            .and_then(|v| v.as_object())
+            .expect("usage object");
+        assert_eq!(usage.len(), 6);
+        assert!(usage.contains_key("requests"));
+        assert!(usage.contains_key("prompt_tokens"));
+        assert!(usage.contains_key("cached_tokens"));
+        assert!(usage.contains_key("output_tokens"));
+        assert!(usage.contains_key("reasoning_tokens"));
+        assert!(usage.contains_key("cache_hit_ratio"));
+        let cloudcode = obj
+            .get("cloudcode")
+            .and_then(|v| v.as_object())
+            .expect("cloudcode object");
+        assert_eq!(cloudcode.len(), 4);
+        assert!(cloudcode.contains_key("mode"));
+        assert!(cloudcode.contains_key("resolved_upstream"));
+        assert!(cloudcode.contains_key("last_catalog_refresh_at_ms"));
+        assert!(cloudcode.contains_key("last_catalog_included_proxy_models"));
     }
 
     #[test]
-    fn records_catalog_refresh_and_deserializes_legacy_six_field_snapshot() {
+    fn records_catalog_refresh_and_deserializes_partial_usage_only_snapshot() {
         let stats = ProxyStats::new();
         let initial = stats.snapshot_with_cloudcode("auto", None);
-        assert_eq!(initial.last_catalog_refresh_at_ms, None);
-        assert_eq!(initial.last_catalog_included_proxy_models, None);
-        assert_eq!(initial.cloudcode_mode, "auto");
-        assert_eq!(initial.cloudcode_resolved_upstream, None);
+        assert_eq!(initial.cloudcode.last_catalog_refresh_at_ms, None);
+        assert_eq!(initial.cloudcode.last_catalog_included_proxy_models, None);
+        assert_eq!(initial.cloudcode.mode, "auto");
+        assert_eq!(initial.cloudcode.resolved_upstream, None);
 
         stats.record_catalog_refresh(1_700_000_000_123, false);
         let day0 = stats.snapshot_with_cloudcode(
             "auto",
             Some("https://daily-cloudcode-pa.googleapis.com".to_string()),
         );
-        assert_eq!(day0.last_catalog_refresh_at_ms, Some(1_700_000_000_123));
-        assert_eq!(day0.last_catalog_included_proxy_models, Some(false));
-        assert_eq!(day0.cloudcode_mode, "auto");
         assert_eq!(
-            day0.cloudcode_resolved_upstream.as_deref(),
+            day0.cloudcode.last_catalog_refresh_at_ms,
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            day0.cloudcode.last_catalog_included_proxy_models,
+            Some(false)
+        );
+        assert_eq!(day0.cloudcode.mode, "auto");
+        assert_eq!(
+            day0.cloudcode.resolved_upstream.as_deref(),
             Some("https://daily-cloudcode-pa.googleapis.com")
         );
 
@@ -165,40 +168,45 @@ mod tests {
             "fixed",
             Some("https://cloudcode-pa.googleapis.com".to_string()),
         );
-        assert_eq!(merged.last_catalog_refresh_at_ms, Some(1_700_000_005_000));
-        assert_eq!(merged.last_catalog_included_proxy_models, Some(true));
-        assert_eq!(merged.cloudcode_mode, "fixed");
         assert_eq!(
-            merged.cloudcode_resolved_upstream.as_deref(),
+            merged.cloudcode.last_catalog_refresh_at_ms,
+            Some(1_700_000_005_000)
+        );
+        assert_eq!(
+            merged.cloudcode.last_catalog_included_proxy_models,
+            Some(true)
+        );
+        assert_eq!(merged.cloudcode.mode, "fixed");
+        assert_eq!(
+            merged.cloudcode.resolved_upstream.as_deref(),
             Some("https://cloudcode-pa.googleapis.com")
         );
 
-        // Legacy 6-field JSON payload must deserialize cleanly via #[serde(default)].
-        let legacy: StatsSnapshot = serde_json::from_str(
+        // Minimal structured JSON payload omitting `cloudcode` must deserialize via #[serde(default)].
+        let partial: StatsSnapshot = serde_json::from_str(
             r#"{
-                "requests": 3,
-                "prompt_tokens": 300,
-                "cached_tokens": 150,
-                "output_tokens": 45,
-                "reasoning_tokens": 10,
-                "cache_hit_ratio": 0.5
+                "usage": {
+                    "requests": 3,
+                    "prompt_tokens": 300,
+                    "cached_tokens": 150,
+                    "output_tokens": 45,
+                    "reasoning_tokens": 10,
+                    "cache_hit_ratio": 0.5
+                }
             }"#,
         )
-        .expect("legacy 6-field snapshot must deserialize");
-        assert_eq!(legacy.requests, 3);
-        assert_eq!(legacy.last_catalog_refresh_at_ms, None);
-        assert_eq!(legacy.last_catalog_included_proxy_models, None);
-        assert_eq!(legacy.cloudcode_mode, "");
-        assert_eq!(legacy.cloudcode_resolved_upstream, None);
+        .expect("partial usage-only snapshot must deserialize");
+        assert_eq!(partial.usage.requests, 3);
+        assert_eq!(partial.cloudcode, CloudCodeStatsSnapshot::default());
     }
 
     #[test]
     fn zero_prompt_tokens_returns_zero_ratio_without_nan_or_inf() {
         let stats = ProxyStats::new();
         let initial = stats.snapshot();
-        assert_eq!(initial.requests, 0);
-        assert_eq!(initial.cache_hit_ratio, 0.0);
-        assert!(initial.cache_hit_ratio.is_finite());
+        assert_eq!(initial.usage.requests, 0);
+        assert_eq!(initial.usage.cache_hit_ratio, 0.0);
+        assert!(initial.usage.cache_hit_ratio.is_finite());
 
         stats.record(&GeminiUsageMetadata {
             prompt_token_count: 0,
@@ -207,9 +215,9 @@ mod tests {
             thoughts_token_count: 2,
         });
         let after_zero_prompt = stats.snapshot();
-        assert_eq!(after_zero_prompt.requests, 1);
-        assert_eq!(after_zero_prompt.cache_hit_ratio, 0.0);
-        assert!(after_zero_prompt.cache_hit_ratio.is_finite());
+        assert_eq!(after_zero_prompt.usage.requests, 1);
+        assert_eq!(after_zero_prompt.usage.cache_hit_ratio, 0.0);
+        assert!(after_zero_prompt.usage.cache_hit_ratio.is_finite());
 
         // Saturating arithmetic on u64::MAX must never wrap or overflow.
         stats.record(&GeminiUsageMetadata {
@@ -225,13 +233,13 @@ mod tests {
             thoughts_token_count: 10,
         });
         let saturated = stats.snapshot();
-        assert_eq!(saturated.requests, 3);
-        assert_eq!(saturated.prompt_tokens, u64::MAX);
-        assert_eq!(saturated.cached_tokens, u64::MAX);
-        assert_eq!(saturated.output_tokens, u64::MAX);
-        assert_eq!(saturated.reasoning_tokens, u64::MAX);
-        assert!(saturated.cache_hit_ratio.is_finite());
-        assert!((saturated.cache_hit_ratio - 1.0).abs() < 1e-12);
+        assert_eq!(saturated.usage.requests, 3);
+        assert_eq!(saturated.usage.prompt_tokens, u64::MAX);
+        assert_eq!(saturated.usage.cached_tokens, u64::MAX);
+        assert_eq!(saturated.usage.output_tokens, u64::MAX);
+        assert_eq!(saturated.usage.reasoning_tokens, u64::MAX);
+        assert!(saturated.usage.cache_hit_ratio.is_finite());
+        assert!((saturated.usage.cache_hit_ratio - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -259,14 +267,14 @@ mod tests {
                 for _ in 0..400 {
                     let snap = s.snapshot();
                     // Atomic point-in-time snapshot invariants: never torn!
-                    assert_eq!(snap.prompt_tokens, snap.requests * 100);
-                    assert_eq!(snap.cached_tokens, snap.requests * 50);
-                    assert_eq!(snap.output_tokens, snap.requests * 20);
-                    assert_eq!(snap.reasoning_tokens, snap.requests * 5);
-                    if snap.requests > 0 {
-                        assert!((snap.cache_hit_ratio - 0.5).abs() < 1e-12);
+                    assert_eq!(snap.usage.prompt_tokens, snap.usage.requests * 100);
+                    assert_eq!(snap.usage.cached_tokens, snap.usage.requests * 50);
+                    assert_eq!(snap.usage.output_tokens, snap.usage.requests * 20);
+                    assert_eq!(snap.usage.reasoning_tokens, snap.usage.requests * 5);
+                    if snap.usage.requests > 0 {
+                        assert!((snap.usage.cache_hit_ratio - 0.5).abs() < 1e-12);
                     } else {
-                        assert_eq!(snap.cache_hit_ratio, 0.0);
+                        assert_eq!(snap.usage.cache_hit_ratio, 0.0);
                     }
                 }
             }));
@@ -280,11 +288,11 @@ mod tests {
         }
 
         let final_snap = stats.snapshot();
-        assert_eq!(final_snap.requests, 1600);
-        assert_eq!(final_snap.prompt_tokens, 160_000);
-        assert_eq!(final_snap.cached_tokens, 80_000);
-        assert_eq!(final_snap.output_tokens, 32_000);
-        assert_eq!(final_snap.reasoning_tokens, 8_000);
-        assert!((final_snap.cache_hit_ratio - 0.5).abs() < 1e-12);
+        assert_eq!(final_snap.usage.requests, 1600);
+        assert_eq!(final_snap.usage.prompt_tokens, 160_000);
+        assert_eq!(final_snap.usage.cached_tokens, 80_000);
+        assert_eq!(final_snap.usage.output_tokens, 32_000);
+        assert_eq!(final_snap.usage.reasoning_tokens, 8_000);
+        assert!((final_snap.usage.cache_hit_ratio - 0.5).abs() < 1e-12);
     }
 }

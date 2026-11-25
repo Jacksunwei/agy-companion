@@ -15,7 +15,7 @@
 | Path | Responsibility |
 | --- | --- |
 | `Cargo.toml` | Workspace manifest and single version source of truth (`0.1.0`) |
-| `crates/companion-core/src/{lib,config,redaction,usage}.rs` | Pure domain: `Config` (`schema_version = 1`), URL/path validation, API key masking, Gemini `usageMetadata` parser, `UsageEvent` + `UsageSink` trait + `JsonlUsageSink` |
+| `crates/companion-core/src/{lib,config,fs_safe,protocol,validation,models,redaction,usage/{mod,sqlite},integration}.rs` | Core domain & safe FS primitives: nested v1 `Config` (`schema_version = 1`), `fs_safe` TOCTOU/atomic guards, shared `protocol` wire DTOs, URL/path/header `validation`, Gemini 3.8+/4+ `models` catalog, nested `RedactedConfig`, `UsageEvent` + `UsageSink` trait + `SqliteUsageSink` behind optional `sqlite` feature, and login-shell `integration` |
 | `crates/companion-providers/src/{lib,gemini}.rs` | `ProviderAdapter` trait + raw `reqwest` (`rustls`, 15-min timeout) Gemini streaming pass-through adapter (`x-goog-api-key` header) |
 | `crates/companion-proxy/src/{lib,routes,stats,sse}.rs` | `axum` loopback server (`127.0.0.1`), `GET /health`, `GET /api/stats`, `POST /v1beta/models/{model_action}` streaming pass-through + SSE usage tee |
 | `ui/{package.json,vite.config.ts,index.html,src/main.ts,src/style.css}` | Build-time Vite single-file MCP App UI (strict DOM APIs, zero `innerHTML`, host CSS tokens, write-only API key form, cache telemetry, copyable `customModelsConfig`) |
@@ -101,9 +101,9 @@ Expected: FAIL (`not yet implemented`).
 - [ ] **Step 4: Implement `config.rs`, `redaction.rs`, and `usage.rs` minimally to go green**
 
 Key types & behaviors:
-- `Config` (`schema_version: u32` defaulting to `1`, `listen_host: String` validated to `127.0.0.1`/`localhost`, `listen_port: u16` defaulting to `24141`, `gemini: GeminiConfig { base_url, api_key, default_model, timeout_secs }`, `usage_dir: Option<PathBuf>`).
+- `Config` (`schema_version: u32` defaulting to `1`, `proxy: ProxyConfig { host: LoopbackHost, port: NonZeroU16 }` defaulting to `127.0.0.1:24141`, `cloudcode: CloudCodeConfig { upstream: CloudCodeUpstream }` defaulting to `"auto"`, `providers: ProvidersConfig { gemini: GeminiConfig { base_url, api_key: Option<ApiKey>, default_model, timeout_secs } }`, `usage_dir: Option<PathBuf>`).
 - `Config::load_or_default(path)` and `Config::save_secure(path)` (creates parent dirs, writes atomically via temp file + rename, enforces mode `0600` on Unix).
-- `RedactedConfig` (never contains plaintext `api_key`; carries `api_key_configured: bool` and `api_key_hint: Option<String>`).
+- `RedactedConfig` (nested mirror of `Config`: `schema_version`, `proxy`, `cloudcode`, `providers.gemini` carrying `api_key_configured: bool` and `api_key_hint: Option<String>`, never plaintext `api_key`).
 - `GeminiUsageMetadata::parse_from_json(&[u8]) -> Option<GeminiUsageMetadata>` extracting `promptTokenCount`, `candidatesTokenCount`, `cachedContentTokenCount`, `thoughtsTokenCount`.
 - `UsageEvent`, `UsageSink` trait (`fn record(&self, event: UsageEvent)`), `NoopUsageSink`, and `JsonlUsageSink` writing monthly `YYYY-MM.jsonl` files with mode `0600`.
 
@@ -200,7 +200,7 @@ Expected: FAIL.
 
 Routes (strict method allow-list: `GET` and `POST` only):
 - `GET /health` → `{ "status": "ok", "version": "<pkg>", "protocol_version": 1 }`
-- `GET /api/stats` → `{ "requests": N, "prompt_tokens": ..., "cached_tokens": ..., "output_tokens": ..., "cache_hit_ratio": ... }`
+- `GET /api/stats` → `{ "usage": { "requests": N, "prompt_tokens": ..., "cached_tokens": ..., "output_tokens": ..., "reasoning_tokens": ..., "cache_hit_ratio": ... }, "cloudcode": { "mode": ..., "resolved_upstream": ..., "last_catalog_refresh_at_ms": ..., "last_catalog_included_proxy_models": ... } }`
 - `POST /v1beta/models/{*rest}` → byte-for-byte pass-through via `GeminiProvider` with streaming SSE tee (for `:streamGenerateContent`) or JSON parse tee (for `:generateContent`), recording `UsageEvent` asynchronously into `UsageSink` and updating `ProxyStats`.
 - Enforce loopback-only `SocketAddr` (`127.0.0.1:<port>`) in `serve()`.
 - Attach `X-Content-Type-Options: nosniff` and `Cache-Control: no-store` on `/health` and `/api/stats`.

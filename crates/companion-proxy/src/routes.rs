@@ -11,14 +11,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, on};
 use axum::{Json, Router};
 use bytes::Bytes;
-use companion_core::{GeminiUsageMetadata, UsageEvent, UsageSink};
+use companion_core::{
+    GeminiUsageMetadata, HealthResponse, UsageEvent, UsageSink, is_printable_ascii_with_space,
+    validate_api_key_str,
+};
 use companion_providers::{
     ByteStream, ForwardRequest, ProviderError, curated_gemini_models, filter_and_order_models,
 };
 use futures_util::{Stream, StreamExt};
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
-use serde::{Deserialize, Serialize};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::cloudcode::{
@@ -26,7 +28,7 @@ use crate::cloudcode::{
 };
 use crate::sse::SseUsageTracker;
 use crate::stats::ProxyStats;
-use crate::{ActiveProvider, InFlightGuard, PROTOCOL_VERSION, ProxyState};
+use crate::{ActiveProvider, InFlightGuard, ProxyState};
 
 pub const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_JSON_TEE_BYTES: usize = 8 * 1024 * 1024;
@@ -35,13 +37,6 @@ const THOUGHT_SIG_ERROR_SNIFF_MAX_BYTES: usize = 64 * 1024;
 
 const GEMINI_MODELS_PREFIX: &str = "/v1beta/models/";
 static X_GOOG_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-goog-api-key");
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HealthResponse {
-    pub status: String,
-    pub version: String,
-    pub protocol_version: u32,
-}
 
 pub fn build_router(state: ProxyState) -> Router {
     let internal_security_headers = (
@@ -424,11 +419,7 @@ async fn cloudcode_or_not_found_handler(State(state): State<ProxyState>, req: Re
 }
 
 async fn health_handler() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_version: PROTOCOL_VERSION,
-    })
+    Json(HealthResponse::ok(env!("CARGO_PKG_VERSION")))
 }
 
 async fn stats_handler(State(state): State<ProxyState>) -> impl IntoResponse {
@@ -731,10 +722,6 @@ fn json_error_response(status: StatusCode, message: &'static str) -> Response {
     resp
 }
 
-fn is_printable_ascii_with_space(bytes: &[u8]) -> bool {
-    bytes.iter().all(|&b| (0x20..=0x7E).contains(&b))
-}
-
 fn validate_inbound_content_type(headers: &HeaderMap) -> Result<Option<String>, &'static str> {
     let mut iter = headers.get_all(header::CONTENT_TYPE).iter();
     let Some(first) = iter.next() else {
@@ -778,14 +765,11 @@ fn validate_inbound_api_key(
         return Ok(None);
     }
 
-    let trimmed = raw.trim_matches(' ');
-    if trimmed.is_empty() || companion_core::is_placeholder_api_key(trimmed) {
-        return Ok(None);
+    match validate_api_key_str(raw) {
+        Ok(Some(trimmed)) => Ok(Some(trimmed.to_string())),
+        Ok(None) => Ok(None),
+        Err(_) => Err("invalid x-goog-api-key header"),
     }
-    if !trimmed.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
-        return Err("invalid x-goog-api-key header");
-    }
-    Ok(Some(trimmed.to_string()))
 }
 
 fn sanitize_outbound_content_type(raw: Option<&str>) -> Option<HeaderValue> {
@@ -1000,7 +984,7 @@ mod tests {
     use axum::body::Body;
     use axum::routing::post;
     use bytes::Bytes;
-    use companion_core::{NoopUsageSink, UsageEvent, UsageSink};
+    use companion_core::{ApiKey, CloudCodeUpstream, NoopUsageSink, UsageEvent, UsageSink};
     use companion_providers::{
         BoxFuture, ForwardRequest, ForwardResponse, GeminiProvider, ProviderAdapter, ProviderError,
     };
@@ -1250,12 +1234,12 @@ mod tests {
         assert_security_headers(stats_resp.headers());
         let stats_body = stats_resp.into_body().collect().await.unwrap().to_bytes();
         let snap: StatsSnapshot = serde_json::from_slice(&stats_body).unwrap();
-        assert_eq!(snap.requests, 1);
-        assert_eq!(snap.prompt_tokens, 100);
-        assert_eq!(snap.cached_tokens, 60);
-        assert_eq!(snap.output_tokens, 25);
-        assert_eq!(snap.reasoning_tokens, 8);
-        assert!((snap.cache_hit_ratio - 0.6).abs() < 1e-12);
+        assert_eq!(snap.usage.requests, 1);
+        assert_eq!(snap.usage.prompt_tokens, 100);
+        assert_eq!(snap.usage.cached_tokens, 60);
+        assert_eq!(snap.usage.output_tokens, 25);
+        assert_eq!(snap.usage.reasoning_tokens, 8);
+        assert!((snap.usage.cache_hit_ratio - 0.6).abs() < 1e-12);
     }
 
     #[tokio::test]
@@ -1752,8 +1736,8 @@ mod tests {
             let body = resp.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(body, raw_error_body);
             assert!(sink.snapshot().is_empty());
-            assert_eq!(state.stats().snapshot().requests, 0);
-            assert_eq!(state.stats().snapshot().prompt_tokens, 0);
+            assert_eq!(state.stats().snapshot().usage.requests, 0);
+            assert_eq!(state.stats().snapshot().usage.prompt_tokens, 0);
         }
     }
 
@@ -2030,7 +2014,7 @@ mod tests {
         let collect_res = resp_err.into_body().collect().await;
         assert!(collect_res.is_err());
         assert!(sink_err.snapshot().is_empty());
-        assert_eq!(state_err.stats().snapshot().requests, 0);
+        assert_eq!(state_err.stats().snapshot().usage.requests, 0);
 
         // 2. Early client disconnect (drop response body after reading only chunk 1 before EOF).
         let sink_drop = Arc::new(RecordingSink::default());
@@ -2063,7 +2047,7 @@ mod tests {
         drop(body_drop);
 
         assert!(sink_drop.snapshot().is_empty());
-        assert_eq!(state_drop.stats().snapshot().requests, 0);
+        assert_eq!(state_drop.stats().snapshot().usage.requests, 0);
     }
 
     #[tokio::test]
@@ -2096,7 +2080,7 @@ mod tests {
         assert_eq!(&body[..DEFAULT_MAX_JSON_TEE_BYTES], chunk_a.as_ref());
         assert_eq!(&body[DEFAULT_MAX_JSON_TEE_BYTES..], chunk_b.as_ref());
         assert!(sink.snapshot().is_empty());
-        assert_eq!(state.stats().snapshot().requests, 0);
+        assert_eq!(state.stats().snapshot().usage.requests, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2306,7 +2290,10 @@ mod tests {
             "/v1beta/models/gemini-3.7-flash:generateContent",
             "/v1beta/models/gemini-3.1-pro-preview:generateContent",
             "/v1beta/models/models/gemini-2.5-pro:generateContent",
-            "/v1beta/models/gemini-30-pro:generateContent",
+            "/v1beta/models/gemini-3-pro:generateContent",
+            "/v1beta/models/gemini-5:generateContent",
+            "/v1beta/models/gemini-5-:generateContent",
+            "/v1beta/models/gemini-5pro:generateContent",
             "/v1beta/models/gpt-4o:generateContent",
         ] {
             let resp = app
@@ -2336,6 +2323,64 @@ mod tests {
 
         assert_eq!(provider.hit_count(), 0, "upstream must receive 0 hits");
         assert!(sink.snapshot().is_empty(), "must record 0 usage events");
+    }
+
+    #[tokio::test]
+    async fn accepts_gemini_5_and_3_9_models_and_rejects_bare_gemini_5() {
+        let sink = Arc::new(RecordingSink::default());
+        let provider = Arc::new(StubProvider::ok_stream(
+            Some("application/json"),
+            vec![Bytes::from_static(
+                br#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#,
+            )],
+        ));
+        let app = build_router(ProxyState::new(
+            Arc::clone(&provider) as Arc<dyn companion_providers::ProviderAdapter>,
+            Arc::clone(&sink) as Arc<dyn UsageSink>,
+            true,
+        ));
+
+        for uri in [
+            "/v1beta/models/gemini-5-pro:generateContent",
+            "/v1beta/models/gemini-3.9-pro:generateContent",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "uri={uri}");
+        }
+        assert_eq!(
+            provider.hit_count(),
+            2,
+            "both gemini-5-pro and gemini-3.9-pro must reach upstream"
+        );
+
+        let bare_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/gemini-5:generateContent")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bare_resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            provider.hit_count(),
+            2,
+            "bare gemini-5 must be rejected before hitting upstream"
+        );
     }
 
     #[tokio::test]
@@ -2436,9 +2481,10 @@ mod tests {
         });
 
         let mut cfg = companion_core::Config::default();
-        cfg.gemini.base_url = format!("http://{upstream_addr}");
-        cfg.gemini.api_key = Some("AIzaSyGatewayDiscovery123".to_string());
-        cfg.gemini.default_model = "gemini-3.8-flash".to_string();
+        cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaSyGatewayDiscovery123").unwrap());
+        cfg.providers.gemini.default_model = "gemini-3.8-flash".to_string();
         let live_state =
             ProxyState::from_config_with_env_fallback(cfg, None, Arc::new(NoopUsageSink), false)
                 .unwrap();
@@ -2562,13 +2608,12 @@ mod tests {
             let _ = axum::serve(ccpa_listener, mock_ccpa).await;
         });
 
-        let mut cfg = companion_core::Config {
-            cloudcode_upstream_url: format!("http://{ccpa_addr}"),
-            ..Default::default()
-        };
-        cfg.gemini.base_url = format!("http://{ccpa_addr}");
-        cfg.gemini.api_key = Some("AIzaSyCloudCodeMergeKey1".to_string());
-        cfg.gemini.default_model = "gemini-4-hydrogen".to_string();
+        let mut cfg = companion_core::Config::default();
+        cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{ccpa_addr}"));
+        cfg.providers.gemini.base_url = format!("http://{ccpa_addr}");
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaSyCloudCodeMergeKey1").unwrap());
+        cfg.providers.gemini.default_model = "gemini-4-hydrogen".to_string();
         let state =
             ProxyState::from_config_with_env_fallback(cfg, None, Arc::new(NoopUsageSink), false)
                 .unwrap();
@@ -2644,11 +2689,14 @@ mod tests {
             .await
             .unwrap();
         let stats_snap: crate::StatsSnapshot = serde_json::from_slice(&stats_body).unwrap();
-        assert!(stats_snap.last_catalog_refresh_at_ms.is_some());
-        assert_eq!(stats_snap.last_catalog_included_proxy_models, Some(true));
-        assert_eq!(stats_snap.cloudcode_mode, "fixed");
+        assert!(stats_snap.cloudcode.last_catalog_refresh_at_ms.is_some());
         assert_eq!(
-            stats_snap.cloudcode_resolved_upstream.as_deref(),
+            stats_snap.cloudcode.last_catalog_included_proxy_models,
+            Some(true)
+        );
+        assert_eq!(stats_snap.cloudcode.mode, "fixed");
+        assert_eq!(
+            stats_snap.cloudcode.resolved_upstream.as_deref(),
             Some(format!("http://{ccpa_addr}").as_str())
         );
 
@@ -2752,16 +2800,27 @@ mod tests {
             let _ = axum::serve(ccpa_listener, mock_ccpa).await;
         });
 
-        for api_key in [
-            None,
-            Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string()),
-        ] {
-            let mut cfg = companion_core::Config {
-                cloudcode_upstream_url: format!("http://{ccpa_addr}"),
-                ..Default::default()
-            };
-            cfg.gemini.base_url = format!("http://{ccpa_addr}");
-            cfg.gemini.api_key = api_key;
+        for raw_api_key in [None, Some(companion_core::PROXY_PLACEHOLDER_API_KEY)] {
+            let json = serde_json::json!({
+                "schema_version": 1,
+                "cloudcode": {
+                    "upstream": format!("http://{ccpa_addr}")
+                },
+                "providers": {
+                    "gemini": {
+                        "base_url": format!("http://{ccpa_addr}"),
+                        "api_key": raw_api_key
+                    }
+                }
+            })
+            .to_string();
+            let cfg =
+                companion_core::Config::from_json_str(&json, std::path::Path::new("config.json"))
+                    .unwrap();
+            assert!(
+                cfg.providers.gemini.api_key.is_none(),
+                "placeholder/null API key must deserialize as None"
+            );
             let state = ProxyState::from_config_with_env_fallback(
                 cfg,
                 None,
@@ -2817,8 +2876,11 @@ mod tests {
                 .await
                 .unwrap();
             let snap: crate::StatsSnapshot = serde_json::from_slice(&stats_body).unwrap();
-            assert!(snap.last_catalog_refresh_at_ms.is_some());
-            assert_eq!(snap.last_catalog_included_proxy_models, Some(false));
+            assert!(snap.cloudcode.last_catalog_refresh_at_ms.is_some());
+            assert_eq!(
+                snap.cloudcode.last_catalog_included_proxy_models,
+                Some(false)
+            );
         }
 
         ccpa_server.abort();
@@ -2846,12 +2908,11 @@ mod tests {
             let _ = axum::serve(ccpa_listener, mock_ccpa).await;
         });
 
-        let mut cfg = companion_core::Config {
-            cloudcode_upstream_url: format!("http://{ccpa_addr}"),
-            ..Default::default()
-        };
-        cfg.gemini.base_url = format!("http://{ccpa_addr}");
-        cfg.gemini.api_key = Some("AIzaSyMergeFallbackKey12".to_string());
+        let mut cfg = companion_core::Config::default();
+        cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{ccpa_addr}"));
+        cfg.providers.gemini.base_url = format!("http://{ccpa_addr}");
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaSyMergeFallbackKey12").unwrap());
         let state =
             ProxyState::from_config_with_env_fallback(cfg, None, Arc::new(NoopUsageSink), false)
                 .unwrap();
@@ -2895,7 +2956,10 @@ mod tests {
             .await
             .unwrap();
         let snap: crate::StatsSnapshot = serde_json::from_slice(&stats_body).unwrap();
-        assert_eq!(snap.last_catalog_included_proxy_models, Some(false));
+        assert_eq!(
+            snap.cloudcode.last_catalog_included_proxy_models,
+            Some(false)
+        );
 
         ccpa_server.abort();
     }

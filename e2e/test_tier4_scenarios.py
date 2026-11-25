@@ -111,12 +111,13 @@ class TestTier4Scenarios(E2ETestCase):
         # 3. Verify /api/stats totals and exact cache_hit_ratio = 2400 / 4200 (after SSE EOF flush, Guard A13).
         poll_usage_events(env.usage_dir, min_count=3)
         stats = poll_stats(proxy.port, min_requests=3)
-        self.assertEqual(stats["requests"], 3)
-        self.assertEqual(stats["prompt_tokens"], 4200)
-        self.assertEqual(stats["cached_tokens"], 2400)
-        self.assertEqual(stats["output_tokens"], 470)
-        self.assertEqual(stats["reasoning_tokens"], 120)
-        self.assertAlmostEqual(stats["cache_hit_ratio"], 2400 / 4200, places=6)
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 3)
+        self.assertEqual(usage["prompt_tokens"], 4200)
+        self.assertEqual(usage["cached_tokens"], 2400)
+        self.assertEqual(usage["output_tokens"], 470)
+        self.assertEqual(usage["reasoning_tokens"], 120)
+        self.assertAlmostEqual(usage["cache_hit_ratio"], 2400 / 4200, places=6)
 
         # 4. Verify ui-mcp get_settings reports masked hint & live stats.
         get_res = mcp.call_tool("get_settings", {})
@@ -311,7 +312,7 @@ class TestTier4Scenarios(E2ETestCase):
         )
         self.assertEqual(r_rec.status, 200)
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertGreaterEqual(stats["requests"], 2)
+        self.assertGreaterEqual(stats["usage"]["requests"], 2)
         _, events = poll_usage_events(env.usage_dir, min_count=2)
         self.assertGreaterEqual(len(events), 2)
 
@@ -410,11 +411,12 @@ class TestTier4Scenarios(E2ETestCase):
         self.assertEqual(len(files), 1)
 
         stats = poll_stats(proxy.port, min_requests=16, timeout=4.0)
-        self.assertEqual(stats["requests"], 16)
-        self.assertEqual(stats["prompt_tokens"], expected_prompt)
-        self.assertEqual(stats["cached_tokens"], expected_cached)
-        self.assertEqual(stats["output_tokens"], expected_out)
-        self.assertEqual(stats["reasoning_tokens"], expected_think)
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 16)
+        self.assertEqual(usage["prompt_tokens"], expected_prompt)
+        self.assertEqual(usage["cached_tokens"], expected_cached)
+        self.assertEqual(usage["output_tokens"], expected_out)
+        self.assertEqual(usage["reasoning_tokens"], expected_think)
 
     def test_t4_05_end_to_end_security_and_privacy_audit_s1_to_s8(self) -> None:
         """Full-stack S1–S8 security & canary privacy audit across HTTP, MCP, CLI, SQLite, UI, plugin, and npm."""

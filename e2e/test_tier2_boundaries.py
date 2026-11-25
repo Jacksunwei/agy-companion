@@ -1,8 +1,8 @@
-"""Tier 2: Boundary, Corner-Case, Negative & Security Tests (92 tests).
+"""Tier 2: Boundary, Corner-Case, Negative & Security Tests (98 tests).
 
-Covers all 12 core features (6–9 tests per feature F1–F12 = 87 tests) plus 5
-additive boundary tests for F14, F15 & F16 (XDG boundaries), enforcing
-Security Invariants S1–S8 and Ambiguity Guards A1–A15.
+Covers all core features F1–F12 plus additive boundary tests for F14–F16 (XDG
+boundaries), legacy model rejection, and strict unknown-field denial on
+save_settings, enforcing Security Invariants S1–S8 and Ambiguity Guards A1–A15.
 """
 
 from __future__ import annotations
@@ -1054,10 +1054,11 @@ class TestTier2F5ProxyBoundaries(E2ETestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["input_tokens"], 321)
         stats = poll_stats(proxy.port, min_requests=1)
-        self.assertEqual(stats["prompt_tokens"], 321)
-        self.assertEqual(stats["output_tokens"], 65)
-        self.assertEqual(stats["cached_tokens"], 100)
-        self.assertEqual(stats["reasoning_tokens"], 11)
+        usage = stats["usage"]
+        self.assertEqual(usage["prompt_tokens"], 321)
+        self.assertEqual(usage["output_tokens"], 65)
+        self.assertEqual(usage["cached_tokens"], 100)
+        self.assertEqual(usage["reasoning_tokens"], 11)
 
     def test_t2_f5_crlf_sse_framing_extracted(self) -> None:
         """CRLF-framed SSE lines preserve exact bytes and accurately extract usageMetadata."""
@@ -1095,8 +1096,8 @@ class TestTier2F5ProxyBoundaries(E2ETestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["input_tokens"], 250)
         stats = poll_stats(proxy.port, min_requests=1)
-        self.assertEqual(stats["prompt_tokens"], 250)
-        self.assertEqual(stats["output_tokens"], 75)
+        self.assertEqual(stats["usage"]["prompt_tokens"], 250)
+        self.assertEqual(stats["usage"]["output_tokens"], 75)
 
     def test_t2_f5_multiple_usage_metadata_frames_records_last_not_sum(self) -> None:
         """Cumulative SSE usageMetadata chunks record ONLY the final chunk, never summing."""
@@ -1145,10 +1146,11 @@ class TestTier2F5ProxyBoundaries(E2ETestCase):
         self.assertEqual(events[0]["output_tokens"], 75)
         self.assertEqual(events[0]["cached_tokens"], 50)
         stats = poll_stats(proxy.port, min_requests=1)
-        self.assertEqual(stats["requests"], 1)
-        self.assertEqual(stats["prompt_tokens"], 100)
-        self.assertEqual(stats["output_tokens"], 75)
-        self.assertEqual(stats["cached_tokens"], 50)
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 1)
+        self.assertEqual(usage["prompt_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 75)
+        self.assertEqual(usage["cached_tokens"], 50)
 
     def test_t2_f5_binary_invalid_utf8_response_passthrough_safe(self) -> None:
         """Invalid UTF-8 binary response passes through untouched without crashing proxy."""
@@ -1191,8 +1193,8 @@ class TestTier2F5ProxyBoundaries(E2ETestCase):
         self.assertEqual(r.body, b"")
         self.assertEqual(http_raw_request("127.0.0.1", proxy.port, "GET", "/health").status, 200)
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertTrue(math.isfinite(stats["cache_hit_ratio"]))
-        self.assertEqual(stats["cache_hit_ratio"], 0.0)
+        self.assertTrue(math.isfinite(stats["usage"]["cache_hit_ratio"]))
+        self.assertEqual(stats["usage"]["cache_hit_ratio"], 0.0)
 
 
 class TestTier2F6HealthAndStatsBoundaries(E2ETestCase):
@@ -1209,7 +1211,7 @@ class TestTier2F6HealthAndStatsBoundaries(E2ETestCase):
         proxy = self.start_proxy(env, config_path=cfg)
 
         s0 = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertEqual(s0["cache_hit_ratio"], 0.0)
+        self.assertEqual(s0["usage"]["cache_hit_ratio"], 0.0)
 
         r = http_raw_request(
             "127.0.0.1",
@@ -1221,9 +1223,9 @@ class TestTier2F6HealthAndStatsBoundaries(E2ETestCase):
         )
         self.assertEqual(r.status, 200)
         s1 = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertIsInstance(s1["cache_hit_ratio"], (int, float))
-        self.assertTrue(math.isfinite(s1["cache_hit_ratio"]))
-        self.assertEqual(s1["cache_hit_ratio"], 0.0)
+        self.assertIsInstance(s1["usage"]["cache_hit_ratio"], (int, float))
+        self.assertTrue(math.isfinite(s1["usage"]["cache_hit_ratio"]))
+        self.assertEqual(s1["usage"]["cache_hit_ratio"], 0.0)
 
     def test_t2_f6_cache_hit_ratio_one_when_fully_cached(self) -> None:
         """cache_hit_ratio equals 1.0 when cachedContentTokenCount == promptTokenCount."""
@@ -1243,7 +1245,7 @@ class TestTier2F6HealthAndStatsBoundaries(E2ETestCase):
         )
         self.assertEqual(r.status, 200)
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertAlmostEqual(stats["cache_hit_ratio"], 1.0, places=6)
+        self.assertAlmostEqual(stats["usage"]["cache_hit_ratio"], 1.0, places=6)
 
     def test_t2_f6_security_headers_present_on_both_health_and_stats(self) -> None:
         """Both /health and /api/stats set nosniff and no-store security headers (S7)."""
@@ -1414,24 +1416,24 @@ class TestTier2F8McpBoundaries(E2ETestCase):
         mcp.assert_clean_stdout()
 
     def test_t2_f8_save_settings_rejects_non_loopback_host(self) -> None:
-        """Attempting listen_host='0.0.0.0' via save_settings never persists '0.0.0.0' (S1)."""
+        """Attempting proxy.host='0.0.0.0' via save_settings never persists '0.0.0.0' (S1)."""
         env = self.make_env()
         cfg = env.write_config(env.make_config_dict())
         mcp = self.start_mcp(env, config_path=cfg)
         props = mcp.get_save_settings_schema()
         resp = mcp.save_settings_smart(listen_host="0.0.0.0", raw=True)
         mcp.assert_clean_stdout()
-        if "listen_host" in props or "host" in props:
+        if "proxy" in props or "listen_host" in props or "host" in props:
             self.assertTrue(
                 McpStdioClient.is_tool_error(resp),
-                f"Expected rejection when listen_host='0.0.0.0' is in schema, got {resp!r}",
+                f"Expected rejection when proxy.host='0.0.0.0' is in schema, got {resp!r}",
             )
         disk = json.loads(cfg.read_text(encoding="utf-8"))
-        self.assertNotEqual(disk.get("listen_host"), "0.0.0.0")
-        self.assertIn(disk.get("listen_host"), ("127.0.0.1", "localhost"))
+        self.assertNotEqual(disk["proxy"]["host"], "0.0.0.0")
+        self.assertIn(disk["proxy"]["host"], ("127.0.0.1", "localhost"))
 
     def test_t2_f8_save_settings_rejects_remote_http_and_port_zero(self) -> None:
-        """save_settings rejects remote http:// base_url and listen_port==0 without corrupting disk config (S5)."""
+        """save_settings rejects remote http:// base_url and proxy.port==0 without corrupting disk config (S5)."""
         env = self.make_env()
         cfg = env.write_config(env.make_config_dict(base_url="https://generativelanguage.googleapis.com", listen_port=4141))
         mcp = self.start_mcp(env, config_path=cfg)
@@ -1440,25 +1442,38 @@ class TestTier2F8McpBoundaries(E2ETestCase):
             r1 = mcp.save_settings_smart(base_url="http://example.com", raw=True)
             self.assertTrue(McpStdioClient.is_tool_error(r1), f"Expected error for http://example.com, got {r1!r}")
             disk = json.loads(cfg.read_text(encoding="utf-8"))
-            self.assertEqual(disk["gemini"]["base_url"], "https://generativelanguage.googleapis.com")
+            self.assertEqual(disk["providers"]["gemini"]["base_url"], "https://generativelanguage.googleapis.com")
 
         with self.subTest(case="port_zero"):
             r2 = mcp.save_settings_smart(listen_port=0, raw=True)
-            self.assertTrue(McpStdioClient.is_tool_error(r2), f"Expected error for listen_port=0, got {r2!r}")
+            self.assertTrue(McpStdioClient.is_tool_error(r2), f"Expected error for proxy.port=0, got {r2!r}")
             disk = json.loads(cfg.read_text(encoding="utf-8"))
-            self.assertEqual(disk["listen_port"], 4141)
+            self.assertEqual(disk["proxy"]["port"], 4141)
 
         mcp.assert_clean_stdout()
 
     def test_t2_f8_save_settings_omitting_api_key_preserves_existing_key(self) -> None:
-        """save_settings with omitted or empty api_key preserves previously stored key."""
+        """save_settings with omitted/null api_key preserves stored key, while explicit blank {set: ''} is rejected without mutating disk."""
         env = self.make_env()
         secret = "AIzaSyPreserveMe12345678"
         cfg = env.write_config(env.make_config_dict(api_key=secret))
         mcp = self.start_mcp(env, config_path=cfg)
 
+        # 1. Omitted api_key preserves existing key.
         mcp.save_settings_smart(default_model="gemini-3.8-flash")
-        mcp.save_settings_smart(default_model="gemini-4-hydrogen", api_key="")
+        # 2. Explicit null api_key preserves existing key.
+        null_res = mcp.call_tool(
+            "save_settings",
+            {"providers": {"gemini": {"default_model": "gemini-4-hydrogen", "api_key": None}}},
+        )
+        self.assertFalse(McpStdioClient.is_tool_error(null_res), null_res)
+        # 3. Explicit blank {"set": ""} is rejected under ApiKeyPatch without mutating disk.
+        resp_empty = mcp.save_settings_smart(default_model="gemini-3.8-flash", api_key="", raw=True)
+        self.assertTrue(
+            McpStdioClient.is_tool_error(resp_empty),
+            f"Expected rejection for blank api_key={{set: ''}}, got {resp_empty!r}",
+        )
+
         res = mcp.call_tool("get_settings", {})
         mcp.assert_clean_stdout()
 
@@ -1468,10 +1483,11 @@ class TestTier2F8McpBoundaries(E2ETestCase):
         self.assertTrue(found_c and configured is True)
         self.assertTrue(found_h and hint == "AIza...5678")
         disk = json.loads(cfg.read_text(encoding="utf-8"))
-        self.assertEqual(disk["gemini"]["api_key"], secret)
+        self.assertEqual(disk["providers"]["gemini"]["api_key"], secret)
+        self.assertEqual(disk["providers"]["gemini"]["default_model"], "gemini-4-hydrogen")
 
     def test_t2_f8_save_settings_clear_api_key_true_removes_key(self) -> None:
-        """save_settings(clear_api_key=True) clears api_key in memory and on disk."""
+        """save_settings(api_key='clear') clears api_key in memory and on disk."""
         env = self.make_env()
         cfg = env.write_config(env.make_config_dict(api_key="AIzaSyClearMe12345678"))
         mcp = self.start_mcp(env, config_path=cfg)
@@ -1486,7 +1502,7 @@ class TestTier2F8McpBoundaries(E2ETestCase):
         if found_h:
             self.assertIsNone(hint)
         disk = json.loads(cfg.read_text(encoding="utf-8"))
-        self.assertIsNone(disk.get("gemini", {}).get("api_key"))
+        self.assertIsNone(disk["providers"]["gemini"]["api_key"])
 
     def test_t2_f8_ui_mcp_stdout_strictly_json_rpc_only(self) -> None:
         """Full MCP session with RUST_LOG=debug emits strictly JSON-RPC 2.0 lines on stdout."""
@@ -1521,6 +1537,72 @@ class TestTier2F8McpBoundaries(E2ETestCase):
             sc = resp.get("result", {}).get("structuredContent", {})
             found_ok, ok_val = find_key_recursive(sc, "ok")
             self.assertTrue(found_ok and ok_val is False, f"Expected ok=False on 400 API_KEY_INVALID, got {resp!r}")
+
+    def test_t2_f8_save_settings_denies_unknown_fields_top_level_and_nested(self) -> None:
+        """save_settings advertises additionalProperties=false and rejects unknown fields at every nesting level without mutating disk."""
+        env = self.make_env()
+        cfg = env.write_config(
+            env.make_config_dict(
+                listen_host="127.0.0.1",
+                listen_port=24141,
+                default_model="gemini-4-hydrogen",
+                api_key="AIzaSyKeepIntact12345",
+            )
+        )
+        initial_disk = json.loads(cfg.read_text(encoding="utf-8"))
+        mcp = self.start_mcp(env, config_path=cfg)
+
+        # 1. Verify advertised tools/list schema sets additionalProperties: false at top-level and all patch $defs.
+        tools = {t["name"]: t for t in mcp.list_tools().get("tools", []) if isinstance(t, dict) and "name" in t}
+        schema = tools["save_settings"].get("inputSchema") or {}
+        self.assertIs(schema.get("additionalProperties"), False, schema)
+        self.assertEqual(set((schema.get("properties") or {}).keys()), {"proxy", "cloudcode", "providers"})
+        defs = schema.get("$defs") or {}
+        for def_name in (
+            "ProxySettingsPatch",
+            "CloudCodeSettingsPatch",
+            "ProvidersSettingsPatch",
+            "GeminiSettingsPatch",
+        ):
+            self.assertIn(def_name, defs, defs)
+            self.assertIs(defs[def_name].get("additionalProperties"), False, defs[def_name])
+
+        # 2. Reject every legacy flat and nested unknown field payload cleanly.
+        unknown_payloads: list[tuple[str, dict[str, Any]]] = [
+            ("flat_listen_port", {"listen_port": 24142}),
+            ("flat_listen_host", {"listen_host": "localhost"}),
+            ("flat_gemini_default_model", {"gemini_default_model": "gemini-3.8-flash"}),
+            ("flat_gemini_base_url", {"gemini_base_url": "https://generativelanguage.googleapis.com"}),
+            ("flat_api_key", {"api_key": "AIzaSyLegacyFlat12345"}),
+            ("flat_clear_api_key", {"clear_api_key": True}),
+            ("flat_cloudcode_upstream_url", {"cloudcode_upstream_url": "auto"}),
+            ("flat_usage_dir", {"usage_dir": "/tmp/evil"}),
+            ("unknown_top", {"unknown_top": 1}),
+            ("proxy_bogus", {"proxy": {"port": 24142, "bogus": True}}),
+            ("cloudcode_bogus", {"cloudcode": {"upstream": "auto", "bogus": "x"}}),
+            ("providers_openai", {"providers": {"openai": {"api_key": {"set": "sk-123"}}}}),
+            ("gemini_timeout_secs", {"providers": {"gemini": {"timeout_secs": 30}}}),
+            ("gemini_bogus", {"providers": {"gemini": {"default_model": "gemini-3.8-flash", "bogus": 1}}}),
+            (
+                "api_key_set_extra",
+                {"providers": {"gemini": {"api_key": {"set": "AIzaSyValid123456", "extra": 1}}}},
+            ),
+        ]
+        for label, bad_payload in unknown_payloads:
+            with self.subTest(payload=label):
+                resp = mcp.call_tool_raw("save_settings", bad_payload)
+                mcp.assert_clean_stdout()
+                self.assertTrue(
+                    McpStdioClient.is_tool_error(resp),
+                    f"Expected unknown-field rejection for {label}, got {resp!r}",
+                )
+                self.assertNotIn("panicked", mcp.stderr_text.lower())
+
+        # 3. Server stays alive and disk config is completely untouched.
+        health_snap = mcp.call_tool("get_settings", {})
+        mcp.assert_clean_stdout()
+        self.assertFalse(McpStdioClient.is_tool_error(health_snap), health_snap)
+        self.assertEqual(json.loads(cfg.read_text(encoding="utf-8")), initial_disk)
 
 
 class TestTier2F9CliBoundaries(E2ETestCase):
@@ -2865,8 +2947,8 @@ class TestTier2F16XdgBoundaries(E2ETestCase):
                 )
                 sc = mcp.call_tool("get_settings", {}).get("structuredContent", {})
                 mcp.assert_clean_stdout()
-                found_m, model = find_key_recursive(sc, "gemini_default_model")
-                self.assertTrue(found_m and model == "gemini-4-home-fallback", f"Unexpected model in {sc!r}")
+                model = sc.get("config", {}).get("providers", {}).get("gemini", {}).get("default_model")
+                self.assertEqual(model, "gemini-4-home-fallback", f"Unexpected model in {sc!r}")
 
                 proxy = self.start_proxy(
                     env,
@@ -2960,7 +3042,7 @@ class TestTier2F16XdgBoundaries(E2ETestCase):
             self.assertTrue(is_err, f"save_settings must reject {bad_model!r}: {res!r}")
             self.assertIn("Gemini 3.8+ and Gemini 4+", json.dumps(res))
         persisted = json.loads(env.config_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["gemini"]["default_model"], "gemini-4-hydrogen")
+        self.assertEqual(persisted["providers"]["gemini"]["default_model"], "gemini-4-hydrogen")
         mcp.close()
 
         # 2. Proxy rejects legacy Gemini 2.x/1.x model URIs with 400 and zero upstream hits.
@@ -2985,7 +3067,7 @@ class TestTier2F16XdgBoundaries(E2ETestCase):
         self.assertEqual(len(mock.requests), 0, "Upstream must receive 0 hits for rejected models")
         stats_resp = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats")
         self.assertEqual(stats_resp.status, 200)
-        self.assertEqual(json.loads(stats_resp.text).get("requests"), 0)
+        self.assertEqual(json.loads(stats_resp.text)["usage"]["requests"], 0)
         proxy.stop()
 
         # 3. doctor fails if config.json is hand-edited to a legacy Gemini 2.5 model.

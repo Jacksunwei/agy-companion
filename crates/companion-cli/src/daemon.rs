@@ -197,7 +197,7 @@ pub fn write_proxy_pid(pid_path: &Path, info: &ProxyPidInfo) -> Result<ProxyPidG
         serde_json::to_string_pretty(info).map_err(|e| CliError::Serialization(e.to_string()))?;
     payload.push('\n');
 
-    companion_core::write_file_atomic_secure(pid_path, payload.as_bytes())?;
+    companion_core::write_atomic_secure(pid_path, payload.as_bytes())?;
     Ok(ProxyPidGuard {
         path: pid_path.to_path_buf(),
         expected_pid: info.pid,
@@ -661,7 +661,7 @@ mod tests {
         cfg.usage_dir = Some(PathBuf::from("../escape/usage"));
         assert!(matches!(
             resolve_runtime_data_dir(&cfg),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(companion_core::FsError::ParentDirTraversal))
         ));
 
         // None -> companion_core::default_data_dir()

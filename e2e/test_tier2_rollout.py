@@ -665,7 +665,7 @@ class TestTier2RolloutR07PlaceholderKeyQuarantineBoundaries(E2ETestCase):
                 )
 
         on_disk = json.loads(cfg.read_text(encoding="utf-8"))
-        self.assertEqual(on_disk["gemini"]["api_key"], real_key)
+        self.assertEqual(on_disk["providers"]["gemini"]["api_key"], real_key)
 
     def test_t2_r07_padded_placeholder_in_config_and_header_never_reaches_upstream(self) -> None:
         """R07: Whitespace-padded placeholder key in config and header returns 401 with 0 upstream requests."""
@@ -721,7 +721,7 @@ class TestTier2RolloutR08Day0UntouchedCatalogBoundaries(E2ETestCase):
         self.assertEqual(resp.status, 200, resp.text)
         self.assertEqual(resp.body, raw)
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertIs(stats["last_catalog_included_proxy_models"], False)
+        self.assertIs(stats["cloudcode"]["last_catalog_included_proxy_models"], False)
 
     def test_t2_r08_clearing_api_key_via_hot_reload_reverts_to_day0_untouched(self) -> None:
         """R08: Clearing a configured real API key via hot-reload reverts fetchAvailableModels to untouched."""
@@ -763,7 +763,7 @@ class TestTier2RolloutR08Day0UntouchedCatalogBoundaries(E2ETestCase):
         self.assertEqual(r2.status, 200)
         self.assertNotIn("companion/gemini-4-hydrogen-low", r2.json()["models"])
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertIs(stats["last_catalog_included_proxy_models"], False)
+        self.assertIs(stats["cloudcode"]["last_catalog_included_proxy_models"], False)
 
 
 class TestTier2RolloutR09ExtendedApiStatsBoundaries(E2ETestCase):
@@ -822,7 +822,7 @@ class TestTier2RolloutR09ExtendedApiStatsBoundaries(E2ETestCase):
             headers={"Authorization": "Bearer r09-mono", "Content-Type": "application/json"},
             body=b"{}",
         )
-        ts1 = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()["last_catalog_refresh_at_ms"]
+        ts1 = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()["cloudcode"]["last_catalog_refresh_at_ms"]
         self.assertIsInstance(ts1, int)
         time.sleep(0.05)
         http_raw_request(
@@ -833,7 +833,7 @@ class TestTier2RolloutR09ExtendedApiStatsBoundaries(E2ETestCase):
             headers={"Authorization": "Bearer r09-mono", "Content-Type": "application/json"},
             body=b"{}",
         )
-        ts2 = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()["last_catalog_refresh_at_ms"]
+        ts2 = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()["cloudcode"]["last_catalog_refresh_at_ms"]
         self.assertIsInstance(ts2, int)
         self.assertGreaterEqual(ts2, ts1)
 
@@ -1173,7 +1173,8 @@ class TestTier2RolloutR14ShellRcHooksSafetyBoundaries(E2ETestCase):
         r_def = run_cli([str(binary), "integration", "enable", "--shell", "zsh", "--json"], env=proc_env)
         self.assertEqual(r_def.returncode, 0, r_def.stderr)
         d_def = r_def.json_stdout()
-        self.assertIs(d_def["manual_required"], True, d_def)
+        self.assertEqual(d_def["state"], "manual_required", d_def)
+        self.assertNotIn("manual_required", d_def)
         self.assertTrue(d_def.get("manual_snippet"), d_def)
         self.assertTrue(zlogin.is_symlink())
         self.assertEqual(dotfiles_target.read_text(encoding="utf-8"), "# dotfiles original\n")
@@ -1217,7 +1218,8 @@ class TestTier2RolloutR14ShellRcHooksSafetyBoundaries(E2ETestCase):
             )
             self.assertEqual(r_ro.returncode, 0, r_ro.stderr)
             d_ro = r_ro.json_stdout()
-            self.assertIs(d_ro["manual_required"], True, d_ro)
+            self.assertEqual(d_ro["state"], "manual_required", d_ro)
+            self.assertNotIn("manual_required", d_ro)
             self.assertEqual(ro_rc.read_text(encoding="utf-8"), "# readonly\n")
         finally:
             os.chmod(ro_rc, 0o644)
@@ -1437,7 +1439,8 @@ class TestTier2RolloutR18McpLauncherCloudCodeBoundaries(E2ETestCase):
         res = mcp.call_tool("set_launcher_integration", {"enabled": True})
         mcp.assert_clean_stdout()
         li = res.get("structuredContent", {}).get("launcher_integration", {})
-        self.assertIs(li.get("manual_required"), True, li)
+        self.assertEqual(li.get("state"), "manual_required", li)
+        self.assertNotIn("manual_required", li)
         self.assertTrue(li.get("manual_snippet"), li)
         self.assertTrue(zlogin.is_symlink())
         self.assertEqual(target.read_text(encoding="utf-8"), "# managed by nix\n")
@@ -1753,11 +1756,11 @@ class TestTier2RolloutR22InstallCliBoundaries(E2ETestCase):
             env=env.build_env(set_config_env=False),
         )
         self.assertEqual(res.returncode, 0, f"{res.stdout}\n{res.stderr}")
-        self.assertTrue(env.config_path.is_file(), "Fresh install should persist fallback listen_port to config.json")
+        self.assertTrue(env.config_path.is_file(), "Fresh install should persist fallback proxy.port to config.json")
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(os.lstat(env.config_path).st_mode), 0o600)
         written = json.loads(env.config_path.read_text(encoding="utf-8"))
-        chosen_port = written["listen_port"]
+        chosen_port = written["proxy"]["port"]
         self.assertGreaterEqual(chosen_port, 24142)
         self.assertLessEqual(chosen_port, 24150)
 
@@ -1876,11 +1879,11 @@ class TestTier2RolloutR24WindowsParityBoundaries(E2ETestCase):
     FEATURE = "R24"
 
     def test_t2_r24_windows_integration_unsupported_and_manifests_avoid_bash(self) -> None:
-        """R24: Windows integration reports supported=false and Windows manifests do not shell out to bash."""
+        """R24: Windows integration reports state=unsupported and Windows manifests do not shell out to bash."""
         integ_rs = (self.repo_root / "crates" / "companion-core" / "src" / "integration.rs").read_text(encoding="utf-8")
         install_rs = (self.repo_root / "crates" / "companion-cli" / "src" / "install.rs").read_text(encoding="utf-8")
         self.assertRegex(integ_rs, r"cfg\(\s*(?:windows|not\s*\(\s*unix\s*\))\s*\)")
-        self.assertRegex(integ_rs, r"supported\s*:\s*(?:false|cfg!\(\s*unix\s*\))")
+        self.assertRegex(integ_rs, r"IntegrationState::Unsupported|IntegrationStatus::unsupported\(")
         self.assertIn("agy-companion.exe", install_rs)
 
     def test_t2_r24_windows_shortcut_hides_console_window_and_cleans_up_on_uninstall(self) -> None:

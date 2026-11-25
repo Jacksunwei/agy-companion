@@ -351,7 +351,7 @@ pub async fn run_launch_with_env<W: Write>(
     let config_path = resolve_cli_config_path(config_override.as_deref())?;
     let mut config = load_config_checked(&config_path)?;
     if let Some(port) = port_override {
-        config.listen_port = port;
+        config.proxy.port = std::num::NonZeroU16::new(port).ok_or(CliError::InvalidPort(0))?;
     }
     config.validate()?;
 
@@ -363,7 +363,7 @@ pub async fn run_launch_with_env<W: Write>(
         None => default_antigravity_app_path(),
     };
 
-    let port = config.listen_port;
+    let port = config.proxy.port.get();
     if print_env {
         writeln!(
             out,

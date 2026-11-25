@@ -1,18 +1,28 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::is_placeholder_api_key;
+use crate::config::{CloudCodeConfig, ProxyConfig};
+use crate::validation::is_placeholder_api_key;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactedGeminiConfig {
+    pub base_url: String,
+    pub default_model: String,
+    pub timeout_secs: u64,
+    pub api_key_configured: bool,
+    pub api_key_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactedProvidersConfig {
+    pub gemini: RedactedGeminiConfig,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactedConfig {
     pub schema_version: u32,
-    pub listen_host: String,
-    pub listen_port: u16,
-    pub gemini_base_url: String,
-    pub gemini_default_model: String,
-    pub gemini_timeout_secs: u64,
-    pub cloudcode_upstream_url: String,
-    pub api_key_configured: bool,
-    pub api_key_hint: Option<String>,
+    pub proxy: ProxyConfig,
+    pub cloudcode: CloudCodeConfig,
+    pub providers: RedactedProvidersConfig,
 }
 
 pub fn mask_api_key(key: &str) -> String {
@@ -38,7 +48,7 @@ pub fn api_key_hint(key: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Config;
+    use crate::{ApiKey, Config, PROXY_PLACEHOLDER_API_KEY};
 
     #[test]
     fn masks_api_key_without_leaking_middle() {
@@ -67,29 +77,38 @@ mod tests {
     }
 
     #[test]
-    fn redacted_config_never_exposes_plaintext_api_key() {
+    fn redacted_config_never_exposes_plaintext_api_key_and_matches_nested_shape() {
         let secret = "AIzaSyD1234567890abcd";
         let mut cfg = Config::default();
-        cfg.gemini.api_key = Some(secret.to_string());
+        cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(secret).unwrap());
 
         let redacted = cfg.redacted();
-        assert!(redacted.api_key_configured);
-        assert_eq!(redacted.api_key_hint.as_deref(), Some("AIza...abcd"));
+        assert!(redacted.providers.gemini.api_key_configured);
+        assert_eq!(
+            redacted.providers.gemini.api_key_hint.as_deref(),
+            Some("AIza...abcd")
+        );
 
         let json = serde_json::to_string(&redacted).expect("serialize redacted");
         assert!(!json.contains(secret));
         assert!(!json.contains("SyD1234567890"));
 
-        cfg.gemini.api_key = Some("   ".to_string());
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["schema_version"], 1);
+        assert_eq!(val["proxy"]["host"], "127.0.0.1");
+        assert_eq!(val["proxy"]["port"], 24141);
+        assert_eq!(val["cloudcode"]["upstream"], "auto");
+        assert_eq!(val["providers"]["gemini"]["api_key_configured"], true);
+        assert_eq!(val["providers"]["gemini"]["api_key_hint"], "AIza...abcd");
+
+        cfg.providers.gemini.api_key = None;
         let blank_redacted = cfg.redacted();
-        assert!(!blank_redacted.api_key_configured);
-        assert_eq!(blank_redacted.api_key_hint, None);
+        assert!(!blank_redacted.providers.gemini.api_key_configured);
+        assert_eq!(blank_redacted.providers.gemini.api_key_hint, None);
     }
 
     #[test]
     fn api_key_hint_and_redacted_quarantine_proxy_placeholder_sentinel() {
-        use crate::PROXY_PLACEHOLDER_API_KEY;
-
         for raw in [
             PROXY_PLACEHOLDER_API_KEY,
             "  agy-companion-local  ",
@@ -103,14 +122,15 @@ mod tests {
         }
 
         for raw in [PROXY_PLACEHOLDER_API_KEY, "  agy-companion-local  "] {
-            let mut cfg = Config::default();
-            cfg.gemini.api_key = Some(raw.to_string());
+            let json = format!(r#"{{"providers":{{"gemini":{{"api_key":"{raw}"}}}}}}"#);
+            let cfg = Config::from_json_str(&json, std::path::Path::new("placeholder.json"))
+                .expect("disk placeholder normalizes to None");
 
             let redacted = cfg.redacted();
-            assert!(!redacted.api_key_configured);
-            assert_eq!(redacted.api_key_hint, None);
+            assert!(!redacted.providers.gemini.api_key_configured);
+            assert_eq!(redacted.providers.gemini.api_key_hint, None);
 
-            let debug = format!("{:?}", cfg.gemini);
+            let debug = format!("{:?}", cfg.providers.gemini);
             assert!(
                 debug.contains("api_key: None"),
                 "expected GeminiConfig Debug to treat placeholder as None, got {debug}"

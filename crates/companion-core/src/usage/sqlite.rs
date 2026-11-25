@@ -1,21 +1,14 @@
-use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior, params};
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
-use uuid::Uuid;
 
-use crate::config::{CoreError, validate_path};
-
-pub const USAGE_DB_FILENAME: &str = "usage.db";
-pub const USAGE_DB_SCHEMA_VERSION: u32 = 1;
+use super::{USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION, UsageEvent, UsageSink};
+use crate::config::CoreError;
+use crate::fs_safe::{self, FsError, OpenRegularMode};
 
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const SQLITE_INIT_BUSY_RETRIES: u32 = 16;
@@ -44,107 +37,6 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_provider_model
 PRAGMA user_version = 1;
 ";
 
-fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    T: Default + Deserialize<'de>,
-    D: Deserializer<'de>,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GeminiUsageMetadata {
-    #[serde(
-        rename = "promptTokenCount",
-        default,
-        deserialize_with = "deserialize_null_default"
-    )]
-    pub prompt_token_count: u64,
-    #[serde(
-        rename = "candidatesTokenCount",
-        default,
-        deserialize_with = "deserialize_null_default"
-    )]
-    pub candidates_token_count: u64,
-    #[serde(
-        rename = "cachedContentTokenCount",
-        default,
-        deserialize_with = "deserialize_null_default"
-    )]
-    pub cached_content_token_count: u64,
-    #[serde(
-        rename = "thoughtsTokenCount",
-        default,
-        deserialize_with = "deserialize_null_default"
-    )]
-    pub thoughts_token_count: u64,
-}
-
-impl GeminiUsageMetadata {
-    fn extract_from_object(value: &Value) -> Option<GeminiUsageMetadata> {
-        let usage = value.as_object()?.get("usageMetadata")?;
-        if !usage.is_object() {
-            return None;
-        }
-        serde_json::from_value(usage.clone()).ok()
-    }
-
-    pub fn parse_from_json(bytes: &[u8]) -> Option<GeminiUsageMetadata> {
-        let value: Value = serde_json::from_slice(bytes).ok()?;
-        match &value {
-            Value::Object(_) => Self::extract_from_object(&value),
-            Value::Array(items) => items.iter().rev().find_map(Self::extract_from_object),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UsageEvent {
-    pub timestamp_utc: String,
-    pub request_id: String,
-    pub provider: String,
-    pub model: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub latency_ms: u64,
-    pub source: String,
-}
-
-impl UsageEvent {
-    pub fn from_gemini(
-        model: impl Into<String>,
-        usage: &GeminiUsageMetadata,
-        latency_ms: u64,
-    ) -> Self {
-        Self {
-            timestamp_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-            request_id: Uuid::new_v4().to_string(),
-            provider: "gemini".to_string(),
-            model: model.into(),
-            input_tokens: usage.prompt_token_count,
-            output_tokens: usage.candidates_token_count,
-            cached_tokens: usage.cached_content_token_count,
-            reasoning_tokens: usage.thoughts_token_count,
-            latency_ms,
-            source: "proxy".to_string(),
-        }
-    }
-}
-
-pub trait UsageSink: Send + Sync {
-    fn record(&self, event: UsageEvent);
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopUsageSink;
-
-impl UsageSink for NoopUsageSink {
-    fn record(&self, _event: UsageEvent) {}
-}
-
 pub struct SqliteUsageSink {
     usage_dir: PathBuf,
     db_path: PathBuf,
@@ -158,18 +50,6 @@ impl fmt::Debug for SqliteUsageSink {
             .field("db_path", &self.db_path)
             .finish_non_exhaustive()
     }
-}
-
-fn normalized_path(path: &Path) -> PathBuf {
-    // Normalizing trailing separators prevents POSIX lstat(2) from following a
-    // trailing-slash symlink path.
-    path.components().collect()
-}
-
-fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut os = OsString::from(path.as_os_str());
-    os.push(suffix);
-    PathBuf::from(os)
 }
 
 fn u64_to_sqlite_i64(value: u64) -> i64 {
@@ -194,91 +74,15 @@ fn should_invalidate_connection(err: &rusqlite::Error) -> bool {
     )
 }
 
-fn validate_regular_file_if_exists(path: &Path) -> Result<Option<fs::Metadata>, CoreError> {
-    let check_path = normalized_path(path);
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(CoreError::InvalidPath {
-                    reason: "symbolic links are not allowed for usage database files".to_string(),
-                });
-            }
-            if !meta.file_type().is_file() {
-                return Err(CoreError::InvalidPath {
-                    reason: "usage database path must be a regular file".to_string(),
-                });
-            }
-            Ok(Some(meta))
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(CoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-#[cfg(unix)]
-fn tighten_regular_file_mode_0600(path: &Path) -> Result<(), CoreError> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let Some(lstat_meta) = validate_regular_file_if_exists(path)? else {
-        return Ok(());
-    };
-    if (lstat_meta.permissions().mode() & 0o777) == 0o600 {
-        return Ok(());
-    }
-
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(CoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    let open_meta = file.metadata().map_err(|source| CoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !open_meta.file_type().is_file()
-        || open_meta.dev() != lstat_meta.dev()
-        || open_meta.ino() != lstat_meta.ino()
-    {
-        return Err(CoreError::InvalidPath {
-            reason: "usage database file changed concurrently during permission hardening"
-                .to_string(),
-        });
-    }
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|source| CoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    Ok(())
-}
-
 impl SqliteUsageSink {
     pub fn new(usage_dir: impl Into<PathBuf>) -> Result<Self, CoreError> {
         let usage_dir = usage_dir.into();
-        validate_path(&usage_dir)?;
-        let check_dir = normalized_path(&usage_dir);
-        match fs::symlink_metadata(&check_dir) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(CoreError::InvalidPath {
-                    reason: "symbolic links are not allowed for usage directories".to_string(),
-                });
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(CoreError::Io {
-                    path: usage_dir,
-                    source,
-                });
-            }
+        fs_safe::validate_path(&usage_dir)?;
+        // Reject symlink usage directories eagerly while preserving lazy NotDirectory rejection
+        // until first record/read operation.
+        match fs_safe::inspect_existing_dir(&usage_dir) {
+            Ok(_) | Err(FsError::NotDirectory { .. }) => {}
+            Err(err) => return Err(err.into()),
         }
         let db_path = usage_dir.join(USAGE_DB_FILENAME);
         Ok(Self {
@@ -306,173 +110,25 @@ impl SqliteUsageSink {
     fn sqlite_related_paths(&self) -> [PathBuf; 4] {
         [
             self.db_path.clone(),
-            append_os_suffix(&self.db_path, "-wal"),
-            append_os_suffix(&self.db_path, "-shm"),
-            append_os_suffix(&self.db_path, "-journal"),
+            fs_safe::append_os_suffix(&self.db_path, "-wal"),
+            fs_safe::append_os_suffix(&self.db_path, "-shm"),
+            fs_safe::append_os_suffix(&self.db_path, "-journal"),
         ]
-    }
-
-    fn ensure_usage_dir(&self) -> Result<(), CoreError> {
-        let check_usage_dir = normalized_path(&self.usage_dir);
-        match fs::symlink_metadata(&check_usage_dir) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(CoreError::InvalidPath {
-                        reason: "symbolic links are not allowed for usage directories".to_string(),
-                    });
-                }
-                if !meta.file_type().is_dir() {
-                    return Err(CoreError::InvalidPath {
-                        reason: "usage directory path must be a directory".to_string(),
-                    });
-                }
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                let mut dir_builder = fs::DirBuilder::new();
-                dir_builder.recursive(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    dir_builder.mode(0o700);
-                }
-                dir_builder
-                    .create(&self.usage_dir)
-                    .map_err(|source| CoreError::Io {
-                        path: self.usage_dir.clone(),
-                        source,
-                    })?;
-
-                let created_meta =
-                    fs::symlink_metadata(&check_usage_dir).map_err(|source| CoreError::Io {
-                        path: self.usage_dir.clone(),
-                        source,
-                    })?;
-                if created_meta.file_type().is_symlink() || !created_meta.file_type().is_dir() {
-                    return Err(CoreError::InvalidPath {
-                        reason: "usage directory path must be a non-symlink directory".to_string(),
-                    });
-                }
-            }
-            Err(source) => {
-                return Err(CoreError::Io {
-                    path: self.usage_dir.clone(),
-                    source,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn check_existing_usage_dir(&self) -> Result<bool, CoreError> {
-        let check_usage_dir = normalized_path(&self.usage_dir);
-        match fs::symlink_metadata(&check_usage_dir) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(CoreError::InvalidPath {
-                        reason: "symbolic links are not allowed for usage directories".to_string(),
-                    });
-                }
-                if !meta.file_type().is_dir() {
-                    return Err(CoreError::InvalidPath {
-                        reason: "usage directory path must be a directory".to_string(),
-                    });
-                }
-                Ok(true)
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-            Err(source) => Err(CoreError::Io {
-                path: self.usage_dir.clone(),
-                source,
-            }),
-        }
     }
 
     fn validate_sqlite_paths(&self) -> Result<Option<fs::Metadata>, CoreError> {
         let paths = self.sqlite_related_paths();
-        let db_meta = validate_regular_file_if_exists(&paths[0])?;
+        let db_meta = fs_safe::inspect_regular_file_if_exists(&paths[0], None)?;
         for sidecar in &paths[1..] {
-            let _ = validate_regular_file_if_exists(sidecar)?;
+            let _ = fs_safe::inspect_regular_file_if_exists(sidecar, None)?;
         }
         Ok(db_meta)
     }
 
-    #[cfg(unix)]
     fn tighten_sqlite_file_permissions(&self) -> Result<(), CoreError> {
         for path in self.sqlite_related_paths() {
-            tighten_regular_file_mode_0600(&path)?;
+            fs_safe::tighten_regular_file_mode_0600(&path)?;
         }
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn tighten_sqlite_file_permissions(&self) -> Result<(), CoreError> {
-        Ok(())
-    }
-
-    fn precreate_and_verify_db_file(
-        &self,
-        pre_open_meta: Option<fs::Metadata>,
-    ) -> Result<(), CoreError> {
-        let check_db_path = normalized_path(&self.db_path);
-        let mut open_opts = fs::OpenOptions::new();
-        open_opts.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open_opts.mode(0o600);
-        }
-
-        let file = open_opts
-            .open(&self.db_path)
-            .map_err(|source| CoreError::Io {
-                path: self.db_path.clone(),
-                source,
-            })?;
-
-        let open_meta = file.metadata().map_err(|source| CoreError::Io {
-            path: self.db_path.clone(),
-            source,
-        })?;
-        if !open_meta.file_type().is_file() {
-            return Err(CoreError::InvalidPath {
-                reason: "usage database path must be a regular file".to_string(),
-            });
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if let Some(lstat_meta) = pre_open_meta {
-                if open_meta.dev() != lstat_meta.dev() || open_meta.ino() != lstat_meta.ino() {
-                    return Err(CoreError::InvalidPath {
-                        reason: "usage database file changed concurrently during open".to_string(),
-                    });
-                }
-            } else {
-                let post_lstat =
-                    fs::symlink_metadata(&check_db_path).map_err(|source| CoreError::Io {
-                        path: self.db_path.clone(),
-                        source,
-                    })?;
-                if post_lstat.file_type().is_symlink()
-                    || !post_lstat.file_type().is_file()
-                    || post_lstat.dev() != open_meta.dev()
-                    || post_lstat.ino() != open_meta.ino()
-                {
-                    return Err(CoreError::InvalidPath {
-                        reason: "usage database file changed concurrently during open".to_string(),
-                    });
-                }
-            }
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|source| CoreError::Io {
-                    path: self.db_path.clone(),
-                    source,
-                })?;
-        }
-        #[cfg(not(unix))]
-        let _ = (check_db_path, pre_open_meta);
-
         Ok(())
     }
 
@@ -575,9 +231,12 @@ impl SqliteUsageSink {
     }
 
     fn open_rw_connection(&self) -> Result<Connection, CoreError> {
-        self.ensure_usage_dir()?;
-        let pre_open_meta = self.validate_sqlite_paths()?;
-        self.precreate_and_verify_db_file(pre_open_meta)?;
+        fs_safe::ensure_dir_no_symlink(&self.usage_dir, 0o700)?;
+        let _ = self.validate_sqlite_paths()?;
+        let _ = fs_safe::open_verified_regular_file_0600(
+            &self.db_path,
+            OpenRegularMode::ReadWriteCreate,
+        )?;
 
         // Explicitly omit SQLITE_OPEN_CREATE and SQLITE_OPEN_URI so SQLite only
         // opens the pre-verified regular file path verbatim.
@@ -697,7 +356,7 @@ impl SqliteUsageSink {
             };
         }
 
-        if !self.check_existing_usage_dir()? {
+        if fs_safe::inspect_existing_dir(&self.usage_dir)?.is_none() {
             return Ok(Vec::new());
         }
         let Some(_) = self.validate_sqlite_paths()? else {
@@ -729,11 +388,13 @@ impl UsageSink for SqliteUsageSink {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashSet;
     use std::fs;
     use std::sync::Arc;
+
     use tempfile::TempDir;
+
+    use super::*;
 
     fn sample_event(timestamp_utc: &str, request_id: &str) -> UsageEvent {
         UsageEvent {
@@ -768,28 +429,6 @@ mod tests {
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
-    }
-
-    #[test]
-    fn parses_gemini_usage_metadata_with_cached_and_thoughts() {
-        let payload = br#"{
-            "candidates": [{"content": {"parts": [{"text": "hello"}]}}],
-            "usageMetadata": {
-                "promptTokenCount": 1200,
-                "candidatesTokenCount": 350,
-                "cachedContentTokenCount": 900,
-                "thoughtsTokenCount": 120,
-                "totalTokenCount": 1670,
-                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 1200}],
-                "serviceTier": "STANDARD"
-            }
-        }"#;
-
-        let parsed = GeminiUsageMetadata::parse_from_json(payload).expect("parsed usageMetadata");
-        assert_eq!(parsed.prompt_token_count, 1200);
-        assert_eq!(parsed.candidates_token_count, 350);
-        assert_eq!(parsed.cached_content_token_count, 900);
-        assert_eq!(parsed.thoughts_token_count, 120);
     }
 
     #[test]
@@ -852,38 +491,6 @@ mod tests {
                 "source",
             ]
         );
-    }
-
-    #[test]
-    fn parses_usage_from_array_handles_missing_and_null_fields() {
-        let array_payload = br#"[
-            {"candidates": [{"content": {"parts": [{"text": "part1"}]}}], "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 10}},
-            {"candidates": [{"content": {"parts": [{"text": "part2"}]}}], "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 42, "cachedContentTokenCount": null, "thoughtsTokenCount": null}}
-        ]"#;
-        let parsed = GeminiUsageMetadata::parse_from_json(array_payload).expect("array usage");
-        assert_eq!(parsed.prompt_token_count, 100);
-        assert_eq!(parsed.candidates_token_count, 42);
-        assert_eq!(parsed.cached_content_token_count, 0);
-        assert_eq!(parsed.thoughts_token_count, 0);
-
-        let partial = br#"{"usageMetadata": {"promptTokenCount": 50}}"#;
-        let parsed_partial = GeminiUsageMetadata::parse_from_json(partial).expect("partial usage");
-        assert_eq!(parsed_partial.prompt_token_count, 50);
-        assert_eq!(parsed_partial.candidates_token_count, 0);
-
-        assert_eq!(
-            GeminiUsageMetadata::parse_from_json(br#"{"error": {"code": 400, "message": "bad"}}"#),
-            None
-        );
-        assert_eq!(
-            GeminiUsageMetadata::parse_from_json(br#"{"candidates": []}"#),
-            None
-        );
-        assert_eq!(
-            GeminiUsageMetadata::parse_from_json(br#"{"usageMetadata": null}"#),
-            None
-        );
-        assert_eq!(GeminiUsageMetadata::parse_from_json(b"not-json"), None);
     }
 
     #[test]
@@ -1113,22 +720,13 @@ mod tests {
         assert_eq!(events[0].reasoning_tokens, i64::MAX as u64);
         assert_eq!(events[0].latency_ms, i64::MAX as u64);
         assert_eq!(events[4].request_id, "after-dup");
-
-        let db_err = CoreError::UsageDatabase {
-            path: PathBuf::from("/tmp/usage.db"),
-            reason: "boom".to_string(),
-        };
-        assert_eq!(
-            db_err.to_string(),
-            "usage database error at '/tmp/usage.db': boom"
-        );
     }
 
     #[test]
     fn sqlite_sink_handles_io_failure_without_panicking() {
         assert!(matches!(
             SqliteUsageSink::new("../escape"),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::ParentDirTraversal))
         ));
 
         let tmp = TempDir::new().expect("temp dir");
@@ -1140,26 +738,6 @@ mod tests {
         assert!(sink.record_checked(&event).is_err());
 
         // UsageSink::record must never panic on I/O errors
-        sink.record(event);
-    }
-
-    #[test]
-    fn noop_sink_accepts_events() {
-        let sink: Box<dyn UsageSink> = Box::new(NoopUsageSink);
-        let usage = GeminiUsageMetadata {
-            prompt_token_count: 10,
-            candidates_token_count: 5,
-            cached_content_token_count: 2,
-            thoughts_token_count: 1,
-        };
-        let event = UsageEvent::from_gemini("gemini-4-hydrogen", &usage, 123);
-        assert_eq!(event.provider, "gemini");
-        assert_eq!(event.source, "proxy");
-        assert_eq!(event.input_tokens, 10);
-        assert_eq!(event.output_tokens, 5);
-        assert_eq!(event.cached_tokens, 2);
-        assert_eq!(event.reasoning_tokens, 1);
-        assert_eq!(event.latency_ms, 123);
         sink.record(event);
     }
 
@@ -1263,16 +841,16 @@ mod tests {
                 .record_checked(&sample_event("2026-11-23T08:00:00Z", "sym-db"))
                 .expect_err("symlinked sqlite file must fail write");
             assert!(
-                matches!(write_err, CoreError::InvalidPath { .. }),
-                "expected InvalidPath for symlinked {file_name}, got {write_err:?}"
+                matches!(write_err, CoreError::Fs(FsError::SymlinkRejected { .. })),
+                "expected SymlinkRejected for symlinked {file_name}, got {write_err:?}"
             );
 
             let read_err = sink
                 .read_all_events()
                 .expect_err("symlinked sqlite file must fail read");
             assert!(
-                matches!(read_err, CoreError::InvalidPath { .. }),
-                "expected InvalidPath on read for symlinked {file_name}, got {read_err:?}"
+                matches!(read_err, CoreError::Fs(FsError::SymlinkRejected { .. })),
+                "expected SymlinkRejected on read for symlinked {file_name}, got {read_err:?}"
             );
 
             assert_eq!(
@@ -1307,7 +885,7 @@ mod tests {
 
         assert!(matches!(
             SqliteUsageSink::new(&sym_usage_dir),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
         ));
 
         let swapped_dir = tmp.path().join("swapped_usage");
@@ -1316,10 +894,13 @@ mod tests {
         let swap_err = swapped_sink
             .record_checked(&sample_event("2026-11-23T08:00:00Z", "swapped-dir"))
             .expect_err("post-construction symlinked usage_dir must fail");
-        assert!(matches!(swap_err, CoreError::InvalidPath { .. }));
+        assert!(matches!(
+            swap_err,
+            CoreError::Fs(FsError::SymlinkRejected { .. })
+        ));
         assert!(matches!(
             swapped_sink.read_all_events(),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
         ));
         assert!(
             fs::read_dir(&target_dir)
@@ -1353,8 +934,8 @@ mod tests {
             handle.join().expect("thread join");
             let err = res.expect_err("FIFO sqlite path must fail");
             assert!(
-                matches!(err, CoreError::InvalidPath { .. }),
-                "expected InvalidPath for FIFO {fifo_name}, got {err:?}"
+                matches!(err, CoreError::Fs(FsError::NotRegularFile { .. })),
+                "expected NotRegularFile for FIFO {fifo_name}, got {err:?}"
             );
         }
     }

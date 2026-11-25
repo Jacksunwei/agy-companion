@@ -10,17 +10,39 @@ type HostPlatform = "macos" | "linux" | "windows";
 type ActiveTab = "monitor" | "settings";
 type StatusTone = "ok" | "warn" | "err" | "info";
 type CloudCodeModeId = "auto" | "daily" | "prod" | "custom";
+type IntegrationState =
+  | "active"
+  | "enabled"
+  | "manual_required"
+  | "disabled"
+  | "unsupported";
+
+interface ProxyConfig {
+  host: string;
+  port: number;
+}
+
+interface CloudCodeConfig {
+  upstream: string;
+}
+
+interface RedactedGeminiConfig {
+  base_url: string;
+  default_model: string;
+  timeout_secs: number;
+  api_key_configured: boolean;
+  api_key_hint: string | null;
+}
+
+interface RedactedProvidersConfig {
+  gemini: RedactedGeminiConfig;
+}
 
 interface RedactedConfig {
   schema_version: number;
-  listen_host: string;
-  listen_port: number;
-  gemini_base_url: string;
-  gemini_default_model: string;
-  gemini_timeout_secs: number;
-  cloudcode_upstream_url: string;
-  api_key_configured: boolean;
-  api_key_hint: string | null;
+  proxy: ProxyConfig;
+  cloudcode: CloudCodeConfig;
+  providers: RedactedProvidersConfig;
 }
 
 interface ProxyHealthPayload {
@@ -31,17 +53,25 @@ interface ProxyHealthPayload {
   error: string | null;
 }
 
-interface ProxyStatsPayload {
+interface UsageStatsSnapshot {
   requests: number;
   prompt_tokens: number;
   cached_tokens: number;
   output_tokens: number;
   reasoning_tokens: number;
   cache_hit_ratio: number;
+}
+
+interface CloudCodeStatsSnapshot {
+  mode: string;
+  resolved_upstream: string | null;
   last_catalog_refresh_at_ms: number | null;
   last_catalog_included_proxy_models: boolean | null;
-  cloudcode_mode: string | null;
-  cloudcode_resolved_upstream: string | null;
+}
+
+interface StatsSnapshot {
+  usage: UsageStatsSnapshot;
+  cloudcode: CloudCodeStatsSnapshot;
 }
 
 interface CloudCodeStatusPayload {
@@ -51,17 +81,22 @@ interface CloudCodeStatusPayload {
 }
 
 interface LauncherIntegrationStatus {
-  supported: boolean;
+  state: IntegrationState;
   enabled: boolean;
-  manual_required: boolean;
+  hybrid_active: boolean;
   shell: string | null;
   rc_path: string | null;
   env_script_path: string | null;
   binary_path: string | null;
   symlink_target: string | null;
   manual_snippet: string | null;
-  hybrid_active: boolean;
   message: string | null;
+}
+
+interface ModelPreset {
+  id: string;
+  display_name: string;
+  short_label: string;
 }
 
 interface SettingsSnapshot {
@@ -69,20 +104,38 @@ interface SettingsSnapshot {
   binary_version: string;
   proxy: ProxyHealthPayload;
   version_skew: boolean;
-  stats: ProxyStatsPayload | null;
+  stats: StatsSnapshot | null;
   launcher_integration: LauncherIntegrationStatus | null;
   cloudcode: CloudCodeStatusPayload;
+  supported_models: ModelPreset[];
   platform: HostPlatform;
 }
 
-interface SaveSettingsArgs {
-  api_key?: string;
-  clear_api_key?: boolean;
-  default_model?: string;
+type ApiKeyPatch = "clear" | { set: string };
+
+interface ProxySettingsPatch {
+  host?: string;
+  port?: number;
+}
+
+interface CloudCodeSettingsPatch {
+  upstream?: string;
+}
+
+interface GeminiSettingsPatch {
+  api_key?: ApiKeyPatch;
   base_url?: string;
-  cloudcode_upstream_url?: string;
-  listen_port?: number;
-  listen_host?: string;
+  default_model?: string;
+}
+
+interface ProvidersSettingsPatch {
+  gemini?: GeminiSettingsPatch;
+}
+
+interface SaveSettingsArgs {
+  proxy?: ProxySettingsPatch;
+  cloudcode?: CloudCodeSettingsPatch;
+  providers?: ProvidersSettingsPatch;
 }
 
 interface TestConnectionPayload {
@@ -122,23 +175,31 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 
 const DEFAULT_CONFIG: RedactedConfig = {
   schema_version: 1,
-  listen_host: "127.0.0.1",
-  listen_port: 24141,
-  gemini_base_url: "https://generativelanguage.googleapis.com",
-  gemini_default_model: "gemini-4-hydrogen",
-  gemini_timeout_secs: 900,
-  cloudcode_upstream_url: "auto",
-  api_key_configured: false,
-  api_key_hint: null,
+  proxy: {
+    host: "127.0.0.1",
+    port: 24141,
+  },
+  cloudcode: {
+    upstream: "auto",
+  },
+  providers: {
+    gemini: {
+      base_url: "https://generativelanguage.googleapis.com",
+      default_model: "gemini-4-hydrogen",
+      timeout_secs: 900,
+      api_key_configured: false,
+      api_key_hint: null,
+    },
+  },
 };
 
-const MODEL_PRESETS = [
-  { id: "gemini-4-carbon", label: "4 Carbon" },
-  { id: "gemini-4-neon", label: "4 Neon" },
-  { id: "gemini-4-hydrogen", label: "4 Hydrogen" },
-  { id: "gemini-4-argon", label: "4 Argon" },
-  { id: "gemini-3.8-flash", label: "3.8 Flash" },
-] as const;
+const DEFAULT_MODEL_PRESETS: ReadonlyArray<ModelPreset> = [
+  { id: "gemini-4-carbon", display_name: "Gemini 4 Carbon", short_label: "4 Carbon" },
+  { id: "gemini-4-neon", display_name: "Gemini 4 Neon", short_label: "4 Neon" },
+  { id: "gemini-4-hydrogen", display_name: "Gemini 4 Hydrogen", short_label: "4 Hydrogen" },
+  { id: "gemini-4-argon", display_name: "Gemini 4 Argon", short_label: "4 Argon" },
+  { id: "gemini-3.8-flash", display_name: "Gemini 3.8 Flash", short_label: "3.8 Flash" },
+];
 
 const CLOUDCODE_PRESETS: ReadonlyArray<{
   id: CloudCodeModeId;
@@ -210,7 +271,7 @@ const state: AppState = {
   hydratedFromInitialResult: false,
   snapshotEpoch: 0,
   snapshot: null,
-  savedPort: DEFAULT_CONFIG.listen_port,
+  savedPort: DEFAULT_CONFIG.proxy.port,
   portChangedSinceSave: false,
   tab: "settings",
   tabPinnedByUser: false,
@@ -293,23 +354,46 @@ function normalizeHostPlatform(raw: unknown): HostPlatform {
   return detectClientPlatform();
 }
 
+function asIntegrationState(value: unknown): IntegrationState | null {
+  if (
+    value === "active" ||
+    value === "enabled" ||
+    value === "manual_required" ||
+    value === "disabled" ||
+    value === "unsupported"
+  ) {
+    return value;
+  }
+  return null;
+}
+
 function parseRedactedConfig(raw: unknown): RedactedConfig | null {
   if (!isRecord(raw)) return null;
   const schemaVersion = asNumber(raw.schema_version);
-  const listenHost = asString(raw.listen_host);
-  const listenPort = asNumber(raw.listen_port);
-  const baseUrl = asString(raw.gemini_base_url);
-  const defaultModel = asString(raw.gemini_default_model);
-  const timeoutSecs = asNumber(raw.gemini_timeout_secs);
-  const cloudcodeUpstreamUrl =
-    asString(raw.cloudcode_upstream_url) ?? DEFAULT_CONFIG.cloudcode_upstream_url;
-  const apiKeyConfigured = asBoolean(raw.api_key_configured);
-  const apiKeyHint = asNullableString(raw.api_key_hint);
-
   if (
     schemaVersion === null ||
-    listenHost === null ||
-    listenPort === null ||
+    !isRecord(raw.proxy) ||
+    !isRecord(raw.cloudcode) ||
+    !isRecord(raw.providers) ||
+    !isRecord(raw.providers.gemini)
+  ) {
+    return null;
+  }
+
+  const host = asString(raw.proxy.host);
+  const port = asNumber(raw.proxy.port);
+  const upstream = asString(raw.cloudcode.upstream);
+  const gem = raw.providers.gemini;
+  const baseUrl = asString(gem.base_url);
+  const defaultModel = asString(gem.default_model);
+  const timeoutSecs = asNumber(gem.timeout_secs);
+  const apiKeyConfigured = asBoolean(gem.api_key_configured);
+  const apiKeyHint = asNullableString(gem.api_key_hint);
+
+  if (
+    host === null ||
+    port === null ||
+    upstream === null ||
     baseUrl === null ||
     defaultModel === null ||
     timeoutSecs === null ||
@@ -321,14 +405,22 @@ function parseRedactedConfig(raw: unknown): RedactedConfig | null {
 
   return {
     schema_version: schemaVersion,
-    listen_host: listenHost,
-    listen_port: listenPort,
-    gemini_base_url: baseUrl,
-    gemini_default_model: defaultModel,
-    gemini_timeout_secs: timeoutSecs,
-    cloudcode_upstream_url: cloudcodeUpstreamUrl,
-    api_key_configured: apiKeyConfigured,
-    api_key_hint: apiKeyHint,
+    proxy: {
+      host,
+      port,
+    },
+    cloudcode: {
+      upstream,
+    },
+    providers: {
+      gemini: {
+        base_url: baseUrl,
+        default_model: defaultModel,
+        timeout_secs: timeoutSecs,
+        api_key_configured: apiKeyConfigured,
+        api_key_hint: apiKeyHint,
+      },
+    },
   };
 }
 
@@ -359,14 +451,15 @@ function parseProxyHealth(raw: unknown): ProxyHealthPayload | null {
   };
 }
 
-function parseProxyStats(raw: unknown): ProxyStatsPayload | null {
-  if (!isRecord(raw)) return null;
-  const requests = asNumber(raw.requests);
-  const promptTokens = asNumber(raw.prompt_tokens);
-  const cachedTokens = asNumber(raw.cached_tokens);
-  const outputTokens = asNumber(raw.output_tokens);
-  const reasoningTokens = asNumber(raw.reasoning_tokens);
-  const cacheHitRatio = asNumber(raw.cache_hit_ratio);
+function parseStatsSnapshot(raw: unknown): StatsSnapshot | null {
+  if (!isRecord(raw) || !isRecord(raw.usage)) return null;
+  const u = raw.usage;
+  const requests = asNumber(u.requests);
+  const promptTokens = asNumber(u.prompt_tokens);
+  const cachedTokens = asNumber(u.cached_tokens);
+  const outputTokens = asNumber(u.output_tokens);
+  const reasoningTokens = asNumber(u.reasoning_tokens);
+  const cacheHitRatio = asNumber(u.cache_hit_ratio);
 
   if (
     requests === null ||
@@ -379,31 +472,50 @@ function parseProxyStats(raw: unknown): ProxyStatsPayload | null {
     return null;
   }
 
+  let cloudcode: CloudCodeStatsSnapshot = {
+    mode: "",
+    resolved_upstream: null,
+    last_catalog_refresh_at_ms: null,
+    last_catalog_included_proxy_models: null,
+  };
+  if (raw.cloudcode !== undefined) {
+    if (!isRecord(raw.cloudcode)) return null;
+    cloudcode = {
+      mode: asString(raw.cloudcode.mode) ?? "",
+      resolved_upstream: asOptionalNullableString(raw.cloudcode.resolved_upstream),
+      last_catalog_refresh_at_ms: asOptionalNullableNumber(
+        raw.cloudcode.last_catalog_refresh_at_ms,
+      ),
+      last_catalog_included_proxy_models: asOptionalNullableBoolean(
+        raw.cloudcode.last_catalog_included_proxy_models,
+      ),
+    };
+  }
+
   return {
-    requests,
-    prompt_tokens: promptTokens,
-    cached_tokens: cachedTokens,
-    output_tokens: outputTokens,
-    reasoning_tokens: reasoningTokens,
-    cache_hit_ratio: cacheHitRatio,
-    last_catalog_refresh_at_ms: asOptionalNullableNumber(raw.last_catalog_refresh_at_ms),
-    last_catalog_included_proxy_models: asOptionalNullableBoolean(
-      raw.last_catalog_included_proxy_models,
-    ),
-    cloudcode_mode: asOptionalNullableString(raw.cloudcode_mode),
-    cloudcode_resolved_upstream: asOptionalNullableString(raw.cloudcode_resolved_upstream),
+    usage: {
+      requests,
+      prompt_tokens: promptTokens,
+      cached_tokens: cachedTokens,
+      output_tokens: outputTokens,
+      reasoning_tokens: reasoningTokens,
+      cache_hit_ratio: cacheHitRatio,
+    },
+    cloudcode,
   };
 }
 
 function parseCloudCodeStatus(
   raw: unknown,
   config: RedactedConfig,
-  stats: ProxyStatsPayload | null,
+  stats: StatsSnapshot | null,
 ): CloudCodeStatusPayload {
   if (isRecord(raw)) {
     const mode = asString(raw.mode);
     const configured = asString(raw.configured_upstream);
-    const resolved = asOptionalNullableString(raw.resolved_upstream);
+    const rawResolved = asOptionalNullableString(raw.resolved_upstream);
+    const resolved =
+      rawResolved && rawResolved.trim().toLowerCase() !== "auto" ? rawResolved : null;
     if (mode !== null && configured !== null) {
       return {
         mode,
@@ -413,46 +525,63 @@ function parseCloudCodeStatus(
     }
   }
 
-  const isAuto = config.cloudcode_upstream_url.toLowerCase() === "auto";
-  const mode = stats?.cloudcode_mode || (isAuto ? "auto" : "fixed");
+  const configuredUpstream = config.cloudcode.upstream;
+  const isAuto = configuredUpstream.trim().toLowerCase() === "auto";
+  const mode = stats?.cloudcode.mode || (isAuto ? "auto" : "fixed");
+  const rawResolved =
+    stats?.cloudcode.resolved_upstream ||
+    (mode === "fixed" ? configuredUpstream : null);
   const resolved =
-    stats?.cloudcode_resolved_upstream ||
-    (mode === "fixed" ? config.cloudcode_upstream_url : null);
+    rawResolved && rawResolved.trim().toLowerCase() !== "auto" ? rawResolved : null;
   return {
     mode,
-    configured_upstream: config.cloudcode_upstream_url,
+    configured_upstream: configuredUpstream,
     resolved_upstream: resolved,
   };
 }
 
 function parseLauncherIntegration(raw: unknown): LauncherIntegrationStatus | null {
   if (!isRecord(raw)) return null;
-  const supported = asBoolean(raw.supported);
+  const integrationState = asIntegrationState(raw.state);
   const enabled = asBoolean(raw.enabled);
-  const manualRequired = asBoolean(raw.manual_required);
   const hybridActive = asBoolean(raw.hybrid_active);
-  if (
-    supported === null ||
-    enabled === null ||
-    manualRequired === null ||
-    hybridActive === null
-  ) {
+  if (integrationState === null || enabled === null || hybridActive === null) {
     return null;
   }
 
   return {
-    supported,
+    state: integrationState,
     enabled,
-    manual_required: manualRequired,
+    hybrid_active: hybridActive,
     shell: asOptionalNullableString(raw.shell),
     rc_path: asOptionalNullableString(raw.rc_path),
     env_script_path: asOptionalNullableString(raw.env_script_path),
     binary_path: asOptionalNullableString(raw.binary_path),
     symlink_target: asOptionalNullableString(raw.symlink_target),
     manual_snippet: asOptionalNullableString(raw.manual_snippet),
-    hybrid_active: hybridActive,
     message: asOptionalNullableString(raw.message),
   };
+}
+
+function parseModelPresets(raw: unknown): ModelPreset[] {
+  if (!Array.isArray(raw)) {
+    return [...DEFAULT_MODEL_PRESETS];
+  }
+  const presets: ModelPreset[] = [];
+  for (const item of raw) {
+    if (!isRecord(item)) continue;
+    const id = asString(item.id)?.trim() ?? "";
+    const displayName = asString(item.display_name)?.trim() ?? "";
+    const shortLabel = asString(item.short_label)?.trim() ?? "";
+    if (id && displayName && shortLabel) {
+      presets.push({ id, display_name: displayName, short_label: shortLabel });
+    }
+  }
+  return presets.length > 0 ? presets : [...DEFAULT_MODEL_PRESETS];
+}
+
+function activeModelPresets(snap: SettingsSnapshot | null): ReadonlyArray<ModelPreset> {
+  return snap && snap.supported_models.length > 0 ? snap.supported_models : DEFAULT_MODEL_PRESETS;
 }
 
 function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
@@ -465,9 +594,9 @@ function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
     return null;
   }
 
-  let stats: ProxyStatsPayload | null = null;
+  let stats: StatsSnapshot | null = null;
   if (raw.stats !== null && raw.stats !== undefined) {
-    stats = parseProxyStats(raw.stats);
+    stats = parseStatsSnapshot(raw.stats);
     if (stats === null) {
       return null;
     }
@@ -478,6 +607,7 @@ function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
       ? parseLauncherIntegration(raw.launcher_integration)
       : null;
   const cloudcode = parseCloudCodeStatus(raw.cloudcode, config, stats);
+  const supportedModels = parseModelPresets(raw.supported_models);
   const platform = normalizeHostPlatform(raw.platform);
 
   return {
@@ -488,6 +618,7 @@ function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
     stats,
     launcher_integration: launcherIntegration,
     cloudcode,
+    supported_models: supportedModels,
     platform,
   };
 }
@@ -542,22 +673,43 @@ function formatCaughtError(err: unknown): string {
  * VALIDATION & DOMAIN FORMATTERS
  * ========================================================================= */
 
+function parseAsciiU32Prefix(s: string): { value: number; rest: string } | null {
+  const m = /^([0-9]+)([\s\S]*)$/.exec(s);
+  if (!m) return null;
+  const value = Number(m[1]);
+  if (!Number.isSafeInteger(value) || value > 0xffff_ffff) return null;
+  return { value, rest: m[2] };
+}
+
 function isSupportedGeminiModel(model: string): boolean {
-  const match = /^gemini-(\d+)(?:\.(\d+))?(?:[.-](.+))?$/.exec(model);
-  if (!match) {
+  if (!model.startsWith("gemini-")) {
     return false;
   }
-  const major = Number(match[1]);
-  const minorStr = match[2];
-  const suffix = match[3];
-  if (major === 4) {
-    return Boolean((suffix && suffix.length > 0) || minorStr);
+  const majorParsed = parseAsciiU32Prefix(model.slice("gemini-".length));
+  if (!majorParsed) {
+    return false;
+  }
+  const { value: major, rest: afterMajor } = majorParsed;
+  if (major >= 4) {
+    return (
+      (afterMajor.startsWith("-") || afterMajor.startsWith(".")) &&
+      afterMajor.length > 1
+    );
   }
   if (major === 3) {
-    if (minorStr === undefined) {
+    if (!afterMajor.startsWith(".")) {
       return false;
     }
-    return Number(minorStr) >= 8;
+    const minorParsed = parseAsciiU32Prefix(afterMajor.slice(1));
+    if (!minorParsed || minorParsed.value < 8) {
+      return false;
+    }
+    const afterMinor = minorParsed.rest;
+    return (
+      afterMinor.length === 0 ||
+      ((afterMinor.startsWith("-") || afterMinor.startsWith(".")) &&
+        afterMinor.length > 1)
+    );
   }
   return false;
 }
@@ -665,15 +817,15 @@ function platformLabel(platform: HostPlatform): string {
 
 function buildLaunchCommand(port: number): string {
   const safePort =
-    Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
+    Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.proxy.port;
   return `agy-companion launch --port ${safePort}`;
 }
 
 function buildCustomModelsSnippet(host: string, port: number, model: string): string {
-  const safeHost = host.trim() || DEFAULT_CONFIG.listen_host;
+  const safeHost = host.trim() || DEFAULT_CONFIG.proxy.host;
   const safePort =
-    Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.listen_port;
-  const safeModel = model.trim() || DEFAULT_CONFIG.gemini_default_model;
+    Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_CONFIG.proxy.port;
+  const safeModel = model.trim() || DEFAULT_CONFIG.providers.gemini.default_model;
   return JSON.stringify(
     {
       modelProvider: "gemini",
@@ -905,7 +1057,10 @@ interface UiRefs {
 
   // Settings column — Default Model
   modelCurrentVal: HTMLSpanElement;
+  modelPillStrip: HTMLDivElement;
+  renderedModelPresetsKey: string;
   modelPresetBtns: Array<{ id: string; btn: HTMLButtonElement }>;
+  onSelectModelPreset: ((modelId: string) => void) | null;
   customModelToggleBtn: HTMLButtonElement;
   customModelRow: HTMLDivElement;
   customModelInput: HTMLInputElement;
@@ -1052,26 +1207,22 @@ function mountUi(root: HTMLElement): UiRefs {
   // Default Model sub-section
   const modSec = el("div", "divider");
   const mh = el("div", "sec-h");
-  const modelCurrentVal = el("span", "sec-right sec-val mono", DEFAULT_CONFIG.gemini_default_model);
-  modelCurrentVal.title = DEFAULT_CONFIG.gemini_default_model;
+  const modelCurrentVal = el(
+    "span",
+    "sec-right sec-val mono",
+    DEFAULT_CONFIG.providers.gemini.default_model,
+  );
+  modelCurrentVal.title = DEFAULT_CONFIG.providers.gemini.default_model;
   mh.append(el("span", "sec-t", "Default model"), modelCurrentVal);
   modSec.append(mh);
 
-  const pillStrip = el("div", "pill-strip");
+  const modelPillStrip = el("div", "pill-strip");
   const modelPresetBtns: Array<{ id: string; btn: HTMLButtonElement }> = [];
-  for (const preset of MODEL_PRESETS) {
-    const pbtn = el("button", "m-pill", preset.label);
-    pbtn.type = "button";
-    pbtn.title = preset.id;
-    pbtn.setAttribute("aria-pressed", String(preset.id === DEFAULT_CONFIG.gemini_default_model));
-    pillStrip.append(pbtn);
-    modelPresetBtns.push({ id: preset.id, btn: pbtn });
-  }
   const customModelToggleBtn = el("button", "m-pill", "Custom");
   customModelToggleBtn.type = "button";
   customModelToggleBtn.setAttribute("aria-pressed", "false");
-  pillStrip.append(customModelToggleBtn);
-  modSec.append(pillStrip);
+  modelPillStrip.append(customModelToggleBtn);
+  modSec.append(modelPillStrip);
 
   const customModelRow = el("div", "custom-model-row");
   customModelRow.hidden = true;
@@ -1080,8 +1231,8 @@ function mountUi(root: HTMLElement): UiRefs {
   customModelInput.type = "text";
   customModelInput.autocomplete = "off";
   customModelInput.spellcheck = false;
-  customModelInput.placeholder = DEFAULT_CONFIG.gemini_default_model;
-  customModelInput.value = DEFAULT_CONFIG.gemini_default_model;
+  customModelInput.placeholder = DEFAULT_CONFIG.providers.gemini.default_model;
+  customModelInput.value = DEFAULT_CONFIG.providers.gemini.default_model;
   customModelInput.setAttribute("aria-label", "Custom default model ID");
   const customModelApplyBtn = el("button", "btn btn-sm", "Apply");
   customModelApplyBtn.type = "button";
@@ -1232,7 +1383,7 @@ function mountUi(root: HTMLElement): UiRefs {
   baseUrlInput.type = "url";
   baseUrlInput.autocomplete = "off";
   baseUrlInput.spellcheck = false;
-  baseUrlInput.value = DEFAULT_CONFIG.gemini_base_url;
+  baseUrlInput.value = DEFAULT_CONFIG.providers.gemini.base_url;
   fUrl.append(urlLbl, baseUrlInput);
 
   const fPort = el("div", "ep-field");
@@ -1245,7 +1396,7 @@ function mountUi(root: HTMLElement): UiRefs {
   listenPortInput.max = "65535";
   listenPortInput.step = "1";
   listenPortInput.setAttribute("inputmode", "numeric");
-  listenPortInput.value = String(DEFAULT_CONFIG.listen_port);
+  listenPortInput.value = String(DEFAULT_CONFIG.proxy.port);
   fPort.append(portLbl, listenPortInput);
 
   epGrid.append(fUrl, fPort);
@@ -1268,7 +1419,7 @@ function mountUi(root: HTMLElement): UiRefs {
   const cliSec = el("div", "divider cli-stack");
   cliSec.append(el("div", "sec-t", "CLI & manual setup"));
 
-  const initialLaunchCmd = buildLaunchCommand(DEFAULT_CONFIG.listen_port);
+  const initialLaunchCmd = buildLaunchCommand(DEFAULT_CONFIG.proxy.port);
   const launchChip = el("div", "cmd");
   const launchCmdCode = el("code", null, initialLaunchCmd);
   launchCmdCode.title = initialLaunchCmd;
@@ -1288,9 +1439,9 @@ function mountUi(root: HTMLElement): UiRefs {
     "pre",
     null,
     buildCustomModelsSnippet(
-      DEFAULT_CONFIG.listen_host,
-      DEFAULT_CONFIG.listen_port,
-      DEFAULT_CONFIG.gemini_default_model,
+      DEFAULT_CONFIG.proxy.host,
+      DEFAULT_CONFIG.proxy.port,
+      DEFAULT_CONFIG.providers.gemini.default_model,
     ),
   );
   jsonBlock.append(jbHdr, cliJsonPre);
@@ -1309,7 +1460,7 @@ function mountUi(root: HTMLElement): UiRefs {
   const footer = el("footer", "status-bar");
   const statusItem = el("span", "status-item");
   const footerDot = el("span", "sdot");
-  const endpointTag = el("span", "mono num", `${DEFAULT_CONFIG.listen_host}:${DEFAULT_CONFIG.listen_port}`);
+  const endpointTag = el("span", "mono num", `${DEFAULT_CONFIG.proxy.host}:${DEFAULT_CONFIG.proxy.port}`);
   statusItem.append(footerDot, endpointTag);
 
   const footerSep = el("span", "status-sep", "\u00b7");
@@ -1347,7 +1498,10 @@ function mountUi(root: HTMLElement): UiRefs {
     cancelClearBtn,
     keyFeedbackLine,
     modelCurrentVal,
+    modelPillStrip,
+    renderedModelPresetsKey: "",
     modelPresetBtns,
+    onSelectModelPreset: null,
     customModelToggleBtn,
     customModelRow,
     customModelInput,
@@ -1405,9 +1559,8 @@ function needsSettingsAttention(snap: SettingsSnapshot | null): boolean {
   if (!snap) return false;
   const li = snap.launcher_integration;
   return (
-    !snap.config.api_key_configured ||
-    Boolean(li && li.manual_required) ||
-    Boolean(li && li.enabled && !li.hybrid_active) ||
+    !snap.config.providers.gemini.api_key_configured ||
+    Boolean(li && (li.state === "manual_required" || li.state === "enabled")) ||
     state.portChangedSinceSave
   );
 }
@@ -1447,59 +1600,60 @@ function describeDockState(snap: SettingsSnapshot | null): {
       supported: false,
     };
   }
-  if (!li.supported) {
-    return {
-      tagClass: "tag",
-      tagText: "CLI only",
-      subText: "Use agy-companion launch on Windows",
-      checked: false,
-      supported: false,
-    };
+  switch (li.state) {
+    case "unsupported":
+      return {
+        tagClass: "tag",
+        tagText: "CLI only",
+        subText: "Use agy-companion launch on Windows",
+        checked: false,
+        supported: false,
+      };
+    case "manual_required":
+      return {
+        tagClass: "tag tag-warn",
+        tagText: "Manual",
+        subText: "Dotfile is a symlink \u2014 manual line needed",
+        checked: li.enabled,
+        supported: true,
+      };
+    case "active":
+      return {
+        tagClass: "tag tag-ok",
+        tagText: "Active",
+        subText: "Hybrid Mode active on launch",
+        checked: true,
+        supported: true,
+      };
+    case "enabled":
+      return {
+        tagClass: "tag tag-warn",
+        tagText: "Restart",
+        subText: `${quitChord(snap ? snap.platform : detectClientPlatform())} to activate`,
+        checked: true,
+        supported: true,
+      };
+    case "disabled":
+      return {
+        tagClass: "tag",
+        tagText: "Off",
+        subText: "Hybrid Mode on app launch",
+        checked: false,
+        supported: true,
+      };
   }
-  if (li.manual_required) {
-    return {
-      tagClass: "tag tag-warn",
-      tagText: "Manual",
-      subText: "Dotfile is a symlink \u2014 manual line needed",
-      checked: li.enabled,
-      supported: true,
-    };
-  }
-  if (li.enabled && li.hybrid_active) {
-    return {
-      tagClass: "tag tag-ok",
-      tagText: "Active",
-      subText: "Hybrid Mode active on launch",
-      checked: true,
-      supported: true,
-    };
-  }
-  if (li.enabled) {
-    return {
-      tagClass: "tag tag-warn",
-      tagText: "Restart",
-      subText: `${quitChord(snap ? snap.platform : detectClientPlatform())} to activate`,
-      checked: true,
-      supported: true,
-    };
-  }
-  return {
-    tagClass: "tag",
-    tagText: "Off",
-    subText: "Hybrid Mode on app launch",
-    checked: false,
-    supported: true,
-  };
 }
 
 function updateCliSnippets(refs: UiRefs): void {
-  const host = state.snapshot?.config.listen_host ?? DEFAULT_CONFIG.listen_host;
+  const host = state.snapshot?.config.proxy.host ?? DEFAULT_CONFIG.proxy.host;
   const parsedPort = Number.parseInt(refs.listenPortInput.value.trim(), 10);
   const port =
     Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535
       ? parsedPort
       : state.savedPort;
-  const model = state.snapshot?.config.gemini_default_model ?? DEFAULT_CONFIG.gemini_default_model;
+  const model =
+    state.snapshot?.config.providers.gemini.default_model ??
+    DEFAULT_CONFIG.providers.gemini.default_model;
 
   const launchCmd = buildLaunchCommand(port);
   refs.launchCmdCode.textContent = launchCmd;
@@ -1511,7 +1665,7 @@ function updateCliSnippets(refs: UiRefs): void {
 function updateKeyButtons(refs: UiRefs): void {
   const anyWrite = state.saving || state.clearing || state.updatingIntegration;
   const canCall = state.connected && state.activeCalls < 4;
-  const configured = state.snapshot?.config.api_key_configured ?? false;
+  const configured = state.snapshot?.config.providers.gemini.api_key_configured ?? false;
   const hasDraftKey = refs.apiKeyInput.value.trim().length > 0;
 
   if (state.savingKey && state.testing) {
@@ -1574,13 +1728,38 @@ function updateBusyControls(refs: UiRefs): void {
   refs.saveEndpointBtn.disabled = !canCall || anyWrite;
 }
 
+function syncModelPresetPills(refs: UiRefs, presets: ReadonlyArray<ModelPreset>): void {
+  const key = presets.map((p) => `${p.id}\0${p.short_label}\0${p.display_name}`).join("\n");
+  if (refs.renderedModelPresetsKey === key) {
+    return;
+  }
+  const nextBtns: Array<{ id: string; btn: HTMLButtonElement }> = [];
+  for (const preset of presets) {
+    const pbtn = el("button", "m-pill", preset.short_label);
+    pbtn.type = "button";
+    pbtn.title = `${preset.display_name} (${preset.id})`;
+    pbtn.setAttribute("aria-pressed", "false");
+    pbtn.addEventListener("click", () => {
+      refs.onSelectModelPreset?.(preset.id);
+    });
+    nextBtns.push({ id: preset.id, btn: pbtn });
+  }
+  refs.modelPresetBtns = nextBtns;
+  refs.renderedModelPresetsKey = key;
+  refs.modelPillStrip.replaceChildren(
+    ...nextBtns.map((item) => item.btn),
+    refs.customModelToggleBtn,
+  );
+}
+
 function renderSettings(refs: UiRefs, syncFormInputs: boolean, syncDegradedFeedback = true): void {
   const snap = state.snapshot;
   const cfg = snap?.config ?? DEFAULT_CONFIG;
+  const gem = cfg.providers.gemini;
 
   // API key status tag & write-only placeholder
-  if (cfg.api_key_configured) {
-    const hintText = cfg.api_key_hint || "Set";
+  if (gem.api_key_configured) {
+    const hintText = gem.api_key_hint || "Set";
     const tag = el("span", "tag tag-ok mono");
     tag.title = hintText;
     tag.append(el("span", "sdot ok"), el("span", "tag-txt", hintText));
@@ -1594,24 +1773,26 @@ function renderSettings(refs: UiRefs, syncFormInputs: boolean, syncDegradedFeedb
     state.clearConfirmOpen = false;
     state.lastSaveVerified = false;
   }
-  refs.clearConfirmRow.hidden = !(state.clearConfirmOpen && cfg.api_key_configured);
+  refs.clearConfirmRow.hidden = !(state.clearConfirmOpen && gem.api_key_configured);
   setInlineFeedback(refs.keyFeedbackLine, state.keyFeedback);
 
   // Default model pills
-  refs.modelCurrentVal.textContent = cfg.gemini_default_model;
-  refs.modelCurrentVal.title = cfg.gemini_default_model;
-  const isPreset = MODEL_PRESETS.some((p) => p.id === cfg.gemini_default_model);
+  const presets = activeModelPresets(snap);
+  syncModelPresetPills(refs, presets);
+  refs.modelCurrentVal.textContent = gem.default_model;
+  refs.modelCurrentVal.title = gem.default_model;
+  const isPreset = presets.some((p) => p.id === gem.default_model);
   const showCustomModel = state.customModelOpen || !isPreset;
   for (const item of refs.modelPresetBtns) {
     item.btn.setAttribute(
       "aria-pressed",
-      String(!state.customModelOpen && cfg.gemini_default_model === item.id),
+      String(!state.customModelOpen && gem.default_model === item.id),
     );
   }
   refs.customModelToggleBtn.setAttribute("aria-pressed", String(showCustomModel));
   refs.customModelRow.hidden = !showCustomModel;
   if (syncFormInputs) {
-    refs.customModelInput.value = cfg.gemini_default_model;
+    refs.customModelInput.value = gem.default_model;
   }
   setInlineFeedback(refs.modelFeedbackLine, state.modelFeedback);
 
@@ -1620,9 +1801,7 @@ function renderSettings(refs: UiRefs, syncFormInputs: boolean, syncDegradedFeedb
   if (syncDegradedFeedback) {
     const isDegradedState4 =
       li !== null &&
-      li.supported &&
-      !li.manual_required &&
-      !li.enabled &&
+      li.state === "disabled" &&
       li.message !== null &&
       li.message.trim().length > 0;
     if (isDegradedState4 && li.message) {
@@ -1640,7 +1819,7 @@ function renderSettings(refs: UiRefs, syncFormInputs: boolean, syncDegradedFeedb
   refs.dockTag.textContent = dock.tagText;
   refs.dockSub.textContent = dock.subText;
 
-  if (li && li.shell && li.rc_path && !li.manual_required) {
+  if (li && li.shell && li.rc_path && li.state !== "manual_required") {
     refs.dockMeta.textContent = `${li.shell} \u00b7 ${li.rc_path}`;
     refs.dockMeta.hidden = false;
   } else {
@@ -1648,7 +1827,7 @@ function renderSettings(refs: UiRefs, syncFormInputs: boolean, syncDegradedFeedb
     refs.dockMeta.hidden = true;
   }
 
-  if (li && li.manual_required) {
+  if (li && li.state === "manual_required") {
     const rcLabel = li.rc_path || "your login-shell profile";
     refs.manualWrap.hidden = false;
     if (li.manual_snippet) {
@@ -1669,11 +1848,11 @@ function renderSettings(refs: UiRefs, syncFormInputs: boolean, syncDegradedFeedb
 
   // CloudCode routing .pr-row radios
   if (syncFormInputs) {
-    state.cloudCodeSelection = classifyCloudCodeMode(cfg.cloudcode_upstream_url);
+    state.cloudCodeSelection = classifyCloudCodeMode(cfg.cloudcode.upstream);
     refs.cloudCodeCustomInput.value =
-      state.cloudCodeSelection === "custom" ? cfg.cloudcode_upstream_url : "";
-    refs.baseUrlInput.value = cfg.gemini_base_url;
-    refs.listenPortInput.value = String(cfg.listen_port);
+      state.cloudCodeSelection === "custom" ? cfg.cloudcode.upstream : "";
+    refs.baseUrlInput.value = gem.base_url;
+    refs.listenPortInput.value = String(cfg.proxy.port);
   }
 
   const resolvedShort =
@@ -1726,7 +1905,7 @@ function renderMonitor(
     right.append(el("span", "tag tag-err", "Offline"));
   } else if (!snap.stats) {
     right.append(el("span", "tag", "Unavailable"));
-  } else if (snap.stats.requests > 0) {
+  } else if (snap.stats.usage.requests > 0) {
     const liveTag = el("span", "tag tag-ok");
     liveTag.append(el("span", "sdot ok"), el("span", "tag-txt", "Live"));
     right.append(liveTag);
@@ -1746,7 +1925,7 @@ function renderMonitor(
         : "Session stats are currently unavailable. Click Refresh to retry.";
     statsCard.append(el("div", "quiet-note", noteText));
   } else {
-    const st = snap.stats;
+    const st = snap.stats.usage;
     const hasReqs = st.requests > 0;
     const newIn = Math.max(0, st.prompt_tokens - st.cached_tokens);
     const totalOut = st.output_tokens + st.reasoning_tokens;
@@ -1875,8 +2054,8 @@ function renderMonitor(
   const rKey = el("div", "kv-row");
   rKey.append(el("span", "kv-k", "API key"));
   const vKey = el("span", "kv-v");
-  if (cfg.api_key_configured) {
-    const hintText = cfg.api_key_hint || "Configured";
+  if (cfg.providers.gemini.api_key_configured) {
+    const hintText = cfg.providers.gemini.api_key_hint || "Configured";
     vKey.title = hintText;
     vKey.append(el("span", "sdot ok"), el("span", "mono kv-trunc", hintText));
   } else {
@@ -1885,8 +2064,8 @@ function renderMonitor(
   rKey.append(vKey);
 
   const rModel = el("div", "kv-row");
-  const vModel = el("span", "kv-v kv-text mono", cfg.gemini_default_model);
-  vModel.title = cfg.gemini_default_model;
+  const vModel = el("span", "kv-v kv-text mono", cfg.providers.gemini.default_model);
+  vModel.title = cfg.providers.gemini.default_model;
   rModel.append(el("span", "kv-k", "Default model"), vModel);
 
   const rRoute = el("div", "kv-row");
@@ -1933,7 +2112,7 @@ function renderMonitor(
   const cEnd = el("div", "kv-row");
   cEnd.append(
     el("span", "kv-k", "Endpoint"),
-    el("span", "kv-v mono num", `${cfg.listen_host}:${cfg.listen_port}`),
+    el("span", "kv-v mono num", `${cfg.proxy.host}:${cfg.proxy.port}`),
   );
   const cRoute = el("div", "kv-row");
   const cRouteVal = el("span", "kv-v kv-text", routeSummary);
@@ -1969,7 +2148,7 @@ function renderFooter(refs: UiRefs): void {
     refs.footerRoute.textContent = state.standalone ? "Standalone" : "Connecting\u2026";
     return;
   }
-  refs.endpointTag.textContent = `${snapshot.config.listen_host}:${snapshot.config.listen_port}`;
+  refs.endpointTag.textContent = `${snapshot.config.proxy.host}:${snapshot.config.proxy.port}`;
   refs.footerDot.className = !snapshot.proxy.reachable
     ? "sdot err"
     : snapshot.version_skew
@@ -2056,11 +2235,11 @@ async function main(): Promise<void> {
     if (state.portChangedSinceSave) {
       return {
         banner: {
-          key: `port-changed:${snap.config.listen_port}:${snap.platform}`,
+          key: `port-changed:${snap.config.proxy.port}:${snap.platform}`,
           tone: "warn",
           icon: "warn",
           title: "Restart Antigravity",
-          sub: `Port updated to ${snap.config.listen_port}. ${quitChord(snap.platform)} to apply.`,
+          sub: `Port updated to ${snap.config.proxy.port}. ${quitChord(snap.platform)} to apply.`,
           action: {
             label: "Refresh",
             requiresCall: true,
@@ -2111,7 +2290,7 @@ async function main(): Promise<void> {
     }
 
     // Priority 5: API key needed (Day-0)
-    if (!snap.config.api_key_configured) {
+    if (!snap.config.providers.gemini.api_key_configured) {
       return {
         banner: {
           key: `api-key-needed:${state.tab}`,
@@ -2135,7 +2314,7 @@ async function main(): Promise<void> {
 
     // Priority 6: Dock restart needed
     const li = snap.launcher_integration;
-    if (li && li.enabled && !li.hybrid_active && !li.manual_required) {
+    if (li && li.state === "enabled") {
       return {
         banner: {
           key: `dock-restart:${snap.platform}`,
@@ -2150,13 +2329,13 @@ async function main(): Promise<void> {
 
     // Priority 7: Catalog refresh countdown
     if (
-      snap.config.api_key_configured &&
+      snap.config.providers.gemini.api_key_configured &&
       snap.proxy.reachable &&
       snap.stats &&
-      snap.stats.last_catalog_included_proxy_models === false
+      snap.stats.cloudcode.last_catalog_included_proxy_models === false
     ) {
       const prefix = state.lastSaveVerified ? "Key verified" : "Key saved";
-      const lastMs = snap.stats.last_catalog_refresh_at_ms;
+      const lastMs = snap.stats.cloudcode.last_catalog_refresh_at_ms;
       if (lastMs === null) {
         return {
           banner: {
@@ -2293,11 +2472,11 @@ async function main(): Promise<void> {
 
   function applySnapshot(snapshot: SettingsSnapshot, syncFormInputs: boolean): void {
     state.snapshot = snapshot;
-    state.savedPort = snapshot.config.listen_port;
+    state.savedPort = snapshot.config.proxy.port;
     state.loadError = null;
 
     if (!state.initialTabApplied && !state.tabPinnedByUser) {
-      state.tab = snapshot.config.api_key_configured ? "monitor" : "settings";
+      state.tab = snapshot.config.providers.gemini.api_key_configured ? "monitor" : "settings";
       state.initialTabApplied = true;
     }
 
@@ -2427,7 +2606,7 @@ async function main(): Promise<void> {
     setInlineFeedback(refs.keyFeedbackLine, null);
 
     await savePartialSettings(
-      { api_key: raw },
+      { providers: { gemini: { api_key: { set: raw } } } },
       {
         syncFormInputs: false,
         isKeySave: true,
@@ -2440,7 +2619,7 @@ async function main(): Promise<void> {
           state.clearConfirmOpen = false;
           renderSettings(refs, false, false);
 
-          if (!snapshot.config.api_key_configured) {
+          if (!snapshot.config.providers.gemini.api_key_configured) {
             state.lastSaveVerified = false;
             return;
           }
@@ -2480,7 +2659,10 @@ async function main(): Promise<void> {
     ) {
       return;
     }
-    if (!state.snapshot?.config.api_key_configured || refs.apiKeyInput.value.trim().length > 0) {
+    if (
+      !state.snapshot?.config.providers.gemini.api_key_configured ||
+      refs.apiKeyInput.value.trim().length > 0
+    ) {
       return;
     }
 
@@ -2522,9 +2704,12 @@ async function main(): Promise<void> {
     setInlineFeedback(refs.keyFeedbackLine, null);
     updateBusyControls(refs);
     try {
+      const clearArgs: SaveSettingsArgs = {
+        providers: { gemini: { api_key: "clear" } },
+      };
       const outcome = await callTool(
         "save_settings",
-        { clear_api_key: true },
+        clearArgs as Record<string, unknown>,
         parseSettingsSnapshot,
       );
       if (!outcome.ok) {
@@ -2562,7 +2747,7 @@ async function main(): Promise<void> {
     setInlineFeedback(refs.modelFeedbackLine, null);
 
     await savePartialSettings(
-      { default_model: trimmed },
+      { providers: { gemini: { default_model: trimmed } } },
       {
         syncFormInputs: false,
         onError: (msg) => {
@@ -2573,10 +2758,10 @@ async function main(): Promise<void> {
           if (closeCustom) {
             state.customModelOpen = false;
           }
-          refs.customModelInput.value = snapshot.config.gemini_default_model;
+          refs.customModelInput.value = snapshot.config.providers.gemini.default_model;
           state.modelFeedback = {
             tone: "ok",
-            text: `Saved \u00b7 ${snapshot.config.gemini_default_model}`,
+            text: `Saved \u00b7 ${snapshot.config.providers.gemini.default_model}`,
           };
           renderSettings(refs, false, false);
         },
@@ -2590,7 +2775,7 @@ async function main(): Promise<void> {
       return;
     }
     const info = state.snapshot?.launcher_integration ?? null;
-    if (!info || !info.supported) {
+    if (!info || info.state === "unsupported") {
       renderAll(false, false);
       return;
     }
@@ -2614,24 +2799,35 @@ async function main(): Promise<void> {
       }
 
       const li = outcome.data.launcher_integration;
-      if (li && li.manual_required) {
-        state.dockFeedback = {
-          tone: "warn",
-          text:
-            li.message ||
-            (nextEnabled
-              ? "Managed dotfile left untouched. Copy the line above to finish."
-              : "Remove the managed agy-companion line from your dotfile manually."),
-        };
-      } else if (li && li.enabled && li.hybrid_active) {
-        state.dockFeedback = { tone: "ok", text: "Dock auto-start active" };
-      } else if (li && li.enabled) {
-        state.dockFeedback = {
-          tone: "ok",
-          text: `Enabled \u00b7 ${quitChord(outcome.data.platform)} Antigravity`,
-        };
-      } else {
-        state.dockFeedback = { tone: "info", text: "Dock auto-start disabled" };
+      switch (li?.state) {
+        case "manual_required":
+          state.dockFeedback = {
+            tone: "warn",
+            text:
+              li.message ||
+              (nextEnabled
+                ? "Managed dotfile left untouched. Copy the line above to finish."
+                : "Remove the managed agy-companion line from your dotfile manually."),
+          };
+          break;
+        case "active":
+          state.dockFeedback = { tone: "ok", text: "Dock auto-start active" };
+          break;
+        case "enabled":
+          state.dockFeedback = {
+            tone: "ok",
+            text: `Enabled \u00b7 ${quitChord(outcome.data.platform)} Antigravity`,
+          };
+          break;
+        case "unsupported":
+          state.dockFeedback = {
+            tone: "warn",
+            text: li.message || "Dock auto-start is unavailable on this platform",
+          };
+          break;
+        default:
+          state.dockFeedback = { tone: "info", text: "Dock auto-start disabled" };
+          break;
       }
       applySnapshot(outcome.data, false);
     } finally {
@@ -2661,12 +2857,12 @@ async function main(): Promise<void> {
     state.advFeedback = null;
     setInlineFeedback(refs.advFeedbackLine, null);
     await savePartialSettings(
-      { cloudcode_upstream_url: urlValue },
+      { cloudcode: { upstream: urlValue } },
       {
         syncFormInputs: false,
         onError: (msg) => {
           state.cloudCodeSelection = classifyCloudCodeMode(
-            state.snapshot?.config.cloudcode_upstream_url ?? DEFAULT_CONFIG.cloudcode_upstream_url,
+            state.snapshot?.config.cloudcode.upstream ?? DEFAULT_CONFIG.cloudcode.upstream,
           );
           state.advFeedback = { tone: "err", text: msg };
           renderSettings(refs, false, false);
@@ -2690,7 +2886,7 @@ async function main(): Promise<void> {
     state.advFeedback = null;
     setInlineFeedback(refs.advFeedbackLine, null);
     await savePartialSettings(
-      { cloudcode_upstream_url: raw },
+      { cloudcode: { upstream: raw } },
       {
         syncFormInputs: false,
         onError: (msg) => {
@@ -2698,7 +2894,7 @@ async function main(): Promise<void> {
           setInlineFeedback(refs.advFeedbackLine, state.advFeedback);
         },
         onSuccess: (snapshot) => {
-          state.cloudCodeSelection = classifyCloudCodeMode(snapshot.config.cloudcode_upstream_url);
+          state.cloudCodeSelection = classifyCloudCodeMode(snapshot.config.cloudcode.upstream);
           state.advFeedback = { tone: "ok", text: "Saved \u00b7 Custom CloudCode endpoint" };
           renderSettings(refs, false, false);
         },
@@ -2724,8 +2920,8 @@ async function main(): Promise<void> {
     }
 
     const args: SaveSettingsArgs = {
-      base_url: baseUrl,
-      listen_port: port,
+      proxy: { port },
+      providers: { gemini: { base_url: baseUrl } },
     };
 
     if (state.cloudCodeSelection === "custom") {
@@ -2737,7 +2933,7 @@ async function main(): Promise<void> {
           setInlineFeedback(refs.advFeedbackLine, state.advFeedback);
           return;
         }
-        args.cloudcode_upstream_url = customUrl;
+        args.cloudcode = { upstream: customUrl };
       }
     }
 
@@ -2752,7 +2948,7 @@ async function main(): Promise<void> {
         setInlineFeedback(refs.advFeedbackLine, state.advFeedback);
       },
       onSuccess: (snapshot) => {
-        const changed = snapshot.config.listen_port !== previousPort;
+        const changed = snapshot.config.proxy.port !== previousPort;
         if (changed) {
           state.portChangedSinceSave = true;
         }
@@ -2843,15 +3039,15 @@ async function main(): Promise<void> {
     void handleClearKey();
   });
 
-  for (const item of refs.modelPresetBtns) {
-    item.btn.addEventListener("click", () => {
-      void handleSaveDefaultModel(item.id, true);
-    });
-  }
+  refs.onSelectModelPreset = (modelId: string) => {
+    void handleSaveDefaultModel(modelId, true);
+  };
 
   refs.customModelToggleBtn.addEventListener("click", () => {
-    const cfgModel = state.snapshot?.config.gemini_default_model ?? DEFAULT_CONFIG.gemini_default_model;
-    const isPreset = MODEL_PRESETS.some((p) => p.id === cfgModel);
+    const cfgModel =
+      state.snapshot?.config.providers.gemini.default_model ??
+      DEFAULT_CONFIG.providers.gemini.default_model;
+    const isPreset = activeModelPresets(state.snapshot).some((p) => p.id === cfgModel);
     if (!isPreset) {
       state.customModelOpen = true;
     } else {

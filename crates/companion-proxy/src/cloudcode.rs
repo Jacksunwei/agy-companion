@@ -7,8 +7,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use companion_core::{
     CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CoreError,
-    DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_TIMEOUT_SECS, is_supported_gemini_model,
-    validate_cloudcode_upstream_url, validate_upstream_url,
+    DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_TIMEOUT_SECS, is_printable_ascii_with_space,
+    is_supported_gemini_model, model_capability_sort_key, validate_cloudcode_upstream_url,
+    validate_upstream_url,
 };
 use companion_providers::ByteStream;
 use futures_util::TryStreamExt;
@@ -1224,7 +1225,7 @@ fn copy_safe_request_headers(
             continue;
         };
         if let Some(value) = inbound.get(&name)
-            && value.as_bytes().iter().all(|&b| (0x20..=0x7E).contains(&b))
+            && is_printable_ascii_with_space(value.as_bytes())
         {
             out.push((name, value.clone()));
         }
@@ -1245,7 +1246,7 @@ fn copy_safe_response_headers(upstream: &HeaderMap) -> HeaderMap {
             continue;
         };
         if let Some(value) = upstream.get(&name)
-            && value.as_bytes().iter().all(|&b| (0x20..=0x7E).contains(&b))
+            && is_printable_ascii_with_space(value.as_bytes())
         {
             out.insert(name, value.clone());
         }
@@ -1418,14 +1419,11 @@ fn find_upstream_model_template<'a>(
             return Some(obj);
         }
     }
-    // 4. Fallback to any upstream Gemini 4 or Gemini 3.8 model carrying experiment/compaction
+    // 4. Fallback to any upstream supported Gemini 3.8+ / 4+ / 5+ model carrying experiment/compaction
     // metadata so newly discovered Gemini models still inherit the native checkpointer config.
     let mut gemini_candidates: Vec<&String> = models
         .keys()
-        .filter(|k| {
-            !k.starts_with("companion/")
-                && (k.starts_with("gemini-4-") || k.starts_with("gemini-3.8-"))
-        })
+        .filter(|k| !k.starts_with("companion/") && is_supported_gemini_model(k))
         .collect();
     gemini_candidates.sort();
     for key in &gemini_candidates {
@@ -1578,10 +1576,7 @@ pub fn merge_available_models(
             ordered_models.push(norm);
         }
     }
-    ordered_models.sort_by(|a, b| {
-        companion_providers::model_capability_sort_key(a)
-            .cmp(&companion_providers::model_capability_sort_key(b))
-    });
+    ordered_models.sort_by(|a, b| model_capability_sort_key(a).cmp(&model_capability_sort_key(b)));
 
     if ordered_models.is_empty() {
         return serde_json::to_vec(&root);
@@ -3769,5 +3764,66 @@ mod tests {
 
         daily_server.abort();
         prod_server.abort();
+    }
+
+    #[test]
+    fn merge_available_models_accepts_gemini_5_and_3_9_with_template_inheritance_and_rejects_bare_gemini_5()
+     {
+        let upstream = serde_json::to_vec(&json!({
+            "models": {
+                "gemini-5-pro-high": {
+                    "model": "MODEL_PLACEHOLDER_M501",
+                    "displayName": "Gemini 5 Pro (High)",
+                    "thinkingLevel": 3,
+                    "supportsCumulativeContext": true,
+                    "modelExperimentIds": ["exp-gemini-5-checkpointer"]
+                }
+            },
+            "defaultAgentModelId": "gemini-5-pro-high",
+            "agentModelSorts": [{
+                "displayName": "Recommended",
+                "groups": [{
+                    "displayName": "Google AI Pro",
+                    "modelIds": ["gemini-5-pro-high"]
+                }]
+            }],
+            "groupedModels": {}
+        }))
+        .unwrap();
+
+        let proxy_models = vec![
+            "gemini-5-pro".to_string(),
+            "gemini-3.9-pro".to_string(),
+            "gemini-5".to_string(),
+        ];
+        let merged_bytes =
+            merge_available_models(&upstream, &proxy_models, "gemini-5-pro").unwrap();
+        let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+        let models = merged["models"].as_object().expect("models object");
+
+        // gemini-5-pro & gemini-3.9-pro must be injected; bare gemini-5 must be excluded.
+        assert!(
+            models.contains_key("companion/gemini-5-pro-high"),
+            "expected companion/gemini-5-pro-high in merged models"
+        );
+        assert!(
+            models.contains_key("companion/gemini-3.9-pro-high"),
+            "expected companion/gemini-3.9-pro-high in merged models"
+        );
+        assert!(
+            !models
+                .keys()
+                .any(|k| k == "companion/gemini-5" || k == "companion/gemini-5-high"),
+            "bare gemini-5 must not be injected into merged catalog"
+        );
+
+        // Verify template inheritance (step 4 fallback via is_supported_gemini_model) worked for
+        // gemini-3.9-pro even when upstream only carried a gemini-5-pro-high template.
+        let inherited = &models["companion/gemini-3.9-pro-high"];
+        assert_eq!(inherited["supportsCumulativeContext"], json!(true));
+        assert_eq!(
+            inherited["modelExperimentIds"],
+            json!(["exp-gemini-5-checkpointer"])
+        );
     }
 }

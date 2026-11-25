@@ -13,10 +13,10 @@ Pure Python 3 standard-library opaque-box E2E test suite verifying all Milestone
 | `harness.py` | `E2ETestCase`, `TestRuntimeConfig`, `IsolatedEnv`, `CompanionProcess`, `MockConnectProxy`, 5-layer `reap_pidfile_daemon` / `register_pidfile_cleanup`, `run_cli`, `http_raw_request`, `http_stream_request`, `poll_usage_events`, `poll_stats`, `find_key_recursive`, `resolve_binary` |
 | `mock_gemini.py` | Ephemeral HTTP/1.1 `MockGeminiServer` (exact request capture, chunked SSE, split UTF-8/CRLF, FIFO fault queues, `SO_LINGER` TCP RST, `EchoChecksumAction`) & `MockHealthServer` |
 | `mcp_client.py` | Strict newline-delimited JSON-RPC 2.0 `McpStdioClient` (stdout purity auditing, fast EOF detection, thread-safe stdin writes, `save_settings_smart` schema introspection) |
-| `test_tier1_features.py` | **Tier 1 (M1 + PR 1/2)** — Core happy-path feature coverage (`89` tests) |
-| `test_tier1_rollout.py` | **Tier 1 (Rollout)** — Happy-path coverage for `R01`–`R25` (`50` tests; combined Tier 1 = `139`) |
-| `test_tier2_boundaries.py` | **Tier 2 (M1)** — Boundaries, corner cases, negative inputs & S1–S8 security tests (`97` tests) |
-| `test_tier2_rollout.py` | **Tier 2 (Rollout)** — Boundary, negative & S1–S8 coverage for `R01`–`R25` (`51` tests; combined Tier 2 = `148`) |
+| `test_tier1_features.py` | **Tier 1 (M1 + PR 1/2)** — Core happy-path feature coverage (`90` tests) |
+| `test_tier1_rollout.py` | **Tier 1 (Rollout)** — Happy-path coverage for `R01`–`R25` (`50` tests; combined Tier 1 = `140`) |
+| `test_tier2_boundaries.py` | **Tier 2 (M1)** — Boundaries, corner cases, negative inputs & S1–S8 security tests (`98` tests) |
+| `test_tier2_rollout.py` | **Tier 2 (Rollout)** — Boundary, negative & S1–S8 coverage for `R01`–`R25` (`51` tests; combined Tier 2 = `149`) |
 | `test_tier3_combinations.py` | **Tier 3 (M1)** — Pairwise cross-feature combinations (`16` tests) |
 | `test_tier3_rollout.py` | **Tier 3 (Rollout)** — Pairwise cross-PR combinations (`15` tests; combined Tier 3 = `31`) |
 | `test_tier4_scenarios.py` | **Tier 4 (M1)** — Multi-step real-world end-to-end application workloads (`7` tests) |
@@ -25,7 +25,7 @@ Pure Python 3 standard-library opaque-box E2E test suite verifying all Milestone
 | `__init__.py` | Package marker |
 | `README.md` | This guide |
 
-Combined totals: **`331` E2E tests** (`T1=139, T2=148, T3=31, T4=13`) + **`26` harness self-tests**.
+Combined totals: **`333` E2E tests** (`T1=140, T2=149, T3=31, T4=13`) + **`26` harness self-tests**.
 
 ## Quick Usage
 
@@ -35,7 +35,7 @@ Always invoke with `python3 -B` so no `__pycache__` or `*.pyc` files are created
 # 1. Verify harness integrity without needing a compiled agy-companion binary (26 self-tests)
 python3 -B e2e/run_e2e.py --self-test -v
 
-# 2. List all 331 tests (plain text or JSON) without needing a binary
+# 2. List all 333 tests (plain text or JSON) without needing a binary
 python3 -B e2e/run_e2e.py --list
 python3 -B e2e/run_e2e.py --list --json
 

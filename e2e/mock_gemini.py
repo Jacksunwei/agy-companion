@@ -731,12 +731,20 @@ class MockHealthServer:
             "protocol_version": protocol_version,
         }
         self.stats_payload: dict[str, Any] = stats_payload or {
-            "requests": 0,
-            "prompt_tokens": 0,
-            "cached_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_tokens": 0,
-            "cache_hit_ratio": 0.0,
+            "usage": {
+                "requests": 0,
+                "prompt_tokens": 0,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cache_hit_ratio": 0.0,
+            },
+            "cloudcode": {
+                "mode": "auto",
+                "resolved_upstream": None,
+                "last_catalog_refresh_at_ms": None,
+                "last_catalog_included_proxy_models": None,
+            },
         }
         self._lock = threading.Lock()
         self._paths: list[str] = []

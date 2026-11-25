@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-companion-core.workspace = true
+companion-core = { workspace = true, features = ["sqlite"] }
 companion-proxy.workspace = true
 companion-ui-mcp.workspace = true
 dirs.workspace = true

@@ -939,8 +939,8 @@ class TestTier1RolloutR07PlaceholderKeyQuarantine(E2ETestCase):
         gs = mcp.call_tool("get_settings", {})
         mcp.assert_clean_stdout()
         sc = gs.get("structuredContent", {})
-        self.assertIs(sc["config"]["api_key_configured"], False)
-        self.assertIsNone(sc["config"]["api_key_hint"])
+        self.assertIs(sc["config"]["providers"]["gemini"]["api_key_configured"], False)
+        self.assertIsNone(sc["config"]["providers"]["gemini"]["api_key_hint"])
 
         tc = mcp.call_tool("test_connection", {})
         mcp.assert_clean_stdout()
@@ -1005,9 +1005,9 @@ class TestTier1RolloutR08Day0UntouchedCatalog(E2ETestCase):
         self.assertNotIn("companion/", resp.text)
 
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertIs(stats["last_catalog_included_proxy_models"], False)
-        self.assertIsInstance(stats["last_catalog_refresh_at_ms"], int)
-        self.assertGreater(stats["last_catalog_refresh_at_ms"], 0)
+        self.assertIs(stats["cloudcode"]["last_catalog_included_proxy_models"], False)
+        self.assertIsInstance(stats["cloudcode"]["last_catalog_refresh_at_ms"], int)
+        self.assertGreater(stats["cloudcode"]["last_catalog_refresh_at_ms"], 0)
 
     def test_t1_r08_saving_real_key_transitions_day0_to_merged_catalog(self) -> None:
         """R08: Adding a real API key via hot-reload switches fetchAvailableModels from untouched to merged."""
@@ -1053,7 +1053,7 @@ class TestTier1RolloutR08Day0UntouchedCatalog(E2ETestCase):
         self.assertEqual(r_day1.status, 200, r_day1.text)
         self.assertIn("companion/gemini-4-hydrogen-low", r_day1.json()["models"])
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertIs(stats["last_catalog_included_proxy_models"], True)
+        self.assertIs(stats["cloudcode"]["last_catalog_included_proxy_models"], True)
 
 
 class TestTier1RolloutR09ExtendedApiStats(E2ETestCase):
@@ -1078,24 +1078,35 @@ class TestTier1RolloutR09ExtendedApiStats(E2ETestCase):
         self.assertEqual(resp0.header("x-content-type-options"), "nosniff")
         self.assertIn("no-store", resp0.header("cache-control") or "")
         s0 = resp0.json()
-        required = {
+        self.assertEqual(set(s0.keys()), {"usage", "cloudcode"})
+        required_usage = {
             "requests",
             "prompt_tokens",
             "cached_tokens",
             "output_tokens",
             "reasoning_tokens",
             "cache_hit_ratio",
+        }
+        required_cc = {
+            "mode",
+            "resolved_upstream",
             "last_catalog_refresh_at_ms",
             "last_catalog_included_proxy_models",
-            "cloudcode_mode",
-            "cloudcode_resolved_upstream",
         }
-        self.assertTrue(required.issubset(set(s0.keys())), f"Missing keys: {required - set(s0.keys())}")
-        self.assertIsNone(s0["last_catalog_refresh_at_ms"])
-        self.assertIsNone(s0["last_catalog_included_proxy_models"])
-        self.assertEqual(s0["cloudcode_mode"], "fixed")
-        self.assertIsInstance(s0["cloudcode_resolved_upstream"], str)
-        self.assertTrue(s0["cloudcode_resolved_upstream"])
+        self.assertTrue(
+            required_usage.issubset(set(s0["usage"].keys())),
+            f"Missing usage keys: {required_usage - set(s0['usage'].keys())}",
+        )
+        self.assertTrue(
+            required_cc.issubset(set(s0["cloudcode"].keys())),
+            f"Missing cloudcode keys: {required_cc - set(s0['cloudcode'].keys())}",
+        )
+        cc0 = s0["cloudcode"]
+        self.assertIsNone(cc0["last_catalog_refresh_at_ms"])
+        self.assertIsNone(cc0["last_catalog_included_proxy_models"])
+        self.assertEqual(cc0["mode"], "fixed")
+        self.assertIsInstance(cc0["resolved_upstream"], str)
+        self.assertTrue(cc0["resolved_upstream"])
 
         fetch = http_raw_request(
             "127.0.0.1",
@@ -1108,12 +1119,13 @@ class TestTier1RolloutR09ExtendedApiStats(E2ETestCase):
         self.assertEqual(fetch.status, 200, fetch.text)
 
         s1 = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertIsInstance(s1["last_catalog_refresh_at_ms"], int)
-        self.assertGreater(s1["last_catalog_refresh_at_ms"], 0)
-        self.assertIs(s1["last_catalog_included_proxy_models"], True)
+        cc1 = s1["cloudcode"]
+        self.assertIsInstance(cc1["last_catalog_refresh_at_ms"], int)
+        self.assertGreater(cc1["last_catalog_refresh_at_ms"], 0)
+        self.assertIs(cc1["last_catalog_included_proxy_models"], True)
 
     def test_t1_r09_stats_auto_mode_initial_state_and_mcp_legacy_6_field_compat(self) -> None:
-        """R09: Auto mode reports cloudcode_mode=auto and ui-mcp accepts legacy 6-field /api/stats."""
+        """R09: Auto mode reports cloudcode.mode=auto and ui-mcp accepts usage-only /api/stats (defaulted cloudcode)."""
         env = self.make_env()
         cfg = env.write_config(
             env.make_config_dict(
@@ -1123,14 +1135,25 @@ class TestTier1RolloutR09ExtendedApiStats(E2ETestCase):
         )
         proxy = self.start_proxy(env, config_path=cfg)
         s_auto = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertEqual(s_auto["cloudcode_mode"], "auto")
-        self.assertIsNone(s_auto["cloudcode_resolved_upstream"])
+        self.assertEqual(s_auto["cloudcode"]["mode"], "auto")
+        self.assertIsNone(s_auto["cloudcode"]["resolved_upstream"])
         proxy.stop()
 
-        # Legacy 6-field MockHealthServer must deserialize cleanly in ui-mcp.
-        legacy_health = self.start_mock_health()
+        # Usage-only StatsSnapshot (omitting optional `cloudcode`) must deserialize cleanly in ui-mcp via #[serde(default)].
+        usage_only_health = self.start_mock_health(
+            stats_payload={
+                "usage": {
+                    "requests": 0,
+                    "prompt_tokens": 0,
+                    "cached_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "cache_hit_ratio": 0.0,
+                }
+            }
+        )
         cfg_legacy = env.write_config(
-            env.make_config_dict(listen_port=legacy_health.port, api_key="AIzaSyRolloutR09Leg1234"),
+            env.make_config_dict(listen_port=usage_only_health.port, api_key="AIzaSyRolloutR09Leg1234"),
             path=env.root / "legacy_cfg.json",
         )
         mcp = self.start_mcp(env, config_path=cfg_legacy)
@@ -1139,6 +1162,8 @@ class TestTier1RolloutR09ExtendedApiStats(E2ETestCase):
         sc = res.get("structuredContent", {})
         self.assertTrue(sc["proxy"]["reachable"])
         self.assertIsInstance(sc.get("stats"), dict)
+        self.assertEqual(sc["stats"]["usage"]["requests"], 0)
+        self.assertEqual(sc["cloudcode"]["mode"], "auto")
 
 
 class TestTier1RolloutR10NonGemini34Hint(E2ETestCase):
@@ -1624,21 +1649,26 @@ class TestTier1RolloutR16IntegrationCli(E2ETestCase):
         st0 = run_cli([str(binary), "integration", "status", "--json"], env=proc_env)
         self.assertEqual(st0.returncode, 0, st0.stderr)
         d0 = st0.json_stdout()
-        self.assertIs(d0["supported"], True)
+        self.assertEqual(d0["state"], "disabled")
         self.assertIs(d0["enabled"], False)
+        self.assertNotIn("supported", d0)
+        self.assertNotIn("manual_required", d0)
         self.assertEqual(d0["shell"], "zsh")
 
         en = run_cli([str(binary), "integration", "enable", "--json"], env=proc_env)
         self.assertEqual(en.returncode, 0, en.stderr)
         d1 = en.json_stdout()
+        self.assertEqual(d1["state"], "enabled")
         self.assertIs(d1["enabled"], True)
-        self.assertIs(d1["manual_required"], False)
+        self.assertNotIn("supported", d1)
+        self.assertNotIn("manual_required", d1)
         self.assertTrue(Path(d1["rc_path"]).is_file())
         self.assertTrue(Path(d1["env_script_path"]).is_file())
 
         dis = run_cli([str(binary), "integration", "disable", "--json"], env=proc_env)
         self.assertEqual(dis.returncode, 0, dis.stderr)
         d2 = dis.json_stdout()
+        self.assertEqual(d2["state"], "disabled")
         self.assertIs(d2["enabled"], False)
 
     def test_t1_r16_binary_path_precedence_flag_over_stable_cache_over_current_exe(self) -> None:
@@ -1781,13 +1811,26 @@ class TestTier1RolloutR18McpLauncherCloudCode(E2ETestCase):
             self.assertIn("launcher_integration", sc, sc)
             self.assertIn("cloudcode", sc, sc)
             li = sc["launcher_integration"]
-            self.assertIn("supported", li)
+            self.assertIn(
+                li.get("state"),
+                ("active", "enabled", "manual_required", "disabled", "unsupported"),
+            )
             self.assertIn("enabled", li)
-            self.assertIn("manual_required", li)
+            self.assertIn("hybrid_active", li)
+            self.assertNotIn("supported", li)
+            self.assertNotIn("manual_required", li)
             cc = sc["cloudcode"]
             self.assertIn("mode", cc)
             self.assertIn("configured_upstream", cc)
             self.assertIn("resolved_upstream", cc)
+            supported_models = sc.get("supported_models")
+            self.assertIsInstance(supported_models, list)
+            self.assertGreaterEqual(len(supported_models), 5)
+            for preset in supported_models:
+                self.assertIn("id", preset)
+                self.assertIn("display_name", preset)
+                self.assertIn("short_label", preset)
+            self.assertIn(sc.get("platform"), ("macos", "linux", "windows"))
 
     def test_t1_r18_set_launcher_integration_toggles_rc_hook_and_returns_snapshot(self) -> None:
         """R18: set_launcher_integration enables and disables RC hook in isolated HOME and updates snapshot."""

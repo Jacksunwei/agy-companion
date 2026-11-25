@@ -400,6 +400,7 @@ class McpStdioClient:
         base_url: Any = _UNSET,
         listen_port: Any = _UNSET,
         listen_host: Any = _UNSET,
+        cloudcode_upstream: Any = _UNSET,
         clear_api_key: Any = _UNSET,
         usage_dir: Any = _UNSET,
         extra: dict[str, Any] | None = None,
@@ -407,6 +408,41 @@ class McpStdioClient:
     ) -> dict[str, Any]:
         """Map logical setting names to exact advertised `save_settings` schema keys (Guard A3)."""
         props = self.get_save_settings_schema(timeout=timeout)
+        is_nested = any(k in props for k in ("proxy", "cloudcode", "providers"))
+
+        args: dict[str, Any] = {}
+        if is_nested:
+            proxy_patch: dict[str, Any] = {}
+            if listen_host is not _UNSET:
+                proxy_patch["host"] = listen_host
+            if listen_port is not _UNSET:
+                proxy_patch["port"] = listen_port
+            if proxy_patch:
+                args["proxy"] = proxy_patch
+
+            if cloudcode_upstream is not _UNSET:
+                args["cloudcode"] = {"upstream": cloudcode_upstream}
+
+            gemini_patch: dict[str, Any] = {}
+            if clear_api_key is True:
+                gemini_patch["api_key"] = "clear"
+            elif api_key is not _UNSET:
+                if api_key is None or api_key == "clear" or isinstance(api_key, dict):
+                    gemini_patch["api_key"] = api_key
+                else:
+                    gemini_patch["api_key"] = {"set": api_key}
+            if default_model is not _UNSET:
+                gemini_patch["default_model"] = default_model
+            if base_url is not _UNSET:
+                gemini_patch["base_url"] = base_url
+            if gemini_patch:
+                args["providers"] = {"gemini": gemini_patch}
+
+            if usage_dir is not _UNSET and "usage_dir" in props:
+                args["usage_dir"] = usage_dir
+            if extra:
+                args.update(extra)
+            return args
 
         def pick(candidates: tuple[str, ...]) -> str:
             for key in candidates:
@@ -414,7 +450,6 @@ class McpStdioClient:
                     return key
             return candidates[0]
 
-        args: dict[str, Any] = {}
         if api_key is not _UNSET:
             args[pick(("api_key", "gemini_api_key"))] = api_key
         if default_model is not _UNSET:
@@ -425,6 +460,8 @@ class McpStdioClient:
             args[pick(("listen_port", "port"))] = listen_port
         if listen_host is not _UNSET:
             args[pick(("listen_host", "host"))] = listen_host
+        if cloudcode_upstream is not _UNSET:
+            args[pick(("cloudcode_upstream_url", "upstream"))] = cloudcode_upstream
         if clear_api_key is not _UNSET:
             args[pick(("clear_api_key",))] = clear_api_key
         if usage_dir is not _UNSET:
@@ -441,6 +478,7 @@ class McpStdioClient:
         base_url: Any = _UNSET,
         listen_port: Any = _UNSET,
         listen_host: Any = _UNSET,
+        cloudcode_upstream: Any = _UNSET,
         clear_api_key: Any = _UNSET,
         usage_dir: Any = _UNSET,
         extra: dict[str, Any] | None = None,
@@ -454,6 +492,7 @@ class McpStdioClient:
             base_url=base_url,
             listen_port=listen_port,
             listen_host=listen_host,
+            cloudcode_upstream=cloudcode_upstream,
             clear_api_key=clear_api_key,
             usage_dir=usage_dir,
             extra=extra,

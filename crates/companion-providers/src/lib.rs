@@ -8,7 +8,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use companion_core::{api_key_hint, is_supported_gemini_model};
+use companion_core::{
+    CURATED_GEMINI_MODELS, api_key_hint, is_discoverable_chat_model, is_supported_gemini_model,
+    model_capability_sort_key,
+};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -107,81 +110,8 @@ pub struct GeminiModelList {
     pub models: Vec<GeminiModelInfo>,
 }
 
-const CURATED_GATEWAY_MODELS: &[(&str, &str)] = &[
-    ("gemini-4-carbon", "Gemini 4 Carbon"),
-    ("gemini-4-neon", "Gemini 4 Neon"),
-    ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
-    ("gemini-4-argon", "Gemini 4 Argon"),
-    ("gemini-3.8-flash", "Gemini 3.8 Flash"),
-];
-
 const DEFAULT_GATEWAY_INPUT_TOKEN_LIMIT: u64 = 1_048_576;
 const DEFAULT_GATEWAY_OUTPUT_TOKEN_LIMIT: u64 = 65_536;
-
-fn parse_gemini_version_pair(model_id: &str) -> (u32, u32) {
-    let Some(rest) = model_id.strip_prefix("gemini-") else {
-        return (0, 0);
-    };
-    let major_end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
-    let major = rest[..major_end].parse::<u32>().unwrap_or(0);
-    let minor = rest[major_end..]
-        .strip_prefix('.')
-        .map(|after_dot| {
-            let minor_end = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
-            after_dot[..minor_end].parse::<u32>().unwrap_or(0)
-        })
-        .unwrap_or(0);
-    (major, minor)
-}
-
-/// Orders Gemini models from most capable to least capable, matching Antigravity's native picker:
-/// Carbon -> Neon -> Hydrogen -> Argon -> other Gemini 4 -> Gemini 3.9+ -> Gemini 3.8 Flash.
-pub fn model_capability_sort_key(model_id: &str) -> (u8, std::cmp::Reverse<(u32, u32)>, &str) {
-    let clean = model_id.strip_prefix("models/").unwrap_or(model_id);
-    let tier = match clean {
-        "gemini-4-carbon" => 0,
-        "gemini-4-neon" => 1,
-        "gemini-4-hydrogen" => 2,
-        "gemini-4-argon" => 3,
-        "gemini-3.8-flash" => 6,
-        _ => {
-            let (major, minor) = parse_gemini_version_pair(clean);
-            if major >= 4 {
-                4
-            } else if major == 3 && minor >= 9 {
-                5
-            } else if major == 3 && minor == 8 {
-                7
-            } else {
-                8
-            }
-        }
-    };
-    (
-        tier,
-        std::cmp::Reverse(parse_gemini_version_pair(clean)),
-        clean,
-    )
-}
-
-/// Returns `true` when `model_id` (without `models/` prefix) is a chat-capable Gemini 3/4 model.
-/// Filters out specialized non-chat endpoints (TTS, speech transcription, image generation, live audio)
-/// so Antigravity App's model picker only lists interactive coding/agent models.
-pub fn is_discoverable_chat_model(model_id: &str) -> bool {
-    if !is_supported_gemini_model(model_id) {
-        return false;
-    }
-    let lower = model_id.to_ascii_lowercase();
-    let non_chat_markers = [
-        "-tts",
-        "-transcribe",
-        "-image",
-        "-live",
-        "-translate",
-        "-embedding",
-    ];
-    !non_chat_markers.iter().any(|marker| lower.contains(marker))
-}
 
 fn make_curated_model_info(id: &str, display_name: Option<&str>) -> GeminiModelInfo {
     GeminiModelInfo {
@@ -198,9 +128,9 @@ fn make_curated_model_info(id: &str, display_name: Option<&str>) -> GeminiModelI
 /// Builds the curated Gemini 4 & 3 model catalog for `GET /v1beta/models` fallback,
 /// placing `default_model` first when provided and valid.
 pub fn curated_gemini_models(default_model: Option<&str>) -> GeminiModelList {
-    let mut models: Vec<GeminiModelInfo> = CURATED_GATEWAY_MODELS
+    let mut models: Vec<GeminiModelInfo> = CURATED_GEMINI_MODELS
         .iter()
-        .map(|(id, label)| make_curated_model_info(id, Some(label)))
+        .map(|m| make_curated_model_info(m.id, Some(m.display_name)))
         .collect();
     filter_and_order_models(std::mem::take(&mut models), default_model)
 }
@@ -238,10 +168,10 @@ pub fn filter_and_order_models(
         }
         entry.name = format!("models/{clean_id}");
         if entry.display_name.as_deref().is_none_or(str::is_empty) {
-            let curated_label = CURATED_GATEWAY_MODELS
+            let curated_label = CURATED_GEMINI_MODELS
                 .iter()
-                .find(|(id, _)| *id == clean_id)
-                .map(|(_, label)| (*label).to_string());
+                .find(|m| m.id == clean_id)
+                .map(|m| m.display_name.to_string());
             entry.display_name = Some(curated_label.unwrap_or_else(|| clean_id.clone()));
         }
         if entry.supported_generation_methods.is_empty() {
@@ -265,10 +195,10 @@ pub fn filter_and_order_models(
                 let item = filtered.remove(pos);
                 filtered.insert(0, item);
             } else {
-                let curated_label = CURATED_GATEWAY_MODELS
+                let curated_label = CURATED_GEMINI_MODELS
                     .iter()
-                    .find(|(id, _)| *id == default_id)
-                    .map(|(_, label)| *label);
+                    .find(|m| m.id == default_id)
+                    .map(|m| m.display_name);
                 filtered.insert(0, make_curated_model_info(default_id, curated_label));
             }
         }

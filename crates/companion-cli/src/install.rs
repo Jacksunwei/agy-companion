@@ -1772,11 +1772,12 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
         )
         .await?;
         if auto_selected {
-            config.listen_port = selected_port;
+            config.proxy.port =
+                std::num::NonZeroU16::new(selected_port).ok_or(CliError::InvalidPort(0))?;
             port_auto_selected = true;
         }
     }
-    let listen_port = config.listen_port;
+    let listen_port = config.proxy.port.get();
     let runtime_data_dir = resolve_runtime_data_dir(&config)?;
 
     // 2. Stage binary, .version, and 7-file plugin directory BEFORE swapping anything.

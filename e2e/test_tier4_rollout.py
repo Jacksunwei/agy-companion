@@ -155,14 +155,14 @@ class TestTier4RolloutScenarios(E2ETestCase):
         self.assertEqual(day0_resp.status, 200, day0_resp.text)
         self.assertNotIn("companion/gemini-4-hydrogen-low", day0_resp.json()["models"])
         self.assertIs(
-            http_raw_request("127.0.0.1", port, "GET", "/api/stats").json()["last_catalog_included_proxy_models"],
+            http_raw_request("127.0.0.1", port, "GET", "/api/stats").json()["cloudcode"]["last_catalog_included_proxy_models"],
             False,
         )
 
         # 3. MCP save_settings saves a real API key -> Day-1 merged catalog
         mcp = self.start_mcp(env, config_path=cfg, extra_env=shell_extra)
         snap0 = mcp.call_tool("get_settings", {}).get("structuredContent", {})
-        self.assertIs(snap0["config"]["api_key_configured"], False)
+        self.assertIs(snap0["config"]["providers"]["gemini"]["api_key_configured"], False)
         if os.name != "nt":
             self.assertIs(snap0["launcher_integration"]["enabled"], True)
 
@@ -181,7 +181,7 @@ class TestTier4RolloutScenarios(E2ETestCase):
         self.assertEqual(day1_resp.status, 200, day1_resp.text)
         self.assertIn("companion/gemini-4-hydrogen-low", day1_resp.json()["models"])
         self.assertIs(
-            http_raw_request("127.0.0.1", port, "GET", "/api/stats").json()["last_catalog_included_proxy_models"],
+            http_raw_request("127.0.0.1", port, "GET", "/api/stats").json()["cloudcode"]["last_catalog_included_proxy_models"],
             True,
         )
         mcp.close()
@@ -556,7 +556,8 @@ class TestTier4RolloutScenarios(E2ETestCase):
         r_mcp = mcp.call_tool("set_launcher_integration", {"enabled": True})
         mcp.assert_clean_stdout()
         li = r_mcp["structuredContent"]["launcher_integration"]
-        self.assertIs(li["manual_required"], True)
+        self.assertEqual(li["state"], "manual_required")
+        self.assertNotIn("manual_required", li)
         self.assertTrue(li.get("manual_snippet"))
         self.assertEqual(dotfiles_zlogin.read_text(encoding="utf-8"), "# managed by stow\n")
         self.assertTrue((env.data_dir / "env.sh").is_file())
@@ -565,7 +566,9 @@ class TestTier4RolloutScenarios(E2ETestCase):
         # 2. CLI default also reports manual_required; explicit --follow-rc-symlink updates target
         r_cli_def = run_cli([str(binary), "integration", "enable", "--shell", "zsh", "--json"], env=env.build_env(extra=z_extra))
         self.assertEqual(r_cli_def.returncode, 0, r_cli_def.stderr)
-        self.assertIs(r_cli_def.json_stdout()["manual_required"], True)
+        d_cli = r_cli_def.json_stdout()
+        self.assertEqual(d_cli["state"], "manual_required")
+        self.assertNotIn("manual_required", d_cli)
 
         r_cli_opt = run_cli(
             [str(binary), "integration", "enable", "--shell", "zsh", "--follow-rc-symlink", "--json"],

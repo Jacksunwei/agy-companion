@@ -141,11 +141,56 @@ for line in sys.stdin:
                         "name": "save_settings",
                         "description": "Save settings",
                         "inputSchema": {
+                            "$defs": {
+                                "ApiKeyPatch": {
+                                    "oneOf": [
+                                        {"enum": ["clear"], "type": "string"},
+                                        {
+                                            "additionalProperties": False,
+                                            "properties": {"set": {"type": "string"}},
+                                            "required": ["set"],
+                                            "type": "object",
+                                        },
+                                    ]
+                                },
+                                "ProxySettingsPatch": {
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "host": {"type": ["string", "null"]},
+                                        "port": {"type": ["integer", "null"]},
+                                    },
+                                    "type": "object",
+                                },
+                                "CloudCodeSettingsPatch": {
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "upstream": {"type": ["string", "null"]},
+                                    },
+                                    "type": "object",
+                                },
+                                "GeminiSettingsPatch": {
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "api_key": {"anyOf": [{"$ref": "#/$defs/ApiKeyPatch"}, {"type": "null"}]},
+                                        "base_url": {"type": ["string", "null"]},
+                                        "default_model": {"type": ["string", "null"]},
+                                    },
+                                    "type": "object",
+                                },
+                                "ProvidersSettingsPatch": {
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "gemini": {"anyOf": [{"$ref": "#/$defs/GeminiSettingsPatch"}, {"type": "null"}]},
+                                    },
+                                    "type": "object",
+                                },
+                            },
+                            "additionalProperties": False,
                             "type": "object",
                             "properties": {
-                                "api_key": {"type": "string"},
-                                "gemini_base_url": {"type": "string"},
-                                "gemini_default_model": {"type": "string"},
+                                "proxy": {"anyOf": [{"$ref": "#/$defs/ProxySettingsPatch"}, {"type": "null"}]},
+                                "cloudcode": {"anyOf": [{"$ref": "#/$defs/CloudCodeSettingsPatch"}, {"type": "null"}]},
+                                "providers": {"anyOf": [{"$ref": "#/$defs/ProvidersSettingsPatch"}, {"type": "null"}]},
                             },
                         },
                     }
@@ -404,11 +449,35 @@ class TestHarnessSelfTests(E2ETestCase):
         self.assertEqual(read_res["contents"][0]["mimeType"], "text/html;profile=mcp-app")
         tools = client.list_tools()
         self.assertEqual(tools["tools"][0]["name"], "save_settings")
-        # save_settings_smart should map base_url -> gemini_base_url & default_model -> gemini_default_model!
-        call_res = client.save_settings_smart(base_url="http://127.0.0.1:9999", default_model="gemini-4-hydrogen")
+        # save_settings_smart should map logical settings to nested SaveSettingsArgs + ApiKeyPatch!
+        call_res = client.save_settings_smart(
+            api_key="AIzaSySelfTest1234",
+            base_url="http://127.0.0.1:9999",
+            default_model="gemini-4-hydrogen",
+            listen_host="localhost",
+            listen_port=24142,
+            cloudcode_upstream="auto",
+        )
         echo_args = call_res["structuredContent"]["echo_args"]
-        self.assertEqual(echo_args["gemini_base_url"], "http://127.0.0.1:9999")
-        self.assertEqual(echo_args["gemini_default_model"], "gemini-4-hydrogen")
+        self.assertEqual(
+            echo_args,
+            {
+                "proxy": {"host": "localhost", "port": 24142},
+                "cloudcode": {"upstream": "auto"},
+                "providers": {
+                    "gemini": {
+                        "api_key": {"set": "AIzaSySelfTest1234"},
+                        "base_url": "http://127.0.0.1:9999",
+                        "default_model": "gemini-4-hydrogen",
+                    }
+                },
+            },
+        )
+        clear_res = client.save_settings_smart(clear_api_key=True)
+        self.assertEqual(
+            clear_res["structuredContent"]["echo_args"],
+            {"providers": {"gemini": {"api_key": "clear"}}},
+        )
         client.assert_clean_stdout()
         self.assertIn("fake-mcp stderr: initialized", client.stderr_text)
 
@@ -991,8 +1060,11 @@ class TestHarnessSelfTests(E2ETestCase):
 
         cfg_default = env.make_config_dict()
         self.assertNotIn("cloudcode_upstream_url", cfg_default)
+        self.assertEqual(cfg_default["cloudcode"]["upstream"], "auto")
+        self.assertEqual(cfg_default["proxy"], {"host": "127.0.0.1", "port": 24141})
+        self.assertEqual(cfg_default["providers"]["gemini"]["default_model"], "gemini-4-hydrogen")
         cfg_cc = env.make_config_dict(cloudcode_upstream_url="http://127.0.0.1:49999")
-        self.assertEqual(cfg_cc["cloudcode_upstream_url"], "http://127.0.0.1:49999")
+        self.assertEqual(cfg_cc["cloudcode"]["upstream"], "http://127.0.0.1:49999")
 
     def test_self_23_pidfile_reaper_kills_verified_daemon_and_refuses_unsafe_targets(self) -> None:
         """SELF-23: PID-file reaper terminates verified detached daemon in LIFO teardown and refuses unsafe targets."""

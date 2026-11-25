@@ -1,7 +1,10 @@
 use std::fmt;
 use std::time::Duration;
 
-use companion_core::{GeminiConfig, api_key_hint, is_placeholder_api_key, validate_upstream_url};
+use companion_core::{
+    GeminiConfig, api_key_hint, decode_ascii_hex_nibble, is_printable_ascii_with_space,
+    is_safe_path_segment_byte, validate_api_key_str, validate_upstream_url,
+};
 use futures_util::TryStreamExt;
 use http::header::{self, HeaderName, HeaderValue};
 use url::Url;
@@ -85,7 +88,7 @@ impl GeminiProvider {
     pub fn from_config(config: &GeminiConfig) -> Result<Self, ProviderError> {
         Self::new(
             config.base_url.as_str(),
-            config.api_key.clone(),
+            config.api_key.as_ref().map(|k| k.expose().to_string()),
             config.timeout_secs,
         )
     }
@@ -122,7 +125,7 @@ impl GeminiProvider {
     ) -> Result<Self, ProviderError> {
         Self::build(
             config.base_url.clone(),
-            config.api_key.clone(),
+            config.api_key.as_ref().map(|k| k.expose().to_string()),
             config.timeout_secs,
             EnvKeySource::Fixed(env_key.map(str::to_owned)),
         )
@@ -431,38 +434,6 @@ fn is_loopback_url(url: &Url) -> bool {
     }
 }
 
-fn decode_ascii_hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Exact RFC 3986 `pchar \ {';', '%'}` (78 bytes), matching `companion-core`.
-fn is_safe_path_segment_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'-' | b'.'
-                | b'_'
-                | b'~'
-                | b'!'
-                | b'$'
-                | b'&'
-                | b'\''
-                | b'('
-                | b')'
-                | b'*'
-                | b'+'
-                | b','
-                | b'='
-                | b':'
-                | b'@'
-        )
-}
-
 fn normalize_base_url(raw: &str) -> Result<(Url, String, String), ProviderError> {
     validate_upstream_url(raw).map_err(|err| ProviderError::InvalidConfig(err.to_string()))?;
 
@@ -673,20 +644,14 @@ fn sanitize_query(raw_query: &str) -> Result<Option<String>, ProviderError> {
 }
 
 fn validate_api_key_string(raw: &str) -> Result<Option<String>, ProviderError> {
-    if !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
-        return Err(ProviderError::InvalidConfig(
-            "api key contains invalid header characters".to_string(),
-        ));
-    }
-
-    let trimmed = raw.trim_matches(' ');
-    if trimmed.is_empty() || is_placeholder_api_key(trimmed) {
+    let Some(trimmed) = validate_api_key_str(raw).map_err(|_| {
+        ProviderError::InvalidConfig("api key contains invalid header characters".to_string())
+    })?
+    else {
         return Ok(None);
-    }
+    };
 
-    if !trimmed.bytes().all(|b| (0x21..=0x7E).contains(&b))
-        || HeaderValue::from_str(trimmed).is_err()
-    {
+    if HeaderValue::from_str(trimmed).is_err() {
         return Err(ProviderError::InvalidConfig(
             "api key contains invalid header characters".to_string(),
         ));
@@ -712,7 +677,7 @@ fn resolve_content_type_header(content_type: Option<&str>) -> Result<HeaderValue
         return Ok(HeaderValue::from_static("application/json"));
     };
 
-    if !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+    if !is_printable_ascii_with_space(raw.as_bytes()) {
         return Err(ProviderError::InvalidConfig(
             "Content-Type header contains invalid characters".to_string(),
         ));
@@ -816,7 +781,7 @@ mod tests {
     use axum::response::Response;
     use axum::routing::{any, get, post};
     use bytes::Bytes;
-    use companion_core::{DEFAULT_TIMEOUT_SECS, GeminiConfig};
+    use companion_core::{ApiKey, DEFAULT_TIMEOUT_SECS, GeminiConfig};
     use futures_util::{StreamExt, stream};
     use tokio::sync::{Mutex, mpsc};
 
@@ -850,7 +815,7 @@ mod tests {
     fn config_for(base_url: &str, api_key: Option<&str>, timeout_secs: u64) -> GeminiConfig {
         GeminiConfig {
             base_url: base_url.to_string(),
-            api_key: api_key.map(str::to_owned),
+            api_key: api_key.and_then(|k| ApiKey::parse_from_disk(k).expect("valid test api_key")),
             timeout_secs,
             ..GeminiConfig::default()
         }
@@ -861,8 +826,13 @@ mod tests {
         api_key: Option<&str>,
         env_key: Option<&str>,
     ) -> GeminiProvider {
-        let cfg = config_for(base_url, api_key, DEFAULT_TIMEOUT_SECS);
-        GeminiProvider::with_env_api_key(&cfg, env_key).expect("construct test provider")
+        GeminiProvider::build(
+            base_url.to_string(),
+            api_key.map(str::to_owned),
+            DEFAULT_TIMEOUT_SECS,
+            EnvKeySource::Fixed(env_key.map(str::to_owned)),
+        )
+        .expect("construct test provider")
     }
 
     async fn collect_stream(mut response: ForwardResponse) -> Vec<u8> {
@@ -1733,10 +1703,20 @@ mod tests {
         ];
 
         for bad in bad_keys {
-            // Source 1: configured api_key (eager validation in new/from_config)
-            let cfg = config_for("http://127.0.0.1:4141", Some(bad), DEFAULT_TIMEOUT_SECS);
-            let err = GeminiProvider::from_config(&cfg)
-                .expect_err(&format!("must reject configured key: {bad:?}"));
+            // Source 1: configured api_key (eager validation in new & ApiKey::parse_from_disk)
+            let parse_err =
+                ApiKey::parse_from_disk(bad).expect_err(&format!("must reject disk key: {bad:?}"));
+            assert!(!parse_err.to_string().contains("AIzaSySecret"));
+            assert!(!parse_err.to_string().contains("X-Injected"));
+            assert!(!format!("{parse_err:?}").contains("AIzaSySecret"));
+            assert!(!format!("{parse_err:?}").contains('\u{1F511}'));
+
+            let err = GeminiProvider::new(
+                "http://127.0.0.1:4141",
+                Some(bad.to_string()),
+                DEFAULT_TIMEOUT_SECS,
+            )
+            .expect_err(&format!("must reject configured key: {bad:?}"));
             assert!(matches!(err, ProviderError::InvalidConfig(_)));
             assert!(!err.to_string().contains("AIzaSySecret"));
             assert!(!err.to_string().contains("X-Injected"));
@@ -1780,7 +1760,7 @@ mod tests {
     fn debug_redacts_api_keys_on_gemini_provider_and_forward_request() {
         let provider = GeminiProvider::from_config(&GeminiConfig {
             base_url: "https://generativelanguage.googleapis.com/v1beta/".to_string(),
-            api_key: Some("AIzaSyTopSecretConfigured9999".to_string()),
+            api_key: Some(ApiKey::parse_strict("AIzaSyTopSecretConfigured9999").unwrap()),
             timeout_secs: 900,
             ..GeminiConfig::default()
         })
