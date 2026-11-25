@@ -15,7 +15,7 @@ use companion_core::{GeminiUsageMetadata, UsageEvent, UsageSink};
 use companion_providers::{
     ByteStream, ForwardRequest, ProviderError, curated_gemini_models, filter_and_order_models,
 };
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use crate::{ActiveProvider, InFlightGuard, PROTOCOL_VERSION, ProxyState};
 pub const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_JSON_TEE_BYTES: usize = 8 * 1024 * 1024;
 const CLOUDCODE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const THOUGHT_SIG_ERROR_SNIFF_MAX_BYTES: usize = 64 * 1024;
 
 const GEMINI_MODELS_PREFIX: &str = "/v1beta/models/";
 static X_GOOG_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-goog-api-key");
@@ -505,7 +506,7 @@ async fn proxy_gemini_handler(
     if !companion_core::is_supported_gemini_model(&model) {
         return json_error_response(
             StatusCode::BAD_REQUEST,
-            "unsupported model: only Gemini 3 and Gemini 4 models are supported (unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly)",
+            "unsupported model: only Gemini 3.8+ and Gemini 4+ models are supported (unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly)",
         );
     }
 
@@ -521,14 +522,15 @@ async fn proxy_gemini_handler(
     };
 
     let started_at = Instant::now();
+    let has_thought_sig = body_contains_thought_signature(&body);
     let forward_req = ForwardRequest {
         path_and_query: path_and_query.to_string(),
-        body,
-        content_type,
-        api_key_override,
+        body: body.clone(),
+        content_type: content_type.clone(),
+        api_key_override: api_key_override.clone(),
     };
 
-    let upstream = match active.provider.forward_gemini(forward_req).await {
+    let mut upstream = match active.provider.forward_gemini(forward_req).await {
         Ok(resp) => resp,
         Err(ProviderError::InvalidPath(_)) => {
             return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
@@ -552,6 +554,52 @@ async fn proxy_gemini_handler(
             );
         }
     };
+
+    // Mid-conversation switching from Vertex/CloudCode to Gemini Developer API can carry
+    // foreign thoughtSignature tokens that generativelanguage.googleapis.com rejects with
+    // 400 INVALID_THOUGHT_SIGNATURE. Keep byte-for-byte pass-through on the normal path (S4),
+    // and only strip foreign thoughtSignature keys on an explicit 400 INVALID_THOUGHT_SIGNATURE.
+    if upstream.status == StatusCode::BAD_REQUEST.as_u16() && has_thought_sig {
+        let mut sniffed = Vec::new();
+        let mut remainder = upstream.stream;
+        let mut stream_err: Option<ProviderError> = None;
+        while sniffed.len() < THOUGHT_SIG_ERROR_SNIFF_MAX_BYTES {
+            match remainder.next().await {
+                Some(Ok(chunk)) => sniffed.extend_from_slice(&chunk),
+                Some(Err(err)) => {
+                    stream_err = Some(err);
+                    break;
+                }
+                None => break,
+            }
+        }
+        if is_invalid_thought_signature_error(&sniffed)
+            && let Some(stripped_body) = strip_thought_signatures_from_json(&body)
+        {
+            tracing::info!(
+                model = %model,
+                "retrying Gemini request once without foreign thoughtSignature fields after INVALID_THOUGHT_SIGNATURE"
+            );
+            let retry_req = ForwardRequest {
+                path_and_query: path_and_query.to_string(),
+                body: stripped_body,
+                content_type,
+                api_key_override,
+            };
+            match active.provider.forward_gemini(retry_req).await {
+                Ok(retry_resp) => {
+                    upstream = retry_resp;
+                }
+                Err(_) => {
+                    let prefix = Bytes::from(sniffed);
+                    upstream.stream = replay_buffered_stream(prefix, stream_err, remainder);
+                }
+            }
+        } else {
+            let prefix = Bytes::from(sniffed);
+            upstream.stream = replay_buffered_stream(prefix, stream_err, remainder);
+        }
+    }
 
     let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response_builder = Response::builder().status(status);
@@ -595,6 +643,70 @@ async fn proxy_gemini_handler(
             "failed to build proxy response",
         ),
     }
+}
+
+fn body_contains_thought_signature(body: &[u8]) -> bool {
+    const CAMEL: &[u8] = b"thoughtSignature";
+    const SNAKE: &[u8] = b"thought_signature";
+    body.windows(CAMEL.len()).any(|w| w == CAMEL) || body.windows(SNAKE.len()).any(|w| w == SNAKE)
+}
+
+fn is_invalid_thought_signature_error(body: &[u8]) -> bool {
+    const REASON: &[u8] = b"INVALID_THOUGHT_SIGNATURE";
+    const MSG: &[u8] = b"Corrupted thought signature";
+    body.windows(REASON.len()).any(|w| w == REASON) || body.windows(MSG.len()).any(|w| w == MSG)
+}
+
+fn strip_thought_signatures_value(value: &mut serde_json::Value) -> bool {
+    let mut removed = false;
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.remove("thoughtSignature").is_some() {
+                removed = true;
+            }
+            if map.remove("thought_signature").is_some() {
+                removed = true;
+            }
+            for child in map.values_mut() {
+                if strip_thought_signatures_value(child) {
+                    removed = true;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if strip_thought_signatures_value(item) {
+                    removed = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    removed
+}
+
+fn strip_thought_signatures_from_json(body: &[u8]) -> Option<Bytes> {
+    let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !strip_thought_signatures_value(&mut parsed) {
+        return None;
+    }
+    serde_json::to_vec(&parsed).ok().map(Bytes::from)
+}
+
+fn replay_buffered_stream(
+    prefix: Bytes,
+    stream_err: Option<ProviderError>,
+    remainder: ByteStream,
+) -> ByteStream {
+    let mut head: Vec<Result<Bytes, ProviderError>> = Vec::new();
+    if !prefix.is_empty() {
+        head.push(Ok(prefix));
+    }
+    if let Some(err) = stream_err {
+        head.push(Err(err));
+        return Box::pin(futures_util::stream::iter(head));
+    }
+    Box::pin(futures_util::stream::iter(head).chain(remainder))
 }
 
 fn json_error_response(status: StatusCode, message: &'static str) -> Response {
@@ -2191,6 +2303,8 @@ mod tests {
             "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
             "/v1beta/models/gemini-2.0-flash:generateContent",
             "/v1beta/models/gemini-1.5-pro:generateContent",
+            "/v1beta/models/gemini-3.7-flash:generateContent",
+            "/v1beta/models/gemini-3.1-pro-preview:generateContent",
             "/v1beta/models/models/gemini-2.5-pro:generateContent",
             "/v1beta/models/gemini-30-pro:generateContent",
             "/v1beta/models/gpt-4o:generateContent",
@@ -2214,7 +2328,7 @@ mod tests {
                 .unwrap();
             let text = String::from_utf8_lossy(&body);
             assert!(
-                text.contains("Gemini 3 and Gemini 4")
+                text.contains("Gemini 3.8+ and Gemini 4+")
                     && text.contains("unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly"),
                 "expected clear error with unset hint for {uri}, got: {text}"
             );
@@ -2832,5 +2946,138 @@ mod tests {
         let seen = stub.captured_requests();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].api_key_override, None);
+    }
+
+    #[tokio::test]
+    async fn retries_once_without_thought_signature_on_400_invalid_thought_signature() {
+        struct ThoughtSigFallbackProvider {
+            seen: std::sync::Mutex<Vec<Bytes>>,
+        }
+
+        impl ProviderAdapter for ThoughtSigFallbackProvider {
+            fn name(&self) -> &'static str {
+                "thought-sig-test"
+            }
+
+            fn forward_gemini(
+                &self,
+                req: ForwardRequest,
+            ) -> BoxFuture<'_, Result<ForwardResponse, ProviderError>> {
+                let attempt = {
+                    let mut guard = self.seen.lock().unwrap();
+                    guard.push(req.body.clone());
+                    guard.len()
+                };
+                Box::pin(async move {
+                    if attempt == 1 {
+                        let err_body = Bytes::from_static(
+                            br#"{"error":{"code":400,"message":"Corrupted thought signature.","status":"INVALID_ARGUMENT","details":[{"reason":"INVALID_THOUGHT_SIGNATURE"}]}}"#,
+                        );
+                        Ok(ForwardResponse {
+                            status: 400,
+                            content_type: Some("application/json".to_string()),
+                            stream: Box::pin(futures_util::stream::once(
+                                async move { Ok(err_body) },
+                            )),
+                        })
+                    } else {
+                        let ok_body = Bytes::from_static(
+                            br#"{"candidates":[],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":5,"totalTokenCount":17}}"#,
+                        );
+                        Ok(ForwardResponse {
+                            status: 200,
+                            content_type: Some("application/json".to_string()),
+                            stream: Box::pin(futures_util::stream::once(
+                                async move { Ok(ok_body) },
+                            )),
+                        })
+                    }
+                })
+            }
+
+            fn health_check(&self) -> BoxFuture<'_, Result<(), ProviderError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let provider = Arc::new(ThoughtSigFallbackProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let sink = Arc::new(RecordingSink::default());
+        let app = build_router(ProxyState::new(
+            Arc::clone(&provider) as Arc<dyn companion_providers::ProviderAdapter>,
+            Arc::clone(&sink) as Arc<dyn UsageSink>,
+            true,
+        ));
+
+        let payload = br#"{"contents":[{"role":"model","parts":[{"text":"hi","thoughtSignature":"vertex-sig-abc"},{"thought":true,"text":"plan","thought_signature":"vertex-sig-xyz"}]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/gemini-4-neon:generateContent")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(Bytes::from_static(payload)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(resp_bytes.windows(13).any(|w| w == b"usageMetadata"));
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "expected initial attempt + 1 stripped retry");
+        assert_eq!(
+            seen[0].as_ref(),
+            payload,
+            "first attempt must be byte-for-byte untouched"
+        );
+        let retried: serde_json::Value = serde_json::from_slice(&seen[1]).unwrap();
+        let parts = retried["contents"][0]["parts"].as_array().unwrap();
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts[0]["text"], "hi");
+        assert!(parts[1].get("thought_signature").is_none());
+        assert_eq!(parts[1]["text"], "plan");
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_unrelated_400_even_when_thought_signature_present() {
+        let sink = Arc::new(RecordingSink::default());
+        let err_body = Bytes::from_static(br#"{"error":{"code":400,"message":"Bad schema"}}"#);
+        let stub = Arc::new(StubProvider::with_status(
+            400,
+            Some("application/json"),
+            err_body.clone(),
+        ));
+        let app = build_router(ProxyState::new(
+            Arc::clone(&stub) as Arc<dyn companion_providers::ProviderAdapter>,
+            Arc::clone(&sink) as Arc<dyn UsageSink>,
+            true,
+        ));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/gemini-4-neon:generateContent")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"contents":[{"parts":[{"thoughtSignature":"abc"}]}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body, err_body);
+        assert_eq!(stub.captured_requests().len(), 1);
     }
 }
