@@ -45,6 +45,30 @@ _S5_EXTERNAL_TAGS_RE = re.compile(
 )
 
 
+def _read_rust_module_source(module_base: Path, *, include_tests: bool = False) -> str:
+    single_file = module_base.with_suffix(".rs")
+    if single_file.is_file():
+        files = [single_file]
+    elif module_base.is_dir():
+        files = [
+            candidate
+            for candidate in sorted(module_base.rglob("*.rs"))
+            if candidate.is_file()
+            and (
+                include_tests
+                or (
+                    candidate.name != "tests.rs"
+                    and "tests" not in candidate.relative_to(module_base).parts
+                )
+            )
+        ]
+    else:
+        files = []
+    if not files:
+        raise AssertionError(f"Missing expected Rust module: {module_base}")
+    return "\n".join(path.read_text(encoding="utf-8") for path in files)
+
+
 def _sample_catalog(used_slots: list[int] | None = None) -> dict[str, Any]:
     models: dict[str, Any] = {
         "gemini-4-carbon-high": {
@@ -1880,20 +1904,20 @@ class TestTier2RolloutR24WindowsParityBoundaries(E2ETestCase):
 
     def test_t2_r24_windows_integration_unsupported_and_manifests_avoid_bash(self) -> None:
         """R24: Windows integration reports state=unsupported and Windows manifests do not shell out to bash."""
-        integ_rs = (self.repo_root / "crates" / "companion-core" / "src" / "integration.rs").read_text(encoding="utf-8")
-        install_rs = (self.repo_root / "crates" / "companion-cli" / "src" / "install.rs").read_text(encoding="utf-8")
+        integ_rs = _read_rust_module_source(self.repo_root / "crates" / "companion-core" / "src" / "integration")
+        install_rs = _read_rust_module_source(self.repo_root / "crates" / "companion-cli" / "src" / "install")
         self.assertRegex(integ_rs, r"cfg\(\s*(?:windows|not\s*\(\s*unix\s*\))\s*\)")
         self.assertRegex(integ_rs, r"IntegrationState::Unsupported|IntegrationStatus::unsupported\(")
         self.assertIn("agy-companion.exe", install_rs)
 
     def test_t2_r24_windows_shortcut_hides_console_window_and_cleans_up_on_uninstall(self) -> None:
         """R24: Windows Start Menu shortcut hides console window and uninstall includes shortcut removal."""
-        install_rs = (self.repo_root / "crates" / "companion-cli" / "src" / "install.rs").read_text(encoding="utf-8")
+        install_rs = _read_rust_module_source(self.repo_root / "crates" / "companion-cli" / "src" / "install")
         self.assertRegex(install_rs, r"CREATE_NO_WINDOW|0x0800_?0000|WindowStyle")
         self.assertGreaterEqual(
             install_rs.count("Antigravity (Companion).lnk"),
             1,
-            "Expected Start Menu shortcut filename in install.rs",
+            "Expected Start Menu shortcut filename in install module",
         )
 
 
