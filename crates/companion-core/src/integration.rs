@@ -1413,6 +1413,9 @@ fn env_script_still_referenced_elsewhere(
     ctx: &ResolvedContext,
     excluded_rc: &Path,
 ) -> Result<bool, CoreError> {
+    if !ctx.use_portable_env_expr {
+        return Ok(false);
+    }
     let candidates = collect_known_rc_paths(
         &ctx.home,
         ctx.zdotdir.as_deref(),

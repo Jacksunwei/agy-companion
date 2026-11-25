@@ -743,7 +743,7 @@ class TestTier1F5Proxy(E2ETestCase):
         mock = self.start_mock_gemini()
         cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyWildcardModel12"))
         proxy = self.start_proxy(env, config_path=cfg)
-        path = "/v1beta/models/gemini-3.0-pro-preview-05-06:generateContent"
+        path = "/v1beta/models/gemini-3.9-pro-preview-05-06:generateContent"
         resp = http_raw_request(
             "127.0.0.1",
             proxy.port,
@@ -2384,7 +2384,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
             body=b'{"contents":[{"parts":[{"text":"hi"}]}]}',
         )
         self.assertEqual(resp.status, 400, resp.text)
-        self.assertIn("Gemini 3 and Gemini 4", resp.text)
+        self.assertIn("Gemini 3.8+ and Gemini 4+", resp.text)
         self.assertIn("unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly", resp.text)
         self.assertEqual(len(mock_gemini.requests), 0)
         proxy.stop()

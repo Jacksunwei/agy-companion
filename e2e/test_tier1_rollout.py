@@ -1168,7 +1168,7 @@ class TestTier1RolloutR10NonGemini34Hint(E2ETestCase):
         self.assertEqual(resp.header("x-content-type-options"), "nosniff")
         self.assertIn("no-store", resp.header("cache-control") or "")
         msg = resp.json()["error"]["message"]
-        self.assertIn("Gemini 3 and Gemini 4", msg)
+        self.assertIn("Gemini 3.8+ and Gemini 4+", msg)
         self.assertIn("unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly", msg)
         self.assertEqual(len(mock_gemini.requests), 0)
 

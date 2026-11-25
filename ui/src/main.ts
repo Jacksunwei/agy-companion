@@ -133,7 +133,23 @@ const QUICK_MODELS = [
 ] as const;
 
 function isSupportedGeminiModel(model: string): boolean {
-  return /^gemini-(?:3|4)[-.].+/.test(model);
+  const match = /^gemini-(\d+)(?:\.(\d+))?(?:[.-](.+))?$/.exec(model);
+  if (!match) {
+    return false;
+  }
+  const major = Number(match[1]);
+  const minorStr = match[2];
+  const suffix = match[3];
+  if (major === 4) {
+    return Boolean((suffix && suffix.length > 0) || minorStr);
+  }
+  if (major === 3) {
+    if (minorStr === undefined) {
+      return false;
+    }
+    return Number(minorStr) >= 8;
+  }
+  return false;
 }
 
 function detectClientPlatform(): HostPlatform {
@@ -2075,7 +2091,7 @@ async function main(): Promise<void> {
       showFormFeedback(
         refs,
         "danger",
-        "Only Gemini 3 and Gemini 4 models are supported (e.g. gemini-4-hydrogen, gemini-4-argon, gemini-3.8-flash).",
+        "Only Gemini 3.8+ and Gemini 4+ models are supported (e.g. gemini-4-hydrogen, gemini-4-argon, gemini-3.8-flash).",
       );
       return;
     }

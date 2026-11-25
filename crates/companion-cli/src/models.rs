@@ -180,15 +180,15 @@ mod tests {
             "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen"
         );
 
-        let custom = build_custom_models_config(5151, "gemini-3.6-flash").expect("custom");
+        let custom = build_custom_models_config(5151, "gemini-3.9-pro").expect("custom");
         assert_eq!(custom.custom_models_config.custom_models.len(), 6);
         assert_eq!(
             custom.custom_models_config.custom_models[0].model_name,
-            "gemini-api://http://127.0.0.1:5151/models/gemini-3.6-flash"
+            "gemini-api://http://127.0.0.1:5151/models/gemini-3.9-pro"
         );
         assert_eq!(
             custom.custom_models_config.custom_models[0].label,
-            "Antigravity Companion (gemini-3.6-flash)"
+            "Antigravity Companion (gemini-3.9-pro)"
         );
         assert_eq!(
             custom.custom_models_config.custom_models[1].model_name,

@@ -839,18 +839,50 @@ pub fn default_plugins_dir() -> Result<PathBuf, CoreError> {
     resolve_plugins_dir_for_platform(dirs::home_dir(), TargetPlatform::current())
 }
 
-/// Returns `true` if `model` belongs to the Gemini 3 or Gemini 4 model family.
+/// Returns `true` if `model` is Gemini 3.8 or above (e.g. `gemini-3.8-flash`, `gemini-4-hydrogen`).
 pub fn is_supported_gemini_model(model: &str) -> bool {
-    ["gemini-3-", "gemini-3.", "gemini-4-", "gemini-4."]
-        .iter()
-        .any(|prefix| {
-            model
-                .strip_prefix(prefix)
-                .is_some_and(|rest| !rest.is_empty())
-        })
+    let Some(rest) = model.strip_prefix("gemini-") else {
+        return false;
+    };
+    let major_end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if major_end == 0 {
+        return false;
+    }
+    let Ok(major) = rest[..major_end].parse::<u32>() else {
+        return false;
+    };
+    let after_major = &rest[major_end..];
+    if major == 4 {
+        return after_major
+            .strip_prefix('-')
+            .or_else(|| after_major.strip_prefix('.'))
+            .is_some_and(|suffix| !suffix.is_empty());
+    }
+    if major == 3 {
+        let Some(after_dot) = after_major.strip_prefix('.') else {
+            return false;
+        };
+        let minor_end = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if minor_end == 0 {
+            return false;
+        }
+        let Ok(minor) = after_dot[..minor_end].parse::<u32>() else {
+            return false;
+        };
+        if minor < 8 {
+            return false;
+        }
+        let after_minor = &after_dot[minor_end..];
+        return after_minor.is_empty()
+            || after_minor
+                .strip_prefix('-')
+                .or_else(|| after_minor.strip_prefix('.'))
+                .is_some_and(|suffix| !suffix.is_empty());
+    }
+    false
 }
 
-/// Validates a Gemini model identifier for syntax safety and Gemini 3 / Gemini 4 membership.
+/// Validates a Gemini model identifier for syntax safety and Gemini 3.8+ / Gemini 4+ membership.
 pub fn validate_gemini_model(model: &str) -> Result<(), CoreError> {
     if model.is_empty()
         || !model.bytes().all(|b| (0x21..=0x7E).contains(&b))
@@ -867,7 +899,7 @@ pub fn validate_gemini_model(model: &str) -> Result<(), CoreError> {
     if !is_supported_gemini_model(model) {
         return Err(CoreError::InvalidModel {
             reason:
-                "only Gemini 3 and Gemini 4 models are supported (e.g. gemini-4-hydrogen, gemini-4-argon, gemini-3.8-flash)"
+                "only Gemini 3.8+ and Gemini 4+ models are supported (e.g. gemini-4-hydrogen, gemini-4-argon, gemini-3.8-flash)"
                     .to_string(),
         });
     }
@@ -2041,10 +2073,9 @@ mod tests {
             "gemini-4-carbon",
             "gemini-4.1-pro",
             "gemini-3.8-flash",
-            "gemini-3.6-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-pro-preview",
-            "gemini-3-flash-preview",
+            "gemini-3.8-flash-preview",
+            "gemini-3.9-pro",
+            "gemini-3.10-flash",
         ];
 
         for good_model in valid_models {
@@ -2053,6 +2084,28 @@ mod tests {
             assert!(
                 cfg.validate().is_ok(),
                 "false positive rejection for valid default_model '{good_model}'"
+            );
+        }
+
+        let pre_38_models = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-3.0-pro",
+            "gemini-3-flash-preview",
+            "gemini-2.5-pro",
+            "gemini-3.8-",
+            "gemini-3.8flash",
+        ];
+
+        for old_model in pre_38_models {
+            let mut cfg = Config::default();
+            cfg.gemini.default_model = old_model.to_string();
+            assert!(
+                cfg.validate().is_err(),
+                "expected pre-3.8 or malformed model '{old_model}' to be rejected"
             );
         }
     }

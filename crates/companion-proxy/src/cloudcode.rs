@@ -829,7 +829,7 @@ fn detect_auth_method_from_headers(headers: &HeaderMap) -> Option<bool> {
                 .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
                 .unwrap_or(rest.len());
             match &rest[..val_end] {
-                "gcp" | "adc" => return Some(true),
+                "gcp" | "adc" | "corp" | "business" | "enterprise" | "paygo" => return Some(true),
                 "consumer" => return Some(false),
                 _ => {}
             }
@@ -2776,5 +2776,32 @@ mod tests {
         assert_eq!(neon_xhigh["thinkingLevel"], 7);
         assert_eq!(neon_xhigh["displayName"], "Gemini 4 Neon (Proxy) (XHigh)");
         assert_eq!(neon_xhigh["modelUrl"], "gemini-api://gemini-4-neon");
+    }
+
+    #[test]
+    fn detect_auth_method_from_headers_routes_corp_and_paygo_to_prod_and_consumer_to_daily() {
+        for ua in [
+            "antigravity/2.35.1 (aidev_client; auth_method=corp)",
+            "antigravity/2.35.1 (aidev_client; auth_method=gcp)",
+            "antigravity/2.35.1 (aidev_client; auth_method=adc)",
+            "antigravity/2.35.1 (aidev_client; auth_method=paygo)",
+            "antigravity/2.35.1 (aidev_client; auth_method=enterprise)",
+            "antigravity/2.35.1 (aidev_client; auth_method=business)",
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(header::USER_AGENT, HeaderValue::from_str(ua).unwrap());
+            assert_eq!(
+                detect_auth_method_from_headers(&h),
+                Some(true),
+                "expected prod for {ua}"
+            );
+        }
+
+        let mut h_consumer = HeaderMap::new();
+        h_consumer.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("antigravity/2.35.1 (aidev_client; auth_method=consumer)"),
+        );
+        assert_eq!(detect_auth_method_from_headers(&h_consumer), Some(false));
     }
 }

@@ -844,7 +844,7 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
         listen_port: 5353,
         ..Config::default()
     };
-    cfg.gemini.default_model = "gemini-3.0-pro".to_string();
+    cfg.gemini.default_model = "gemini-3.9-pro".to_string();
     cfg.save_secure(&env_cfg).expect("save env_cfg");
 
     // AGY_COMPANION_CONFIG is honored when --config is omitted
@@ -858,7 +858,7 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid json");
     assert_eq!(
         parsed["customModelsConfig"]["customModels"][0]["modelName"],
-        "gemini-api://http://127.0.0.1:5353/models/gemini-3.0-pro"
+        "gemini-api://http://127.0.0.1:5353/models/gemini-3.9-pro"
     );
 
     // Explicit --config overrides even an invalid AGY_COMPANION_CONFIG
