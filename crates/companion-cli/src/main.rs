@@ -150,6 +150,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Install {
+            config,
             plugins_dir,
             no_launcher_hook,
             no_start_proxy,
@@ -160,6 +161,7 @@ async fn main() -> ExitCode {
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_install(
                 InstallOptions {
+                    config,
                     plugins_dir,
                     no_launcher_hook,
                     no_start_proxy,
@@ -176,6 +178,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Uninstall {
+            config,
             plugins_dir,
             purge,
             dry_run,
@@ -185,6 +188,7 @@ async fn main() -> ExitCode {
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_uninstall(
                 UninstallOptions {
+                    config,
                     plugins_dir,
                     purge,
                     dry_run,

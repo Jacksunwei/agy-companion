@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod gemini;
+pub mod probe_client;
 
 use std::borrow::Cow;
 use std::fmt;
@@ -17,6 +18,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use gemini::{GEMINI_API_KEY_ENV_VAR, GeminiProvider};
+pub use probe_client::{
+    DEFAULT_PROBE_TIMEOUT, HealthEvaluation, LoopbackProxyClient, MAX_PROBE_BODY_BYTES, ProbeError,
+    evaluate_health,
+};
 
 /// Boxed `Send` future enabling dyn-compatible (`Arc<dyn ProviderAdapter>`) async traits
 /// under Rust Edition 2024 without an external macro dependency.

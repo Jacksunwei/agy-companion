@@ -311,9 +311,9 @@ dependencies = [
  "axum",
  "clap",
  "companion-core",
+ "companion-providers",
  "companion-proxy",
  "companion-ui-mcp",
- "dirs",
  "reqwest",
  "serde",
  "serde_json",
@@ -322,8 +322,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]
@@ -390,7 +388,6 @@ dependencies = [
  "axum",
  "companion-core",
  "companion-providers",
- "reqwest",
  "rmcp",
  "schemars",
  "serde",

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use companion_core::{Config, CoreError, FsError, SqliteUsageSink, UsageSink};
+use companion_providers::{LoopbackProxyClient, ProbeError};
 use companion_proxy::{ProxyError, ProxyState, ProxyStateOptions};
 use companion_ui_mcp::UiMcpError;
 use thiserror::Error;
@@ -34,6 +35,8 @@ pub use companion_core::MAX_CONFIG_FILE_BYTES;
 pub enum CliError {
     #[error("{0}")]
     Core(#[from] CoreError),
+    #[error("{0}")]
+    Probe(#[from] ProbeError),
     #[error("{0}")]
     Proxy(#[from] ProxyError),
     #[error("{0}")]
@@ -249,6 +252,11 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         }
     });
 
+    let adopt_probe = if options.adopt_running {
+        Some(LoopbackProxyClient::with_default_timeouts()?)
+    } else {
+        None
+    };
     let mut logged_adopt = false;
     let mut takeover_retry_used = false;
     let listener = loop {
@@ -257,8 +265,12 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
             Err(ProxyError::Bind { addr, source })
                 if options.adopt_running && source.kind() == ErrorKind::AddrInUse =>
             {
-                if let Some(health) =
-                    launch::probe_running_companion_proxy(config.proxy.port.get()).await
+                let probe = adopt_probe
+                    .as_ref()
+                    .expect("adopt_running guarantees LoopbackProxyClient");
+                if let Some(health) = probe
+                    .probe_healthy_companion(config.proxy.port.get(), None)
+                    .await
                 {
                     takeover_retry_used = false;
                     if !logged_adopt {
@@ -363,7 +375,7 @@ pub async fn run_ui_mcp(
     if let Some(ref dir) = validated_data_dir {
         precheck_existing_data_dir(dir)?;
     }
-    companion_ui_mcp::serve_stdio(config_path, validated_data_dir).await?;
+    companion_ui_mcp::serve_stdio(config_path).await?;
     Ok(())
 }
 

@@ -2,9 +2,10 @@ use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use companion_core::{Config, CoreError};
+use companion_core::{Config, CoreError, HealthResponse};
+use companion_providers::LoopbackProxyClient;
 use serde::{Deserialize, Serialize};
 
 use crate::{CliError, normalized_metadata_path};
@@ -612,6 +613,95 @@ pub(crate) fn spawn_detached_proxy_daemon_with_exe(
     Ok(cmd.spawn()?)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WaitHealthyOptions<'a> {
+    pub port: u16,
+    pub total_timeout: Duration,
+    pub poll_interval: Duration,
+    pub probe_timeout: Duration,
+    pub expected_version: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitHealthyOutcome {
+    Ready(HealthResponse),
+    ExitedEarly {
+        status: std::process::ExitStatus,
+        last_observed_version: Option<String>,
+    },
+    TimedOut {
+        last_observed_version: Option<String>,
+    },
+}
+
+/// Polls loopback `/health` via a shared `LoopbackProxyClient` until the spawned daemon
+/// reports healthy (matching `expected_version` when provided), exits early, or times out.
+///
+/// Checks `child.try_wait()` on every iteration so crashed daemons fail fast instead of
+/// hanging until `total_timeout`, and performs one final probe on early exit in case a
+/// concurrent daemon won the bind race.
+pub async fn wait_for_daemon_healthy(
+    probe: &LoopbackProxyClient,
+    child: &mut std::process::Child,
+    opts: WaitHealthyOptions<'_>,
+) -> WaitHealthyOutcome {
+    let deadline = Instant::now() + opts.total_timeout;
+    let mut last_observed_version: Option<String> = None;
+    let matches_expected = |health: &HealthResponse| {
+        opts.expected_version
+            .is_none_or(|exp| health.version == exp)
+    };
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return WaitHealthyOutcome::TimedOut {
+                last_observed_version,
+            };
+        }
+
+        let probe_budget = opts.probe_timeout.min(remaining);
+        if let Some(health) = probe
+            .probe_healthy_companion(opts.port, Some(probe_budget))
+            .await
+        {
+            if matches_expected(&health) {
+                return WaitHealthyOutcome::Ready(health);
+            }
+            last_observed_version = Some(health.version);
+        }
+
+        if let Ok(Some(status)) = child.try_wait() {
+            // One final check in case a concurrent companion daemon won the bind race.
+            let final_budget = opts
+                .probe_timeout
+                .min(deadline.saturating_duration_since(Instant::now()));
+            if !final_budget.is_zero()
+                && let Some(health) = probe
+                    .probe_healthy_companion(opts.port, Some(final_budget))
+                    .await
+            {
+                if matches_expected(&health) {
+                    return WaitHealthyOutcome::Ready(health);
+                }
+                last_observed_version = Some(health.version);
+            }
+            return WaitHealthyOutcome::ExitedEarly {
+                status,
+                last_observed_version,
+            };
+        }
+
+        let sleep_remaining = deadline.saturating_duration_since(Instant::now());
+        if sleep_remaining.is_zero() {
+            return WaitHealthyOutcome::TimedOut {
+                last_observed_version,
+            };
+        }
+        tokio::time::sleep(opts.poll_interval.min(sleep_remaining)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,5 +971,245 @@ mod tests {
         assert_eq!(info.version, "0.1.0");
         assert_eq!(info.started_at_ms, 0);
         assert!(info.binary_path.is_empty());
+    }
+
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn spawn_fast_exiting_child() -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .arg("--exact")
+            .arg("__nonexistent_daemon_test_case__")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fast-exiting child")
+    }
+
+    fn spawn_long_lived_child() -> KillOnDrop {
+        #[cfg(unix)]
+        let child = std::process::Command::new("sleep")
+            .arg("10")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep child");
+        #[cfg(windows)]
+        let child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 11 127.0.0.1 >nul"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping child");
+        KillOnDrop(child)
+    }
+
+    #[tokio::test]
+    async fn wait_for_daemon_healthy_returns_exited_early_immediately_on_child_crash() {
+        let probe = LoopbackProxyClient::with_default_timeouts().expect("probe client");
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closed_port = closed.local_addr().expect("addr").port();
+        drop(closed);
+
+        let mut child = spawn_fast_exiting_child();
+        let started = Instant::now();
+        let outcome = wait_for_daemon_healthy(
+            &probe,
+            &mut child,
+            WaitHealthyOptions {
+                port: closed_port,
+                total_timeout: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(50),
+                probe_timeout: Duration::from_millis(250),
+                expected_version: None,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                outcome,
+                WaitHealthyOutcome::ExitedEarly {
+                    last_observed_version: None,
+                    ..
+                }
+            ),
+            "expected ExitedEarly, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "early child exit must return promptly instead of waiting 5s: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_daemon_healthy_succeeds_via_final_probe_when_child_exits_after_winner_binds()
+    {
+        use axum::routing::get;
+
+        let probe = LoopbackProxyClient::with_default_timeouts().expect("probe client");
+        let router = axum::Router::new().route(
+            "/health",
+            get(|| async { axum::Json(HealthResponse::ok("0.1.0")) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut child = spawn_fast_exiting_child();
+        // Wait briefly so child exits before wait_for_daemon_healthy polls try_wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let outcome = wait_for_daemon_healthy(
+            &probe,
+            &mut child,
+            WaitHealthyOptions {
+                port,
+                total_timeout: Duration::from_secs(2),
+                poll_interval: Duration::from_millis(25),
+                probe_timeout: Duration::from_millis(250),
+                expected_version: None,
+            },
+        )
+        .await;
+        handle.abort();
+
+        assert_eq!(
+            outcome,
+            WaitHealthyOutcome::Ready(HealthResponse::ok("0.1.0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_daemon_healthy_requires_exact_version_match_and_tracks_stale_version() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::routing::get;
+
+        let probe = LoopbackProxyClient::with_default_timeouts().expect("probe client");
+
+        // 1. Stale version stays bound while child runs -> TimedOut with last_observed_version
+        let stale_router = axum::Router::new().route(
+            "/health",
+            get(|| async { axum::Json(HealthResponse::ok("0.0.9")) }),
+        );
+        let stale_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stale");
+        let stale_port = stale_listener.local_addr().expect("addr").port();
+        let stale_handle = tokio::spawn(async move {
+            let _ = axum::serve(stale_listener, stale_router).await;
+        });
+
+        let mut running_child = spawn_long_lived_child();
+        let stale_outcome = wait_for_daemon_healthy(
+            &probe,
+            &mut running_child.0,
+            WaitHealthyOptions {
+                port: stale_port,
+                total_timeout: Duration::from_millis(180),
+                poll_interval: Duration::from_millis(25),
+                probe_timeout: Duration::from_millis(150),
+                expected_version: Some("0.1.0"),
+            },
+        )
+        .await;
+        assert_eq!(
+            stale_outcome,
+            WaitHealthyOutcome::TimedOut {
+                last_observed_version: Some("0.0.9".to_string()),
+            }
+        );
+        stale_handle.abort();
+
+        // 2. Transitions from stale "0.0.9" on poll 1 to expected "0.1.0" on poll 2 -> Ready!
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        let upgrade_router = axum::Router::new().route(
+            "/health",
+            get(move || {
+                let hits = Arc::clone(&hits_clone);
+                async move {
+                    let count = hits.fetch_add(1, Ordering::SeqCst);
+                    let ver = if count == 0 { "0.0.9" } else { "0.1.0" };
+                    axum::Json(HealthResponse::ok(ver))
+                }
+            }),
+        );
+        let upgrade_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upgrade");
+        let upgrade_port = upgrade_listener.local_addr().expect("addr").port();
+        let upgrade_handle = tokio::spawn(async move {
+            let _ = axum::serve(upgrade_listener, upgrade_router).await;
+        });
+
+        let upgrade_outcome = wait_for_daemon_healthy(
+            &probe,
+            &mut running_child.0,
+            WaitHealthyOptions {
+                port: upgrade_port,
+                total_timeout: Duration::from_secs(2),
+                poll_interval: Duration::from_millis(20),
+                probe_timeout: Duration::from_millis(200),
+                expected_version: Some("0.1.0"),
+            },
+        )
+        .await;
+        assert_eq!(
+            upgrade_outcome,
+            WaitHealthyOutcome::Ready(HealthResponse::ok("0.1.0"))
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "must poll past initial stale response until version matches"
+        );
+        upgrade_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn wait_for_daemon_healthy_times_out_cleanly_while_child_running() {
+        let probe = LoopbackProxyClient::with_default_timeouts().expect("probe client");
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closed_port = closed.local_addr().expect("addr").port();
+        drop(closed);
+
+        let mut running_child = spawn_long_lived_child();
+        let outcome = wait_for_daemon_healthy(
+            &probe,
+            &mut running_child.0,
+            WaitHealthyOptions {
+                port: closed_port,
+                total_timeout: Duration::from_millis(150),
+                poll_interval: Duration::from_millis(25),
+                probe_timeout: Duration::from_millis(100),
+                expected_version: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            WaitHealthyOutcome::TimedOut {
+                last_observed_version: None,
+            }
+        );
     }
 }

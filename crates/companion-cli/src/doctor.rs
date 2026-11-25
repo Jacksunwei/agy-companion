@@ -4,18 +4,22 @@ use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use companion_core::protocol::sanitize_health_token;
 use companion_core::{
-    Config, DEFAULT_LISTEN_PORT, HealthResponse, PROTOCOL_VERSION, ProxyHealthSummary,
-    is_placeholder_api_key, sanitize_base_url,
+    Config, DEFAULT_LISTEN_PORT, PROTOCOL_VERSION, ProxyHealthSummary, is_placeholder_api_key,
+    sanitize_base_url,
 };
+use companion_providers::LoopbackProxyClient;
 use serde::{Deserialize, Serialize};
 
 use crate::{CliError, MAX_CONFIG_FILE_BYTES, resolve_cli_config_path};
 
+pub use companion_providers::{
+    HealthEvaluation, MAX_PROBE_BODY_BYTES as MAX_HEALTH_BODY_BYTES,
+    evaluate_health as evaluate_health_response,
+};
+
 pub const GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 pub const GOOGLE_GEMINI_BASE_URL_ENV: &str = "GOOGLE_GEMINI_BASE_URL";
-pub const MAX_HEALTH_BODY_BYTES: usize = 64 * 1024;
 pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 3;
 pub const DEFAULT_HEALTH_CONNECT_TIMEOUT_SECS: u64 = 2;
 
@@ -158,122 +162,6 @@ impl Default for DoctorOptions {
             health_connect_timeout: Duration::from_secs(DEFAULT_HEALTH_CONNECT_TIMEOUT_SECS),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealthEvaluation {
-    pub status_ok: bool,
-    pub version_skew: bool,
-    pub protocol_skew: bool,
-    pub health_message: String,
-    pub version_message: String,
-}
-
-pub fn evaluate_health_response(
-    health: &HealthResponse,
-    expected_version: &str,
-    expected_protocol: u32,
-) -> HealthEvaluation {
-    let status_ok = health.status == "ok";
-    let version_skew = health.version != expected_version;
-    let protocol_skew = health.protocol_version != expected_protocol;
-
-    let safe_status = sanitize_health_token(&health.status);
-    let safe_version = sanitize_health_token(&health.version);
-
-    let health_message = if status_ok {
-        format!(
-            "proxy /health responded ok (version {safe_version}, protocol {})",
-            health.protocol_version
-        )
-    } else {
-        format!("proxy /health reported non-ok status '{safe_status}'")
-    };
-
-    let version_message = match (version_skew, protocol_skew) {
-        (false, false) => format!(
-            "binary v{expected_version} matches proxy v{safe_version} (protocol v{expected_protocol})"
-        ),
-        (true, true) => format!(
-            "version skew and protocol skew: binary v{expected_version} (protocol v{expected_protocol}) vs proxy v{safe_version} (protocol v{})",
-            health.protocol_version
-        ),
-        (true, false) => {
-            format!("version skew: binary v{expected_version} vs proxy v{safe_version}")
-        }
-        (false, true) => format!(
-            "protocol skew: expected protocol v{expected_protocol} vs proxy protocol v{}",
-            health.protocol_version
-        ),
-    };
-
-    HealthEvaluation {
-        status_ok,
-        version_skew,
-        protocol_skew,
-        health_message,
-        version_message,
-    }
-}
-
-fn sanitize_transport_error(err: &reqwest::Error) -> String {
-    if err.is_timeout() {
-        "proxy /health request timed out".to_string()
-    } else if err.is_connect() {
-        "proxy /health unreachable (connection failed)".to_string()
-    } else if err.is_redirect() {
-        "proxy /health redirect rejected".to_string()
-    } else {
-        "proxy /health request failed".to_string()
-    }
-}
-
-async fn probe_proxy_health(
-    port: u16,
-    timeout: Duration,
-    connect_timeout: Duration,
-) -> Result<HealthResponse, String> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(timeout)
-        .connect_timeout(connect_timeout)
-        .user_agent(concat!("agy-companion/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|_| "failed to build loopback HTTP probe client".to_string())?;
-
-    let url = format!("http://127.0.0.1:{port}/health");
-    let mut resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|err| sanitize_transport_error(&err))?;
-
-    if resp.status() != reqwest::StatusCode::OK {
-        return Err(format!(
-            "proxy /health returned HTTP {}",
-            resp.status().as_u16()
-        ));
-    }
-
-    let mut body = Vec::new();
-    let mut total_bytes: usize = 0;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|err| sanitize_transport_error(&err))?
-    {
-        total_bytes = total_bytes.saturating_add(chunk.len());
-        if total_bytes > MAX_HEALTH_BODY_BYTES {
-            return Err(format!(
-                "proxy /health response exceeded {MAX_HEALTH_BODY_BYTES}-byte size limit"
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    serde_json::from_slice::<HealthResponse>(&body)
-        .map_err(|_| "proxy /health returned invalid JSON".to_string())
 }
 
 pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<DoctorReport, CliError> {
@@ -444,13 +332,16 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
         .or_else(|| loaded_config.as_ref().map(|c| c.proxy.port.get()))
         .unwrap_or(DEFAULT_LISTEN_PORT);
 
-    let (proxy_summary, version_skew, protocol_skew) = match probe_proxy_health(
-        target_port,
-        options.health_timeout,
-        options.health_connect_timeout,
-    )
-    .await
-    {
+    let probe_result =
+        match LoopbackProxyClient::new(options.health_timeout, options.health_connect_timeout) {
+            Ok(client) => client
+                .probe_health(target_port, None)
+                .await
+                .map_err(|err| err.to_string()),
+            Err(err) => Err(err.to_string()),
+        };
+
+    let (proxy_summary, version_skew, protocol_skew) = match probe_result {
         Ok(health) => {
             let eval = evaluate_health_response(
                 &health,

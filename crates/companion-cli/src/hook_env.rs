@@ -1,10 +1,14 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::daemon::{DEFAULT_IDLE_SHUTDOWN_SECS, spawn_detached_proxy_daemon};
-use crate::launch::probe_running_companion_proxy_with_timeout;
+use companion_providers::LoopbackProxyClient;
+
+use crate::daemon::{
+    DEFAULT_IDLE_SHUTDOWN_SECS, WaitHealthyOptions, WaitHealthyOutcome,
+    spawn_detached_proxy_daemon, wait_for_daemon_healthy,
+};
 use crate::{CliError, load_config_checked, resolve_cli_config_path};
 
 pub const HOOK_ENV_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -71,7 +75,11 @@ async fn try_hook_env(opts: &HookEnvOptions) -> Result<Option<u16>, String> {
     config.validate().map_err(|e| e.to_string())?;
     let port = config.proxy.port.get();
 
-    if probe_running_companion_proxy_with_timeout(port, HOOK_ENV_PROBE_TIMEOUT)
+    let probe = LoopbackProxyClient::new(HOOK_ENV_PROBE_TIMEOUT, HOOK_ENV_PROBE_TIMEOUT)
+        .map_err(|e| e.to_string())?;
+
+    if probe
+        .probe_healthy_companion(port, Some(HOOK_ENV_PROBE_TIMEOUT))
         .await
         .is_some()
     {
@@ -85,46 +93,33 @@ async fn try_hook_env(opts: &HookEnvOptions) -> Result<Option<u16>, String> {
     let mut child = spawn_detached_proxy_daemon(port, &config_path, DEFAULT_IDLE_SHUTDOWN_SECS)
         .map_err(|e| e.to_string())?;
 
-    let deadline = Instant::now() + HOOK_ENV_STARTUP_TIMEOUT;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        tokio::time::sleep(HOOK_ENV_POLL_INTERVAL.min(remaining)).await;
-
-        let probe_budget =
-            HOOK_ENV_PROBE_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
-        if !probe_budget.is_zero()
-            && probe_running_companion_proxy_with_timeout(port, probe_budget)
-                .await
-                .is_some()
-        {
-            return Ok(Some(port));
-        }
-
-        if let Ok(Some(_status)) = child.try_wait() {
-            // One final check in case a concurrent companion proxy won the bind race.
-            if probe_running_companion_proxy_with_timeout(port, HOOK_ENV_PROBE_TIMEOUT)
-                .await
-                .is_some()
-            {
-                return Ok(Some(port));
-            }
-            return Err(format!(
-                "detached proxy daemon exited before becoming healthy on 127.0.0.1:{port}"
-            ));
-        }
+    match wait_for_daemon_healthy(
+        &probe,
+        &mut child,
+        WaitHealthyOptions {
+            port,
+            total_timeout: HOOK_ENV_STARTUP_TIMEOUT,
+            poll_interval: HOOK_ENV_POLL_INTERVAL,
+            probe_timeout: HOOK_ENV_PROBE_TIMEOUT,
+            expected_version: None,
+        },
+    )
+    .await
+    {
+        WaitHealthyOutcome::Ready(_) => Ok(Some(port)),
+        WaitHealthyOutcome::ExitedEarly { .. } => Err(format!(
+            "detached proxy daemon exited before becoming healthy on 127.0.0.1:{port}"
+        )),
+        WaitHealthyOutcome::TimedOut { .. } => Err(format!(
+            "timed out waiting for agy-companion proxy on 127.0.0.1:{port}"
+        )),
     }
-
-    Err(format!(
-        "timed out waiting for agy-companion proxy on 127.0.0.1:{port}"
-    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use axum::http::StatusCode;
     use axum::routing::get;

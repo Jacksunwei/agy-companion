@@ -4469,3 +4469,221 @@ fn install_step1_unsafe_leaf_env_sh_fails_before_creating_dirs_unless_fish_or_no
         );
     }
 }
+
+#[test]
+fn install_and_uninstall_respect_explicit_config_flag_and_fail_closed_on_invalid_or_symlink() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_config = temp.path().join("xdg_config");
+    let xdg_data = temp.path().join("xdg_data");
+    let plugins_dir = temp.path().join("plugins");
+    fs::create_dir_all(&home).expect("mkdir home");
+
+    // Seed default XDG config with a different port so we prove --config overrides XDG.
+    let default_cfg_path = xdg_config.join("agy-companion").join("config.json");
+    config_with_port(24191)
+        .save_secure(&default_cfg_path)
+        .expect("save default xdg config");
+
+    // Custom config in a non-`agy-companion` directory with a distinct port.
+    let custom_dir = temp.path().join("custom_cfg_dir");
+    fs::create_dir_all(&custom_dir).expect("mkdir custom dir");
+    let keep_sibling = custom_dir.join("keep.txt");
+    fs::write(&keep_sibling, "keep").expect("write sibling");
+    let custom_cfg = custom_dir.join("my-companion.json");
+    let custom_port = 24149u16;
+    config_with_port(custom_port)
+        .save_secure(&custom_cfg)
+        .expect("save custom config");
+
+    // 1. `install --config <custom_cfg>` honors custom port and ignores XDG config.
+    let install_out = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .args([
+            "install",
+            "--config",
+            custom_cfg.to_str().expect("utf8 cfg"),
+            "--plugins-dir",
+            plugins_dir.to_str().expect("utf8 plugins"),
+            "--no-launcher-hook",
+            "--no-start-proxy",
+            "--json",
+        ])
+        .output()
+        .expect("run install --config");
+    assert_eq!(
+        install_out.status.code(),
+        Some(0),
+        "install --config failed: stderr={}",
+        String::from_utf8_lossy(&install_out.stderr)
+    );
+    let install_rep: Value =
+        serde_json::from_slice(&install_out.stdout).expect("parse install json");
+    assert_eq!(install_rep["ok"], true);
+    assert_eq!(install_rep["listen_port"], custom_port);
+
+    // 2. `install --config ../escape.json` fails closed before creating plugin dir.
+    let traversal_plugins = temp.path().join("traversal_plugins");
+    let bad_install = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .args([
+            "install",
+            "--config",
+            "../escape.json",
+            "--plugins-dir",
+            traversal_plugins.to_str().expect("utf8 plugins"),
+            "--no-launcher-hook",
+            "--no-start-proxy",
+            "--json",
+        ])
+        .output()
+        .expect("run traversal install");
+    assert_ne!(bad_install.status.code(), Some(0));
+    assert!(
+        !traversal_plugins.exists(),
+        "invalid --config path must fail closed before creating directories"
+    );
+
+    // 3. `uninstall --config <custom_cfg>` (no --purge) preserves custom_cfg in preserved_paths.
+    let uninstall_preserve = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .args([
+            "uninstall",
+            "--config",
+            custom_cfg.to_str().expect("utf8 cfg"),
+            "--plugins-dir",
+            plugins_dir.to_str().expect("utf8 plugins"),
+            "--json",
+        ])
+        .output()
+        .expect("run uninstall preserve");
+    assert_eq!(uninstall_preserve.status.code(), Some(0));
+    let preserve_rep: Value =
+        serde_json::from_slice(&uninstall_preserve.stdout).expect("parse preserve json");
+    assert!(
+        custom_cfg.is_file(),
+        "non-purge uninstall must preserve config"
+    );
+    let preserved = preserve_rep["preserved_paths"]
+        .as_array()
+        .expect("preserved_paths");
+    assert!(
+        preserved
+            .iter()
+            .any(|p| p.as_str() == Some(custom_cfg.to_str().expect("utf8")))
+    );
+
+    // 4. `uninstall --config <custom_cfg> --purge` removes custom_cfg, keeps default XDG config,
+    //    and NEVER removes the non-`agy-companion` custom parent directory.
+    let uninstall_purge = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .args([
+            "uninstall",
+            "--config",
+            custom_cfg.to_str().expect("utf8 cfg"),
+            "--plugins-dir",
+            plugins_dir.to_str().expect("utf8 plugins"),
+            "--purge",
+            "--json",
+        ])
+        .output()
+        .expect("run uninstall purge");
+    assert_eq!(uninstall_purge.status.code(), Some(0));
+    let purge_rep: Value =
+        serde_json::from_slice(&uninstall_purge.stdout).expect("parse purge json");
+    assert!(
+        !custom_cfg.exists(),
+        "--purge must delete explicit --config file"
+    );
+    assert!(
+        default_cfg_path.is_file(),
+        "default XDG config must remain untouched when explicit --config is purged"
+    );
+    assert!(
+        custom_dir.is_dir() && keep_sibling.is_file(),
+        "non-agy-companion parent directory must never be deleted"
+    );
+    let purged = purge_rep["purged_paths"].as_array().expect("purged_paths");
+    assert!(
+        purged
+            .iter()
+            .any(|p| p.as_str() == Some(custom_cfg.to_str().expect("utf8")))
+    );
+
+    // 5. Symlinked parent directory of `--config` fails closed on install and warns/untouched on uninstall --purge.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let victim_dir = temp.path().join("victim_cfg_dir");
+        fs::create_dir_all(&victim_dir).expect("mkdir victim");
+        let victim_cfg = victim_dir.join("config.json");
+        config_with_port(24155)
+            .save_secure(&victim_cfg)
+            .expect("save victim cfg");
+        let sym_parent = temp.path().join("sym_cfg_parent");
+        symlink(&victim_dir, &sym_parent).expect("symlink cfg parent");
+        let sym_cfg = sym_parent.join("config.json");
+
+        let sym_install = isolated_cli_command(&home)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_DATA_HOME", &xdg_data)
+            .env("ZDOTDIR", &home)
+            .args([
+                "install",
+                "--config",
+                sym_cfg.to_str().expect("utf8 sym cfg"),
+                "--plugins-dir",
+                plugins_dir.to_str().expect("utf8 plugins"),
+                "--no-launcher-hook",
+                "--no-start-proxy",
+                "--json",
+            ])
+            .output()
+            .expect("run symlink config install");
+        assert_ne!(
+            sym_install.status.code(),
+            Some(0),
+            "install must reject symlinked --config parent dir"
+        );
+
+        let sym_uninstall = isolated_cli_command(&home)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_DATA_HOME", &xdg_data)
+            .env("ZDOTDIR", &home)
+            .args([
+                "uninstall",
+                "--config",
+                sym_cfg.to_str().expect("utf8 sym cfg"),
+                "--plugins-dir",
+                plugins_dir.to_str().expect("utf8 plugins"),
+                "--purge",
+                "--json",
+            ])
+            .output()
+            .expect("run symlink config uninstall");
+        assert_eq!(sym_uninstall.status.code(), Some(0));
+        assert!(
+            victim_cfg.is_file(),
+            "uninstall --purge must NOT delete config through symlinked --config parent dir"
+        );
+        let sym_rep: Value =
+            serde_json::from_slice(&sym_uninstall.stdout).expect("parse sym uninstall json");
+        let warnings = sym_rep["warnings"].as_array().expect("warnings");
+        assert!(
+            warnings.iter().any(|w| {
+                w.as_str()
+                    .is_some_and(|s| s.contains("refusing to traverse symlinked/non-directory"))
+            }),
+            "expected symlink refusal warning, got {warnings:?}"
+        );
+    }
+}
