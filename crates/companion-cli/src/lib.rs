@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use companion_core::{Config, CoreError, FsError, SqliteUsageSink, UsageSink};
-use companion_proxy::{ProxyError, ProxyState};
+use companion_proxy::{ProxyError, ProxyState, ProxyStateOptions};
 use companion_ui_mcp::UiMcpError;
 use thiserror::Error;
 
@@ -301,7 +301,14 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         &runtime_data_dir.join(PROXY_PID_FILENAME),
         &ProxyPidInfo::for_current_process(bound_addr.port()),
     )?;
-    let state = ProxyState::from_config(config, Some(config_path), usage_sink)?;
+    let state = ProxyState::from_config_with_options(
+        config,
+        usage_sink,
+        ProxyStateOptions {
+            config_path: Some(config_path),
+            ..Default::default()
+        },
+    )?;
 
     tracing::info!(
         addr = %bound_addr,
