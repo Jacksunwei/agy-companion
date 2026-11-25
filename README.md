@@ -33,7 +33,7 @@ flowchart LR
 | --- | --- | --- |
 | **Core Domain** | [`crates/companion-core/`](crates/companion-core/) | Nested v1 config (`schema_version = 1`), `fs_safe` TOCTOU/atomic `0600` guards, `protocol` wire DTOs, `validation`, unified Gemini 3.8+/4+ `models` catalog, nested `RedactedConfig` masking, `PROXY_PLACEHOLDER_API_KEY` quarantine, `UsageSink` + optional `sqlite` feature (`SqliteUsageSink`, WAL `usage.db`), zero-`eval` `integration` (`env.sh` + shell RC hooks, canonical `state` enum) |
 | **Provider Layer** | [`crates/companion-providers/`](crates/companion-providers/) | `ProviderAdapter` async trait + raw `reqwest 0.13` (`rustls`, zero compression) `GeminiProvider` pass-through & `health_check()` |
-| **Loopback Proxy** | [`crates/companion-proxy/`](crates/companion-proxy/) | Strict `127.0.0.1` Axum 0.8 proxy, `GET /health`, `GET /api/stats` (incl. CloudCode & catalog telemetry), `POST /v1beta/models/{*rest}` (64 MiB cap), CloudCode 8-entry 128-bit SipHash per-account LRU & Day-0 untouched catalog, SSE/JSON `usageMetadata` tee, config mtime hot-reload, active in-flight `IdleTracker` |
+| **Loopback Proxy** | [`crates/companion-proxy/`](crates/companion-proxy/) | Strict `127.0.0.1` Axum 0.8 proxy, `GET /health`, `GET /api/stats` (incl. CloudCode & catalog telemetry), `POST /v1beta/models/{*rest}` (64 MiB cap), CloudCode 8-entry 128-bit SipHash per-account LRU & Day-0 untouched catalog, SSE/JSON `usageMetadata` tee, non-blocking async config hot-reload, active in-flight `ActivityTracker` |
 | **MCP App Server** | [`crates/companion-ui-mcp/`](crates/companion-ui-mcp/) | `rmcp 3.11` stdio MCP server serving embedded `ui://companion/settings.html` + 5 tools (`open_settings`, redacted `get_settings`, serialized `save_settings`, `test_connection`, `set_launcher_integration`) |
 | **Unified CLI** | [`crates/companion-cli/`](crates/companion-cli/) | Single `agy-companion` binary (`install`, `uninstall`, `integration`, `hook-env`, `serve`, `launch`, `ui-mcp`, `doctor`, `models`, `--version`) with embedded 7-file plugin bundle and `rmcp` `INFO` log ceiling |
 | **Embedded UI** | [`ui/`](ui/) | Vite 8 + TypeScript + `@modelcontextprotocol/ext-apps 2` single-file bundle ([`ui/dist/index.html`](ui/dist/index.html), `302,701` bytes `< 512,000`, zero `innerHTML`) |
@@ -227,7 +227,7 @@ npm --prefix ui run build
 # 4. Inspect daemon & sidecar logs:
 ls -la ~/.local/share/agy-companion/proxy.log ~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/
 
-# 5. Full 7-gate local verification & Rust workspace tests (307 tests)
+# 5. Full 7-gate local verification & Rust workspace tests (320 tests)
 ./scripts/agent_check.sh
 cargo test --workspace
 
@@ -258,7 +258,7 @@ All 5 Rust crates, `crates/companion-cli/src/main.rs`, and CLI integration tests
 
 ## Roadmap
 
-- **Milestone 1 + Rollout PR 1–PR 3 (Complete — `v0.1.0`):** Loopback Gemini pass-through proxy with implicit cache preservation, CloudCode Pro/PayGo/Enterprise transparency (per-account SipHash LRU + Day-0 untouched catalog), Managed On-Demand Daemon, native Dock/Launcher auto-start (`env.sh` + shell RC hooks), one-command `install`/`uninstall` with embedded 7-file plugin bundle and Windows parity, embedded MCP App Settings UI (`aux_pane` + `global`), SQLite WAL usage storage (`usage.db`), npm/PyPI distribution shims, `307` Rust tests, and `333` opaque-box E2E tests (+ `26` self-tests).
+- **Milestone 1 + Rollout PR 1–PR 3 (Complete — `v0.1.0`):** Loopback Gemini pass-through proxy with implicit cache preservation, CloudCode Pro/PayGo/Enterprise transparency (per-account SipHash LRU + Day-0 untouched catalog), Managed On-Demand Daemon, native Dock/Launcher auto-start (`env.sh` + shell RC hooks), one-command `install`/`uninstall` with embedded 7-file plugin bundle and Windows parity, embedded MCP App Settings UI (`aux_pane` + `global`), SQLite WAL usage storage (`usage.db`), npm/PyPI distribution shims, `320` Rust tests, and `333` opaque-box E2E tests (+ `26` self-tests).
 - **M2 & M3 (Planned):** Codex Pro and Claude provider adapters behind the `ProviderAdapter` trait ([`crates/companion-providers/`](crates/companion-providers/)).
 - **M4 (Planned):** Ollama Cloud and OpenAI-compatible 1-hop `Gemini ↔ OpenAI Chat Completions` adapter (local Ollama, OpenRouter, vLLM, LM Studio, OpenAI API).
 - **Deferred Day-1 Seams:**

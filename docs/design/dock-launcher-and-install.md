@@ -57,7 +57,7 @@ When Antigravity App starts from macOS Dock/Spotlight or a Linux desktop launche
 
 ### 2.1 Accurate, OAuth-Refresh-Safe CloudCode `auto` Routing
 
-Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionProject` field, so treating any `"project"` key as PayGo/Business misrouted personal accounts to `prod`. PR 1 deletes `request_hints_business_project` and enforces a strict precedence order in `crates/companion-proxy/src/cloudcode.rs`:
+Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionProject` field, so treating any `"project"` key as PayGo/Business misrouted personal accounts to `prod`. PR 1 deletes `request_hints_business_project` and enforces a strict precedence order in `crates/companion-proxy/src/cloudcode/` (`routing.rs` / `metadata.rs`):
 
 1. **Explicit fixed `cloudcode.upstream`** (any value other than `"auto"`): honors the configured upstream directly.
 2. **Enterprise entitlement hint:** `fetchAvailableModels` request body containing `entitlement.userTier` routes to `https://cloudcode-pa.googleapis.com` (`prod`) with `strip_user_project = true`.
@@ -71,7 +71,7 @@ Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionPr
 - `HotReloadProvider` preserves the `Arc<CloudCodeClient>` (and routing cache) across config hot-reloads whenever `cloudcode.upstream` and `timeout_secs` are unchanged.
 
 **Hard Idempotency Invariant:**
-- `daily` <-> `prod` fallback and the 1-time Enterprise `403` retry without `x-goog-user-project` run **ONLY** on read-only metadata RPCs (`fetchAvailableModels`, `loadCodeAssist`) — **NEVER** on generation or streaming RPCs (`streamGenerateContent`, etc.).
+- `daily` <-> `prod` fallback and the 1-time Enterprise `403` retry without `x-goog-user-project` run **ONLY** on read-only metadata RPCs (`fetchAvailableModels`, `loadCodeAssist`, `listExperiments`) — **NEVER** on generation or streaming RPCs (`streamGenerateContent`, etc.).
 
 **Transport, Timeout & Model Slot Fidelity:**
 - Conditional `.no_proxy()` on `CloudCodeClient` (only for loopback upstream URLs) preserves corporate `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`.

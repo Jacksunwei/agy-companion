@@ -16,8 +16,8 @@
 | --- | --- |
 | `Cargo.toml` | Workspace manifest and single version source of truth (`0.1.0`) |
 | `crates/companion-core/src/{lib,config,fs_safe,protocol,validation,models,redaction,usage/{mod,sqlite},integration}.rs` | Core domain & safe FS primitives: nested v1 `Config` (`schema_version = 1`), `fs_safe` TOCTOU/atomic guards, shared `protocol` wire DTOs, URL/path/header `validation`, Gemini 3.8+/4+ `models` catalog, nested `RedactedConfig`, `UsageEvent` + `UsageSink` trait + `SqliteUsageSink` behind optional `sqlite` feature, and login-shell `integration` |
-| `crates/companion-providers/src/{lib,gemini}.rs` | `ProviderAdapter` trait + raw `reqwest` (`rustls`, 15-min timeout) Gemini streaming pass-through adapter (`x-goog-api-key` header) |
-| `crates/companion-proxy/src/{lib,routes,stats,sse}.rs` | `axum` loopback server (`127.0.0.1`), `GET /health`, `GET /api/stats`, `POST /v1beta/models/{model_action}` streaming pass-through + SSE usage tee |
+| `crates/companion-providers/src/{lib,gemini/{mod,url}}.rs` | `ProviderAdapter` trait + raw `reqwest` (`rustls`, 15-min timeout) Gemini streaming pass-through adapter (`x-goog-api-key` header) |
+| `crates/companion-proxy/src/{lib,activity,hot_reload,cloudcode/*,routes/*,stats,sse}.rs` | `axum` loopback server (`127.0.0.1`), `GET /health`, `GET /api/stats`, `POST /v1beta/models/{model_action}` streaming pass-through + SSE usage tee |
 | `ui/{package.json,vite.config.ts,index.html,src/main.ts,src/style.css}` | Build-time Vite single-file MCP App UI (strict DOM APIs, zero `innerHTML`, host CSS tokens, write-only API key form, cache telemetry, copyable `customModelsConfig`) |
 | `crates/companion-ui-mcp/src/{lib,server}.rs` | `rmcp` stdio MCP App server: `ui://companion/settings.html` (`include_str!`), `open_settings` (`aux_pane` + `global`), redacted `get_settings`, eager `save_settings`, `test_connection` |
 | `crates/companion-cli/src/main.rs` | Single binary `agy-companion`: `serve`, `ui-mcp`, `doctor`, `models` |
