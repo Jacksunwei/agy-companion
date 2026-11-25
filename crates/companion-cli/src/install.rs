@@ -5,16 +5,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use companion_core::fs_safe::default_platform_config_dir;
+use companion_core::fs_safe::{default_home_dir, unique_temp_suffix};
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::{Config, CoreError, DEFAULT_LISTEN_PORT};
+use companion_providers::LoopbackProxyClient;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::daemon::{
     DEFAULT_IDLE_SHUTDOWN_SECS, PROXY_LOG_FILENAME, PROXY_LOG_ROTATED_FILENAME, PROXY_PID_FILENAME,
-    ProxyPidInfo, read_proxy_pid, resolve_runtime_data_dir, spawn_detached_proxy_daemon_with_exe,
+    ProxyPidInfo, WaitHealthyOptions, WaitHealthyOutcome, read_proxy_pid, resolve_runtime_data_dir,
+    spawn_detached_proxy_daemon_with_exe, wait_for_daemon_healthy,
 };
-use crate::launch::probe_running_companion_proxy_with_timeout;
 use crate::{
     BINARY_NAME, CliError, load_config_checked, normalized_metadata_path,
     precheck_existing_config_file, precheck_existing_data_dir, resolve_cli_config_path,
@@ -89,6 +92,7 @@ pub const EMBEDDED_PLUGIN_FILES: &[EmbeddedPluginFile] = &[
 
 #[derive(Debug, Clone, Default)]
 pub struct InstallOptions {
+    pub config: Option<PathBuf>,
     pub plugins_dir: Option<PathBuf>,
     pub no_launcher_hook: bool,
     pub no_start_proxy: bool,
@@ -98,6 +102,7 @@ pub struct InstallOptions {
 
 #[derive(Debug, Clone, Default)]
 pub struct UninstallOptions {
+    pub config: Option<PathBuf>,
     pub plugins_dir: Option<PathBuf>,
     pub purge: bool,
     pub dry_run: bool,
@@ -197,7 +202,7 @@ fn resolve_home_dir() -> Result<PathBuf, CliError> {
             return Ok(path);
         }
     }
-    let home = dirs::home_dir().ok_or(CoreError::HomeDirUnavailable)?;
+    let home = default_home_dir().ok_or(CoreError::HomeDirUnavailable)?;
     companion_core::validate_path(&home)?;
     Ok(home)
 }
@@ -419,12 +424,14 @@ pub(crate) fn is_companion_plugin_dir(plugin_dir: &Path) -> Result<bool, CliErro
 /// proxy, `start_port` is selected so `install` can reuse or upgrade it. Otherwise the first
 /// bindable port in the inclusive range is returned along with `port_auto_selected`.
 pub(crate) async fn select_fresh_install_port(
+    probe: &LoopbackProxyClient,
     start_port: u16,
     end_port: u16,
     check_companion_on_first: bool,
 ) -> Result<(u16, bool), CliError> {
     if check_companion_on_first
-        && probe_running_companion_proxy_with_timeout(start_port, FRESH_PORT_PROBE_TIMEOUT)
+        && probe
+            .probe_healthy_companion(start_port, Some(FRESH_PORT_PROBE_TIMEOUT))
             .await
             .is_some()
     {
@@ -551,7 +558,7 @@ fn create_windows_start_menu_shortcut(binary_path: &Path) -> Result<PathBuf, Cli
     let app_data = std::env::var_os("APPDATA")
         .filter(|v| !v.to_string_lossy().trim().is_empty())
         .map(PathBuf::from)
-        .or_else(dirs::config_dir)
+        .or_else(default_platform_config_dir)
         .ok_or_else(|| {
             CliError::Install(
                 "cannot resolve %APPDATA% for Windows Start Menu shortcut".to_string(),
@@ -628,7 +635,7 @@ fn remove_windows_start_menu_shortcut(
     let Some(app_data) = std::env::var_os("APPDATA")
         .filter(|v| !v.to_string_lossy().trim().is_empty())
         .map(PathBuf::from)
-        .or_else(dirs::config_dir)
+        .or_else(default_platform_config_dir)
     else {
         return Ok(false);
     };
@@ -660,7 +667,7 @@ fn remove_windows_start_menu_shortcut(
 }
 
 fn stage_binary_copy(src_exe: &Path, bin_dir: &Path) -> Result<(PathBuf, TempPathGuard), CliError> {
-    let staged_path = bin_dir.join(format!(".{BINARY_NAME}.new.{}", Uuid::new_v4()));
+    let staged_path = bin_dir.join(format!(".{BINARY_NAME}.new.{}", unique_temp_suffix()));
     let guard = TempPathGuard::file(staged_path.clone());
 
     let mut reader = File::open(src_exe)?;
@@ -686,7 +693,7 @@ fn stage_binary_copy(src_exe: &Path, bin_dir: &Path) -> Result<(PathBuf, TempPat
 }
 
 fn stage_version_file(bin_dir: &Path, version: &str) -> Result<(PathBuf, TempPathGuard), CliError> {
-    let staged_path = bin_dir.join(format!(".version.new.{}", Uuid::new_v4()));
+    let staged_path = bin_dir.join(format!(".version.new.{}", unique_temp_suffix()));
     let guard = TempPathGuard::file(staged_path.clone());
 
     let mut open_opts = fs::OpenOptions::new();
@@ -714,7 +721,7 @@ fn write_staged_plugin_dir(
     plugins_root: &Path,
     #[allow(unused_variables)] stable_bin: &Path,
 ) -> Result<(PathBuf, TempPathGuard), CliError> {
-    let stage_dir = plugins_root.join(format!(".{PLUGIN_DIR_NAME}.stage.{}", Uuid::new_v4()));
+    let stage_dir = plugins_root.join(format!(".{PLUGIN_DIR_NAME}.stage.{}", unique_temp_suffix()));
     fs::create_dir(&stage_dir)?;
     let guard = TempPathGuard::dir(stage_dir.clone());
 
@@ -877,7 +884,8 @@ fn install_local_bin_symlink(
                 ));
                 return None;
             }
-            let tmp_link = local_bin_dir.join(format!(".{BINARY_NAME}.link.{}", Uuid::new_v4()));
+            let tmp_link =
+                local_bin_dir.join(format!(".{BINARY_NAME}.link.{}", unique_temp_suffix()));
             let mut tmp_guard = TempPathGuard::file(tmp_link.clone());
             if let Err(sym_err) = symlink(stable_bin, &tmp_link) {
                 warnings.push(format!(
@@ -933,7 +941,7 @@ fn swap_staged_binary_and_version(
                     let old_bin = stable_bin
                         .parent()
                         .unwrap_or_else(|| Path::new("."))
-                        .join(format!(".{BINARY_NAME}.old.{}.exe", Uuid::new_v4()));
+                        .join(format!(".{BINARY_NAME}.old.{}.exe", unique_temp_suffix()));
                     if stable_bin.exists() {
                         fs::rename(stable_bin, &old_bin)?;
                     }
@@ -998,8 +1006,10 @@ fn swap_plugin_dir_two_step(
             Ok(())
         }
         Ok(meta) if meta.file_type().is_dir() => {
-            let backup_dir =
-                plugins_root.join(format!(".{PLUGIN_DIR_NAME}.backup.{}", Uuid::new_v4()));
+            let backup_dir = plugins_root.join(format!(
+                ".{PLUGIN_DIR_NAME}.backup.{}",
+                unique_temp_suffix()
+            ));
             fs::rename(plugin_target, &backup_dir)?;
             if let Err(rename_err) = fs::rename(stage_dir, plugin_target) {
                 let _ = fs::rename(&backup_dir, plugin_target);
@@ -1258,9 +1268,14 @@ fn send_unix_signal(pid: u32, signal_flag: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn stop_verified_companion_pid(info: &ProxyPidInfo) -> Result<bool, CliError> {
+async fn stop_verified_companion_pid(
+    probe: &LoopbackProxyClient,
+    info: &ProxyPidInfo,
+) -> Result<bool, CliError> {
     // Layer 2: optional corroborating /health probe (never sufficient alone without Layer 3).
-    let _ = probe_running_companion_proxy_with_timeout(info.port, FRESH_PORT_PROBE_TIMEOUT).await;
+    let _ = probe
+        .probe_healthy_companion(info.port, Some(FRESH_PORT_PROBE_TIMEOUT))
+        .await;
 
     // Layer 3 check before sending any signal.
     match verify_proxy_pid_process(info)? {
@@ -1369,6 +1384,7 @@ fn remove_pid_file_if_matches(pid_path: &Path, expected_pid: u32) {
 }
 
 async fn stop_proxy_from_pid_files(
+    probe: &LoopbackProxyClient,
     pid_paths: &[PathBuf],
     expected_port: Option<u16>,
     dry_run: bool,
@@ -1408,7 +1424,7 @@ async fn stop_proxy_from_pid_files(
                     stopped_any = true;
                     stopped_pid = Some(info.pid);
                 } else {
-                    match stop_verified_companion_pid(&info).await {
+                    match stop_verified_companion_pid(probe, &info).await {
                         Ok(true) => {
                             stopped_any = true;
                             stopped_pid = Some(info.pid);
@@ -1454,29 +1470,6 @@ async fn stop_proxy_from_pid_files(
     }
 
     (stopped_any, stopped_pid)
-}
-
-async fn wait_for_replacement_proxy_version(
-    listen_port: u16,
-    expected_version: &str,
-    timeout: Duration,
-    poll_interval: Duration,
-    probe_timeout: Duration,
-) -> (bool, Option<String>) {
-    let deadline = Instant::now() + timeout;
-    let mut last_observed_version: Option<String> = None;
-    while Instant::now() < deadline {
-        if let Some(new_health) =
-            probe_running_companion_proxy_with_timeout(listen_port, probe_timeout).await
-        {
-            if new_health.version == expected_version {
-                return (true, Some(new_health.version));
-            }
-            last_observed_version = Some(new_health.version);
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
-    (false, last_observed_version)
 }
 
 fn is_binary_on_path(binary_name: &str) -> bool {
@@ -1680,8 +1673,10 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
         }
     }
 
-    let config_path = resolve_cli_config_path(None)?;
+    let config_path = resolve_cli_config_path(opts.config.as_deref())?;
     let norm_config_path = normalized_metadata_path(&config_path);
+    let probe =
+        LoopbackProxyClient::new(INSTALL_HEALTH_PROBE_TIMEOUT, INSTALL_HEALTH_PROBE_TIMEOUT)?;
     let data_dir = companion_core::default_data_dir()?;
     let mut data_dir_warnings = Vec::new();
     let data_dir_safety = inspect_data_dir(&home, &data_dir, &mut data_dir_warnings)?;
@@ -1766,6 +1761,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let mut port_auto_selected = false;
     if !config_existed {
         let (selected_port, auto_selected) = select_fresh_install_port(
+            &probe,
             DEFAULT_LISTEN_PORT,
             DEFAULT_LISTEN_PORT + PORT_FALLBACK_SPAN,
             true,
@@ -1827,9 +1823,9 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let mut proxy_version: Option<String> = None;
 
     if !opts.no_start_proxy {
-        let existing_health =
-            probe_running_companion_proxy_with_timeout(listen_port, INSTALL_HEALTH_PROBE_TIMEOUT)
-                .await;
+        let existing_health = probe
+            .probe_healthy_companion(listen_port, Some(INSTALL_HEALTH_PROBE_TIMEOUT))
+            .await;
         match existing_health {
             Some(health) if health.version == version => {
                 proxy_version = Some(health.version);
@@ -1854,6 +1850,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
                 pid_paths.push(data_dir.join(PROXY_PID_FILENAME));
                 let pid_candidates = deduplicate_paths(pid_paths);
                 let (stopped, _) = stop_proxy_from_pid_files(
+                    &probe,
                     &pid_candidates,
                     Some(listen_port),
                     false,
@@ -1879,35 +1876,61 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
                             stale_health.version
                         ));
                     } else {
-                        let _child = spawn_detached_proxy_daemon_with_exe(
+                        let mut child = spawn_detached_proxy_daemon_with_exe(
                             &stable_bin,
                             listen_port,
                             &config_path,
                             DEFAULT_IDLE_SHUTDOWN_SECS,
                         )?;
-                        let (matched, observed_version) = wait_for_replacement_proxy_version(
-                            listen_port,
-                            &version,
-                            PROXY_START_WAIT_TIMEOUT,
-                            PROXY_START_POLL_INTERVAL,
-                            INSTALL_HEALTH_PROBE_TIMEOUT,
+                        match wait_for_daemon_healthy(
+                            &probe,
+                            &mut child,
+                            WaitHealthyOptions {
+                                port: listen_port,
+                                total_timeout: PROXY_START_WAIT_TIMEOUT,
+                                poll_interval: PROXY_START_POLL_INTERVAL,
+                                probe_timeout: INSTALL_HEALTH_PROBE_TIMEOUT,
+                                expected_version: Some(&version),
+                            },
                         )
-                        .await;
-                        if matched {
-                            proxy_started = true;
-                            proxy_replaced = true;
-                            proxy_version = observed_version;
-                        } else if let Some(stale_ver) = observed_version {
-                            proxy_version = Some(stale_ver.clone());
-                            warnings.push(format!(
-                                "replacement proxy on 127.0.0.1:{listen_port} still reported version {stale_ver} instead of {version} after {}s; check port {listen_port} and restart Antigravity completely",
-                                PROXY_START_WAIT_TIMEOUT.as_secs()
-                            ));
-                        } else {
-                            warnings.push(format!(
-                                "replacement proxy on 127.0.0.1:{listen_port} did not become healthy with version {version} within {}s; check port {listen_port} and restart Antigravity completely",
-                                PROXY_START_WAIT_TIMEOUT.as_secs()
-                            ));
+                        .await
+                        {
+                            WaitHealthyOutcome::Ready(new_health) => {
+                                proxy_started = true;
+                                proxy_replaced = true;
+                                proxy_version = Some(new_health.version);
+                            }
+                            WaitHealthyOutcome::ExitedEarly {
+                                status,
+                                last_observed_version,
+                            } => {
+                                if let Some(stale_ver) = last_observed_version {
+                                    proxy_version = Some(stale_ver.clone());
+                                    warnings.push(format!(
+                                        "replacement proxy exited early ({status}) while 127.0.0.1:{listen_port} still reported version {stale_ver} instead of {version}; check port {listen_port} and restart Antigravity completely"
+                                    ));
+                                } else {
+                                    warnings.push(format!(
+                                        "replacement proxy on 127.0.0.1:{listen_port} exited early ({status}) before becoming healthy with version {version}; check port {listen_port} and restart Antigravity completely"
+                                    ));
+                                }
+                            }
+                            WaitHealthyOutcome::TimedOut {
+                                last_observed_version,
+                            } => {
+                                if let Some(stale_ver) = last_observed_version {
+                                    proxy_version = Some(stale_ver.clone());
+                                    warnings.push(format!(
+                                        "replacement proxy on 127.0.0.1:{listen_port} still reported version {stale_ver} instead of {version} after {}s; check port {listen_port} and restart Antigravity completely",
+                                        PROXY_START_WAIT_TIMEOUT.as_secs()
+                                    ));
+                                } else {
+                                    warnings.push(format!(
+                                        "replacement proxy on 127.0.0.1:{listen_port} did not become healthy with version {version} within {}s; check port {listen_port} and restart Antigravity completely",
+                                        PROXY_START_WAIT_TIMEOUT.as_secs()
+                                    ));
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1919,31 +1942,40 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
                 }
             }
             None => {
-                let _child = spawn_detached_proxy_daemon_with_exe(
+                let mut child = spawn_detached_proxy_daemon_with_exe(
                     &stable_bin,
                     listen_port,
                     &config_path,
                     DEFAULT_IDLE_SHUTDOWN_SECS,
                 )?;
-                let start_deadline = Instant::now() + PROXY_START_WAIT_TIMEOUT;
-                while Instant::now() < start_deadline {
-                    if let Some(new_health) = probe_running_companion_proxy_with_timeout(
-                        listen_port,
-                        INSTALL_HEALTH_PROBE_TIMEOUT,
-                    )
-                    .await
-                    {
+                match wait_for_daemon_healthy(
+                    &probe,
+                    &mut child,
+                    WaitHealthyOptions {
+                        port: listen_port,
+                        total_timeout: PROXY_START_WAIT_TIMEOUT,
+                        poll_interval: PROXY_START_POLL_INTERVAL,
+                        probe_timeout: INSTALL_HEALTH_PROBE_TIMEOUT,
+                        expected_version: None,
+                    },
+                )
+                .await
+                {
+                    WaitHealthyOutcome::Ready(new_health) => {
                         proxy_started = true;
                         proxy_version = Some(new_health.version);
-                        break;
                     }
-                    tokio::time::sleep(PROXY_START_POLL_INTERVAL).await;
-                }
-                if !proxy_started {
-                    warnings.push(format!(
-                        "background proxy on 127.0.0.1:{listen_port} did not become healthy within {}s",
-                        PROXY_START_WAIT_TIMEOUT.as_secs()
-                    ));
+                    WaitHealthyOutcome::ExitedEarly { status, .. } => {
+                        warnings.push(format!(
+                            "background proxy on 127.0.0.1:{listen_port} exited early ({status}) before becoming healthy"
+                        ));
+                    }
+                    WaitHealthyOutcome::TimedOut { .. } => {
+                        warnings.push(format!(
+                            "background proxy on 127.0.0.1:{listen_port} did not become healthy within {}s",
+                            PROXY_START_WAIT_TIMEOUT.as_secs()
+                        ));
+                    }
                 }
             }
         }
@@ -2104,8 +2136,10 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
     let plugins_root = resolve_plugins_root(opts.plugins_dir.as_deref())?;
     let plugin_target = plugins_root.join(PLUGIN_DIR_NAME);
 
-    let config_path = resolve_cli_config_path(None)?;
+    let config_path = resolve_cli_config_path(opts.config.as_deref())?;
     let norm_config_path = normalized_metadata_path(&config_path);
+    let probe =
+        LoopbackProxyClient::new(INSTALL_HEALTH_PROBE_TIMEOUT, INSTALL_HEALTH_PROBE_TIMEOUT)?;
     let data_dir = companion_core::default_data_dir()?;
     let data_dir_safety = inspect_data_dir(&home, &data_dir, &mut warnings)?;
     let config_dir_safety = inspect_config_dir(&home, &norm_config_path, &mut warnings)?;
@@ -2248,7 +2282,7 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
     }
     let pid_candidates = deduplicate_paths(pid_paths);
     let (proxy_stopped, proxy_pid) =
-        stop_proxy_from_pid_files(&pid_candidates, None, opts.dry_run, &mut warnings).await;
+        stop_proxy_from_pid_files(&probe, &pid_candidates, None, opts.dry_run, &mut warnings).await;
 
     #[cfg(windows)]
     let windows_shortcut_removed = remove_windows_start_menu_shortcut(opts.dry_run, &mut warnings)?;
@@ -2329,8 +2363,8 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
                     if opts.dry_run {
                         true
                     } else if let Err(rm_err) = fs::remove_file(&stable_bin) {
-                        let renamed =
-                            bin_dir.join(format!(".{BINARY_NAME}.old.{}.exe", Uuid::new_v4()));
+                        let renamed = bin_dir
+                            .join(format!(".{BINARY_NAME}.old.{}.exe", unique_temp_suffix()));
                         if fs::rename(&stable_bin, &renamed).is_ok() {
                             true
                         } else {
@@ -2902,8 +2936,9 @@ mod tests {
             exhausted.expect("contiguous non-ephemeral loopback range for exhaustion");
 
         // All 3 ports held -> exhausted range must fail closed.
+        let probe = LoopbackProxyClient::with_default_timeouts().expect("probe client");
         assert!(
-            select_fresh_install_port(ex_base, ex_base + 2, false)
+            select_fresh_install_port(&probe, ex_base, ex_base + 2, false)
                 .await
                 .is_err(),
             "exhausted port range must fail closed"
@@ -2926,9 +2961,10 @@ mod tests {
         let (fb_base, f1, f3) =
             fallback.expect("contiguous non-ephemeral loopback range for fallback");
 
-        let (chosen, auto_selected) = select_fresh_install_port(fb_base, fb_base + 2, false)
-            .await
-            .expect("should select fallback port");
+        let (chosen, auto_selected) =
+            select_fresh_install_port(&probe, fb_base, fb_base + 2, false)
+                .await
+                .expect("should select fallback port");
         assert_eq!((chosen, auto_selected), (fb_base + 1, true));
         drop((f1, f3));
     }
@@ -3027,8 +3063,10 @@ mod tests {
         let encoded = serde_json::to_string_pretty(&pid_info).expect("serialize pid");
         fs::write(&pid_path, encoded).expect("write pid file");
 
+        let probe = LoopbackProxyClient::with_default_timeouts().expect("probe client");
         let mut warnings = Vec::new();
         let (stopped, pid) = stop_proxy_from_pid_files(
+            &probe,
             std::slice::from_ref(&pid_path),
             Some(4141),
             false,
@@ -3047,88 +3085,6 @@ mod tests {
                 .any(|w| w.contains("proxy.pid port 4142 does not match target listen_port 4141")),
             "expected port mismatch warning, got: {warnings:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn wait_for_replacement_proxy_version_requires_exact_version_match() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use axum::routing::get;
-        use companion_proxy::HealthResponse;
-
-        // 1. Stale version stays bound -> must NOT report matched; returns last observed stale version.
-        let stale_router = axum::Router::new().route(
-            "/health",
-            get(|| async {
-                axum::Json(HealthResponse {
-                    status: "ok".to_string(),
-                    version: "0.0.9".to_string(),
-                    protocol_version: 1,
-                })
-            }),
-        );
-        let stale_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind stale");
-        let stale_port = stale_listener.local_addr().expect("addr").port();
-        let stale_handle = tokio::spawn(async move {
-            let _ = axum::serve(stale_listener, stale_router).await;
-        });
-
-        let (matched, observed) = wait_for_replacement_proxy_version(
-            stale_port,
-            "0.1.0",
-            Duration::from_millis(200),
-            Duration::from_millis(25),
-            Duration::from_millis(150),
-        )
-        .await;
-        assert!(!matched, "stale version must never be treated as replaced");
-        assert_eq!(observed.as_deref(), Some("0.0.9"));
-        stale_handle.abort();
-
-        // 2. Transitions from stale "0.0.9" on poll 1 to expected "0.1.0" on poll 2 -> matches!
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_clone = Arc::clone(&hits);
-        let upgrade_router = axum::Router::new().route(
-            "/health",
-            get(move || {
-                let hits = Arc::clone(&hits_clone);
-                async move {
-                    let count = hits.fetch_add(1, Ordering::SeqCst);
-                    let ver = if count == 0 { "0.0.9" } else { "0.1.0" };
-                    axum::Json(HealthResponse {
-                        status: "ok".to_string(),
-                        version: ver.to_string(),
-                        protocol_version: 1,
-                    })
-                }
-            }),
-        );
-        let upgrade_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind upgrade");
-        let upgrade_port = upgrade_listener.local_addr().expect("addr").port();
-        let upgrade_handle = tokio::spawn(async move {
-            let _ = axum::serve(upgrade_listener, upgrade_router).await;
-        });
-
-        let (matched, observed) = wait_for_replacement_proxy_version(
-            upgrade_port,
-            "0.1.0",
-            Duration::from_secs(2),
-            Duration::from_millis(20),
-            Duration::from_millis(200),
-        )
-        .await;
-        assert!(matched, "exact version match must return matched=true");
-        assert_eq!(observed.as_deref(), Some("0.1.0"));
-        assert!(
-            hits.load(Ordering::SeqCst) >= 2,
-            "must poll past initial stale response until version matches"
-        );
-        upgrade_handle.abort();
     }
 
     #[test]

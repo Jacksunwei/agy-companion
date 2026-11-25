@@ -1,17 +1,23 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use companion_core::HealthResponse;
 use companion_core::integration::{DEFAULT_RESTORE_PREFIX, is_valid_restore_prefix};
-use companion_proxy::HealthResponse;
+use companion_providers::{DEFAULT_PROBE_TIMEOUT, LoopbackProxyClient};
 
-use crate::daemon::{DEFAULT_IDLE_SHUTDOWN_SECS, spawn_detached_proxy_daemon};
+use crate::daemon::{
+    DEFAULT_IDLE_SHUTDOWN_SECS, WaitHealthyOptions, WaitHealthyOutcome,
+    spawn_detached_proxy_daemon, wait_for_daemon_healthy,
+};
 use crate::{CliError, load_config_checked, resolve_cli_config_path};
 
 pub use companion_core::PROXY_PLACEHOLDER_API_KEY;
-pub const MAX_PROBE_HEALTH_BODY_BYTES: usize = 64 * 1024;
-pub const DEFAULT_PROBE_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+pub use companion_providers::{
+    DEFAULT_PROBE_TIMEOUT as DEFAULT_PROBE_HEALTH_TIMEOUT,
+    MAX_PROBE_BODY_BYTES as MAX_PROBE_HEALTH_BODY_BYTES,
+};
 const HEALTH_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -178,40 +184,8 @@ pub async fn probe_running_companion_proxy_with_timeout(
     if timeout.is_zero() {
         return None;
     }
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .user_agent(concat!("agy-companion/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .ok()?;
-    let url = format!("http://127.0.0.1:{port}/health");
-    let mut resp = client.get(url).send().await.ok()?;
-    if resp.status() != reqwest::StatusCode::OK {
-        return None;
-    }
-    if resp
-        .content_length()
-        .is_some_and(|len| len > MAX_PROBE_HEALTH_BODY_BYTES as u64)
-    {
-        return None;
-    }
-    let mut body = Vec::new();
-    let mut total_bytes: usize = 0;
-    while let Some(chunk) = resp.chunk().await.ok()? {
-        total_bytes = total_bytes.saturating_add(chunk.len());
-        if total_bytes > MAX_PROBE_HEALTH_BODY_BYTES {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let parsed: HealthResponse = serde_json::from_slice(&body).ok()?;
-    if parsed.status == "ok" && parsed.protocol_version > 0 {
-        Some(parsed)
-    } else {
-        None
-    }
+    let client = LoopbackProxyClient::new(timeout, timeout).ok()?;
+    client.probe_healthy_companion(port, Some(timeout)).await
 }
 
 pub async fn probe_running_companion_proxy(port: u16) -> Option<HealthResponse> {
@@ -373,33 +347,36 @@ pub async fn run_launch_with_env<W: Write>(
         return Ok(());
     }
 
-    if probe_running_companion_proxy(port).await.is_none() {
+    let probe = LoopbackProxyClient::with_default_timeouts()?;
+    if probe.probe_healthy_companion(port, None).await.is_none() {
         let mut serve_child =
             spawn_detached_proxy_daemon(port, &config_path, DEFAULT_IDLE_SHUTDOWN_SECS)?;
 
-        let deadline = Instant::now() + HEALTH_POLL_TIMEOUT;
-        let mut ready = false;
-        while Instant::now() < deadline {
-            if probe_running_companion_proxy(port).await.is_some() {
-                ready = true;
-                break;
-            }
-            if let Ok(Some(status)) = serve_child.try_wait() {
-                if probe_running_companion_proxy(port).await.is_some() {
-                    ready = true;
-                    break;
-                }
+        match wait_for_daemon_healthy(
+            &probe,
+            &mut serve_child,
+            WaitHealthyOptions {
+                port,
+                total_timeout: HEALTH_POLL_TIMEOUT,
+                poll_interval: HEALTH_POLL_INTERVAL,
+                probe_timeout: DEFAULT_PROBE_TIMEOUT,
+                expected_version: None,
+            },
+        )
+        .await
+        {
+            WaitHealthyOutcome::Ready(_) => {}
+            WaitHealthyOutcome::ExitedEarly { status, .. } => {
                 return Err(CliError::Io(std::io::Error::other(format!(
                     "agy-companion proxy exited early ({status}) before becoming healthy on 127.0.0.1:{port}"
                 ))));
             }
-            tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
-        }
-        if !ready {
-            return Err(CliError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("timed out waiting for agy-companion proxy on 127.0.0.1:{port}"),
-            )));
+            WaitHealthyOutcome::TimedOut { .. } => {
+                return Err(CliError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("timed out waiting for agy-companion proxy on 127.0.0.1:{port}"),
+                )));
+            }
         }
     }
 
@@ -430,6 +407,7 @@ pub async fn run_launch_with_env<W: Write>(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::Instant;
 
     use super::*;
 

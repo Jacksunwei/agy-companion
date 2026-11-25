@@ -8,7 +8,6 @@ repository.workspace = true
 [dependencies]
 companion-core.workspace = true
 companion-providers.workspace = true
-reqwest.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true

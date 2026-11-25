@@ -107,6 +107,9 @@ pub enum Commands {
     },
     /// Install the embedded Antigravity plugin, stable binary, Dock/Launcher hook, and local proxy.
     Install {
+        /// Path to config.json (overrides AGY_COMPANION_CONFIG).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Override Antigravity plugins directory (defaults to ~/.gemini/config/plugins).
         #[arg(long = "plugins-dir")]
         plugins_dir: Option<PathBuf>,
@@ -125,6 +128,9 @@ pub enum Commands {
     },
     /// Uninstall Antigravity Companion plugin, launcher hooks, proxy daemon, and managed binary.
     Uninstall {
+        /// Path to config.json (overrides AGY_COMPANION_CONFIG).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Override Antigravity plugins directory (defaults to ~/.gemini/config/plugins).
         #[arg(long = "plugins-dir")]
         plugins_dir: Option<PathBuf>,
@@ -566,6 +572,8 @@ mod tests {
         let install = Cli::try_parse_from([
             "agy-companion",
             "install",
+            "--config",
+            "/tmp/custom-config.json",
             "--plugins-dir",
             "/tmp/plugins",
             "--no-launcher-hook",
@@ -577,6 +585,7 @@ mod tests {
         assert_eq!(
             install.command,
             Commands::Install {
+                config: Some(PathBuf::from("/tmp/custom-config.json")),
                 plugins_dir: Some(PathBuf::from("/tmp/plugins")),
                 no_launcher_hook: true,
                 no_start_proxy: true,
@@ -585,11 +594,27 @@ mod tests {
             }
         );
 
+        let install_eq =
+            Cli::try_parse_from(["agy-companion", "install", "--config=/tmp/eq-config.json"])
+                .expect("install --config= should parse");
+        assert_eq!(
+            install_eq.command,
+            Commands::Install {
+                config: Some(PathBuf::from("/tmp/eq-config.json")),
+                plugins_dir: None,
+                no_launcher_hook: false,
+                no_start_proxy: false,
+                force: false,
+                json: false,
+            }
+        );
+
         let install_defaults = Cli::try_parse_from(["agy-companion", "install"])
             .expect("install defaults should parse");
         assert_eq!(
             install_defaults.command,
             Commands::Install {
+                config: None,
                 plugins_dir: None,
                 no_launcher_hook: false,
                 no_start_proxy: false,
@@ -601,6 +626,8 @@ mod tests {
         let uninstall = Cli::try_parse_from([
             "agy-companion",
             "uninstall",
+            "--config",
+            "/tmp/custom-config.json",
             "--plugins-dir",
             "/tmp/plugins",
             "--purge",
@@ -611,10 +638,25 @@ mod tests {
         assert_eq!(
             uninstall.command,
             Commands::Uninstall {
+                config: Some(PathBuf::from("/tmp/custom-config.json")),
                 plugins_dir: Some(PathBuf::from("/tmp/plugins")),
                 purge: true,
                 dry_run: true,
                 json: true,
+            }
+        );
+
+        let uninstall_eq =
+            Cli::try_parse_from(["agy-companion", "uninstall", "--config=/tmp/eq-config.json"])
+                .expect("uninstall --config= should parse");
+        assert_eq!(
+            uninstall_eq.command,
+            Commands::Uninstall {
+                config: Some(PathBuf::from("/tmp/eq-config.json")),
+                plugins_dir: None,
+                purge: false,
+                dry_run: false,
+                json: false,
             }
         );
 
@@ -623,6 +665,7 @@ mod tests {
         assert_eq!(
             uninstall_defaults.command,
             Commands::Uninstall {
+                config: None,
                 plugins_dir: None,
                 purge: false,
                 dry_run: false,
