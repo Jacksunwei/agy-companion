@@ -1,26 +1,183 @@
 <svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="bg-grad" x1="12" y1="10" x2="116" y2="118" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#1A73E8"/>
-      <stop offset="52%" stop-color="#4F46E5"/>
-      <stop offset="100%" stop-color="#7C3AED"/>
+    <clipPath id="tile-clip">
+      <rect x="6" y="6" width="116" height="116" rx="28"/>
+    </clipPath>
+
+    <clipPath id="primary-clip">
+      <path d="M22.5 92.5 C28.5 84 33.8 67.5 38.8 49.5 C43.6 32.5 50.2 24 62.5 24 C74.5 24 82.8 33 87 52 L73 56 C69.5 41.5 64 36.2 57.2 37.5 C50.2 38.8 46.5 49.2 42.5 63.2 C38 78.8 33.5 92.2 28.2 98.2 C25.8 100.8 21.5 99.8 20.8 96.8 C20.4 95 21.2 94.3 22.5 92.5 Z"/>
+    </clipPath>
+
+    <clipPath id="companion-clip">
+      <path d="M41.5 73.5 C48.2 56 59.5 41.5 75.5 41.5 C88.8 41.5 97 51.5 101 68.8 C103.6 80 105.4 88.8 108 93.4 C109.6 96.2 107.6 99.8 103.6 100.2 C98.2 100.8 93.8 96.8 90 88.8 C85.4 79 81.6 66.8 76.2 59.5 C71.2 52.8 64.5 51.2 57.6 54.8 C50.8 58.4 45.8 65.5 41.5 73.5 Z"/>
+    </clipPath>
+
+    <radialGradient id="bg-grad" cx="56" cy="48" r="88" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#14193D"/>
+      <stop offset="50%" stop-color="#090B20"/>
+      <stop offset="100%" stop-color="#030410"/>
+    </radialGradient>
+
+    <linearGradient id="tile-rim" x1="64" y1="6" x2="64" y2="122" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="30%" stop-color="#A5B4FC" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.02"/>
     </linearGradient>
-    <linearGradient id="spark-grad" x1="64" y1="34" x2="64" y2="94" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#FFFFFF"/>
-      <stop offset="100%" stop-color="#DBEAFE"/>
+
+    <filter id="blur-lg" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="8.5"/>
+    </filter>
+    <filter id="blur-md" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3.4"/>
+    </filter>
+    <filter id="blur-sm" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="1.8"/>
+    </filter>
+
+    <linearGradient id="aurora-vault" x1="46" y1="30" x2="78" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE68A"/>
+      <stop offset="30%" stop-color="#FBBF24"/>
+      <stop offset="65%" stop-color="#EA580C"/>
+      <stop offset="100%" stop-color="#7C1D3A"/>
     </linearGradient>
-    <linearGradient id="orbit-grad" x1="25" y1="82" x2="103" y2="46" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#93C5FD" stop-opacity="0.55"/>
-      <stop offset="50%" stop-color="#E0F2FE" stop-opacity="0.95"/>
-      <stop offset="100%" stop-color="#67E8F9" stop-opacity="0.9"/>
+
+    <linearGradient id="aurora-main" x1="62" y1="24" x2="22" y2="99" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FEF08A"/>
+      <stop offset="17%" stop-color="#FDBA74"/>
+      <stop offset="36%" stop-color="#BEF264"/>
+      <stop offset="53%" stop-color="#6EE7B7"/>
+      <stop offset="73%" stop-color="#38BDF8"/>
+      <stop offset="92%" stop-color="#2563EB"/>
+      <stop offset="100%" stop-color="#1D4ED8"/>
+    </linearGradient>
+
+    <radialGradient id="aurora-coral" cx="77" cy="36" r="25" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF5947" stop-opacity="0.96"/>
+      <stop offset="52%" stop-color="#FB923C" stop-opacity="0.54"/>
+      <stop offset="100%" stop-color="#FB923C" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="aurora-bevel" x1="60" y1="30" x2="26" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE047" stop-opacity="0.55"/>
+      <stop offset="28%" stop-color="#F97316" stop-opacity="0.62"/>
+      <stop offset="54%" stop-color="#10B981" stop-opacity="0.58"/>
+      <stop offset="80%" stop-color="#1D4ED8" stop-opacity="0.78"/>
+      <stop offset="100%" stop-color="#172554" stop-opacity="0.92"/>
+    </linearGradient>
+
+    <radialGradient id="foot-left-glass" cx="24" cy="96" r="9.5" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#93C5FD" stop-opacity="0.92"/>
+      <stop offset="55%" stop-color="#3B82F6" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#1D4ED8" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="sapphire-under" x1="62" y1="53" x2="58" y2="99" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#60A5FA"/>
+      <stop offset="28%" stop-color="#3B82F6"/>
+      <stop offset="68%" stop-color="#1D4ED8"/>
+      <stop offset="100%" stop-color="#172554"/>
+    </linearGradient>
+
+    <linearGradient id="comp-under" x1="56" y1="51" x2="94" y2="96" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#60A5FA" stop-opacity="0.88"/>
+      <stop offset="44%" stop-color="#2563EB" stop-opacity="0.72"/>
+      <stop offset="100%" stop-color="#0F172A" stop-opacity="0.9"/>
+    </linearGradient>
+
+    <linearGradient id="comp-base" x1="42" y1="62" x2="105" y2="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#60A5FA"/>
+      <stop offset="14%" stop-color="#CBD5E1"/>
+      <stop offset="38%" stop-color="#F8FAFC"/>
+      <stop offset="66%" stop-color="#E2E8F0"/>
+      <stop offset="88%" stop-color="#CBD5E1"/>
+      <stop offset="100%" stop-color="#F1F5F9"/>
+    </linearGradient>
+
+    <linearGradient id="comp-flank" x1="76" y1="43" x2="107" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.96"/>
+      <stop offset="45%" stop-color="#F8FAFC" stop-opacity="0.92"/>
+      <stop offset="82%" stop-color="#E2E8F0" stop-opacity="0.88"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.95"/>
+    </linearGradient>
+
+    <radialGradient id="comp-irid-peach" cx="65" cy="52" r="21" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE68A" stop-opacity="0.62"/>
+      <stop offset="45%" stop-color="#FDA4AF" stop-opacity="0.46"/>
+      <stop offset="100%" stop-color="#FDA4AF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="comp-irid-opal" cx="82" cy="54" r="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67E8F9" stop-opacity="0.54"/>
+      <stop offset="50%" stop-color="#A7F3D0" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="comp-irid-violet" cx="74" cy="65" r="18" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#C4B5FD" stop-opacity="0.38"/>
+      <stop offset="100%" stop-color="#818CF8" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="comp-crease" x1="56" y1="54" x2="94" y2="95" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3B82F6" stop-opacity="0.35"/>
+      <stop offset="45%" stop-color="#94A3B8" stop-opacity="0.42"/>
+      <stop offset="100%" stop-color="#64748B" stop-opacity="0.32"/>
+    </linearGradient>
+
+    <linearGradient id="spec-primary" x1="33" y1="74" x2="77" y2="25" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6EE7B7" stop-opacity="0"/>
+      <stop offset="38%" stop-color="#FEF3C7" stop-opacity="0.88"/>
+      <stop offset="76%" stop-color="#FFFFFF" stop-opacity="0.94"/>
+      <stop offset="100%" stop-color="#FF6B4A" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="spec-companion" x1="48" y1="60" x2="106" y2="95" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#BAE6FD" stop-opacity="0"/>
+      <stop offset="26%" stop-color="#FFFFFF" stop-opacity="0.96"/>
+      <stop offset="68%" stop-color="#E0F2FE" stop-opacity="0.72"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.38"/>
+    </linearGradient>
+    <linearGradient id="spec-sapphire" x1="31" y1="93" x2="88" y2="91" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#60A5FA" stop-opacity="0"/>
+      <stop offset="46%" stop-color="#BAE6FD" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#60A5FA" stop-opacity="0"/>
     </linearGradient>
   </defs>
-  <rect x="10" y="10" width="108" height="108" rx="28" fill="url(#bg-grad)"/>
-  <rect x="10.75" y="10.75" width="106.5" height="106.5" rx="27.25" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="1.5"/>
-  <ellipse cx="64" cy="64" rx="39" ry="16" transform="rotate(-28 64 64)" stroke="url(#orbit-grad)" stroke-width="3.5"/>
-  <path d="M64 34 C64 52 76 64 94 64 C76 64 64 76 64 94 C64 76 52 64 34 64 C52 64 64 52 64 34 Z" fill="url(#spark-grad)"/>
-  <circle cx="98.4" cy="45.7" r="8.5" fill="#67E8F9" fill-opacity="0.28"/>
-  <circle cx="98.4" cy="45.7" r="5" fill="#FFFFFF"/>
-  <circle cx="29.6" cy="82.3" r="7" fill="#93C5FD" fill-opacity="0.26"/>
-  <circle cx="29.6" cy="82.3" r="4" fill="#E0F2FE"/>
+
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bg-grad)"/>
+
+  <g clip-path="url(#tile-clip)">
+    <g filter="url(#blur-lg)">
+      <ellipse cx="61" cy="35" rx="25" ry="16" fill="#FF6B4A" fill-opacity="0.35"/>
+      <ellipse cx="36" cy="66" rx="16" ry="22" fill="#34D399" fill-opacity="0.24"/>
+      <ellipse cx="46" cy="89" rx="28" ry="17" fill="#2563EB" fill-opacity="0.40"/>
+      <ellipse cx="87" cy="70" rx="20" ry="22" fill="#BAE6FD" fill-opacity="0.14"/>
+    </g>
+
+    <path d="M44 48 C50 32 66 28 81 47 L67 55 C60 44 53 43 46 52 Z" fill="url(#aurora-vault)"/>
+
+    <g clip-path="url(#primary-clip)">
+      <rect x="18" y="21" width="74" height="82" fill="url(#aurora-main)"/>
+      <rect x="18" y="21" width="74" height="82" fill="url(#aurora-coral)"/>
+      <path d="M58 35 C65.5 34 71 39 75.5 52 L65 56 C61 46.5 55.5 44 51 46 C46 48.5 43 58 39.2 70 C35.5 82 31.5 92.5 26.8 99.5 L24 99.5 C30 91 36 76.5 41 60.5 C45.5 46 49.5 36.5 58 35 Z" fill="url(#aurora-bevel)" filter="url(#blur-sm)"/>
+      <circle cx="24" cy="96" r="9.5" fill="url(#foot-left-glass)"/>
+    </g>
+
+    <path d="M26 97.6 C29.2 98.4 32.4 97 35.4 93.4 C41.4 85.8 46 73.2 52.2 65.2 C57.6 58.2 64.8 57.6 70.8 62.8 C77 68.2 82.4 78.6 88.2 89 C92 95.6 96.6 99.2 101.2 99.2 C96.4 97 92.4 90.6 87.4 80.2 C81.6 68.5 76 57.8 68.6 53.6 C60.4 48.8 51.8 52.8 45.6 63.5 C39.4 74.2 35.2 86.8 29 94.2 C27.6 95.8 26.6 97 26 97.6 Z" fill="url(#sapphire-under)"/>
+
+    <path d="M43 70 C50.5 52 63.5 41.5 78.5 44 C84.5 45 89 49.5 92 56.5" stroke="#040615" stroke-width="7.5" stroke-linecap="round" stroke-opacity="0.64" filter="url(#blur-md)"/>
+
+    <path d="M41.8 73 C47.8 58 57.5 48.2 67.8 48.2 C77.5 48.2 84.5 55.2 89 68.8 C93 80.8 96 92.5 102.2 99.2 C95.6 98.6 90.6 92.5 85.8 81.6 C80.8 70.4 75.2 60.4 66.8 58.2 C58 56 50 62.5 41.8 73 Z" fill="url(#comp-under)"/>
+
+    <g clip-path="url(#companion-clip)">
+      <rect x="40" y="40" width="72" height="64" fill="url(#comp-base)"/>
+      <rect x="40" y="40" width="72" height="64" fill="url(#comp-irid-peach)"/>
+      <rect x="40" y="40" width="72" height="64" fill="url(#comp-irid-opal)"/>
+      <rect x="40" y="40" width="72" height="64" fill="url(#comp-irid-violet)"/>
+      <path d="M68 42.5 C83 40.5 95 49.5 100.2 67.8 C103.4 79.8 105.6 89 108.5 94 C110 96.8 108 100.4 103.8 100.6 C100.4 100.8 97.8 99.2 95.8 96.2 C93.4 92.6 91.2 84 88.2 71.8 C84.8 57.8 79.5 47.2 68 42.5 Z" fill="url(#comp-flank)" filter="url(#blur-sm)"/>
+      <path d="M44 70 C50.5 56 60.2 48.2 70.5 49.5 C79.2 50.8 84.8 59.5 89.6 74.8 C92.8 85 95.5 93.8 99.8 98.8" stroke="url(#comp-crease)" stroke-width="3.2" filter="url(#blur-sm)"/>
+    </g>
+
+    <path d="M34.5 64 C39.8 44.5 46.8 26.2 61 24.8 C69 24 75.5 28.2 80 35.8" stroke="url(#spec-primary)" stroke-width="1.6" stroke-linecap="round"/>
+    <path d="M52 57 C61.2 46 70.5 42.2 79.8 44.5 C90.2 47.2 96 59.2 100.2 76.5 C102.6 86.2 104.8 92.8 107 95.8" stroke="url(#spec-companion)" stroke-width="1.6" stroke-linecap="round"/>
+    <path d="M33.5 93 C40.8 81.2 46.8 67.5 54 62.6 C60.4 58.2 67 59 72.4 64.2 C78.4 70.4 83.4 82.2 89.4 91.5" stroke="url(#spec-sapphire)" stroke-width="1.35" stroke-linecap="round"/>
+  </g>
+
+  <rect x="6.5" y="6.5" width="115" height="115" rx="27.5" stroke="url(#tile-rim)" stroke-width="1"/>
 </svg>
