@@ -612,6 +612,7 @@ mod tests {
                 last_catalog_refresh_at_ms: Some(1_700_000_000_000),
                 last_catalog_included_proxy_models: Some(true),
             },
+            ..Default::default()
         };
         let payload = expected.clone();
         let (ok_port, ok_handle) = spawn_router(Router::new().route(

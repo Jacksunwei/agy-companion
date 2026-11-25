@@ -212,6 +212,7 @@ fn open_settings_tool_declares_aux_pane_and_global_entrypoints() {
             "set_launcher_integration",
             "Configure Dock / Launcher Auto-Start",
         ),
+        ("get_usage", "Get Historical Usage Summary"),
     ];
     for (app_only, expected_title) in expected_titles {
         let tool = tools
@@ -242,6 +243,7 @@ fn open_settings_tool_declares_aux_pane_and_global_entrypoints() {
             assert!(props.contains_key("proxy"));
             assert!(props.contains_key("cloudcode"));
             assert!(props.contains_key("providers"));
+            assert!(props.contains_key("account_plan"));
             assert!(!props.contains_key("listen_port"));
             assert!(!props.contains_key("api_key"));
             assert!(!props.contains_key("clear_api_key"));
@@ -260,6 +262,24 @@ fn open_settings_tool_declares_aux_pane_and_global_entrypoints() {
                     .and_then(|e| e.get("type")),
                 Some(&json!("boolean"))
             );
+        }
+        if app_only == "get_usage" {
+            assert_eq!(
+                tool.input_schema.get("additionalProperties"),
+                Some(&json!(false)),
+                "get_usage schema must deny unknown fields: {:?}",
+                tool.input_schema
+            );
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("get_usage properties object");
+            assert!(props.contains_key("range"));
+            let schema_str = serde_json::to_string(&tool.input_schema).expect("schema json");
+            assert!(schema_str.contains("\"1d\""));
+            assert!(schema_str.contains("\"7d\""));
+            assert!(schema_str.contains("\"30d\""));
         }
     }
 }
@@ -440,8 +460,10 @@ async fn save_settings_persists_eagerly_and_validates_inputs() {
                     api_key: Some(ApiKeyPatch::Set(secret.to_string())),
                     base_url: Some("https://generativelanguage.googleapis.com".to_string()),
                     default_model: Some("gemini-3.8-flash".to_string()),
+                    ..Default::default()
                 }),
             }),
+            ..Default::default()
         }))
         .await
         .expect("save_settings ok");
@@ -1210,11 +1232,16 @@ async fn mcp_json_rpc_full_wire_protocol_over_duplex() {
     let tools = tools_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 6);
     assert!(
         tools
             .iter()
             .any(|t| t.get("name") == Some(&json!("set_launcher_integration")))
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|t| t.get("name") == Some(&json!("get_usage")))
     );
 
     // 3b. Verify set_launcher_integration rejects unknown fields at the JSON-RPC boundary
@@ -2471,9 +2498,16 @@ async fn settings_snapshot_json_exposes_nested_config_structured_stats_supported
         "cloudcode",
         "supported_models",
         "platform",
+        "account_plan",
+        "proxy_rss_bytes",
     ] {
         assert!(obj.contains_key(key), "missing snapshot key {key}");
     }
+    assert_eq!(
+        obj["account_plan"],
+        json!({ "mode": "auto", "resolved": null })
+    );
+    assert_eq!(obj["proxy_rss_bytes"], json!(null));
 
     // supported_models has 5 curated presets & platform is lowercase
     let models = obj["supported_models"].as_array().expect("models array");
@@ -2841,4 +2875,580 @@ async fn logo_data_uri_caches_svg_via_oncelock_and_ui_html_override_handles_miss
         .expect_err("symlinked FIFO must fail");
         assert_eq!(fifo_err.code, ErrorCode::INTERNAL_ERROR);
     }
+}
+
+#[test]
+fn account_plan_status_mapping_matrix_never_leaks_raw_urls() {
+    use companion_core::{
+        CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CloudCodeStatsSnapshot,
+        CloudCodeUpstream,
+    };
+
+    let auto = CloudCodeUpstream::Auto;
+    let daily = CloudCodeUpstream::Fixed(CLOUDCODE_DAILY_UPSTREAM_URL.to_string());
+    let prod = CloudCodeUpstream::Fixed(CLOUDCODE_PROD_UPSTREAM_URL.to_string());
+    let custom = CloudCodeUpstream::Fixed("http://127.0.0.1:9999".to_string());
+
+    let stats_with = |url: &str| CloudCodeStatsSnapshot {
+        mode: "auto".to_string(),
+        resolved_upstream: Some(url.to_string()),
+        ..Default::default()
+    };
+
+    let cases = [
+        (
+            AccountPlanStatus::from_config_and_stats(&auto, None),
+            AccountPlanMode::Auto,
+            None,
+        ),
+        (
+            AccountPlanStatus::from_config_and_stats(
+                &auto,
+                Some(&stats_with("https://daily-cloudcode-pa.googleapis.com/")),
+            ),
+            AccountPlanMode::Auto,
+            Some(ResolvedAccountPlan::Personal),
+        ),
+        (
+            AccountPlanStatus::from_config_and_stats(
+                &auto,
+                Some(&stats_with("HTTPS://CLOUDCODE-PA.GOOGLEAPIS.COM")),
+            ),
+            AccountPlanMode::Auto,
+            Some(ResolvedAccountPlan::Organization),
+        ),
+        (
+            AccountPlanStatus::from_config_and_stats(
+                &auto,
+                Some(&stats_with("http://127.0.0.1:9999")),
+            ),
+            AccountPlanMode::Auto,
+            None,
+        ),
+        (
+            AccountPlanStatus::from_config_and_stats(&daily, None),
+            AccountPlanMode::Personal,
+            Some(ResolvedAccountPlan::Personal),
+        ),
+        (
+            AccountPlanStatus::from_config_and_stats(
+                &daily,
+                Some(&stats_with(CLOUDCODE_PROD_UPSTREAM_URL)),
+            ),
+            AccountPlanMode::Personal,
+            Some(ResolvedAccountPlan::Personal),
+        ),
+        (
+            AccountPlanStatus::from_config_and_stats(&prod, None),
+            AccountPlanMode::Organization,
+            Some(ResolvedAccountPlan::Organization),
+        ),
+        (
+            AccountPlanStatus::from_config_and_stats(&custom, None),
+            AccountPlanMode::Custom,
+            None,
+        ),
+    ];
+
+    for (status, expected_mode, expected_resolved) in cases {
+        assert_eq!(status.mode, expected_mode);
+        assert_eq!(status.resolved, expected_resolved);
+        let json_str = serde_json::to_string(&status).expect("serialize account_plan");
+        assert!(
+            !json_str.contains("cloudcode-pa.googleapis.com") && !json_str.contains("127.0.0.1"),
+            "account_plan must never leak raw URLs: {json_str}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_plan_auto_ignores_stale_fixed_mode_proxy_stats() {
+    use companion_core::{
+        CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CloudCodeStatsSnapshot,
+        CloudCodeUpstream,
+    };
+
+    let auto = CloudCodeUpstream::Auto;
+
+    // Unit-level: stale mode="fixed" (or empty) stats must NOT leak into Auto.resolved.
+    let stale_fixed_daily = CloudCodeStatsSnapshot {
+        mode: "fixed".to_string(),
+        resolved_upstream: Some(CLOUDCODE_DAILY_UPSTREAM_URL.to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        AccountPlanStatus::from_config_and_stats(&auto, Some(&stale_fixed_daily)),
+        AccountPlanStatus {
+            mode: AccountPlanMode::Auto,
+            resolved: None,
+        }
+    );
+
+    let stale_fixed_prod = CloudCodeStatsSnapshot {
+        mode: "fixed".to_string(),
+        resolved_upstream: Some(CLOUDCODE_PROD_UPSTREAM_URL.to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        AccountPlanStatus::from_config_and_stats(&auto, Some(&stale_fixed_prod)),
+        AccountPlanStatus {
+            mode: AccountPlanMode::Auto,
+            resolved: None,
+        }
+    );
+
+    let active_auto_prod = CloudCodeStatsSnapshot {
+        mode: " AUTO ".to_string(),
+        resolved_upstream: Some(CLOUDCODE_PROD_UPSTREAM_URL.to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        AccountPlanStatus::from_config_and_stats(&auto, Some(&active_auto_prod)),
+        AccountPlanStatus {
+            mode: AccountPlanMode::Auto,
+            resolved: Some(ResolvedAccountPlan::Organization),
+        }
+    );
+
+    // End-to-end: save_settings({ account_plan: "auto" }) against a proxy still reporting
+    // pre-hot-reload mode="fixed" must return account_plan == { mode: "auto", resolved: null }.
+    let mock_router = Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "protocol_version": 1,
+                }))
+            }),
+        )
+        .route(
+            "/api/stats",
+            get(|| async {
+                axum::Json(json!({
+                    "usage": {
+                        "requests": 0,
+                        "prompt_tokens": 0,
+                        "cached_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "cache_hit_ratio": 0.0
+                    },
+                    "cloudcode": {
+                        "mode": "fixed",
+                        "resolved_upstream": CLOUDCODE_DAILY_UPSTREAM_URL,
+                        "last_catalog_refresh_at_ms": null,
+                        "last_catalog_included_proxy_models": null
+                    }
+                }))
+            }),
+        );
+    let (port, handle) = spawn_mock_http(mock_router).await;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let mut cfg = config_with_port(port);
+    cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(CLOUDCODE_DAILY_UPSTREAM_URL.to_string());
+    cfg.save_secure(&cfg_path).expect("save cfg");
+
+    let server = CompanionUiServer::new(cfg_path).expect("server");
+    let res = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            account_plan: Some(AccountPlan::Auto),
+            ..Default::default()
+        }))
+        .await
+        .expect("save_settings");
+    assert_eq!(res.is_error, Some(false));
+    let sc = res.structured_content.expect("sc");
+    assert_eq!(
+        sc["account_plan"],
+        json!({ "mode": "auto", "resolved": null }),
+        "stale fixed-mode proxy stats must not leak resolved plan when switched to auto"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn save_settings_handles_account_plan_enabled_models_and_rejects_conflict() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let server = CompanionUiServer::with_options(
+        cfg_path.clone(),
+        UiServerOptions {
+            integration_options_override: Some(IntegrationOptions {
+                shell: Some(companion_core::ShellKind::Zsh),
+                rc_file: Some(tmp.path().join(".zlogin")),
+                binary_path: Some(PathBuf::from("/usr/local/bin/agy-companion")),
+                data_dir: Some(tmp.path().join("data")),
+                follow_rc_symlink: false,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("server");
+
+    // 1. Conflict: simultaneous account_plan + cloudcode.upstream must fail closed without touching disk
+    let conflict = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            account_plan: Some(AccountPlan::Personal),
+            cloudcode: Some(CloudCodeSettingsPatch {
+                upstream: Some("https://cloudcode-pa.googleapis.com".to_string()),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("conflict call");
+    assert_eq!(conflict.is_error, Some(true));
+    assert!(!cfg_path.exists(), "conflict must not write config.json");
+
+    // 2. Empty cloudcode: {} alongside account_plan is NOT a conflict; account_plan wins
+    let personal = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            account_plan: Some(AccountPlan::Personal),
+            cloudcode: Some(CloudCodeSettingsPatch { upstream: None }),
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    enabled_models: Some(vec![
+                        "gemini-4-argon".to_string(),
+                        "gemini-4-argon".to_string(),
+                        "gemini-3.8-flash".to_string(),
+                    ]),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("personal save");
+    assert_eq!(personal.is_error, Some(false));
+    let sc = personal.structured_content.expect("sc");
+    assert_eq!(
+        sc["account_plan"],
+        json!({ "mode": "personal", "resolved": "personal" })
+    );
+    assert_eq!(
+        sc["config"]["providers"]["gemini"]["enabled_models"],
+        json!(["gemini-4-argon", "gemini-3.8-flash"])
+    );
+
+    // 3. Empty enabled_models [] + account_plan: "organization" persists cleanly
+    let org = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            account_plan: Some(AccountPlan::Organization),
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    enabled_models: Some(Vec::new()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("org save");
+    assert_eq!(org.is_error, Some(false));
+    let sc2 = org.structured_content.expect("sc2");
+    assert_eq!(
+        sc2["account_plan"],
+        json!({ "mode": "organization", "resolved": "organization" })
+    );
+    assert_eq!(
+        sc2["config"]["providers"]["gemini"]["enabled_models"],
+        json!([])
+    );
+
+    // 4. Invalid model in enabled_models is rejected fail-closed
+    let bad_model = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    enabled_models: Some(vec!["gemini-2.0-flash".to_string()]),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("bad model call");
+    assert_eq!(bad_model.is_error, Some(true));
+}
+
+#[tokio::test]
+async fn snapshot_propagates_proxy_rss_bytes_from_live_stats() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let app = Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "protocol_version": 1
+                }))
+            }),
+        )
+        .route(
+            "/api/stats",
+            get(|| async {
+                axum::Json(json!({
+                    "usage": {
+                        "requests": 2,
+                        "prompt_tokens": 100,
+                        "cached_tokens": 50,
+                        "output_tokens": 25,
+                        "reasoning_tokens": 0,
+                        "cache_hit_ratio": 0.5
+                    },
+                    "cloudcode": {
+                        "mode": "auto",
+                        "resolved_upstream": "https://cloudcode-pa.googleapis.com"
+                    },
+                    "proxy_rss_bytes": 19_922_944,
+                    "recent_calls": [],
+                    "by_model": []
+                }))
+            }),
+        );
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let mut cfg = Config::default();
+    cfg.proxy.port = std::num::NonZeroU16::new(port).expect("nonzero port");
+    cfg.save_secure(&cfg_path).expect("save cfg");
+
+    let server = CompanionUiServer::with_options(
+        cfg_path,
+        UiServerOptions {
+            integration_options_override: Some(IntegrationOptions {
+                shell: Some(companion_core::ShellKind::Zsh),
+                rc_file: Some(tmp.path().join(".zlogin")),
+                binary_path: Some(PathBuf::from("/usr/local/bin/agy-companion")),
+                data_dir: Some(tmp.path().join("data")),
+                follow_rc_symlink: false,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("server");
+
+    let res = server.get_settings().await.expect("get_settings");
+    assert_eq!(res.is_error, Some(false));
+    let sc = res.structured_content.expect("sc");
+    assert_eq!(sc["proxy_rss_bytes"], json!(19_922_944));
+    assert_eq!(
+        sc["account_plan"],
+        json!({ "mode": "auto", "resolved": "organization" })
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn get_usage_missing_db_returns_empty_and_rejects_bad_args_at_json_boundary() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let usage_dir = tmp.path().join("missing-usage-dir");
+    let cfg = Config {
+        usage_dir: Some(usage_dir.clone()),
+        ..Default::default()
+    };
+    cfg.save_secure(&cfg_path).expect("save cfg");
+
+    let server = CompanionUiServer::new(cfg_path).expect("server");
+    let res = server
+        .get_usage(Parameters(GetUsageArgs {
+            range: UsageRangeArg::Days7,
+        }))
+        .await
+        .expect("get_usage");
+    assert_eq!(res.is_error, Some(false));
+    let sc = res.structured_content.expect("sc");
+    assert_eq!(sc["range"], json!("7d"));
+    assert_eq!(sc["totals"]["requests"], json!(0));
+    assert_eq!(sc["buckets"], json!([]));
+    assert!(
+        !usage_dir.exists(),
+        "get_usage must not create missing usage_dir"
+    );
+
+    // Strict serde boundary checks for GetUsageArgs
+    assert!(serde_json::from_str::<GetUsageArgs>("{}").is_err());
+    assert!(serde_json::from_str::<GetUsageArgs>(r#"{"range":"99d"}"#).is_err());
+    assert!(serde_json::from_str::<GetUsageArgs>(r#"{"range":"7d","extra":1}"#).is_err());
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn get_usage_queries_seeded_sqlite_and_rejects_symlink_db() {
+    use companion_core::{GeminiUsageMetadata, SqliteUsageSink, USAGE_DB_FILENAME, UsageEvent};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let usage_dir = tmp.path().join("usage");
+    let cfg = Config {
+        usage_dir: Some(usage_dir.clone()),
+        ..Default::default()
+    };
+    cfg.save_secure(&cfg_path).expect("save cfg");
+
+    let sink = SqliteUsageSink::new(&usage_dir).expect("sink");
+    let u1 = GeminiUsageMetadata {
+        prompt_token_count: 1000,
+        candidates_token_count: 200,
+        cached_content_token_count: 600,
+        thoughts_token_count: 50,
+    };
+    let u2 = GeminiUsageMetadata {
+        prompt_token_count: 500,
+        candidates_token_count: 100,
+        cached_content_token_count: 0,
+        thoughts_token_count: 0,
+    };
+    sink.record_checked(&UsageEvent::from_gemini("gemini-4-carbon", &u1, 200))
+        .expect("record gemini");
+    sink.record_checked(&UsageEvent::from_antigravity_builtin(
+        "gemini-3.8-pro",
+        &u2,
+        100,
+    ))
+    .expect("record builtin");
+
+    let server = CompanionUiServer::new(cfg_path).expect("server");
+    let res = server
+        .get_usage(Parameters(GetUsageArgs {
+            range: UsageRangeArg::Today,
+        }))
+        .await
+        .expect("get_usage");
+    assert_eq!(res.is_error, Some(false));
+    let sc = res.structured_content.expect("sc");
+    assert_eq!(sc["range"], json!("1d"));
+    assert_eq!(sc["totals"]["requests"], json!(2));
+    assert_eq!(sc["totals"]["input_tokens"], json!(1500));
+    assert_eq!(sc["by_model"].as_array().expect("by_model").len(), 2);
+    assert_eq!(sc["by_provider"].as_array().expect("by_provider").len(), 2);
+
+    #[cfg(unix)]
+    {
+        let bad_dir = tmp.path().join("symlink-usage");
+        fs::create_dir_all(&bad_dir).expect("mkdir");
+        let victim = tmp.path().join("victim.db");
+        fs::write(&victim, b"").expect("write victim");
+        std::os::unix::fs::symlink(&victim, bad_dir.join(USAGE_DB_FILENAME)).expect("symlink");
+
+        let bad_cfg_path = tmp.path().join("bad_config.json");
+        let bad_cfg = Config {
+            usage_dir: Some(bad_dir),
+            ..Default::default()
+        };
+        bad_cfg.save_secure(&bad_cfg_path).expect("save bad cfg");
+
+        let bad_server = CompanionUiServer::new(bad_cfg_path).expect("bad server");
+        let bad_res = bad_server
+            .get_usage(Parameters(GetUsageArgs {
+                range: UsageRangeArg::Days7,
+            }))
+            .await
+            .expect("get_usage error result");
+        assert_eq!(bad_res.is_error, Some(true));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn set_launcher_integration_persists_launcher_auto_start_and_open_settings_respects_flag() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let rc_path = tmp.path().join(".zlogin");
+    let data_dir = tmp.path().join("data");
+    let opts = IntegrationOptions {
+        shell: Some(companion_core::ShellKind::Zsh),
+        rc_file: Some(rc_path.clone()),
+        binary_path: Some(PathBuf::from("/usr/local/bin/agy-companion")),
+        data_dir: Some(data_dir.clone()),
+        follow_rc_symlink: false,
+    };
+
+    // 1. Default auto_enable_launcher == false leaves config & RC untouched on open_settings
+    let default_server = CompanionUiServer::with_options(
+        cfg_path.clone(),
+        UiServerOptions {
+            integration_options_override: Some(opts.clone()),
+            auto_enable_launcher: false,
+            ..Default::default()
+        },
+    )
+    .expect("default server");
+    let open_default = default_server.open_settings().await.expect("open default");
+    assert_eq!(open_default.is_error, Some(false));
+    assert!(!rc_path.exists());
+    assert_eq!(
+        open_default.structured_content.expect("sc")["config"]["launcher_auto_start"],
+        json!(null)
+    );
+
+    // 2. auto_enable_launcher == true enables hook on first open_settings and persists Some(true)
+    let auto_server = CompanionUiServer::with_options(
+        cfg_path.clone(),
+        UiServerOptions {
+            integration_options_override: Some(opts.clone()),
+            auto_enable_launcher: true,
+            ..Default::default()
+        },
+    )
+    .expect("auto server");
+    let open_auto = auto_server.open_settings().await.expect("open auto");
+    assert_eq!(open_auto.is_error, Some(false));
+    let open_sc = open_auto.structured_content.expect("open sc");
+    assert_eq!(open_sc["config"]["launcher_auto_start"], json!(true));
+    if companion_core::integration::detect_hybrid_active() {
+        assert_eq!(
+            open_sc["launcher_integration"]["hybrid_active"],
+            json!(true)
+        );
+    } else {
+        assert!(rc_path.exists(), "first-run auto-enable should write RC");
+        assert_eq!(open_sc["launcher_integration"]["enabled"], json!(true));
+    }
+
+    // 3. set_launcher_integration(false) disables hook and persists Some(false) immediately in snapshot
+    let disabled = auto_server
+        .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: false }))
+        .await
+        .expect("disable");
+    assert_eq!(disabled.is_error, Some(false));
+    let dis_sc = disabled.structured_content.expect("dis sc");
+    assert_eq!(dis_sc["config"]["launcher_auto_start"], json!(false));
+    assert_eq!(dis_sc["launcher_integration"]["enabled"], json!(false));
+
+    // 4. Subsequent open_settings with auto_enable_launcher == true respects explicit opt-out Some(false)
+    let reopen = auto_server.open_settings().await.expect("reopen");
+    assert_eq!(reopen.is_error, Some(false));
+    let reopen_sc = reopen.structured_content.expect("reopen sc");
+    assert_eq!(reopen_sc["config"]["launcher_auto_start"], json!(false));
+    assert_eq!(reopen_sc["launcher_integration"]["enabled"], json!(false));
+
+    // 5. Concurrent save_settings + set_launcher_integration(true) loses neither update
+    let (save_res, enable_res) = tokio::join!(
+        auto_server.save_settings(Parameters(SaveSettingsArgs {
+            account_plan: Some(AccountPlan::Organization),
+            ..Default::default()
+        })),
+        auto_server
+            .set_launcher_integration(Parameters(SetLauncherIntegrationArgs { enabled: true })),
+    );
+    assert_eq!(save_res.expect("save").is_error, Some(false));
+    assert_eq!(enable_res.expect("enable").is_error, Some(false));
+    let final_cfg = Config::load_or_default(&cfg_path).expect("reload final cfg");
+    assert_eq!(final_cfg.launcher_auto_start, Some(true));
+    assert_eq!(
+        final_cfg.cloudcode.upstream.as_str(),
+        companion_core::CLOUDCODE_PROD_UPSTREAM_URL
+    );
 }

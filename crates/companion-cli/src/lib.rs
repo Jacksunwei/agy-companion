@@ -153,13 +153,25 @@ pub async fn run_ui_mcp(
     data_dir: Option<PathBuf>,
     config_override: Option<PathBuf>,
 ) -> Result<(), CliError> {
+    run_ui_mcp_with_options(data_dir, config_override, false).await
+}
+
+pub async fn run_ui_mcp_with_options(
+    data_dir: Option<PathBuf>,
+    config_override: Option<PathBuf>,
+    auto_enable_launcher: bool,
+) -> Result<(), CliError> {
     let (config_path, validated_data_dir) =
         validate_ui_mcp_paths(config_override.as_deref(), data_dir.as_deref())?;
     precheck_existing_config_file(&config_path)?;
     if let Some(ref dir) = validated_data_dir {
         precheck_existing_data_dir(dir)?;
     }
-    companion_ui_mcp::serve_stdio(config_path).await?;
+    let options = companion_ui_mcp::UiServerOptions {
+        auto_enable_launcher,
+        ..Default::default()
+    };
+    companion_ui_mcp::serve_stdio_with_options(config_path, options).await?;
     Ok(())
 }
 

@@ -1103,7 +1103,10 @@ class TestTier1RolloutR09ExtendedApiStats(E2ETestCase):
         self.assertEqual(resp0.header("x-content-type-options"), "nosniff")
         self.assertIn("no-store", resp0.header("cache-control") or "")
         s0 = resp0.json()
-        self.assertEqual(set(s0.keys()), {"usage", "cloudcode"})
+        self.assertEqual(
+            set(s0.keys()),
+            {"usage", "cloudcode", "proxy_rss_bytes", "recent_calls", "by_model"},
+        )
         required_usage = {
             "requests",
             "prompt_tokens",
@@ -1824,10 +1827,13 @@ class TestTier1RolloutR18McpLauncherCloudCode(E2ETestCase):
                 "save_settings",
                 "test_connection",
                 "set_launcher_integration",
+                "get_usage",
             },
         )
         meta_ui = (tools["set_launcher_integration"].get("_meta") or {}).get("ui") or {}
         self.assertEqual(meta_ui.get("visibility"), ["app"])
+        usage_meta_ui = (tools["get_usage"].get("_meta") or {}).get("ui") or {}
+        self.assertEqual(usage_meta_ui.get("visibility"), ["app"])
 
         for tool_name in ("open_settings", "get_settings"):
             res = mcp.call_tool(tool_name, {})

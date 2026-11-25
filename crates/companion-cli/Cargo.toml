@@ -14,7 +14,7 @@ clap.workspace = true
 companion-core = { workspace = true, features = ["sqlite"] }
 companion-providers.workspace = true
 companion-proxy.workspace = true
-companion-ui-mcp.workspace = true
+companion-ui-mcp = { workspace = true, features = ["sqlite"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -733,7 +733,14 @@ class TestTier3RolloutCombinations(E2ETestCase):
 
         self.assertEqual(
             tools,
-            {"open_settings", "get_settings", "save_settings", "test_connection", "set_launcher_integration"},
+            {
+                "open_settings",
+                "get_settings",
+                "save_settings",
+                "test_connection",
+                "set_launcher_integration",
+                "get_usage",
+            },
         )
         self.assertLess(len(html.encode("utf-8")), 512_000)
         self.assertIsNone(_S5_FORBIDDEN_SINKS_RE.search(html))

@@ -2450,3 +2450,70 @@ fn merge_available_models_default_three_enabled_models_use_11_of_32_slots_in_cap
         "expected Carbon -> Neon -> Hydrogen order, got {sort_ids:?}"
     );
 }
+
+#[test]
+fn copy_safe_response_headers_preserves_multiple_content_encoding_headers() {
+    let mut upstream = HeaderMap::new();
+    upstream.append(
+        header::CONTENT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    upstream.append(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
+    upstream.append(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+
+    let copied = super::routing::copy_safe_response_headers(&upstream);
+    let encodings: Vec<&str> = copied
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .map(|v| v.to_str().expect("ascii"))
+        .collect();
+    assert_eq!(
+        encodings,
+        vec!["identity", "br"],
+        "must preserve all Content-Encoding headers for S4 fidelity"
+    );
+    assert_eq!(
+        copied
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert!(!super::routing::is_uncompressed_content_encoding(&upstream));
+    assert!(!super::routing::is_uncompressed_content_encoding(&copied));
+
+    // Non-ASCII Content-Encoding is stripped by copy_safe_response_headers, so
+    // is_uncompressed_content_encoding MUST be evaluated on raw upstream headers before filtering.
+    let mut non_ascii = HeaderMap::new();
+    non_ascii.insert(
+        header::CONTENT_ENCODING,
+        HeaderValue::from_bytes(b"\x80br").expect("raw header bytes"),
+    );
+    assert!(!super::routing::is_uncompressed_content_encoding(
+        &non_ascii
+    ));
+    assert!(
+        super::routing::copy_safe_response_headers(&non_ascii)
+            .get(header::CONTENT_ENCODING)
+            .is_none()
+    );
+
+    // Absent or strictly identity headers are uncompressed.
+    let mut identity_only = HeaderMap::new();
+    assert!(super::routing::is_uncompressed_content_encoding(
+        &identity_only
+    ));
+    identity_only.append(
+        header::CONTENT_ENCODING,
+        HeaderValue::from_static("Identity"),
+    );
+    identity_only.append(
+        header::CONTENT_ENCODING,
+        HeaderValue::from_static("identity, "),
+    );
+    assert!(super::routing::is_uncompressed_content_encoding(
+        &identity_only
+    ));
+}

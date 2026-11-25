@@ -1,4 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::rejection::BytesRejection;
@@ -9,15 +10,75 @@ use http::{HeaderMap, Method, StatusCode, header};
 
 use crate::ProxyState;
 use crate::cloudcode::{
-    CloudCodeError, is_cloudcode_path, merge_available_models, validate_cloudcode_path,
+    CloudCodeError, is_cloudcode_path, is_uncompressed_content_encoding, merge_available_models,
+    validate_cloudcode_path,
 };
 
 use super::middleware::{
     body_read_error_response, not_found_handler, read_bounded_request_body, unwrap_bytes_body,
     validate_content_length_headers,
 };
-use super::tee::TrackedStream;
+use super::tee::{TrackedStream, UsageCollector, UsageOrigin, UsageTeeStream, select_tee_mode};
 use super::{MAX_PROXY_BODY_BYTES, json_error_response};
+
+const DEFAULT_BUILTIN_MODEL: &str = "antigravity-builtin";
+const MAX_BUILTIN_MODEL_LEN: usize = 128;
+
+fn is_builtin_generation_path(path_only: &str) -> bool {
+    matches!(
+        path_only,
+        "/v1internal:streamGenerateContent" | "/v1internal:generateContent"
+    ) || (path_only.starts_with("/v1internal/")
+        && (path_only.ends_with(":streamGenerateContent")
+            || path_only.ends_with(":generateContent")))
+}
+
+fn sanitize_builtin_model_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let after_slash_models = trimmed
+        .rsplit_once("/models/")
+        .map_or(trimmed, |(_, rest)| rest);
+    let after_models = after_slash_models
+        .strip_prefix("models/")
+        .unwrap_or(after_slash_models);
+    let cleaned: String = after_models
+        .trim_matches('/')
+        .chars()
+        .filter(|c| c.is_ascii_graphic() && *c != '"' && *c != '\\')
+        .take(MAX_BUILTIN_MODEL_LEN)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BuiltinModelProbe {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn extract_builtin_model_name(path_only: &str, body_bytes: &[u8]) -> String {
+    if let Some((_, after_models)) = path_only.rsplit_once("/models/") {
+        let candidate = after_models
+            .rsplit_once(':')
+            .map_or(after_models, |(m, _)| m);
+        if let Some(model) = sanitize_builtin_model_id(candidate) {
+            return model;
+        }
+    }
+    if !body_bytes.is_empty()
+        && let Some(model) = serde_json::from_slice::<BuiltinModelProbe>(body_bytes)
+            .ok()
+            .and_then(|probe| probe.model)
+            .and_then(|raw| sanitize_builtin_model_id(&raw))
+    {
+        return model;
+    }
+    DEFAULT_BUILTIN_MODEL.to_string()
+}
 
 fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
@@ -182,6 +243,14 @@ pub(super) async fn cloudcode_or_not_found_handler(
         Bytes::new()
     };
 
+    let path_only = path_and_query
+        .split_once('?')
+        .map_or(path_and_query.as_str(), |(p, _)| p);
+    let should_tee_request = method == Method::POST && is_builtin_generation_path(path_only);
+    let builtin_model =
+        should_tee_request.then(|| extract_builtin_model_name(path_only, &body_bytes));
+    let started_at = Instant::now();
+
     let active = state.active_provider().await;
     let upstream = match active
         .cloudcode
@@ -211,15 +280,38 @@ pub(super) async fn cloudcode_or_not_found_handler(
         builder = builder.header(name, value);
     }
     let stream_guard = state.enter_request();
-    builder
-        .body(Body::from_stream(TrackedStream {
+    let should_tee_response = should_tee_request
+        && upstream.status.is_success()
+        && upstream.response_is_uncompressed
+        && is_uncompressed_content_encoding(&upstream.headers);
+    let body = if should_tee_response {
+        let upstream_ct = upstream
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        let collector = UsageCollector::from_mode(select_tee_mode(upstream_ct, &path_and_query));
+        Body::from_stream(UsageTeeStream {
+            inner: upstream.stream,
+            collector,
+            stats: Arc::clone(state.stats()),
+            usage_sink: Arc::clone(state.usage_sink()),
+            origin: UsageOrigin::AntigravityBuiltin,
+            model: builtin_model.unwrap_or_else(|| DEFAULT_BUILTIN_MODEL.to_string()),
+            started_at,
+            finalized: false,
+            errored: false,
+            guard: stream_guard,
+        })
+    } else {
+        Body::from_stream(TrackedStream {
             inner: upstream.stream,
             guard: stream_guard,
-        }))
-        .unwrap_or_else(|_| {
-            json_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to build proxy response",
-            )
         })
+    };
+    builder.body(body).unwrap_or_else(|_| {
+        json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build proxy response",
+        )
+    })
 }

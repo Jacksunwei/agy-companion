@@ -389,6 +389,7 @@ fn buffered_to_stream_response(buffered: CloudCodeBufferedResponse) -> CloudCode
     CloudCodeStreamResponse {
         status: buffered.status,
         headers,
+        response_is_uncompressed: buffered.response_is_uncompressed,
         stream,
     }
 }

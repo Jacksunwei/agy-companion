@@ -129,11 +129,16 @@ fn ui_mcp_stdio_initialize_emits_strict_json_rpc_only_on_stdout() {
         assert_eq!(parsed["jsonrpc"], "2.0");
         if parsed["id"] == 2 {
             let tools = parsed["result"]["tools"].as_array().expect("tools array");
-            assert_eq!(tools.len(), 5);
+            assert_eq!(tools.len(), 6);
             assert!(
                 tools
                     .iter()
                     .any(|t| t.get("name") == Some(&json!("set_launcher_integration")))
+            );
+            assert!(
+                tools
+                    .iter()
+                    .any(|t| t.get("name") == Some(&json!("get_usage")))
             );
             saw_tools_list = true;
         }
@@ -658,4 +663,137 @@ fn ui_mcp_degrades_gracefully_and_preserves_rc_on_unsafe_leaf_env_sh() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn ui_mcp_auto_enable_launcher_and_get_usage_sqlite_end_to_end() {
+    use companion_core::{GeminiUsageMetadata, SqliteUsageSink, UsageEvent};
+
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_config = home.join("xdg-config");
+    let xdg_data = home.join("xdg-data");
+    let usage_dir = xdg_data.join("agy-companion").join("usage");
+    fs::create_dir_all(&home).expect("mkdir home");
+    fs::create_dir_all(&xdg_config).expect("mkdir xdg_config");
+    fs::create_dir_all(&xdg_data).expect("mkdir xdg_data");
+
+    let cfg_path = xdg_config.join("agy-companion").join("config.json");
+    let sink = SqliteUsageSink::new(&usage_dir).expect("sink");
+    sink.record_checked(&UsageEvent::from_gemini(
+        "gemini-4-carbon",
+        &GeminiUsageMetadata {
+            prompt_token_count: 1200,
+            candidates_token_count: 250,
+            cached_content_token_count: 600,
+            thoughts_token_count: 40,
+        },
+        300,
+    ))
+    .expect("seed gemini event");
+    sink.record_checked(&UsageEvent::from_antigravity_builtin(
+        "gemini-3.8-pro",
+        &GeminiUsageMetadata {
+            prompt_token_count: 800,
+            candidates_token_count: 150,
+            cached_content_token_count: 0,
+            thoughts_token_count: 0,
+        },
+        150,
+    ))
+    .expect("seed builtin event");
+    drop(sink);
+
+    let mut child = isolated_cli_command(&home)
+        .args([
+            "ui-mcp",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--auto-enable-launcher",
+        ])
+        .env("SHELL", "/bin/zsh")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ui-mcp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    let init_req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "cli-e2e", "version": "0.1.0" }
+        }
+    });
+    writeln!(stdin, "{init_req}").expect("write init");
+    stdin.flush().expect("flush init");
+    let mut init_line = String::new();
+    stdout.read_line(&mut init_line).expect("read init");
+
+    let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    writeln!(stdin, "{notif}").expect("write notif");
+
+    let open_req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "open_settings", "arguments": {} }
+    });
+    writeln!(stdin, "{open_req}").expect("write open_settings");
+
+    let usage_req = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "get_usage", "arguments": { "range": "7d" } }
+    });
+    writeln!(stdin, "{usage_req}").expect("write get_usage");
+    stdin.flush().expect("flush requests");
+    drop(stdin);
+
+    let mut responses = Vec::new();
+    let mut line = String::new();
+    while stdout.read_line(&mut line).expect("read line") > 0 {
+        if let Ok(val) = serde_json::from_str::<Value>(&line) {
+            responses.push(val);
+        }
+        line.clear();
+    }
+    let status = child.wait().expect("wait ui-mcp");
+    assert!(status.success(), "ui-mcp should exit 0 cleanly");
+
+    let open_resp = responses
+        .iter()
+        .find(|r| r["id"] == 2)
+        .expect("open_settings response");
+    assert_eq!(open_resp["result"]["isError"], false);
+    assert_eq!(
+        open_resp["result"]["structuredContent"]["config"]["launcher_auto_start"],
+        true
+    );
+    assert_eq!(
+        open_resp["result"]["structuredContent"]["launcher_integration"]["enabled"],
+        true
+    );
+    assert!(home.join(".zlogin").is_file());
+
+    let usage_resp = responses
+        .iter()
+        .find(|r| r["id"] == 3)
+        .expect("get_usage response");
+    assert_eq!(usage_resp["result"]["isError"], false);
+    let usage_sc = &usage_resp["result"]["structuredContent"];
+    assert_eq!(usage_sc["range"], "7d");
+    assert_eq!(usage_sc["totals"]["requests"], 2);
+    assert_eq!(usage_sc["totals"]["input_tokens"], 2000);
+    assert_eq!(usage_sc["totals"]["cached_tokens"], 600);
+    assert_eq!(usage_sc["by_model"].as_array().unwrap().len(), 2);
+    assert_eq!(usage_sc["by_provider"].as_array().unwrap().len(), 2);
 }

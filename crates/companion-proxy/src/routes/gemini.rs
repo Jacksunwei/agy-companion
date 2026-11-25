@@ -10,17 +10,13 @@ use companion_providers::{ForwardRequest, ProviderError};
 use http::{HeaderMap, StatusCode, header};
 
 use crate::ProxyState;
-use crate::sse::SseUsageTracker;
 
 use super::json_error_response;
 use super::middleware::{
     body_read_error_response, sanitize_outbound_content_type, unwrap_bytes_body,
     validate_inbound_api_key, validate_inbound_content_type,
 };
-use super::tee::{
-    DEFAULT_MAX_JSON_TEE_BYTES, TrackedStream, UsageCollector, UsageTeeMode, UsageTeeStream,
-    select_tee_mode,
-};
+use super::tee::{TrackedStream, UsageCollector, UsageOrigin, UsageTeeStream, select_tee_mode};
 use super::thought_sig::{
     SniffedErrorPrefix, THOUGHT_SIG_ERROR_SNIFF_MAX_BYTES, body_contains_thought_signature,
     is_invalid_thought_signature_error, replay_buffered_stream, sniff_error_prefix,
@@ -50,6 +46,7 @@ pub(super) async fn proxy_gemini_handler(
 
     let model = extract_model_name(path_and_query);
     if model == "unknown"
+        || model.len() > companion_core::MAX_GEMINI_MODEL_LEN
         || model == "."
         || model.contains("..")
         || model.contains(['?', '#', '/', '\\', '%', ';'])
@@ -157,20 +154,17 @@ pub(super) async fn proxy_gemini_handler(
 
     let stream_guard = state.enter_request();
     let body = if status.is_success() {
-        let collector = match select_tee_mode(upstream.content_type.as_deref(), path_and_query) {
-            UsageTeeMode::Sse => UsageCollector::Sse(SseUsageTracker::new()),
-            UsageTeeMode::UnaryJson => UsageCollector::UnaryJson {
-                buf: Vec::new(),
-                max_bytes: DEFAULT_MAX_JSON_TEE_BYTES,
-                overflowed: false,
-            },
-        };
+        let collector = UsageCollector::from_mode(select_tee_mode(
+            upstream.content_type.as_deref(),
+            path_and_query,
+        ));
         let model = extract_model_name(path_and_query);
         Body::from_stream(UsageTeeStream {
             inner: upstream.stream,
             collector,
             stats: Arc::clone(state.stats()),
             usage_sink: Arc::clone(state.usage_sink()),
+            origin: UsageOrigin::GeminiProxy,
             model,
             started_at,
             finalized: false,

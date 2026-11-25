@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior, params};
 
-use super::{USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION, UsageEvent, UsageSink};
+use super::{
+    USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION, UsageEvent, UsageRange, UsageSink, UsageSummary,
+};
 use crate::config::CoreError;
 use crate::fs_safe::{self, FsError, OpenRegularMode};
 
-const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+pub(super) const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const SQLITE_INIT_BUSY_RETRIES: u32 = 16;
 
 const SCHEMA_V1_DDL: &str = "
@@ -56,8 +58,73 @@ fn u64_to_sqlite_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn sqlite_i64_to_u64(value: i64) -> u64 {
+pub(super) fn sqlite_i64_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
+}
+
+pub(super) fn db_error(db_path: &Path, err: impl fmt::Display) -> CoreError {
+    CoreError::UsageDatabase {
+        path: db_path.to_path_buf(),
+        reason: err.to_string(),
+    }
+}
+
+pub(super) fn sqlite_related_paths(db_path: &Path) -> [PathBuf; 4] {
+    [
+        db_path.to_path_buf(),
+        fs_safe::append_os_suffix(db_path, "-wal"),
+        fs_safe::append_os_suffix(db_path, "-shm"),
+        fs_safe::append_os_suffix(db_path, "-journal"),
+    ]
+}
+
+pub(super) fn validate_sqlite_paths(db_path: &Path) -> Result<Option<fs::Metadata>, CoreError> {
+    let paths = sqlite_related_paths(db_path);
+    let db_meta = fs_safe::inspect_regular_file_if_exists(&paths[0], None)?;
+    for sidecar in &paths[1..] {
+        let _ = fs_safe::inspect_regular_file_if_exists(sidecar, None)?;
+    }
+    Ok(db_meta)
+}
+
+pub(super) fn check_schema_version(db_path: &Path, version: u32) -> Result<(), CoreError> {
+    if version > USAGE_DB_SCHEMA_VERSION {
+        return Err(CoreError::UsageDatabase {
+            path: db_path.to_path_buf(),
+            reason: format!(
+                "unsupported usage database schema version {version} (supported: {USAGE_DB_SCHEMA_VERSION})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn read_user_version_with_busy_retry(
+    db_path: &Path,
+    conn: &Connection,
+) -> Result<u32, CoreError> {
+    let mut last_busy = None;
+    for attempt in 0..SQLITE_INIT_BUSY_RETRIES {
+        match conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)) {
+            Ok(raw) => {
+                return u32::try_from(raw).map_err(|_| {
+                    db_error(
+                        db_path,
+                        format!("invalid negative or out-of-range user_version {raw}"),
+                    )
+                });
+            }
+            Err(err) if is_busy_or_locked(&err) => {
+                last_busy = Some(err);
+                std::thread::sleep(Duration::from_millis(5 * u64::from(attempt + 1)));
+            }
+            Err(err) => return Err(db_error(db_path, err)),
+        }
+    }
+    Err(db_error(
+        db_path,
+        last_busy.expect("SQLITE_INIT_BUSY_RETRIES > 0 guarantees a busy error"),
+    ))
 }
 
 fn is_busy_or_locked(err: &rusqlite::Error) -> bool {
@@ -101,28 +168,15 @@ impl SqliteUsageSink {
     }
 
     fn db_error(&self, err: impl fmt::Display) -> CoreError {
-        CoreError::UsageDatabase {
-            path: self.db_path.clone(),
-            reason: err.to_string(),
-        }
+        db_error(&self.db_path, err)
     }
 
     fn sqlite_related_paths(&self) -> [PathBuf; 4] {
-        [
-            self.db_path.clone(),
-            fs_safe::append_os_suffix(&self.db_path, "-wal"),
-            fs_safe::append_os_suffix(&self.db_path, "-shm"),
-            fs_safe::append_os_suffix(&self.db_path, "-journal"),
-        ]
+        sqlite_related_paths(&self.db_path)
     }
 
     fn validate_sqlite_paths(&self) -> Result<Option<fs::Metadata>, CoreError> {
-        let paths = self.sqlite_related_paths();
-        let db_meta = fs_safe::inspect_regular_file_if_exists(&paths[0], None)?;
-        for sidecar in &paths[1..] {
-            let _ = fs_safe::inspect_regular_file_if_exists(sidecar, None)?;
-        }
-        Ok(db_meta)
+        validate_sqlite_paths(&self.db_path)
     }
 
     fn tighten_sqlite_file_permissions(&self) -> Result<(), CoreError> {
@@ -133,15 +187,7 @@ impl SqliteUsageSink {
     }
 
     fn check_schema_version(&self, version: u32) -> Result<(), CoreError> {
-        if version > USAGE_DB_SCHEMA_VERSION {
-            return Err(CoreError::UsageDatabase {
-                path: self.db_path.clone(),
-                reason: format!(
-                    "unsupported usage database schema version {version} (supported: {USAGE_DB_SCHEMA_VERSION})"
-                ),
-            });
-        }
-        Ok(())
+        check_schema_version(&self.db_path, version)
     }
 
     fn read_user_version(&self, conn: &Connection) -> Result<u32, CoreError> {
@@ -156,24 +202,7 @@ impl SqliteUsageSink {
     }
 
     fn read_user_version_with_busy_retry(&self, conn: &Connection) -> Result<u32, CoreError> {
-        let mut last_busy = None;
-        for attempt in 0..SQLITE_INIT_BUSY_RETRIES {
-            match conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)) {
-                Ok(raw) => {
-                    return u32::try_from(raw).map_err(|_| {
-                        self.db_error(format!(
-                            "invalid negative or out-of-range user_version {raw}"
-                        ))
-                    });
-                }
-                Err(err) if is_busy_or_locked(&err) => {
-                    last_busy = Some(err);
-                    std::thread::sleep(Duration::from_millis(5 * u64::from(attempt + 1)));
-                }
-                Err(err) => return Err(self.db_error(err)),
-            }
-        }
-        Err(self.db_error(last_busy.expect("SQLITE_INIT_BUSY_RETRIES > 0 guarantees a busy error")))
+        read_user_version_with_busy_retry(&self.db_path, conn)
     }
 
     fn configure_and_migrate(&self, conn: &mut Connection) -> Result<(), CoreError> {
@@ -375,6 +404,10 @@ impl SqliteUsageSink {
         drop(conn);
         self.tighten_sqlite_file_permissions()?;
         Ok(events)
+    }
+
+    pub fn query_usage_summary(&self, range: UsageRange) -> Result<UsageSummary, CoreError> {
+        super::query::query_usage_summary(&self.usage_dir, range)
     }
 }
 

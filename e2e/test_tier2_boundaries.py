@@ -1556,7 +1556,10 @@ class TestTier2F8McpBoundaries(E2ETestCase):
         tools = {t["name"]: t for t in mcp.list_tools().get("tools", []) if isinstance(t, dict) and "name" in t}
         schema = tools["save_settings"].get("inputSchema") or {}
         self.assertIs(schema.get("additionalProperties"), False, schema)
-        self.assertEqual(set((schema.get("properties") or {}).keys()), {"proxy", "cloudcode", "providers"})
+        self.assertEqual(
+            set((schema.get("properties") or {}).keys()),
+            {"proxy", "cloudcode", "providers", "account_plan"},
+        )
         defs = schema.get("$defs") or {}
         for def_name in (
             "ProxySettingsPatch",

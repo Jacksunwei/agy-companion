@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::{CloudCodeUpstream, DEFAULT_CLOUDCODE_UPSTREAM_URL};
 
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const MAX_RECENT_CALLS: usize = 32;
+pub const MAX_SESSION_MODELS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -45,11 +47,47 @@ pub struct CloudCodeStatsSnapshot {
     pub last_catalog_included_proxy_models: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentCallSnapshot {
+    pub timestamp_ms: u64,
+    pub provider: String,
+    pub source: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub latency_ms: u64,
+    #[serde(default)]
+    pub cold_start: bool,
+    #[serde(default)]
+    pub cache_break: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSessionStats {
+    pub provider: String,
+    pub source: String,
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_latency_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub usage: UsageStatsSnapshot,
     #[serde(default)]
     pub cloudcode: CloudCodeStatsSnapshot,
+    #[serde(default)]
+    pub proxy_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub recent_calls: Vec<RecentCallSnapshot>,
+    #[serde(default)]
+    pub by_model: Vec<ModelSessionStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,11 +264,45 @@ mod tests {
                 last_catalog_refresh_at_ms: Some(1_700_000_000_000),
                 last_catalog_included_proxy_models: Some(true),
             },
+            proxy_rss_bytes: Some(24 * 1024 * 1024),
+            recent_calls: vec![RecentCallSnapshot {
+                timestamp_ms: 1_700_000_000_123,
+                provider: "gemini".to_string(),
+                source: "proxy".to_string(),
+                model: "gemini-4-carbon".to_string(),
+                input_tokens: 1000,
+                cached_tokens: 600,
+                output_tokens: 250,
+                reasoning_tokens: 80,
+                latency_ms: 420,
+                cold_start: false,
+                cache_break: false,
+            }],
+            by_model: vec![ModelSessionStats {
+                provider: "gemini".to_string(),
+                source: "proxy".to_string(),
+                model: "gemini-4-carbon".to_string(),
+                requests: 5,
+                input_tokens: 1000,
+                cached_tokens: 600,
+                output_tokens: 250,
+                reasoning_tokens: 80,
+                total_latency_ms: 2100,
+            }],
         };
 
         let val = serde_json::to_value(&snap).expect("to_value");
         let root = val.as_object().expect("root object");
-        assert_eq!(root.len(), 2);
+        assert_eq!(root.len(), 5);
+        for k in [
+            "usage",
+            "cloudcode",
+            "proxy_rss_bytes",
+            "recent_calls",
+            "by_model",
+        ] {
+            assert!(root.contains_key(k), "missing root key {k}");
+        }
         let usage = root["usage"].as_object().expect("usage object");
         assert_eq!(usage.len(), 6);
         for k in [
@@ -254,16 +326,80 @@ mod tests {
             assert!(cc.contains_key(k), "missing cloudcode key {k}");
         }
 
-        // Partial {"usage": {...}} deserializes cleanly with default cloudcode
+        let roundtrip: StatsSnapshot =
+            serde_json::from_value(val).expect("roundtrip full StatsSnapshot");
+        assert_eq!(roundtrip, snap);
+
+        // Partial {"usage": {...}} deserializes cleanly with default additive fields
         let partial: StatsSnapshot = serde_json::from_str(
             r#"{"usage":{"requests":1,"prompt_tokens":10,"cached_tokens":0,"output_tokens":5,"reasoning_tokens":0,"cache_hit_ratio":0.0}}"#,
         )
         .expect("partial stats");
         assert_eq!(partial.usage.requests, 1);
         assert_eq!(partial.cloudcode, CloudCodeStatsSnapshot::default());
+        assert_eq!(partial.proxy_rss_bytes, None);
+        assert!(partial.recent_calls.is_empty());
+        assert!(partial.by_model.is_empty());
 
         // Empty object {} must fail deserialization
         assert!(serde_json::from_str::<StatsSnapshot>("{}").is_err());
+    }
+
+    #[test]
+    fn stats_snapshot_worst_case_payload_stays_under_probe_budget() {
+        let long_model = "m".repeat(128);
+        let snap = StatsSnapshot {
+            usage: UsageStatsSnapshot {
+                requests: u64::MAX,
+                prompt_tokens: u64::MAX,
+                cached_tokens: u64::MAX,
+                output_tokens: u64::MAX,
+                reasoning_tokens: u64::MAX,
+                cache_hit_ratio: 0.999_999_999_999_999_9,
+            },
+            cloudcode: CloudCodeStatsSnapshot {
+                mode: "fixed".to_string(),
+                resolved_upstream: Some(format!("https://{}.example.com", "a".repeat(200))),
+                last_catalog_refresh_at_ms: Some(u64::MAX),
+                last_catalog_included_proxy_models: Some(true),
+            },
+            proxy_rss_bytes: Some(u64::MAX),
+            recent_calls: (0..MAX_RECENT_CALLS)
+                .map(|_| RecentCallSnapshot {
+                    timestamp_ms: u64::MAX,
+                    provider: "antigravity".to_string(),
+                    source: "builtin".to_string(),
+                    model: long_model.clone(),
+                    input_tokens: u64::MAX,
+                    cached_tokens: u64::MAX,
+                    output_tokens: u64::MAX,
+                    reasoning_tokens: u64::MAX,
+                    latency_ms: u64::MAX,
+                    cold_start: true,
+                    cache_break: true,
+                })
+                .collect(),
+            by_model: (0..MAX_SESSION_MODELS)
+                .map(|_| ModelSessionStats {
+                    provider: "antigravity".to_string(),
+                    source: "builtin".to_string(),
+                    model: long_model.clone(),
+                    requests: u64::MAX,
+                    input_tokens: u64::MAX,
+                    cached_tokens: u64::MAX,
+                    output_tokens: u64::MAX,
+                    reasoning_tokens: u64::MAX,
+                    total_latency_ms: u64::MAX,
+                })
+                .collect(),
+        };
+
+        let bytes = serde_json::to_vec(&snap).expect("serialize worst-case StatsSnapshot");
+        assert!(
+            bytes.len() < 48 * 1024,
+            "worst-case StatsSnapshot JSON ({} bytes) must stay strictly below 48 KiB (< 64 KiB MAX_PROBE_BODY_BYTES)",
+            bytes.len()
+        );
     }
 
     #[test]
