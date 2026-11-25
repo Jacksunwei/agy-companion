@@ -470,7 +470,11 @@ impl CloudCodeClient {
                     } else if let Some(last_prod) = self.inner.cache.last_resolved_prod() {
                         (last_prod, false)
                     } else {
-                        (false, false)
+                        // Personal Google AI Pro either populates `use_prod=false` via loadCodeAssist
+                        // first or fetches flags from aicode.googleapis.com; PayGo/Enterprise skips
+                        // loadCodeAssist and needs prod (`cloudcode-pa.googleapis.com`) for Mendel
+                        // flags (such as `enable-mcp-apps`), falling back to daily if prod rejects.
+                        (true, false)
                     };
 
                     let (primary_url, primary_is_prod, fallback_url, fallback_is_prod) =
@@ -3161,7 +3165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_experiments_falls_back_from_daily_to_prod_and_caches_account_route() {
+    async fn list_experiments_probes_prod_first_with_daily_fallback_and_caches_account_route() {
         use axum::routing::post;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3176,7 +3180,10 @@ mod tests {
                 let hits = Arc::clone(&daily_hits_c);
                 async move {
                     hits.fetch_add(1, Ordering::SeqCst);
-                    (StatusCode::FORBIDDEN, r#"{"error":"denied on daily"}"#)
+                    (
+                        StatusCode::OK,
+                        r#"{"flags":[{"name":"enable-mcp-apps","boolValue":true}]}"#,
+                    )
                 }
             }),
         );
@@ -3185,14 +3192,22 @@ mod tests {
         let prod_app = axum::Router::new()
             .route(
                 "/v1internal:listExperiments",
-                post(move || {
+                post(move |headers: HeaderMap| {
                     let hits = Arc::clone(&prod_hits_c);
                     async move {
                         hits.fetch_add(1, Ordering::SeqCst);
-                        (
-                            StatusCode::OK,
-                            r#"{"flags":[{"name":"enable-mcp-apps","boolValue":true}]}"#,
-                        )
+                        let is_consumer = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v.contains("consumer-token"));
+                        if is_consumer {
+                            (StatusCode::FORBIDDEN, r#"{"error":"use daily"}"#)
+                        } else {
+                            (
+                                StatusCode::OK,
+                                r#"{"flags":[{"name":"enable-mcp-apps","boolValue":true}]}"#,
+                            )
+                        }
                     }
                 }),
             )
@@ -3229,12 +3244,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
+        let mut paygo_headers = HeaderMap::new();
+        paygo_headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer paygo-token-1"),
         );
-        headers.insert(
+        paygo_headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
@@ -3243,30 +3258,56 @@ mod tests {
             .forward_raw(
                 Method::POST,
                 "/v1internal:listExperiments",
-                &headers,
+                &paygo_headers,
                 Bytes::from_static(br#"{"project":"weisun-cai"}"#),
             )
             .await
             .unwrap();
         assert_eq!(exp_resp.status, StatusCode::OK);
-        assert_eq!(daily_hits.load(Ordering::SeqCst), 1);
         assert_eq!(prod_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(daily_hits.load(Ordering::SeqCst), 0);
         assert_eq!(
             client.resolved_upstream_url().as_deref(),
             Some(format!("http://{prod_addr}").as_str())
         );
 
-        // Subsequent fetchAvailableModels for the same account goes directly to cached prod.
+        // Subsequent fetchAvailableModels for the same PayGo account goes directly to cached prod.
         let models_resp = client
             .forward_fetch_available_models(
                 "/v1internal:fetchAvailableModels",
-                &headers,
+                &paygo_headers,
                 Bytes::from_static(br#"{"project":"weisun-cai"}"#),
             )
             .await
             .unwrap();
         assert_eq!(models_resp.status, StatusCode::OK);
         assert_eq!(prod_models_hits.load(Ordering::SeqCst), 1);
+
+        // Consumer account rejected on prod falls back cleanly to daily and caches daily.
+        let mut consumer_headers = HeaderMap::new();
+        consumer_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer consumer-token-1"),
+        );
+        consumer_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let consumer_resp = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:listExperiments",
+                &consumer_headers,
+                Bytes::from_static(br#"{}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(consumer_resp.status, StatusCode::OK);
+        assert_eq!(daily_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.resolved_upstream_url().as_deref(),
+            Some(format!("http://{daily_addr}").as_str())
+        );
 
         daily_server.abort();
         prod_server.abort();
