@@ -4,7 +4,7 @@
 
 **Goal:** Ship Milestone 1 of `agy-companion` — a standalone Rust binary delivering a byte-for-byte Gemini API pass-through proxy with implicit-cache observability, an embedded Antigravity MCP App (`aux_pane` + `global`) Settings UI, a validated Antigravity plugin bundle, and npm/PyPI binary-shim packaging scaffolds.
 
-**Architecture:** A 5-crate Rust workspace (`companion-core`, `companion-providers`, `companion-proxy`, `companion-ui-mcp`, `companion-cli`) compiles to a single zero-dependency binary `agy-companion`. `agy-companion serve` runs the `axum` + `reqwest` (`rustls`) loopback proxy on `127.0.0.1:4141`, forwarding Gemini API requests untouched while tee-ing `usageMetadata` to rolling stats and a local JSONL `UsageSink`. `agy-companion ui-mcp` runs a stdio `rmcp` server embedding a Vite single-file MCP App HTML bundle via `include_str!`.
+**Architecture:** A 5-crate Rust workspace (`companion-core`, `companion-providers`, `companion-proxy`, `companion-ui-mcp`, `companion-cli`) compiles to a single zero-dependency binary `agy-companion`. `agy-companion serve` runs the `axum` + `reqwest` (`rustls`) loopback proxy on `127.0.0.1:24141`, forwarding Gemini API requests untouched while tee-ing `usageMetadata` to rolling stats and a local JSONL `UsageSink`. `agy-companion ui-mcp` runs a stdio `rmcp` server embedding a Vite single-file MCP App HTML bundle via `include_str!`.
 
 **Tech Stack:** Rust 1.96 (`tokio 1`, `axum 0.8`, `reqwest 0.13` + `rustls`, `rmcp 3.11`, `clap 4`, `serde`/`serde_json`, `chrono`, `uuid`, `thiserror`, `tracing`), Vite 8 + `@modelcontextprotocol/ext-apps 2` + `vite-plugin-singlefile` (build-time only), npm (`@agy-companion/<os>-<arch>`), PyPI (`maturin` `bindings = "bin"`), Antigravity plugin CLI (`agy plugin validate --strict`).
 
@@ -101,7 +101,7 @@ Expected: FAIL (`not yet implemented`).
 - [ ] **Step 4: Implement `config.rs`, `redaction.rs`, and `usage.rs` minimally to go green**
 
 Key types & behaviors:
-- `Config` (`schema_version: u32` defaulting to `1`, `listen_host: String` validated to `127.0.0.1`/`localhost`, `listen_port: u16` defaulting to `4141`, `gemini: GeminiConfig { base_url, api_key, default_model, timeout_secs }`, `usage_dir: Option<PathBuf>`).
+- `Config` (`schema_version: u32` defaulting to `1`, `listen_host: String` validated to `127.0.0.1`/`localhost`, `listen_port: u16` defaulting to `24141`, `gemini: GeminiConfig { base_url, api_key, default_model, timeout_secs }`, `usage_dir: Option<PathBuf>`).
 - `Config::load_or_default(path)` and `Config::save_secure(path)` (creates parent dirs, writes atomically via temp file + rename, enforces mode `0600` on Unix).
 - `RedactedConfig` (never contains plaintext `api_key`; carries `api_key_configured: bool` and `api_key_hint: Option<String>`).
 - `GeminiUsageMetadata::parse_from_json(&[u8]) -> Option<GeminiUsageMetadata>` extracting `promptTokenCount`, `candidatesTokenCount`, `cachedContentTokenCount`, `thoughtsTokenCount`.
@@ -239,7 +239,7 @@ git commit -m "feat(proxy): add loopback Gemini pass-through server with SSE usa
 - Registers `app.ontoolinput`, `app.ontoolresult`, and `app.onhostcontextchanged` **before** calling `await app.connect()`.
 - Strictly uses `document.createElement`, `textContent`, and `replaceChildren()` — **zero** `innerHTML`, `outerHTML`, or `document.write`; **zero** `localStorage`; **zero** `alert()`/`confirm()`.
 - Sections rendered:
-  1. **Proxy Status & Version Skew Bar** (`Running`/`Stopped`, version, `127.0.0.1:4141`, cache hit rate %).
+  1. **Proxy Status & Version Skew Bar** (`Running`/`Stopped`, version, `127.0.0.1:24141`, cache hit rate %).
   2. **Gemini Settings Form** (write-only API key password input with masked hint badge, default model input, upstream base URL input, eager Save via `save_settings` + **Test Connection** via `test_connection`).
   3. **Antigravity CLI Setup Snippet** (copyable `customModelsConfig` JSON block for `~/.gemini/antigravity-cli/settings.json`).
   4. **Usage & Cost Tab Placeholder** (clean read-only card showing live session tokens + note that full `agy-companion usage` reports are coming next).
@@ -294,7 +294,7 @@ git commit -m "feat(ui-mcp): add embedded MCP App aux-pane settings UI and rmcp 
 
 Tests in `crates/companion-cli/src/main.rs`:
 - `parses_serve_ui_mcp_doctor_and_models_subcommands`
-- `models_command_emits_valid_custom_models_config_json` (verifies `gemini-api://http://127.0.0.1:4141/models/...` entries)
+- `models_command_emits_valid_custom_models_config_json` (verifies `gemini-api://http://127.0.0.1:24141/models/...` entries)
 - `doctor_detects_version_skew_between_binary_and_health_response`
 
 - [ ] **Step 2: Run `cargo test -p companion-cli` and confirm tests fail**
@@ -305,7 +305,7 @@ Expected: FAIL.
 - [ ] **Step 3: Implement `crates/companion-cli/src/main.rs` (binary name `agy-companion`)**
 
 Subcommands:
-- `agy-companion serve [--port 4141] [--config <path>]` — starts loopback proxy with structured stderr logging (never prints secrets).
+- `agy-companion serve [--port 24141] [--config <path>]` — starts loopback proxy with structured stderr logging (never prints secrets).
 - `agy-companion ui-mcp [--data-dir <path>] [--config <path>]` — runs stdio `rmcp` server cleanly (stdout reserved strictly for JSON-RPC; all logs to stderr!).
 - `agy-companion doctor` — checks config file permissions, proxy `/health` reachability, version match, and whether `GEMINI_API_KEY` / `GOOGLE_GEMINI_BASE_URL` are configured.
 - `agy-companion models [--json]` — prints ready-to-paste `customModelsConfig` entries for `~/.gemini/antigravity-cli/settings.json`.

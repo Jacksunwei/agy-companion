@@ -23,7 +23,7 @@ use crate::{
 pub const PLUGIN_DIR_NAME: &str = "agy-companion";
 pub const WINDOWS_SHORTCUT_NAME: &str = "Antigravity (Companion).lnk";
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
-const PORT_FALLBACK_SPAN: u16 = 9; // 4141..=4150
+const PORT_FALLBACK_SPAN: u16 = 9; // 24141..=24150
 const INSTALL_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const FRESH_PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const PROXY_START_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1761,7 +1761,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let config_existed = precheck_existing_config_file(&config_path)?;
     let mut config = load_config_checked(&config_path)?;
 
-    // Fresh-install port 4141..=4150 fallback runs even when --no-start-proxy is set.
+    // Fresh-install port 24141..=24150 fallback runs even when --no-start-proxy is set.
     // Defer persisting config.json until preconditions, staging, and swaps succeed.
     let mut port_auto_selected = false;
     if !config_existed {
@@ -2019,8 +2019,8 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     if report.port_auto_selected {
         writeln!(
             out,
-            "  Port:     {} (auto-selected; default 4141 was occupied)",
-            report.listen_port
+            "  Port:     {} (auto-selected; default {} was occupied)",
+            report.listen_port, DEFAULT_LISTEN_PORT
         )?;
     } else {
         writeln!(out, "  Port:     {}", report.listen_port)?;

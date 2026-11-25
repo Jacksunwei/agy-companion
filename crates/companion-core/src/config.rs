@@ -13,7 +13,7 @@ use crate::redaction::{RedactedConfig, api_key_hint};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
-pub const DEFAULT_LISTEN_PORT: u16 = 4141;
+pub const DEFAULT_LISTEN_PORT: u16 = 24141;
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const CLOUDCODE_DAILY_UPSTREAM_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const CLOUDCODE_PROD_UPSTREAM_URL: &str = "https://cloudcode-pa.googleapis.com";
@@ -1320,7 +1320,7 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.schema_version, 1);
         assert_eq!(cfg.listen_host, "127.0.0.1");
-        assert_eq!(cfg.listen_port, 4141);
+        assert_eq!(cfg.listen_port, 24141);
         assert_eq!(
             cfg.gemini.base_url,
             "https://generativelanguage.googleapis.com"

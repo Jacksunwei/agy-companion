@@ -1718,23 +1718,23 @@ class TestTier2RolloutR22InstallCliBoundaries(E2ETestCase):
         self.assertTrue((plugin_link / "plugin.json").is_file())
         self.assertIn("UNRELATED_USER_TOOL", local_bin.read_text(encoding="utf-8"))
 
-    def test_t2_r22_fresh_install_port_4141_collision_falls_back_to_4142_through_4150(self) -> None:
-        """R22: Fresh install with non-companion listener on 4141 auto-falls back to 4142..=4150 and writes 0600 config."""
+    def test_t2_r22_fresh_install_port_24141_collision_falls_back_to_24142_through_24150(self) -> None:
+        """R22: Fresh install with non-companion listener on 24141 auto-falls back to 24142..=24150 and writes 0600 config."""
         binary = self.require_binary()
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            probe.bind(("127.0.0.1", 4141))
+            probe.bind(("127.0.0.1", 24141))
         except OSError:
-            self.skipTest("Host port 4141 is already occupied; skipping 4141 collision fallback test safely")
+            self.skipTest("Host port 24141 is already occupied; skipping 24141 collision fallback test safely")
         finally:
             probe.close()
 
-        blocker = MockGeminiServer(port=4141)
+        blocker = MockGeminiServer(port=24141)
         blocker.set_handler(lambda _req: JsonAction(status=500, payload={"error": "occupied"}))
         try:
             self.stack.enter_context(blocker)
         except OSError:
-            self.skipTest("Host port 4141 is already occupied; skipping 4141 collision fallback test safely")
+            self.skipTest("Host port 24141 is already occupied; skipping 24141 collision fallback test safely")
 
         env = self.make_env()
         # Ensure fresh install with NO pre-existing config.json
@@ -1758,8 +1758,8 @@ class TestTier2RolloutR22InstallCliBoundaries(E2ETestCase):
             self.assertEqual(stat.S_IMODE(os.lstat(env.config_path).st_mode), 0o600)
         written = json.loads(env.config_path.read_text(encoding="utf-8"))
         chosen_port = written["listen_port"]
-        self.assertGreaterEqual(chosen_port, 4142)
-        self.assertLessEqual(chosen_port, 4150)
+        self.assertGreaterEqual(chosen_port, 24142)
+        self.assertLessEqual(chosen_port, 24150)
 
 
 class TestTier2RolloutR23UninstallCliBoundaries(E2ETestCase):

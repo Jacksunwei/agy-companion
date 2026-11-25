@@ -1472,7 +1472,7 @@ class TestTier2F9CliBoundaries(E2ETestCase):
             all("127.0.0.1:15151" in str(m.get("modelName", "")) for m in models),
             f"Expected port 15151 in all customModels: {models!r}",
         )
-        self.assertFalse(any("127.0.0.1:4141" in str(m.get("modelName", "")) for m in models))
+        self.assertFalse(any("127.0.0.1:24141" in str(m.get("modelName", "")) for m in models))
 
 
 class TestTier2F10PluginBoundaries(E2ETestCase):

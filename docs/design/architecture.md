@@ -110,7 +110,7 @@ Because Antigravity CLI, IDE extensions, and SDK all speak **one inbound wire fo
 
 ```mermaid
 flowchart LR
-    Caller["Antigravity CLI / IDE / SDK (Gemini API inbound)"] --> Router["companion-proxy Router (127.0.0.1:4141)"]
+    Caller["Antigravity CLI / IDE / SDK (Gemini API inbound)"] --> Router["companion-proxy Router (127.0.0.1:24141)"]
     Router -->|"Gemini model route"| FastPath["Gemini Byte-for-Byte Pass-Through"]
     Router -->|"Non-Gemini model route"| Adapter["Direct 1-Hop Adapter (Gemini to Provider)"]
     FastPath --> Gemini["Gemini API (generativelanguage.googleapis.com)"]
@@ -137,10 +137,10 @@ If a second inbound format is ever added later, shared types can be factored int
 #### B. Aux Panel Settings UI (`companion-ui-mcp` via `rmcp` + `ui/`)
 - **Surfaces:** Registered with `aux_pane` (side panel `+` menu / beside chat) and `global` (full-page from **Plugins** in left sidebar) entrypoints, themed with Antigravity host CSS variables (`--color-background-*`, `--color-text-*`, `--color-border-*`).
 - **M1 Controls:**
-  1. **Proxy Status Bar:** Live sidecar state (`127.0.0.1:4141`), version, and binary-vs-plugin skew badge.
+  1. **Proxy Status Bar:** Live sidecar state (`127.0.0.1:24141`), version, and binary-vs-plugin skew badge.
   2. **Gemini Provider Settings:** Write-only API key input, default model/alias mapping, upstream base URL override, and **Test Connection** button.
   3. **Cache & Telemetry Panel:** Live implicit cache hit-rate (`cachedContentTokenCount / promptTokenCount`) and recent request metrics from `GET /api/stats`.
-  4. **Antigravity Setup Helper:** Copyable `customModelsConfig` (`gemini-api://http://127.0.0.1:4141/models/...`) JSON snippet for `~/.gemini/antigravity-cli/settings.json`.
+  4. **Antigravity Setup Helper:** Copyable `customModelsConfig` (`gemini-api://http://127.0.0.1:24141/models/...`) JSON snippet for `~/.gemini/antigravity-cli/settings.json`.
   5. **Future Tab Slot (TODO):** Usage & Cost dashboard (scales naturally in the `global` full-page view).
 
 #### C. Configuration, Usage Data Paths & Atomic Persistence

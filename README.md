@@ -1,6 +1,6 @@
 # Antigravity Companion (`agy-companion`)
 
-Bring your own models (BYOM) and track token usage and implicit cache hit rates in Google Antigravity (`agy`) via a single native Rust binary powering a loopback Gemini pass-through proxy (`127.0.0.1:4141`), native Dock/Launcher auto-start, and an embedded MCP App Settings UI (`ui://companion/settings.html`).
+Bring your own models (BYOM) and track token usage and implicit cache hit rates in Google Antigravity (`agy`) via a single native Rust binary powering a loopback Gemini pass-through proxy (`127.0.0.1:24141`), native Dock/Launcher auto-start, and an embedded MCP App Settings UI (`ui://companion/settings.html`).
 
 - **Version:** `0.1.0` | **License:** [Apache-2.0](LICENSE) | **Toolchain:** Rust `edition = "2024"` (`#![forbid(unsafe_code)]`)
 - **Repository:** <https://github.com/Jacksunwei/agy-companion>
@@ -10,7 +10,7 @@ Bring your own models (BYOM) and track token usage and implicit cache hit rates 
 ```mermaid
 flowchart LR
     Client["Antigravity App (Dock / Launcher) / agy CLI / SDKs"]
-    Proxy["companion-proxy<br/>127.0.0.1:4141 (Axum 0.8)<br/>64 MiB limit · mtime hot-reload · idle shutdown"]
+    Proxy["companion-proxy<br/>127.0.0.1:24141 (Axum 0.8)<br/>64 MiB limit · mtime hot-reload · idle shutdown"]
     Provider["companion-providers<br/>GeminiProvider (reqwest rustls)<br/>zero-compression · 900s timeout<br/>x-goog-api-key"]
     Gemini["Google Gemini API<br/>generativelanguage.googleapis.com"]
     Usage["JsonlUsageSink (0600 YYYY-MM.jsonl)<br/>GET /api/stats · GET /health"]
@@ -95,7 +95,7 @@ agy plugin install ./plugin && agy plugin list
 agy-companion launch
 ```
 
-*(Alternative — Gateway Mode)* If you prefer routing all Antigravity App calls exclusively through the proxy without Google OAuth, add `"gateway": {"url": "http://127.0.0.1:4141", "wireProtocol": "genai"}` to `~/.gemini/config/config.json` (`GET /v1beta/models` discovery).
+*(Alternative — Gateway Mode)* If you prefer routing all Antigravity App calls exclusively through the proxy without Google OAuth, add `"gateway": {"url": "http://127.0.0.1:24141", "wireProtocol": "genai"}` to `~/.gemini/config/config.json` (`GET /v1beta/models` discovery).
 
 See [`docs/design/dock-launcher-and-install.md`](docs/design/dock-launcher-and-install.md), [`plugin/README.md`](plugin/README.md), and [`plugin/skills/companion/SKILL.md`](plugin/skills/companion/SKILL.md) for full architecture, plugin usage, and troubleshooting.
 
@@ -113,23 +113,23 @@ agy-companion models --json
   "customModelsConfig": {
     "customModels": [
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-4-hydrogen",
         "label": "Antigravity Companion (gemini-4-hydrogen)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-4-argon",
         "label": "Antigravity Companion (gemini-4-argon)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-neon",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-4-neon",
         "label": "Antigravity Companion (gemini-4-neon)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-carbon",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-4-carbon",
         "label": "Antigravity Companion (gemini-4-carbon)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-3.8-flash",
         "label": "Antigravity Companion (gemini-3.8-flash)"
       }
     ]
@@ -140,7 +140,7 @@ agy-companion models --json
 Or route `agy` CLI / Gemini SDK traffic via environment variables and inline settings:
 
 ```bash
-export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4141"
+export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:24141"
 agy --settings '{"modelProvider":"gemini"}' -p "Hello from Antigravity Companion"
 ```
 
@@ -167,11 +167,11 @@ agy-companion doctor --json   # machine-readable JSON output
 
 | Surface | Invocation / Route | Flags / Behavior |
 | --- | --- | --- |
-| **Installer** | `agy-companion install` | `[--plugins-dir <DIR>]`, `[--no-launcher-hook]`, `[--no-start-proxy]`, `[--force]`, `[--json]`; embeds all 7 `plugin/` files, stages binary & plugin atomically, auto-selects free port `4141..=4150` on fresh install, replaces version-skewed proxy via 4-layer PID check, enables Dock hook / Windows `.lnk` |
+| **Installer** | `agy-companion install` | `[--plugins-dir <DIR>]`, `[--no-launcher-hook]`, `[--no-start-proxy]`, `[--force]`, `[--json]`; embeds all 7 `plugin/` files, stages binary & plugin atomically, auto-selects free port `24141..=24150` on fresh install, replaces version-skewed proxy via 4-layer PID check, enables Dock hook / Windows `.lnk` |
 | **Uninstaller** | `agy-companion uninstall` | `[--plugins-dir <DIR>]`, `[--purge]`, `[--dry-run]`, `[--json]`; strips all shell RCs (deletes empty `.zlogin`/`agy-companion.fish`), removes `env.sh` and plugin dir BEFORE stopping verified proxy, preserves `config.json` & `usage/` unless `--purge` |
 | **Dock Integration** | `agy-companion integration` | `enable\|disable\|status [--shell <zsh\|bash\|fish>] [--rc-file <PATH>] [--binary <PATH>] [--follow-rc-symlink] [--json]` |
 | **Login-Shell Helper** | `agy-companion hook-env` | `--ensure-running --print-port [--port <PORT>] [--config <CONFIG>] [--plugins-dir <DIR>]`; fail-open exit `0`, prints validated `u16` port only |
-| **Proxy Server** | `agy-companion serve` | `[--port <PORT>]` (`1–65535`, default `4141`), `[--config <CONFIG>]`, `[--adopt-running]` (`500ms` poll), `[--idle-shutdown-secs <SECS>]`; binds strictly to `127.0.0.1`, no `--host` flag |
+| **Proxy Server** | `agy-companion serve` | `[--port <PORT>]` (`1–65535`, default `24141`), `[--config <CONFIG>]`, `[--adopt-running]` (`500ms` poll), `[--idle-shutdown-secs <SECS>]`; binds strictly to `127.0.0.1`, no `--host` flag |
 | **Hybrid Launcher** | `agy-companion launch` | `[--port <PORT>]`, `[--config <CONFIG>]`, `[--app <PATH>]`, `[--print-env]`; auto-discovers macOS app / Windows `Antigravity.exe`, starts proxy if needed, emits `JETSKI_MCP_ENV_RESTORE_*` |
 | **MCP App Server** | `agy-companion ui-mcp` | `[--data-dir <DATA_DIR>]`, `[--config <CONFIG>]`; `stdout` strictly JSON-RPC, logs strictly `stderr` |
 | **Diagnostics** | `agy-companion doctor` | `[--config <CONFIG>]`, `[--port <PORT>]`, `[--json]`; checks config perms, schema, placeholder quarantine, `/health`, version skew, env vars |

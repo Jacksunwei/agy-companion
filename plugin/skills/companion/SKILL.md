@@ -37,23 +37,23 @@ Invoke the bundled MCP tool **`open_settings`** (on server `agy-companion_hub`, 
   "customModelsConfig": {
     "customModels": [
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-4-hydrogen",
         "label": "Antigravity Companion (gemini-4-hydrogen)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-4-argon",
         "label": "Antigravity Companion (gemini-4-argon)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-neon",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-4-neon",
         "label": "Antigravity Companion (gemini-4-neon)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-4-carbon",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-4-carbon",
         "label": "Antigravity Companion (gemini-4-carbon)"
       },
       {
-        "modelName": "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash",
+        "modelName": "gemini-api://http://127.0.0.1:24141/models/gemini-3.8-flash",
         "label": "Antigravity Companion (gemini-3.8-flash)"
       }
     ]
@@ -64,7 +64,7 @@ Invoke the bundled MCP tool **`open_settings`** (on server `agy-companion_hub`, 
 - When `modelProvider` is `"gemini"`, `agy` CLI requires `GEMINI_API_KEY` to be non-empty in the shell environment. If an API key is already saved in `agy-companion`'s config file, the proxy authenticates upstream with the saved key.
 - Alternatively, route CLI, IDE extensions, or SDK requests via:
   ```bash
-  export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4141"
+  export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:24141"
   ```
 
 ## 3. CLI Subcommands & Endpoints
@@ -75,14 +75,14 @@ Invoke the bundled MCP tool **`open_settings`** (on server `agy-companion_hub`, 
 | `agy-companion uninstall [--plugins-dir <DIR>] [--purge] [--dry-run] [--json]` | Strip shell RCs, delete `env.sh` and plugin before stopping verified proxy, remove binary (preserve config/usage unless `--purge`) |
 | `agy-companion integration enable\|disable\|status [--shell <zsh\|bash\|fish>] [--rc-file <PATH>] [--binary <PATH>] [--follow-rc-symlink] [--json]` | Manage macOS/Linux login-shell Dock/Launcher integration |
 | `agy-companion hook-env --ensure-running --print-port [--port <PORT>] [--config <CONFIG>] [--plugins-dir <DIR>]` | Fail-open login-shell hook helper: ensure Managed On-Demand Daemon is healthy and print validated `u16` port |
-| `agy-companion serve [--port <PORT>] [--config <CONFIG>] [--adopt-running] [--idle-shutdown-secs <SECS>]` | Run the loopback proxy (`127.0.0.1:4141` by default) with config mtime hot-reload, sidecar adoption (`500ms` poll), and optional idle shutdown |
+| `agy-companion serve [--port <PORT>] [--config <CONFIG>] [--adopt-running] [--idle-shutdown-secs <SECS>]` | Run the loopback proxy (`127.0.0.1:24141` by default) with config mtime hot-reload, sidecar adoption (`500ms` poll), and optional idle shutdown |
 | `agy-companion launch [--port <PORT>] [--config <CONFIG>] [--app <PATH>] [--print-env]` | Ensure proxy is running and launch Antigravity App in Hybrid Mode |
 | `agy-companion ui-mcp [--data-dir <DATA_DIR>] [--config <CONFIG>]` | Run the stdio MCP App server (stdout strictly JSON-RPC; logs to stderr) |
 | `agy-companion doctor [--config <CONFIG>] [--port <PORT>] [--json]` | Check config permissions (Unix `0600`; skipped on Windows), config validity, proxy `/health`, version/protocol skew, and env vars |
 | `agy-companion models [--json] [--port <PORT>] [--config <CONFIG>]` | Emit `customModelsConfig` JSON for `~/.gemini/antigravity-cli/settings.json` |
 | `agy-companion --version` | Print the binary version (`agy-companion 0.1.0`) |
 
-Local proxy HTTP endpoints (`127.0.0.1:4141`):
+Local proxy HTTP endpoints (`127.0.0.1:24141`):
 - `GET /health` — `{"status":"ok","version":"0.1.0","protocol_version":1}`
 - `GET /api/stats` — session request/token totals, `cache_hit_ratio`, `last_catalog_refresh_at_ms`, `last_catalog_included_proxy_models`, `cloudcode_mode`, and `cloudcode_resolved_upstream`
 - `POST /v1beta/models/{model}:generateContent` & `:streamGenerateContent?alt=sse` — byte-for-byte streaming pass-through
