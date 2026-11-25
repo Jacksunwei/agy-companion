@@ -81,12 +81,14 @@ pub struct CloudCodeBufferedResponse {
 struct AccountRoute {
     use_prod: bool,
     strip_user_project: bool,
+    authoritative: bool,
 }
 
 #[derive(Default)]
 struct RoutingCacheInner {
     entries: VecDeque<((u64, u64), AccountRoute)>,
     last_resolved_prod: Option<bool>,
+    last_resolved_authoritative: bool,
 }
 
 struct CloudCodeRoutingCache {
@@ -126,19 +128,58 @@ impl CloudCodeRoutingCache {
 
     fn put(&self, key: (u64, u64), route: AccountRoute) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pos) = inner.entries.iter().position(|(k, _)| *k == key) {
-            inner.entries.remove(pos);
-        }
+        let existing = inner
+            .entries
+            .iter()
+            .position(|(k, _)| *k == key)
+            .and_then(|pos| inner.entries.remove(pos))
+            .map(|(_, existing)| existing);
+
+        let effective = match existing {
+            Some(prev)
+                if !route.authoritative
+                    && (prev.authoritative || (prev.use_prod && !route.use_prod)) =>
+            {
+                // Never let a speculative probe (e.g. concurrent fetchAvailableModels hitting
+                // daily) downgrade an authoritative route or an already-working prod route for
+                // the same account.
+                AccountRoute {
+                    use_prod: prev.use_prod,
+                    strip_user_project: prev.strip_user_project || route.strip_user_project,
+                    authoritative: prev.authoritative,
+                }
+            }
+            _ => route,
+        };
+
         while inner.entries.len() >= ROUTING_CACHE_CAPACITY {
             inner.entries.pop_front();
         }
-        inner.entries.push_back((key, route));
-        inner.last_resolved_prod = Some(route.use_prod);
+        inner.entries.push_back((key, effective));
+
+        if effective.authoritative {
+            inner.last_resolved_prod = Some(effective.use_prod);
+            inner.last_resolved_authoritative = true;
+        } else if existing.is_none() || effective.use_prod || !inner.last_resolved_authoritative {
+            // Preserve prod if the same account was kept on prod above; otherwise reflect the
+            // newly observed account (or an upgrade from speculative daily -> prod).
+            if existing.is_none() || effective.use_prod || inner.last_resolved_prod != Some(true) {
+                inner.last_resolved_prod = Some(effective.use_prod);
+                inner.last_resolved_authoritative = false;
+            }
+        }
     }
 
-    fn record_without_key(&self, use_prod: bool) {
+    fn record_without_key(&self, use_prod: bool, authoritative: bool) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.last_resolved_prod = Some(use_prod);
+        if authoritative {
+            inner.last_resolved_prod = Some(use_prod);
+            inner.last_resolved_authoritative = true;
+        } else if !inner.last_resolved_authoritative
+            && (use_prod || inner.last_resolved_prod.is_none())
+        {
+            inner.last_resolved_prod = Some(use_prod);
+        }
     }
 
     fn last_resolved_prod(&self) -> Option<bool> {
@@ -146,6 +187,15 @@ impl CloudCodeRoutingCache {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .last_resolved_prod
+    }
+
+    fn last_resolved_prod_for_experiments(&self) -> Option<bool> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match inner.last_resolved_prod {
+            Some(true) => Some(true),
+            Some(false) if inner.last_resolved_authoritative => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -264,6 +314,7 @@ impl CloudCodeClient {
         auth_key: Option<(u64, u64)>,
         use_prod: bool,
         strip_user_project: bool,
+        authoritative: bool,
     ) {
         if let Some(key) = auth_key {
             self.inner.cache.put(
@@ -271,10 +322,11 @@ impl CloudCodeClient {
                 AccountRoute {
                     use_prod,
                     strip_user_project,
+                    authoritative,
                 },
             );
         } else {
-            self.inner.cache.record_without_key(use_prod);
+            self.inner.cache.record_without_key(use_prod, authoritative);
         }
     }
 
@@ -322,9 +374,16 @@ impl CloudCodeClient {
                             AccountRoute {
                                 use_prod: true,
                                 strip_user_project: true,
+                                authoritative: true,
                             },
                         );
                     }
+                    tracing::info!(
+                        rpc = "loadCodeAssist",
+                        upstream = %url,
+                        status = resp.status.as_u16(),
+                        "cloudcode metadata routed"
+                    );
                     resp
                 }
                 CloudCodeTarget::Auto {
@@ -347,9 +406,17 @@ impl CloudCodeClient {
 
                     match prod_res {
                         Ok((resp, used_strip)) if resp.status.is_success() => {
-                            if let Some(use_prod) = detect_prod_from_load_code_assist(&resp.body) {
-                                self.record_account_route(auth_key, use_prod, used_strip);
+                            let detected = detect_prod_from_load_code_assist(&resp.body);
+                            if let Some(use_prod) = detected {
+                                self.record_account_route(auth_key, use_prod, used_strip, true);
                             }
+                            tracing::info!(
+                                rpc = "loadCodeAssist",
+                                upstream = %prod_url,
+                                status = resp.status.as_u16(),
+                                detected_prod = ?detected,
+                                "cloudcode metadata routed"
+                            );
                             resp
                         }
                         Ok((prod_resp, _)) => {
@@ -371,7 +438,20 @@ impl CloudCodeClient {
                                     let use_prod =
                                         detect_prod_from_load_code_assist(&daily_resp.body)
                                             .unwrap_or(false);
-                                    self.record_account_route(auth_key, use_prod, daily_strip);
+                                    self.record_account_route(
+                                        auth_key,
+                                        use_prod,
+                                        daily_strip,
+                                        true,
+                                    );
+                                    tracing::info!(
+                                        rpc = "loadCodeAssist",
+                                        upstream = %daily_url,
+                                        status = daily_resp.status.as_u16(),
+                                        fallback = true,
+                                        detected_prod = use_prod,
+                                        "cloudcode metadata routed"
+                                    );
                                     daily_resp
                                 }
                                 _ => prod_resp,
@@ -397,7 +477,20 @@ impl CloudCodeClient {
                                         let use_prod =
                                             detect_prod_from_load_code_assist(&daily_resp.body)
                                                 .unwrap_or(false);
-                                        self.record_account_route(auth_key, use_prod, daily_strip);
+                                        self.record_account_route(
+                                            auth_key,
+                                            use_prod,
+                                            daily_strip,
+                                            true,
+                                        );
+                                        tracing::info!(
+                                            rpc = "loadCodeAssist",
+                                            upstream = %daily_url,
+                                            status = daily_resp.status.as_u16(),
+                                            fallback = true,
+                                            detected_prod = use_prod,
+                                            "cloudcode metadata routed"
+                                        );
                                     }
                                     daily_resp
                                 }
@@ -448,6 +541,7 @@ impl CloudCodeClient {
                             AccountRoute {
                                 use_prod: true,
                                 strip_user_project: true,
+                                authoritative: true,
                             },
                         );
                     }
@@ -463,18 +557,34 @@ impl CloudCodeClient {
                     daily_url,
                     prod_url,
                 } => {
-                    let (prefer_prod, initial_strip) = if let Some(route) = cached {
-                        (route.use_prod, route.strip_user_project)
+                    let (prefer_prod, initial_strip, primary_authoritative) = if let Some(route) =
+                        cached
+                    {
+                        if route.authoritative || route.use_prod {
+                            (
+                                route.use_prod,
+                                route.strip_user_project,
+                                route.authoritative,
+                            )
+                        } else {
+                            // Never trust a speculative daily probe (e.g. fetchAvailableModels
+                            // winning a startup race on a PayGo account): probe prod first so
+                            // PayGo/Enterprise accounts receive official prod Mendel flags.
+                            (true, route.strip_user_project, false)
+                        }
                     } else if let Some(ua_prod) = detect_auth_method_from_headers(inbound_headers) {
-                        (ua_prod, false)
-                    } else if let Some(last_prod) = self.inner.cache.last_resolved_prod() {
-                        (last_prod, false)
+                        (ua_prod, false, true)
+                    } else if let Some(last_prod) =
+                        self.inner.cache.last_resolved_prod_for_experiments()
+                    {
+                        (last_prod, false, false)
                     } else {
-                        // Personal Google AI Pro either populates `use_prod=false` via loadCodeAssist
-                        // first or fetches flags from aicode.googleapis.com; PayGo/Enterprise skips
-                        // loadCodeAssist and needs prod (`cloudcode-pa.googleapis.com`) for Mendel
-                        // flags (such as `enable-mcp-apps`), falling back to daily if prod rejects.
-                        (true, false)
+                        // Personal Google AI Pro either populates `use_prod=false` via
+                        // loadCodeAssist first or fetches flags from aicode.googleapis.com;
+                        // PayGo/Enterprise needs prod (`cloudcode-pa.googleapis.com`) for
+                        // Mendel flags (such as `enable-mcp-apps`), falling back to daily if
+                        // prod rejects.
+                        (true, false, false)
                     };
 
                     let (primary_url, primary_is_prod, fallback_url, fallback_is_prod) =
@@ -506,11 +616,13 @@ impl CloudCodeClient {
                             auth_key,
                             primary_is_prod,
                             initial_strip || used_strip,
+                            primary_authoritative,
                         );
                         tracing::info!(
                             rpc = "listExperiments",
                             upstream = %primary_url,
                             status = resp.status.as_u16(),
+                            authoritative = primary_authoritative,
                             "cloudcode metadata routed"
                         );
                         primary_res.unwrap().0
@@ -533,12 +645,18 @@ impl CloudCodeClient {
                                 if resp.status == StatusCode::OK
                                     && response_has_non_empty_flags(&resp.body) =>
                             {
-                                self.record_account_route(auth_key, fallback_is_prod, used_strip);
+                                self.record_account_route(
+                                    auth_key,
+                                    fallback_is_prod,
+                                    used_strip,
+                                    true,
+                                );
                                 tracing::info!(
                                     rpc = "listExperiments",
                                     upstream = %fallback_url,
                                     status = resp.status.as_u16(),
                                     fallback = true,
+                                    authoritative = true,
                                     "cloudcode metadata routed"
                                 );
                                 resp
@@ -676,9 +794,16 @@ impl CloudCodeClient {
                         AccountRoute {
                             use_prod: true,
                             strip_user_project: true,
+                            authoritative: true,
                         },
                     );
                 }
+                tracing::info!(
+                    rpc = "fetchAvailableModels",
+                    upstream = %base,
+                    status = resp.status.as_u16(),
+                    "cloudcode metadata routed"
+                );
                 Ok(resp)
             }
             CloudCodeTarget::Auto {
@@ -687,14 +812,18 @@ impl CloudCodeClient {
             } => {
                 // Precedence: Enterprise entitlement -> per-account LRU -> User-Agent auth_method
                 // -> default daily first (matching Google AI Pro / LS_CLOUD_CODE_ENDPOINT).
-                let (prefer_prod, initial_strip) = if body_hints_enterprise {
-                    (true, true)
+                let (prefer_prod, initial_strip, primary_authoritative) = if body_hints_enterprise {
+                    (true, true, true)
                 } else if let Some(route) = cached {
-                    (route.use_prod, route.strip_user_project)
+                    (
+                        route.use_prod,
+                        route.strip_user_project,
+                        route.authoritative,
+                    )
                 } else if let Some(ua_prod) = detect_auth_method_from_headers(inbound_headers) {
-                    (ua_prod, false)
+                    (ua_prod, false, true)
                 } else {
-                    (false, false)
+                    (false, false, false)
                 };
 
                 let (primary_url, primary_is_prod, fallback_url, fallback_is_prod) = if prefer_prod
@@ -726,6 +855,14 @@ impl CloudCodeClient {
                         auth_key,
                         primary_is_prod,
                         used_strip || body_hints_enterprise,
+                        primary_authoritative,
+                    );
+                    tracing::info!(
+                        rpc = "fetchAvailableModels",
+                        upstream = %primary_url,
+                        status = resp.status.as_u16(),
+                        authoritative = primary_authoritative,
+                        "cloudcode metadata routed"
                     );
                     return primary_res.map(|(resp, _)| resp);
                 }
@@ -755,6 +892,15 @@ impl CloudCodeClient {
                         auth_key,
                         fallback_is_prod,
                         used_strip || body_hints_enterprise,
+                        true,
+                    );
+                    tracing::info!(
+                        rpc = "fetchAvailableModels",
+                        upstream = %fallback_url,
+                        status = resp.status.as_u16(),
+                        fallback = true,
+                        authoritative = true,
+                        "cloudcode metadata routed"
                     );
                     return fallback_res.map(|(resp, _)| resp);
                 }
@@ -942,7 +1088,10 @@ fn detect_prod_from_load_code_assist(body: &[u8]) -> Option<bool> {
             }
         }
     }
-    Some(false)
+    let has_tier_object = ["paidTier", "currentTier"]
+        .iter()
+        .any(|key| obj.get(*key).is_some_and(Value::is_object));
+    if has_tier_object { Some(false) } else { None }
 }
 
 fn detect_enterprise_from_fetch_body(body: &[u8]) -> bool {
@@ -1713,6 +1862,12 @@ mod tests {
             detect_prod_from_load_code_assist(br#"{"currentTier":{"id":"free-tier"}}"#),
             Some(false)
         );
+        // First-pass loadCodeAssist responses without paidTier/currentTier must not force daily.
+        assert_eq!(
+            detect_prod_from_load_code_assist(br#"{"cloudaicompanionProject":"weisun-cai"}"#),
+            None
+        );
+        assert_eq!(detect_prod_from_load_code_assist(br#"{}"#), None);
     }
 
     #[test]
@@ -2706,6 +2861,7 @@ mod tests {
                 AccountRoute {
                     use_prod: i % 2 == 0,
                     strip_user_project: false,
+                    authoritative: true,
                 },
             );
         }
@@ -2716,6 +2872,7 @@ mod tests {
             AccountRoute {
                 use_prod: true,
                 strip_user_project: true,
+                authoritative: true,
             },
         );
         assert!(cache.get(fp("Bearer tok-0")).is_some());
@@ -3378,5 +3535,239 @@ mod tests {
                 "gemini-3.8-flash",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn speculative_daily_fetch_models_never_downgrades_paygo_list_experiments() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let daily_exp_hits = Arc::new(AtomicUsize::new(0));
+        let prod_exp_hits = Arc::new(AtomicUsize::new(0));
+        let daily_models_started = Arc::new(Notify::new());
+        let allow_daily_models_reply = Arc::new(Notify::new());
+
+        let daily_exp_hits_c = Arc::clone(&daily_exp_hits);
+        let daily_models_started_c = Arc::clone(&daily_models_started);
+        let allow_daily_models_reply_c = Arc::clone(&allow_daily_models_reply);
+        let daily_app = axum::Router::new()
+            .route(
+                "/v1internal:listExperiments",
+                post(move || {
+                    let hits = Arc::clone(&daily_exp_hits_c);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            r#"{"flags":[{"name":"enable-mcp-apps","boolValue":false}]}"#,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:fetchAvailableModels",
+                post(move |headers: HeaderMap| {
+                    let started = Arc::clone(&daily_models_started_c);
+                    let allow = Arc::clone(&allow_daily_models_reply_c);
+                    async move {
+                        let is_race = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v.contains("paygo-race"));
+                        if is_race {
+                            started.notify_one();
+                            allow.notified().await;
+                        }
+                        (
+                            StatusCode::OK,
+                            r#"{"models":{"gemini-4-carbon-high":{"model":"MODEL_PLACEHOLDER_M460"}}}"#,
+                        )
+                    }
+                }),
+            );
+
+        let prod_exp_hits_c = Arc::clone(&prod_exp_hits);
+        let prod_app = axum::Router::new()
+            .route(
+                "/v1internal:listExperiments",
+                post(move || {
+                    let hits = Arc::clone(&prod_exp_hits_c);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            r#"{"flags":[{"name":"enable-mcp-apps","boolValue":true}]}"#,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:loadCodeAssist",
+                post(move || async {
+                    (
+                        StatusCode::OK,
+                        r#"{"currentTier":{"id":"g1-pro-tier","usesGcpTos":false}}"#,
+                    )
+                }),
+            )
+            .route(
+                "/v1internal:fetchAvailableModels",
+                post(move || async {
+                    (
+                        StatusCode::OK,
+                        r#"{"models":{"gemini-4-carbon-high":{"model":"MODEL_PLACEHOLDER_M460"}}}"#,
+                    )
+                }),
+            );
+
+        let daily_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_server = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, daily_app).await;
+        });
+
+        let prod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_server = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, prod_app).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .unwrap();
+
+        // Case A: Startup race — fetchAvailableModels starts with empty cache (hits daily),
+        // listExperiments completes on prod first, then fetchAvailableModels completes on daily.
+        // The speculative daily 200 OK must NOT downgrade the PayGo account to daily.
+        let mut race_headers = HeaderMap::new();
+        race_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer paygo-race-token"),
+        );
+        race_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let client_clone = client.clone();
+        let race_headers_clone = race_headers.clone();
+        let fetch_task = tokio::spawn(async move {
+            client_clone
+                .forward_fetch_available_models(
+                    "/v1internal:fetchAvailableModels",
+                    &race_headers_clone,
+                    Bytes::from_static(br#"{"project":"weisun-cai"}"#),
+                )
+                .await
+                .unwrap()
+        });
+        daily_models_started.notified().await;
+
+        let exp1 = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:listExperiments",
+                &race_headers,
+                Bytes::from_static(br#"{"project":"weisun-cai"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exp1.status, StatusCode::OK);
+        assert_eq!(prod_exp_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(daily_exp_hits.load(Ordering::SeqCst), 0);
+
+        allow_daily_models_reply.notify_one();
+        let _ = fetch_task.await.unwrap();
+
+        // Next 60s listExperiments poll MUST remain on prod (never downgraded to daily).
+        let exp2 = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:listExperiments",
+                &race_headers,
+                Bytes::from_static(br#"{"project":"weisun-cai"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exp2.status, StatusCode::OK);
+        assert_eq!(prod_exp_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(daily_exp_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            client.resolved_upstream_url().as_deref(),
+            Some(format!("http://{prod_addr}").as_str())
+        );
+
+        // Case B: Reverse order — speculative daily fetchAvailableModels completes FIRST,
+        // then listExperiments runs. listExperiments must ignore non-authoritative daily
+        // and still probe prod first so PayGo keeps official prod Mendel flags.
+        let mut reverse_headers = HeaderMap::new();
+        reverse_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer paygo-reverse-token"),
+        );
+        reverse_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let _ = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &reverse_headers,
+                Bytes::from_static(br#"{"project":"weisun-cai"}"#),
+            )
+            .await
+            .unwrap();
+        let exp3 = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:listExperiments",
+                &reverse_headers,
+                Bytes::from_static(br#"{"project":"weisun-cai"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exp3.status, StatusCode::OK);
+        assert_eq!(prod_exp_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(daily_exp_hits.load(Ordering::SeqCst), 0);
+
+        // Case C: Authoritative consumer resolution via loadCodeAssist (usesGcpTos: false)
+        // DOES route subsequent listExperiments directly to daily.
+        let mut pro_headers = HeaderMap::new();
+        pro_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer consumer-pro-token"),
+        );
+        pro_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let _ = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:loadCodeAssist",
+                &pro_headers,
+                Bytes::from_static(br#"{}"#),
+            )
+            .await
+            .unwrap();
+        let exp4 = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:listExperiments",
+                &pro_headers,
+                Bytes::from_static(br#"{}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exp4.status, StatusCode::OK);
+        assert_eq!(daily_exp_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(prod_exp_hits.load(Ordering::SeqCst), 3);
+
+        daily_server.abort();
+        prod_server.abort();
     }
 }
