@@ -108,15 +108,61 @@ pub struct GeminiModelList {
 }
 
 const CURATED_GATEWAY_MODELS: &[(&str, &str)] = &[
+    ("gemini-4-carbon", "Gemini 4 Carbon"),
+    ("gemini-4-neon", "Gemini 4 Neon"),
     ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
     ("gemini-4-argon", "Gemini 4 Argon"),
-    ("gemini-4-neon", "Gemini 4 Neon"),
-    ("gemini-4-carbon", "Gemini 4 Carbon"),
     ("gemini-3.8-flash", "Gemini 3.8 Flash"),
 ];
 
 const DEFAULT_GATEWAY_INPUT_TOKEN_LIMIT: u64 = 1_048_576;
 const DEFAULT_GATEWAY_OUTPUT_TOKEN_LIMIT: u64 = 65_536;
+
+fn parse_gemini_version_pair(model_id: &str) -> (u32, u32) {
+    let Some(rest) = model_id.strip_prefix("gemini-") else {
+        return (0, 0);
+    };
+    let major_end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    let major = rest[..major_end].parse::<u32>().unwrap_or(0);
+    let minor = rest[major_end..]
+        .strip_prefix('.')
+        .map(|after_dot| {
+            let minor_end = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
+            after_dot[..minor_end].parse::<u32>().unwrap_or(0)
+        })
+        .unwrap_or(0);
+    (major, minor)
+}
+
+/// Orders Gemini models from most capable to least capable, matching Antigravity's native picker:
+/// Carbon -> Neon -> Hydrogen -> Argon -> other Gemini 4 -> Gemini 3.9+ -> Gemini 3.8 Flash.
+pub fn model_capability_sort_key(model_id: &str) -> (u8, std::cmp::Reverse<(u32, u32)>, &str) {
+    let clean = model_id.strip_prefix("models/").unwrap_or(model_id);
+    let tier = match clean {
+        "gemini-4-carbon" => 0,
+        "gemini-4-neon" => 1,
+        "gemini-4-hydrogen" => 2,
+        "gemini-4-argon" => 3,
+        "gemini-3.8-flash" => 6,
+        _ => {
+            let (major, minor) = parse_gemini_version_pair(clean);
+            if major >= 4 {
+                4
+            } else if major == 3 && minor >= 9 {
+                5
+            } else if major == 3 && minor == 8 {
+                7
+            } else {
+                8
+            }
+        }
+    };
+    (
+        tier,
+        std::cmp::Reverse(parse_gemini_version_pair(clean)),
+        clean,
+    )
+}
 
 /// Returns `true` when `model_id` (without `models/` prefix) is a chat-capable Gemini 3/4 model.
 /// Filters out specialized non-chat endpoints (TTS, speech transcription, image generation, live audio)
@@ -206,6 +252,10 @@ pub fn filter_and_order_models(
         }
         filtered.push(entry);
     }
+
+    filtered.sort_by(|a, b| {
+        model_capability_sort_key(&a.name).cmp(&model_capability_sort_key(&b.name))
+    });
 
     if let Some(raw_default) = default_model.map(str::trim).filter(|s| !s.is_empty()) {
         let default_id = raw_default.strip_prefix("models/").unwrap_or(raw_default);
