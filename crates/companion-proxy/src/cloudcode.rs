@@ -418,6 +418,152 @@ impl CloudCodeClient {
             });
         }
 
+        // Read-only metadata RPC: /v1internal:listExperiments carries Mendel feature flags
+        // (including enable-mcp-apps). Mirror fetchAvailableModels' daily <-> prod fallback
+        // and Enterprise 403 retry so PayGo/Business accounts never fall back to disabled
+        // embedded defaults when daily rejects or returns empty flags.
+        if method == Method::POST && path_only == "/v1internal:listExperiments" {
+            let buffered = match &self.inner.target {
+                CloudCodeTarget::Fixed(url) => {
+                    let initial_strip = cached.is_some_and(|route| route.strip_user_project);
+                    let (resp, used_strip) = self
+                        .send_buffered_metadata_with_403_retry(
+                            url,
+                            Method::POST,
+                            path_and_query,
+                            inbound_headers,
+                            body,
+                            BufferedRequestOptions {
+                                force_identity_encoding: true,
+                                strip_user_project: initial_strip,
+                            },
+                        )
+                        .await?;
+                    if resp.status.is_success()
+                        && used_strip
+                        && let Some(key) = auth_key
+                    {
+                        self.inner.cache.put(
+                            key,
+                            AccountRoute {
+                                use_prod: true,
+                                strip_user_project: true,
+                            },
+                        );
+                    }
+                    tracing::info!(
+                        rpc = "listExperiments",
+                        upstream = %url,
+                        status = resp.status.as_u16(),
+                        "cloudcode metadata routed"
+                    );
+                    resp
+                }
+                CloudCodeTarget::Auto {
+                    daily_url,
+                    prod_url,
+                } => {
+                    let (prefer_prod, initial_strip) = if let Some(route) = cached {
+                        (route.use_prod, route.strip_user_project)
+                    } else if let Some(ua_prod) = detect_auth_method_from_headers(inbound_headers) {
+                        (ua_prod, false)
+                    } else if let Some(last_prod) = self.inner.cache.last_resolved_prod() {
+                        (last_prod, false)
+                    } else {
+                        (false, false)
+                    };
+
+                    let (primary_url, primary_is_prod, fallback_url, fallback_is_prod) =
+                        if prefer_prod {
+                            (prod_url.as_str(), true, daily_url.as_str(), false)
+                        } else {
+                            (daily_url.as_str(), false, prod_url.as_str(), true)
+                        };
+
+                    let primary_res = self
+                        .send_buffered_metadata_with_403_retry(
+                            primary_url,
+                            Method::POST,
+                            path_and_query,
+                            inbound_headers,
+                            body.clone(),
+                            BufferedRequestOptions {
+                                force_identity_encoding: true,
+                                strip_user_project: initial_strip,
+                            },
+                        )
+                        .await;
+
+                    if let Ok((ref resp, used_strip)) = primary_res
+                        && resp.status == StatusCode::OK
+                        && response_has_non_empty_flags(&resp.body)
+                    {
+                        self.record_account_route(
+                            auth_key,
+                            primary_is_prod,
+                            initial_strip || used_strip,
+                        );
+                        tracing::info!(
+                            rpc = "listExperiments",
+                            upstream = %primary_url,
+                            status = resp.status.as_u16(),
+                            "cloudcode metadata routed"
+                        );
+                        primary_res.unwrap().0
+                    } else {
+                        let fallback_res = self
+                            .send_buffered_metadata_with_403_retry(
+                                fallback_url,
+                                Method::POST,
+                                path_and_query,
+                                inbound_headers,
+                                body,
+                                BufferedRequestOptions {
+                                    force_identity_encoding: true,
+                                    strip_user_project: false,
+                                },
+                            )
+                            .await;
+                        match fallback_res {
+                            Ok((resp, used_strip))
+                                if resp.status == StatusCode::OK
+                                    && response_has_non_empty_flags(&resp.body) =>
+                            {
+                                self.record_account_route(auth_key, fallback_is_prod, used_strip);
+                                tracing::info!(
+                                    rpc = "listExperiments",
+                                    upstream = %fallback_url,
+                                    status = resp.status.as_u16(),
+                                    fallback = true,
+                                    "cloudcode metadata routed"
+                                );
+                                resp
+                            }
+                            Ok((resp, _)) => match primary_res {
+                                Ok((primary_resp, _)) if primary_resp.status.is_success() => {
+                                    primary_resp
+                                }
+                                _ => resp,
+                            },
+                            Err(fallback_err) => match primary_res {
+                                Ok((primary_resp, _)) => primary_resp,
+                                Err(_) => return Err(fallback_err),
+                            },
+                        }
+                    }
+                }
+            };
+
+            let headers = buffered.headers;
+            let stream: ByteStream =
+                Box::pin(futures_util::stream::once(async move { Ok(buffered.body) }));
+            return Ok(CloudCodeStreamResponse {
+                status: buffered.status,
+                headers,
+                stream,
+            });
+        }
+
         // Non-metadata RPCs (generation/streaming): strictly single-attempt pass-through
         // with zero retries and zero host fallback.
         let (target_base, strip_user_project) = match &self.inner.target {
@@ -849,6 +995,16 @@ fn response_has_non_empty_models(body: &[u8]) -> bool {
         .is_some_and(|m| !m.is_empty())
 }
 
+fn response_has_non_empty_flags(body: &[u8]) -> bool {
+    let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    parsed
+        .get("flags")
+        .and_then(Value::as_array)
+        .is_some_and(|f| !f.is_empty())
+}
+
 pub fn is_cloudcode_path(path: &str) -> bool {
     path.starts_with("/v1internal:") || path.starts_with("/v1internal/")
 }
@@ -1077,6 +1233,63 @@ fn gemini_supported_mime_types() -> Value {
     })
 }
 
+fn find_upstream_model_template<'a>(
+    models: &'a Map<String, Value>,
+    raw_id: &str,
+    suffix: &str,
+) -> Option<&'a Map<String, Value>> {
+    // 1. Exact effort variant match (e.g. "gemini-4-neon-high").
+    let exact_variant = format!("{raw_id}-{suffix}");
+    if let Some(obj) = models.get(&exact_variant).and_then(Value::as_object) {
+        return Some(obj);
+    }
+    // 2. Exact base model match (e.g. "gemini-4-neon").
+    if let Some(obj) = models.get(raw_id).and_then(Value::as_object) {
+        return Some(obj);
+    }
+    // 3. Another effort variant of the same base model (prefer high -> medium -> low).
+    for fallback_suffix in ["high", "medium", "low", "xhigh"] {
+        let candidate = format!("{raw_id}-{fallback_suffix}");
+        if let Some(obj) = models.get(&candidate).and_then(Value::as_object) {
+            return Some(obj);
+        }
+    }
+    let prefix = format!("{raw_id}-");
+    let mut same_family: Vec<&String> = models
+        .keys()
+        .filter(|k| !k.starts_with("companion/") && k.starts_with(&prefix))
+        .collect();
+    same_family.sort();
+    for key in same_family {
+        if let Some(obj) = models.get(key).and_then(Value::as_object) {
+            return Some(obj);
+        }
+    }
+    // 4. Fallback to any upstream Gemini 4 or Gemini 3.8 model carrying experiment/compaction
+    // metadata so newly discovered Gemini models still inherit the native checkpointer config.
+    let mut gemini_candidates: Vec<&String> = models
+        .keys()
+        .filter(|k| {
+            !k.starts_with("companion/")
+                && (k.starts_with("gemini-4-") || k.starts_with("gemini-3.8-"))
+        })
+        .collect();
+    gemini_candidates.sort();
+    for key in &gemini_candidates {
+        if let Some(obj) = models.get(*key).and_then(Value::as_object)
+            && (obj.contains_key("modelExperimentIds") || obj.contains_key("modelExperiments"))
+        {
+            return Some(obj);
+        }
+    }
+    for key in gemini_candidates {
+        if let Some(obj) = models.get(key).and_then(Value::as_object) {
+            return Some(obj);
+        }
+    }
+    None
+}
+
 fn collect_used_model_enums(models_obj: &Map<String, Value>) -> HashSet<String> {
     let mut used = HashSet::new();
     for details in models_obj.values() {
@@ -1248,6 +1461,12 @@ pub fn merge_available_models(
     let mut injected_details: Vec<(String, Value)> = Vec::new();
     let mut injected_groups: Vec<(String, Value)> = Vec::new();
 
+    let upstream_models_snapshot = root_obj
+        .get("models")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
     for raw_id in &selected_models {
         let variants = variants_for_model(raw_id);
         let base_id = format!("companion/{raw_id}");
@@ -1263,25 +1482,70 @@ pub fn merge_available_models(
             let variant_id = format!("{base_id}-{}", variant.suffix);
             let display_name = format!("{display_base} ({})", variant.label_effort);
 
-            let details = json!({
-                "model": enum_name,
-                "displayName": display_name,
-                "modelUrl": format!("gemini-api://{raw_id}"),
-                "maxTokens": 1048576,
-                "maxOutputTokens": 65536,
-                "supportsThinking": true,
-                "thinkingLevel": variant.thinking_level,
-                "supportsImages": true,
-                "supportsVideo": true,
-                "supportsPdf": true,
-                "supportedMimeTypes": gemini_supported_mime_types(),
-                "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
-                "modelProvider": "MODEL_PROVIDER_GOOGLE",
-                "toolFormatterType": "TOOL_FORMATTER_TYPE_NONE",
-                "quotaInfo": {
-                    "remainingFraction": 1.0
-                }
-            });
+            // Inherit upstream model metadata (modelExperimentIds / modelExperiments /
+            // ignoreExperimentNames / tokenizerType / supportsCumulativeContext /
+            // supportsThoughtCirculation / maxTokens / maxOutputTokens) so Antigravity
+            // applies the same compaction window and capabilities as the native model.
+            let mut details_map =
+                find_upstream_model_template(&upstream_models_snapshot, raw_id, variant.suffix)
+                    .cloned()
+                    .unwrap_or_default();
+
+            for strip_key in [
+                "vertexModelId",
+                "tagTitle",
+                "tagDescription",
+                "disabled",
+                "recommended",
+                "deprecated",
+                "isInternal",
+            ] {
+                details_map.remove(strip_key);
+            }
+
+            let has_valid_max_tokens = details_map
+                .get("maxTokens")
+                .and_then(Value::as_u64)
+                .is_some_and(|v| v > 0);
+            if !has_valid_max_tokens {
+                details_map.insert("maxTokens".to_string(), json!(1048576));
+            }
+            let has_valid_max_output = details_map
+                .get("maxOutputTokens")
+                .and_then(Value::as_u64)
+                .is_some_and(|v| v > 0);
+            if !has_valid_max_output {
+                details_map.insert("maxOutputTokens".to_string(), json!(65536));
+            }
+            if !details_map.contains_key("supportedMimeTypes") {
+                details_map.insert(
+                    "supportedMimeTypes".to_string(),
+                    gemini_supported_mime_types(),
+                );
+            }
+
+            details_map.insert("model".to_string(), json!(enum_name));
+            details_map.insert("displayName".to_string(), json!(display_name));
+            details_map.insert(
+                "modelUrl".to_string(),
+                json!(format!("gemini-api://{raw_id}")),
+            );
+            details_map.insert("supportsThinking".to_string(), json!(true));
+            details_map.insert("thinkingLevel".to_string(), json!(variant.thinking_level));
+            details_map.insert("supportsImages".to_string(), json!(true));
+            details_map.insert("supportsVideo".to_string(), json!(true));
+            details_map.insert("supportsPdf".to_string(), json!(true));
+            details_map.insert(
+                "apiProvider".to_string(),
+                json!("API_PROVIDER_GOOGLE_GEMINI"),
+            );
+            details_map.insert("modelProvider".to_string(), json!("MODEL_PROVIDER_GOOGLE"));
+            details_map.insert(
+                "toolFormatterType".to_string(),
+                json!("TOOL_FORMATTER_TYPE_NONE"),
+            );
+            details_map.insert("quotaInfo".to_string(), json!({ "remainingFraction": 1.0 }));
+            let details = Value::Object(details_map);
 
             injected_model_ids.push(variant_id.clone());
             injected_details.push((variant_id, details));
@@ -2803,5 +3067,208 @@ mod tests {
             HeaderValue::from_static("antigravity/2.35.1 (aidev_client; auth_method=consumer)"),
         );
         assert_eq!(detect_auth_method_from_headers(&h_consumer), Some(false));
+    }
+
+    #[test]
+    fn merge_available_models_inherits_upstream_compaction_experiments_and_strips_vertex_fields() {
+        let upstream = json!({
+            "models": {
+                "gemini-4-neon-high": {
+                    "model": "MODEL_PLACEHOLDER_M467",
+                    "displayName": "Gemini 4 Neon (High)",
+                    "vertexModelId": "gemini-4-neon",
+                    "maxTokens": 1048576,
+                    "maxOutputTokens": 65536,
+                    "tokenizerType": "TOKENIZER_TYPE_GEMINI",
+                    "supportsCumulativeContext": true,
+                    "supportsThoughtCirculation": true,
+                    "supportsDeferredToolLoading": true,
+                    "promptTemplaterType": "PROMPT_TEMPLATER_TYPE_GEMINI_V2",
+                    "modelExperimentIds": ["shared_gemini4_checkpointer"],
+                    "modelExperiments": {
+                        "experiments": {
+                            "CASCADE_USE_EXPERIMENT_CHECKPOINTER": { "stringValue": "1m-window" }
+                        }
+                    },
+                    "ignoreExperimentNames": ["legacy_small_window"],
+                    "tagTitle": "New",
+                    "disabled": true,
+                    "isInternal": true
+                }
+            },
+            "sharedModelExperiments": {
+                "shared_gemini4_checkpointer": {
+                    "experiments": {
+                        "context-window-options": { "stringValue": "{}" }
+                    }
+                }
+            },
+            "agentModelSorts": [
+                {
+                    "displayName": "Recommended",
+                    "groups": [{ "modelIds": ["gemini-4-neon-high"] }]
+                }
+            ]
+        });
+        let upstream_bytes = serde_json::to_vec(&upstream).unwrap();
+        let merged_bytes = merge_available_models(
+            &upstream_bytes,
+            &["gemini-4-neon".to_string(), "gemini-4-new".to_string()],
+            "gemini-4-neon",
+        )
+        .expect("merge succeeds");
+        let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+
+        let neon_proxy = &merged["models"]["companion/gemini-4-neon-high"];
+        assert_eq!(neon_proxy["displayName"], "Gemini 4 Neon (Proxy) (High)");
+        assert_eq!(neon_proxy["modelUrl"], "gemini-api://gemini-4-neon");
+        assert_eq!(neon_proxy["apiProvider"], "API_PROVIDER_GOOGLE_GEMINI");
+        assert_eq!(neon_proxy["maxTokens"], 1048576);
+        assert_eq!(neon_proxy["maxOutputTokens"], 65536);
+        assert_eq!(neon_proxy["tokenizerType"], "TOKENIZER_TYPE_GEMINI");
+        assert_eq!(neon_proxy["supportsCumulativeContext"], true);
+        assert_eq!(neon_proxy["supportsThoughtCirculation"], true);
+        assert_eq!(neon_proxy["supportsDeferredToolLoading"], true);
+        assert_eq!(
+            neon_proxy["promptTemplaterType"],
+            "PROMPT_TEMPLATER_TYPE_GEMINI_V2"
+        );
+        assert_eq!(
+            neon_proxy["modelExperimentIds"],
+            json!(["shared_gemini4_checkpointer"])
+        );
+        assert_eq!(
+            neon_proxy["modelExperiments"]["experiments"]["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]["stringValue"],
+            "1m-window"
+        );
+        assert_eq!(
+            neon_proxy["ignoreExperimentNames"],
+            json!(["legacy_small_window"])
+        );
+        // Upstream-only routing/UI flags must be stripped so the proxy entry routes cleanly.
+        assert!(neon_proxy.get("vertexModelId").is_none());
+        assert!(neon_proxy.get("tagTitle").is_none());
+        assert!(neon_proxy.get("disabled").is_none());
+        assert!(neon_proxy.get("isInternal").is_none());
+
+        // Even a newly discovered Gemini 4 model inherits the Gemini 4 checkpointer experiments.
+        let new_proxy = &merged["models"]["companion/gemini-4-new-medium"];
+        assert_eq!(
+            new_proxy["modelExperimentIds"],
+            json!(["shared_gemini4_checkpointer"])
+        );
+        assert_eq!(new_proxy["supportsCumulativeContext"], true);
+    }
+
+    #[tokio::test]
+    async fn list_experiments_falls_back_from_daily_to_prod_and_caches_account_route() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let daily_hits = Arc::new(AtomicUsize::new(0));
+        let prod_hits = Arc::new(AtomicUsize::new(0));
+        let prod_models_hits = Arc::new(AtomicUsize::new(0));
+
+        let daily_hits_c = Arc::clone(&daily_hits);
+        let daily_app = axum::Router::new().route(
+            "/v1internal:listExperiments",
+            post(move || {
+                let hits = Arc::clone(&daily_hits_c);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::FORBIDDEN, r#"{"error":"denied on daily"}"#)
+                }
+            }),
+        );
+        let prod_hits_c = Arc::clone(&prod_hits);
+        let prod_models_hits_c = Arc::clone(&prod_models_hits);
+        let prod_app = axum::Router::new()
+            .route(
+                "/v1internal:listExperiments",
+                post(move || {
+                    let hits = Arc::clone(&prod_hits_c);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            r#"{"flags":[{"name":"enable-mcp-apps","boolValue":true}]}"#,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:fetchAvailableModels",
+                post(move || {
+                    let hits = Arc::clone(&prod_models_hits_c);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            r#"{"models":{"gemini-4-neon-high":{"model":"MODEL_PLACEHOLDER_M467"}}}"#,
+                        )
+                    }
+                }),
+            );
+
+        let daily_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daily_addr = daily_listener.local_addr().unwrap();
+        let daily_server = tokio::spawn(async move {
+            let _ = axum::serve(daily_listener, daily_app).await;
+        });
+
+        let prod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prod_addr = prod_listener.local_addr().unwrap();
+        let prod_server = tokio::spawn(async move {
+            let _ = axum::serve(prod_listener, prod_app).await;
+        });
+
+        let client = CloudCodeClient::new_auto_with_urls(
+            &format!("http://{daily_addr}"),
+            &format!("http://{prod_addr}"),
+            30,
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer paygo-token-1"),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let exp_resp = client
+            .forward_raw(
+                Method::POST,
+                "/v1internal:listExperiments",
+                &headers,
+                Bytes::from_static(br#"{"project":"weisun-cai"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exp_resp.status, StatusCode::OK);
+        assert_eq!(daily_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(prod_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.resolved_upstream_url().as_deref(),
+            Some(format!("http://{prod_addr}").as_str())
+        );
+
+        // Subsequent fetchAvailableModels for the same account goes directly to cached prod.
+        let models_resp = client
+            .forward_fetch_available_models(
+                "/v1internal:fetchAvailableModels",
+                &headers,
+                Bytes::from_static(br#"{"project":"weisun-cai"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models_resp.status, StatusCode::OK);
+        assert_eq!(prod_models_hits.load(Ordering::SeqCst), 1);
+
+        daily_server.abort();
+        prod_server.abort();
     }
 }
