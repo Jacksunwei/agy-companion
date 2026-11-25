@@ -5,7 +5,7 @@
 <h1 align="center">Antigravity Companion</h1>
 
 <p align="center">
-  <strong>Bring your own models (BYOM) and track real-time prompt caching in Google Antigravity — powered by a single local Rust binary and native MCP App UI.</strong>
+  <strong>Bring your own models (BYOM) to Google Antigravity — use your own API keys alongside built-in models, preserve prompt caching, and track live token usage locally.</strong>
 </p>
 
 <p align="center">
