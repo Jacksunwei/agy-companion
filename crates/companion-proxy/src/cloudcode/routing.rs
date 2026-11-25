@@ -370,13 +370,39 @@ pub(super) fn copy_safe_request_headers(
     out
 }
 
+/// Returns `true` ONLY when `Content-Encoding` is absent, empty/whitespace, or strictly
+/// `identity` (ASCII case-insensitive across all comma-separated tokens and all header
+/// instances). Non-UTF-8 values or any compression coding (`gzip`, `br`, `deflate`, `zstd`,
+/// etc.) return `false` so S4 streaming pass-through skips teeing without buffering or
+/// mutating compressed bytes.
+pub(crate) fn is_uncompressed_content_encoding(headers: &HeaderMap) -> bool {
+    for value in headers.get_all(header::CONTENT_ENCODING) {
+        let Ok(raw) = value.to_str() else {
+            return false;
+        };
+        for token in raw.split(',') {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("identity") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub(super) fn copy_safe_response_headers(upstream: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for &allowed in ALLOWED_RESPONSE_HEADERS {
         let Ok(name) = HeaderName::from_bytes(allowed.as_bytes()) else {
             continue;
         };
-        if let Some(value) = upstream.get(&name)
+        if allowed == "content-encoding" {
+            for value in upstream.get_all(&name) {
+                if is_printable_ascii_with_space(value.as_bytes()) {
+                    out.append(name.clone(), value.clone());
+                }
+            }
+        } else if let Some(value) = upstream.get(&name)
             && is_printable_ascii_with_space(value.as_bytes())
         {
             out.insert(name, value.clone());

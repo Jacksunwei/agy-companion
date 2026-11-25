@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::CoreError;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
+pub const MAX_GEMINI_MODEL_LEN: usize = 128;
 
 /// Default enabled Gemini models injected into Antigravity's model picker (11/32 placeholder slots).
 pub const DEFAULT_ENABLED_GEMINI_MODELS: &[&str] =
@@ -90,6 +91,9 @@ pub fn curated_model_presets() -> Vec<ModelPreset> {
 /// - `major >= 4`: requires `-<non-empty>` or `.<non-empty>` suffix (rejects bare `gemini-4`, `gemini-5`, `gemini-5-`, `gemini-5.`, `gemini-5pro`).
 /// - `major == 3`: requires `.<minor>` with `minor >= 8`, followed by end-of-string or `-<non-empty>` / `.<non-empty>`.
 pub fn is_supported_gemini_model(model: &str) -> bool {
+    if model.len() > MAX_GEMINI_MODEL_LEN {
+        return false;
+    }
     let Some(rest) = model.strip_prefix("gemini-") else {
         return false;
     };
@@ -133,6 +137,11 @@ pub fn is_supported_gemini_model(model: &str) -> bool {
 
 /// Validates a Gemini model identifier for syntax safety and Gemini 3.8+ / Gemini 4+ membership.
 pub fn validate_gemini_model(model: &str) -> Result<(), CoreError> {
+    if model.len() > MAX_GEMINI_MODEL_LEN {
+        return Err(CoreError::InvalidModel {
+            reason: format!("model ID exceeds maximum length of {MAX_GEMINI_MODEL_LEN} characters"),
+        });
+    }
     if model.is_empty()
         || !model.bytes().all(|b| (0x21..=0x7E).contains(&b))
         || model == "."
@@ -598,5 +607,29 @@ mod tests {
                 "expected InvalidModel for '{bad}'"
             );
         }
+    }
+
+    #[test]
+    fn gemini_model_id_enforces_128_char_length_cap() {
+        let prefix = "gemini-4-";
+        let at_limit = format!("{prefix}{}", "a".repeat(128 - prefix.len()));
+        assert_eq!(at_limit.len(), 128);
+        assert!(is_supported_gemini_model(&at_limit));
+        assert!(validate_gemini_model(&at_limit).is_ok());
+
+        let over_limit = format!("{prefix}{}", "a".repeat(129 - prefix.len()));
+        assert_eq!(over_limit.len(), 129);
+        assert!(!is_supported_gemini_model(&over_limit));
+        assert!(matches!(
+            validate_gemini_model(&over_limit),
+            Err(CoreError::InvalidModel { .. })
+        ));
+
+        let huge = format!("{prefix}{}", "a".repeat(1200));
+        assert!(!is_supported_gemini_model(&huge));
+        assert!(matches!(
+            validate_gemini_model(&huge),
+            Err(CoreError::InvalidModel { .. })
+        ));
     }
 }

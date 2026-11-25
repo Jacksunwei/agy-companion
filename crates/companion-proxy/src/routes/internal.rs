@@ -16,9 +16,11 @@ pub(super) async fn health_handler() -> Json<HealthResponse> {
 
 pub(super) async fn stats_handler(State(state): State<ProxyState>) -> impl IntoResponse {
     let active = state.active_provider().await;
-    Json(state.stats().snapshot_with_cloudcode(
+    let proxy_rss_bytes = state.sample_rss_bytes().await;
+    Json(state.stats().snapshot_with_cloudcode_and_rss(
         active.cloudcode.mode_label(),
         active.cloudcode.resolved_upstream_url(),
+        proxy_rss_bytes,
     ))
 }
 

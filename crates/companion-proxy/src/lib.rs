@@ -4,6 +4,7 @@ mod activity;
 pub mod cloudcode;
 mod hot_reload;
 pub mod routes;
+mod rss;
 pub mod sse;
 pub mod stats;
 #[cfg(test)]
@@ -96,6 +97,7 @@ struct ProxyStateInner {
     stats: Arc<ProxyStats>,
     usage_sink: Arc<dyn UsageSink>,
     activity: Arc<ActivityTracker>,
+    rss: rss::RssSampler,
 }
 
 #[derive(Clone)]
@@ -141,6 +143,7 @@ impl ProxyState {
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
                 activity: Arc::new(ActivityTracker::new()),
+                rss: rss::RssSampler::new(),
             }),
         }
     }
@@ -172,6 +175,7 @@ impl ProxyState {
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
                 activity: Arc::new(ActivityTracker::new()),
+                rss: rss::RssSampler::new(),
             }),
         })
     }
@@ -194,6 +198,10 @@ impl ProxyState {
 
     pub(crate) fn enter_request(&self) -> InFlightGuard {
         self.inner.activity.enter()
+    }
+
+    pub(crate) async fn sample_rss_bytes(&self) -> Option<u64> {
+        self.inner.rss.sample_bytes().await
     }
 
     pub(crate) async fn active_provider(&self) -> ActiveProvider {

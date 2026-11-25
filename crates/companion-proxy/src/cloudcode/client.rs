@@ -13,7 +13,8 @@ use http::{Method, StatusCode};
 
 use super::routing::{
     AccountRoute, CloudCodeRoutingCache, copy_safe_request_headers, copy_safe_response_headers,
-    detect_auth_method_from_headers, is_loopback_url, validate_cloudcode_path,
+    detect_auth_method_from_headers, is_loopback_url, is_uncompressed_content_encoding,
+    validate_cloudcode_path,
 };
 use super::{
     CloudCodeBufferedResponse, CloudCodeError, CloudCodeStreamResponse, MAX_CLOUDCODE_CATALOG_BYTES,
@@ -235,6 +236,7 @@ impl CloudCodeClient {
 
         let resp = req_builder.send().await.map_err(sanitize_reqwest_error)?;
         let status = resp.status();
+        let response_is_uncompressed = is_uncompressed_content_encoding(resp.headers());
         let headers = copy_safe_response_headers(resp.headers());
         let stream: ByteStream = Box::pin(resp.bytes_stream().map_err(|err| {
             companion_providers::ProviderError::Upstream(format!(
@@ -246,6 +248,7 @@ impl CloudCodeClient {
         Ok(CloudCodeStreamResponse {
             status,
             headers,
+            response_is_uncompressed,
             stream,
         })
     }
@@ -341,6 +344,7 @@ impl CloudCodeClient {
         tokio::time::timeout(timeout, async move {
             let mut resp = req_builder.send().await.map_err(sanitize_reqwest_error)?;
             let status = resp.status();
+            let response_is_uncompressed = is_uncompressed_content_encoding(resp.headers());
             let headers = copy_safe_response_headers(resp.headers());
 
             let mut collected = Vec::new();
@@ -354,6 +358,7 @@ impl CloudCodeClient {
             Ok(CloudCodeBufferedResponse {
                 status,
                 headers,
+                response_is_uncompressed,
                 body: Bytes::from(collected),
             })
         })

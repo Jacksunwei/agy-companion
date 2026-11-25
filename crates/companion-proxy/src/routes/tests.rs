@@ -2895,3 +2895,544 @@ async fn cloudcode_fetch_available_models_injects_strictly_enabled_models_only()
 
     handle.abort();
 }
+
+#[tokio::test]
+async fn builtin_antigravity_passive_tee_tracks_sse_unary_path_fallback_and_rss() {
+    let sse_payload = concat!(
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}}\n\n",
+        "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":1200,\"candidatesTokenCount\":300,\"cachedContentTokenCount\":800,\"thoughtsTokenCount\":40}}}\n\n"
+    );
+    let unary_payload = r#"{"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":500,"candidatesTokenCount":120,"cachedContentTokenCount":0,"thoughtsTokenCount":10}}}"#;
+
+    let mock_ccpa = Router::new()
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(move || async move {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    sse_payload,
+                )
+            }),
+        )
+        .route(
+            "/v1internal:generateContent",
+            post(move || async move {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    unary_payload,
+                )
+            }),
+        )
+        .route(
+            "/v1internal/projects/p/locations/l/models/gemini-4-carbon:generateContent",
+            post(move || async move {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    unary_payload,
+                )
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_ccpa).await;
+    });
+
+    let mut cfg = companion_core::Config::default();
+    cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{addr}"));
+    cfg.providers.gemini.base_url = format!("http://{addr}");
+    // Day-0: NO Google AI Studio API key configured — built-in tracking still works!
+    cfg.providers.gemini.api_key = None;
+
+    let sink = Arc::new(RecordingSink::default());
+    let state = ProxyState::from_config_with_options(
+        cfg,
+        sink.clone(),
+        ProxyStateOptions {
+            config_path: None,
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+    let app = build_router(state);
+
+    // 1. SSE streamGenerateContent with JSON body model
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:streamGenerateContent?alt=sse")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"models/gemini-3.8-pro","request":{"contents":[]}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let body1 = axum::body::to_bytes(resp1.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(body1.as_ref(), sse_payload.as_bytes());
+
+    // 2. Unary generateContent with non-JSON body -> fallback "antigravity-builtin"
+    let resp2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:generateContent")
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from("raw-non-json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2 = axum::body::to_bytes(resp2.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(body2.as_ref(), unary_payload.as_bytes());
+
+    // 3. Path-based model extraction when body omits "model"
+    let resp3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal/projects/p/locations/l/models/gemini-4-carbon:generateContent")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"request":{}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp3.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(resp3.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    // Verify /api/stats (usage, recent_calls, by_model, proxy_rss_bytes)
+    let stats_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_resp.status(), StatusCode::OK);
+    let stats_bytes = axum::body::to_bytes(stats_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let snap: StatsSnapshot = serde_json::from_slice(&stats_bytes).unwrap();
+    assert_eq!(snap.usage.requests, 3);
+    assert_eq!(snap.usage.prompt_tokens, 2200);
+    assert_eq!(snap.usage.cached_tokens, 800);
+    assert_eq!(snap.usage.output_tokens, 540);
+    assert_eq!(snap.usage.reasoning_tokens, 60);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert!(snap.proxy_rss_bytes.is_some_and(|b| b > 0));
+
+    assert_eq!(snap.recent_calls.len(), 3);
+    assert_eq!(snap.recent_calls[0].provider, "antigravity");
+    assert_eq!(snap.recent_calls[0].source, "builtin");
+    assert_eq!(snap.recent_calls[0].model, "gemini-3.8-pro");
+    assert_eq!(snap.recent_calls[1].model, "antigravity-builtin");
+    assert_eq!(snap.recent_calls[2].model, "gemini-4-carbon");
+    assert_eq!(snap.by_model.len(), 3);
+    assert_eq!(snap.by_model[0].model, "gemini-3.8-pro");
+
+    // Verify SQLite/RecordingSink received all 3 builtin events
+    let events = sink.snapshot();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].provider, "antigravity");
+    assert_eq!(events[0].source, "builtin");
+    assert_eq!(events[0].model, "gemini-3.8-pro");
+    assert_eq!(events[1].model, "antigravity-builtin");
+    assert_eq!(events[2].model, "gemini-4-carbon");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn builtin_antigravity_passive_tee_skips_compressed_errors_and_non_generation_rpcs() {
+    let raw_compressed: &[u8] = b"\x1f\x8b\x08\x00fake-gzip-stream-payload";
+    let identity_sse = "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":321,\"candidatesTokenCount\":45}}}\n\n";
+
+    let mock_ccpa = Router::new()
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(move |OriginalUri(uri): OriginalUri| async move {
+                let query = uri.query().unwrap_or("");
+                let mode = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("mode="))
+                    .unwrap_or("gzip");
+                match mode {
+                    "gzip" => Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CONTENT_ENCODING, "gzip")
+                        .body(Body::from(raw_compressed))
+                        .unwrap(),
+                    "br" => Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CONTENT_ENCODING, "br")
+                        .body(Body::from(raw_compressed))
+                        .unwrap(),
+                    "mixed" => Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CONTENT_ENCODING, "identity, gzip")
+                        .body(Body::from(raw_compressed))
+                        .unwrap(),
+                    "identity" => Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CONTENT_ENCODING, "Identity")
+                        .body(Body::from(identity_sse))
+                        .unwrap(),
+                    _ => Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"response":{"usageMetadata":{"promptTokenCount":999}}}"#,
+                        ))
+                        .unwrap(),
+                }
+            }),
+        )
+        .route(
+            "/v1internal:loadCodeAssist",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"response":{"usageMetadata":{"promptTokenCount":777}}}"#,
+                )
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_ccpa).await;
+    });
+
+    let mut cfg = companion_core::Config::default();
+    cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{addr}"));
+    cfg.providers.gemini.base_url = format!("http://{addr}");
+
+    let sink = Arc::new(RecordingSink::default());
+    let state = ProxyState::from_config_with_options(
+        cfg,
+        sink.clone(),
+        ProxyStateOptions {
+            config_path: None,
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+    let app = build_router(state.clone());
+
+    // Compressed responses (gzip, br, identity+gzip) stream byte-for-byte untouched & skip tee
+    for mode in ["gzip", "br", "mixed"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1internal:streamGenerateContent?alt=sse&mode={mode}"
+                    ))
+                    .body(Body::from(r#"{"model":"gemini-3.8-pro"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), raw_compressed, "mode={mode}");
+    }
+
+    // Error status (500) skips tee
+    let err_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:streamGenerateContent?alt=sse&mode=err")
+                .body(Body::from(r#"{"model":"gemini-3.8-pro"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(err_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let _ = axum::body::to_bytes(err_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    // Non-generation RPC (/v1internal:loadCodeAssist) skips tee
+    let meta_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:loadCodeAssist")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(meta_resp.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(meta_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    assert_eq!(state.stats().snapshot().usage.requests, 0);
+    assert!(sink.snapshot().is_empty());
+
+    // Content-Encoding: Identity DOES tee!
+    let id_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:streamGenerateContent?alt=sse&mode=identity")
+                .body(Body::from(r#"{"model":"gemini-3.8-pro"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(id_resp.status(), StatusCode::OK);
+    let id_bytes = axum::body::to_bytes(id_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(id_bytes.as_ref(), identity_sse.as_bytes());
+    assert_eq!(state.stats().snapshot().usage.requests, 1);
+    assert_eq!(state.stats().snapshot().usage.prompt_tokens, 321);
+    assert_eq!(sink.snapshot().len(), 1);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn oversized_gemini_model_id_is_rejected_and_stats_stay_within_probe_budget() {
+    let sse_body =
+        "data: {\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":10}}\n\n";
+    let sink = Arc::new(RecordingSink::default());
+    let provider = Arc::new(StubProvider::ok_stream(
+        Some("text/event-stream"),
+        vec![Bytes::from_static(sse_body.as_bytes())],
+    ));
+    let state = test_proxy_state(provider.clone(), sink.clone(), true);
+    let app = build_router(state.clone());
+
+    // 1200+ char Gemini model ID must be rejected with 400 and never reach upstream or inflate stats.
+    let huge_model = format!("gemini-4-00-{}", "a".repeat(1200));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1beta/models/{huge_model}:generateContent"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"contents":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(provider.hit_count(), 0);
+    assert_eq!(state.stats().snapshot().usage.requests, 0);
+
+    // 32 valid 128-char Gemini model IDs must succeed and keep /api/stats well under 64 KiB.
+    for i in 0..32 {
+        let prefix = format!("gemini-4-{i:02}-");
+        let max_model = format!("{prefix}{}", "a".repeat(128 - prefix.len()));
+        assert_eq!(max_model.len(), 128);
+        let ok_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1beta/models/{max_model}:streamGenerateContent?alt=sse"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"contents":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(ok_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+    }
+
+    let stats_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_resp.status(), StatusCode::OK);
+    let stats_bytes = axum::body::to_bytes(stats_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        stats_bytes.len() < companion_providers::MAX_PROBE_BODY_BYTES,
+        "/api/stats payload {} bytes exceeded {} byte probe limit",
+        stats_bytes.len(),
+        companion_providers::MAX_PROBE_BODY_BYTES
+    );
+}
+
+#[tokio::test]
+async fn builtin_tee_preserves_split_content_encoding_and_fails_closed_on_non_ascii_encoding() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let sse_payload = "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":777,\"candidatesTokenCount\":77}}}\n\n";
+
+    // Raw TCP mock upstream so we can emit both split Content-Encoding headers AND a raw non-ASCII
+    // Content-Encoding header byte sequence on the wire.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let raw_server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = vec![0u8; 4096];
+            let n = socket.read(&mut req_buf).await.unwrap();
+            let req_text = String::from_utf8_lossy(&req_buf[..n]);
+            let resp_bytes = if req_text.contains("mode=split") {
+                format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/event-stream\r\n\
+                     Content-Encoding: identity\r\n\
+                     Content-Encoding: br\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    sse_payload.len(),
+                    sse_payload
+                )
+                .into_bytes()
+            } else {
+                let mut raw = Vec::new();
+                raw.extend_from_slice(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Content-Encoding: \x80br\r\n",
+                );
+                raw.extend_from_slice(
+                    format!(
+                        "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse_payload.len(),
+                        sse_payload
+                    )
+                    .as_bytes(),
+                );
+                raw
+            };
+            socket.write_all(&resp_bytes).await.unwrap();
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    let mut cfg = companion_core::Config::default();
+    cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{addr}"));
+    cfg.providers.gemini.base_url = format!("http://{addr}");
+
+    let sink = Arc::new(RecordingSink::default());
+    let state = ProxyState::from_config_with_options(
+        cfg,
+        sink.clone(),
+        ProxyStateOptions {
+            config_path: None,
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+    let app = build_router(state.clone());
+
+    // 1. Split headers: Content-Encoding: identity + Content-Encoding: br -> BOTH preserved, tee skipped.
+    let split_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:streamGenerateContent?alt=sse&mode=split")
+                .body(Body::from(r#"{"model":"gemini-3.8-pro"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(split_resp.status(), StatusCode::OK);
+    let ce_values: Vec<&str> = split_resp
+        .headers()
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .map(|v| v.to_str().expect("ascii"))
+        .collect();
+    assert_eq!(
+        ce_values,
+        vec!["identity", "br"],
+        "proxy must preserve both Content-Encoding headers"
+    );
+    let split_body = axum::body::to_bytes(split_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(split_body.as_ref(), sse_payload.as_bytes());
+    assert_eq!(
+        state.stats().snapshot().usage.requests,
+        0,
+        "split identity+br response must skip passive tee"
+    );
+    assert!(sink.snapshot().is_empty());
+
+    // 2. Non-ASCII Content-Encoding: stripped from outbound headers, AND fails closed to skip tee.
+    let non_ascii_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:streamGenerateContent?alt=sse&mode=nonascii")
+                .body(Body::from(r#"{"model":"gemini-3.8-pro"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(non_ascii_resp.status(), StatusCode::OK);
+    assert!(
+        non_ascii_resp
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .is_none(),
+        "non-ASCII Content-Encoding should still be filtered from outbound headers"
+    );
+    let non_ascii_body = axum::body::to_bytes(non_ascii_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(non_ascii_body.as_ref(), sse_payload.as_bytes());
+    assert_eq!(
+        state.stats().snapshot().usage.requests,
+        0,
+        "non-ASCII Content-Encoding must fail closed and skip passive tee"
+    );
+    assert!(sink.snapshot().is_empty());
+
+    raw_server.abort();
+}

@@ -31,23 +31,24 @@ pub use integration::{
 };
 pub use models::{
     CURATED_GEMINI_MODELS, CuratedGeminiModel, DEFAULT_ENABLED_GEMINI_MODELS, DEFAULT_GEMINI_MODEL,
-    ModelPreset, curated_model_presets, default_enabled_gemini_models, is_discoverable_chat_model,
-    is_supported_gemini_model, model_capability_sort_key, normalize_enabled_gemini_models,
-    parse_gemini_version_pair, validate_gemini_model,
+    MAX_GEMINI_MODEL_LEN, ModelPreset, curated_model_presets, default_enabled_gemini_models,
+    is_discoverable_chat_model, is_supported_gemini_model, model_capability_sort_key,
+    normalize_enabled_gemini_models, parse_gemini_version_pair, validate_gemini_model,
 };
 pub use protocol::{
-    CloudCodeStatsSnapshot, CloudCodeStatus, HealthResponse, HostPlatform, PROTOCOL_VERSION,
-    ProxyHealthSummary, StatsSnapshot, UsageStatsSnapshot,
+    CloudCodeStatsSnapshot, CloudCodeStatus, HealthResponse, HostPlatform, MAX_RECENT_CALLS,
+    MAX_SESSION_MODELS, ModelSessionStats, PROTOCOL_VERSION, ProxyHealthSummary,
+    RecentCallSnapshot, StatsSnapshot, UsageStatsSnapshot,
 };
 pub use redaction::{
     RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig, api_key_hint, mask_api_key,
 };
-#[cfg(feature = "sqlite")]
-pub use usage::SqliteUsageSink;
 pub use usage::{
-    GeminiUsageMetadata, NoopUsageSink, USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION, UsageEvent,
-    UsageSink,
+    GeminiUsageMetadata, NoopUsageSink, USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION,
+    UsageBreakdownRow, UsageBucket, UsageEvent, UsageRange, UsageSink, UsageSummary,
 };
+#[cfg(feature = "sqlite")]
+pub use usage::{SqliteUsageSink, query_usage_summary, query_usage_summary_at};
 pub use validation::{
     ApiKey, PROXY_PLACEHOLDER_API_KEY, decode_ascii_hex_nibble, deserialize_optional_api_key,
     is_placeholder_api_key, is_printable_ascii_with_space, is_safe_path_segment_byte,

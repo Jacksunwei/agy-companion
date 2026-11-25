@@ -15,6 +15,28 @@ use crate::stats::ProxyStats;
 pub const DEFAULT_MAX_JSON_TEE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsageOrigin {
+    GeminiProxy,
+    AntigravityBuiltin,
+}
+
+impl UsageOrigin {
+    pub(super) const fn provider(self) -> &'static str {
+        match self {
+            Self::GeminiProxy => "gemini",
+            Self::AntigravityBuiltin => "antigravity",
+        }
+    }
+
+    pub(super) const fn source(self) -> &'static str {
+        match self {
+            Self::GeminiProxy => "proxy",
+            Self::AntigravityBuiltin => "builtin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UsageTeeMode {
     Sse,
     UnaryJson,
@@ -83,6 +105,17 @@ pub(super) enum UsageCollector {
 }
 
 impl UsageCollector {
+    pub(super) fn from_mode(mode: UsageTeeMode) -> Self {
+        match mode {
+            UsageTeeMode::Sse => Self::Sse(SseUsageTracker::new()),
+            UsageTeeMode::UnaryJson => Self::UnaryJson {
+                buf: Vec::new(),
+                max_bytes: DEFAULT_MAX_JSON_TEE_BYTES,
+                overflowed: false,
+            },
+        }
+    }
+
     fn push_chunk(&mut self, chunk: &[u8]) {
         match self {
             Self::Sse(tracker) => tracker.push_chunk(chunk),
@@ -147,6 +180,7 @@ pub(super) struct UsageTeeStream {
     pub(super) collector: UsageCollector,
     pub(super) stats: Arc<ProxyStats>,
     pub(super) usage_sink: Arc<dyn UsageSink>,
+    pub(super) origin: UsageOrigin,
     pub(super) model: String,
     pub(super) started_at: Instant,
     pub(super) finalized: bool,
@@ -178,12 +212,26 @@ impl Stream for UsageTeeStream {
                     if let Some(usage) = this.collector.finish() {
                         let latency_ms = u64::try_from(this.started_at.elapsed().as_millis())
                             .unwrap_or(u64::MAX);
-                        this.stats.record(&usage);
-                        this.usage_sink.record(UsageEvent::from_gemini(
+                        this.stats.record_call(
+                            this.origin.provider(),
+                            this.origin.source(),
                             &this.model,
                             &usage,
                             latency_ms,
-                        ));
+                        );
+                        let event = match this.origin {
+                            UsageOrigin::GeminiProxy => {
+                                UsageEvent::from_gemini(&this.model, &usage, latency_ms)
+                            }
+                            UsageOrigin::AntigravityBuiltin => {
+                                UsageEvent::from_antigravity_builtin(
+                                    &this.model,
+                                    &usage,
+                                    latency_ms,
+                                )
+                            }
+                        };
+                        this.usage_sink.record(event);
                     }
                 }
                 Poll::Ready(None)

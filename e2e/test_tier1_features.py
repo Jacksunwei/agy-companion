@@ -984,7 +984,10 @@ class TestTier1F6HealthAndStats(E2ETestCase):
         resp = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats")
         self.assertEqual(resp.status, 200)
         stats = resp.json()
-        self.assertEqual(set(stats.keys()), {"usage", "cloudcode"})
+        self.assertEqual(
+            set(stats.keys()),
+            {"usage", "cloudcode", "proxy_rss_bytes", "recent_calls", "by_model"},
+        )
         usage = stats["usage"]
         self.assertEqual(usage["requests"], 0)
         self.assertEqual(usage["prompt_tokens"], 0)
@@ -1294,6 +1297,7 @@ class TestTier1F8McpServer(E2ETestCase):
                 "save_settings",
                 "test_connection",
                 "set_launcher_integration",
+                "get_usage",
             },
         )
 
@@ -1315,6 +1319,7 @@ class TestTier1F8McpServer(E2ETestCase):
             "save_settings",
             "test_connection",
             "set_launcher_integration",
+            "get_usage",
         ):
             meta = tools[app_tool].get("_meta") or {}
             self.assertEqual((meta.get("ui") or {}).get("visibility"), ["app"], f"Bad _meta for {app_tool}: {meta!r}")
@@ -2452,7 +2457,10 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 stats_resp = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats")
                 self.assertEqual(stats_resp.status, 200, stats_resp.text)
                 stats = json.loads(stats_resp.text)
-                self.assertEqual(set(stats.keys()), {"usage", "cloudcode"})
+                self.assertEqual(
+                    set(stats.keys()),
+                    {"usage", "cloudcode", "proxy_rss_bytes", "recent_calls", "by_model"},
+                )
                 expected_usage_keys = {
                     "requests",
                     "prompt_tokens",

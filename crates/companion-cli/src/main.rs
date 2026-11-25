@@ -11,7 +11,7 @@ use companion_cli::install::{InstallOptions, UninstallOptions, run_install, run_
 use companion_cli::integration::run_integration;
 use companion_cli::launch::run_launch;
 use companion_cli::models::run_models;
-use companion_cli::{ServeOptions, run_serve_configured, run_ui_mcp};
+use companion_cli::{ServeOptions, run_serve_configured, run_ui_mcp_with_options};
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -67,9 +67,14 @@ async fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Commands::UiMcp { data_dir, config } => {
+        Commands::UiMcp {
+            data_dir,
+            config,
+            auto_enable_launcher,
+        } => {
             init_tracing("warn", std::io::stderr);
-            if let Err(err) = run_ui_mcp(data_dir, config).await {
+            if let Err(err) = run_ui_mcp_with_options(data_dir, config, auto_enable_launcher).await
+            {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }

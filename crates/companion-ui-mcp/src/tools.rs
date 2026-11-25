@@ -1,6 +1,6 @@
 use companion_core::config::ConfigPatch;
 use companion_core::integration::IntegrationState;
-use companion_core::{Config, GeminiConfig};
+use companion_core::{Config, CoreError, GeminiConfig, UsageRange, UsageSummary};
 use companion_providers::{GeminiProvider, ProviderAdapter};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
@@ -9,7 +9,8 @@ use serde_json::json;
 
 use crate::server::CompanionUiServer;
 use crate::types::{
-    SaveSettingsArgs, SetLauncherIntegrationArgs, SettingsSnapshot, TestConnectionPayload,
+    GetUsageArgs, SaveSettingsArgs, SetLauncherIntegrationArgs, SettingsSnapshot,
+    TestConnectionPayload,
 };
 use crate::ui_resource::{app_only_meta, companion_icons, open_settings_meta};
 
@@ -81,6 +82,22 @@ fn test_connection_result(payload: &TestConnectionPayload) -> Result<CallToolRes
     Ok(result)
 }
 
+fn usage_summary_tool_result(summary: &UsageSummary) -> Result<CallToolResult, ErrorData> {
+    let structured = serde_json::to_value(summary).map_err(|err| {
+        ErrorData::internal_error(format!("failed to serialize usage summary: {err}"), None)
+    })?;
+    let text = format!(
+        "Usage ({}): {} calls, {} input tokens, {} output tokens.",
+        summary.range.as_str(),
+        summary.totals.requests,
+        summary.totals.input_tokens,
+        summary.totals.output_tokens,
+    );
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(structured);
+    Ok(result)
+}
+
 #[tool_router(vis = "pub(crate)")]
 impl CompanionUiServer {
     #[tool(
@@ -91,6 +108,34 @@ impl CompanionUiServer {
         meta = open_settings_meta()
     )]
     pub async fn open_settings(&self) -> Result<CallToolResult, ErrorData> {
+        if self.options.auto_enable_launcher {
+            // Strict lock order: integration_write_lock -> config_write_lock (dropped before HTTP probes).
+            let integration_guard = self.integration_write_lock.lock().await;
+            let config_guard = self.config_write_lock.lock().await;
+            let config_path = self.config_path.clone();
+            let mut opts = self.integration_options();
+            opts.follow_rc_symlink = false;
+            let auto_outcome = tokio::task::spawn_blocking(move || {
+                companion_core::integration::ensure_first_run_launcher_enabled(&config_path, &opts)
+            })
+            .await
+            .map_err(|err| {
+                ErrorData::internal_error(
+                    format!("open_settings auto-enable task failed: {err}"),
+                    None,
+                )
+            })?;
+            drop(config_guard);
+            drop(integration_guard);
+
+            if let Err(err) = auto_outcome {
+                tracing::warn!(
+                    error = %err,
+                    "open_settings first-run launcher auto-enable failed; continuing snapshot load"
+                );
+            }
+        }
+
         let cfg = match self.load_config_blocking().await? {
             Ok(cfg) => cfg,
             Err(err) => return Ok(tool_error(err.to_string())),
@@ -124,7 +169,10 @@ impl CompanionUiServer {
         &self,
         Parameters(args): Parameters<SaveSettingsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let patch: ConfigPatch = args.into();
+        let patch: ConfigPatch = match args.try_into() {
+            Ok(patch) => patch,
+            Err(msg) => return Ok(tool_error(msg)),
+        };
         let write_guard = self.config_write_lock.lock().await;
         let config_path = self.config_path.clone();
         let save_outcome = tokio::task::spawn_blocking(move || -> Result<Config, String> {
@@ -215,33 +263,37 @@ impl CompanionUiServer {
         &self,
         Parameters(args): Parameters<SetLauncherIntegrationArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Validate local config BEFORE acquiring lock or mutating env.sh / shell RC files.
-        let cfg = match self.load_config_blocking().await? {
-            Ok(cfg) => cfg,
-            Err(err) => return Ok(tool_error(err.to_string())),
-        };
-
-        let write_guard = self.integration_write_lock.lock().await;
+        // Strict lock order: integration_write_lock -> config_write_lock (dropped before HTTP probes).
+        let integration_guard = self.integration_write_lock.lock().await;
+        let config_guard = self.config_write_lock.lock().await;
+        let config_path = self.config_path.clone();
         let mut opts = self.integration_options();
         // Hard invariant: MCP tool NEVER follows RC symlinks.
         opts.follow_rc_symlink = false;
         let enabled = args.enabled;
-        let outcome = tokio::task::spawn_blocking(move || {
-            if enabled {
-                companion_core::integration::enable(&opts)
+        let outcome = tokio::task::spawn_blocking(move || -> Result<(Config, _), CoreError> {
+            // Fail closed on corrupt/symlinked config on ALL platforms (including Windows where
+            // enable_and_persist / disable_and_persist return Unsupported before reading config).
+            let _ = Config::load_or_default(&config_path)?;
+            let status = if enabled {
+                companion_core::integration::enable_and_persist(&config_path, &opts)?
             } else {
-                companion_core::integration::disable(&opts)
-            }
+                companion_core::integration::disable_and_persist(&config_path, &opts)?
+            };
+            // Reload updated config so SettingsSnapshot reflects persisted launcher_auto_start.
+            let updated_cfg = Config::load_or_default(&config_path)?;
+            Ok((updated_cfg, status))
         })
         .await
         .map_err(|err| {
             ErrorData::internal_error(format!("set_launcher_integration task failed: {err}"), None)
         })?;
-        // Release write lock before loopback HTTP probes.
-        drop(write_guard);
+        // Release write locks before loopback HTTP probes.
+        drop(config_guard);
+        drop(integration_guard);
 
-        let status = match outcome {
-            Ok(status) => status,
+        let (cfg, status) = match outcome {
+            Ok(pair) => pair,
             Err(err) => return Ok(tool_error(err.to_string())),
         };
 
@@ -277,5 +329,42 @@ impl CompanionUiServer {
             format!("{prefix} {}", format_snapshot_summary(&snapshot)),
             &snapshot,
         )
+    }
+
+    #[tool(
+        name = "get_usage",
+        title = "Get Historical Usage Summary",
+        description = "Query local historical usage and token aggregates for 1d, 7d, or 30d.",
+        meta = app_only_meta()
+    )]
+    pub async fn get_usage(
+        &self,
+        Parameters(args): Parameters<GetUsageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cfg = match self.load_config_blocking().await? {
+            Ok(cfg) => cfg,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
+        let range: UsageRange = args.range.into();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<UsageSummary, CoreError> {
+            let usage_dir = cfg.effective_usage_dir()?;
+            #[cfg(feature = "sqlite")]
+            {
+                companion_core::usage::query_usage_summary(&usage_dir, range)
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                let _ = usage_dir;
+                Ok(UsageSummary::empty(range))
+            }
+        })
+        .await
+        .map_err(|err| ErrorData::internal_error(format!("get_usage task failed: {err}"), None))?;
+
+        let summary = match outcome {
+            Ok(summary) => summary,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
+        usage_summary_tool_result(&summary)
     }
 }

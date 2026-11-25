@@ -16,6 +16,7 @@ mod tests;
 
 pub use catalog::{merge_available_models, pretty_model_name};
 pub use client::CloudCodeClient;
+pub(crate) use routing::is_uncompressed_content_encoding;
 pub use routing::{is_cloudcode_path, validate_cloudcode_path};
 
 pub const MAX_CLOUDCODE_CATALOG_BYTES: usize = 16 * 1024 * 1024;
@@ -35,11 +36,13 @@ pub enum CloudCodeError {
 pub struct CloudCodeStreamResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
+    pub response_is_uncompressed: bool,
     pub stream: ByteStream,
 }
 
 pub struct CloudCodeBufferedResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
+    pub response_is_uncompressed: bool,
     pub body: Bytes,
 }

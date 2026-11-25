@@ -18,7 +18,7 @@ use rmcp::service::RequestContext;
 use rmcp::transport::io::stdio;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, tool_handler};
 
-use crate::types::{SettingsSnapshot, UiMcpError, UiServerOptions};
+use crate::types::{AccountPlanStatus, SettingsSnapshot, UiMcpError, UiServerOptions};
 use crate::ui_resource::{
     EMBEDDED_UI_HTML, UI_MIME_TYPE, UI_RESOURCE_URI, companion_icons, load_ui_html_override,
     resolve_ui_html_override_path, ui_resource_meta,
@@ -195,6 +195,11 @@ impl CompanionUiServer {
             &cfg.cloudcode.upstream,
             stats.as_ref().map(|s| &s.cloudcode),
         );
+        let account_plan = AccountPlanStatus::from_config_and_stats(
+            &cfg.cloudcode.upstream,
+            stats.as_ref().map(|s| &s.cloudcode),
+        );
+        let proxy_rss_bytes = stats.as_ref().and_then(|s| s.proxy_rss_bytes);
 
         // Antigravity's mcp.restoreEnv() strips CLOUD_CODE_URL from MCP children, so a recorded
         // fetchAvailableModels refresh on our local proxy is authoritative proof of live Hybrid Mode.
@@ -216,6 +221,8 @@ impl CompanionUiServer {
             cloudcode,
             supported_models: curated_model_presets(),
             platform: HostPlatform::current(),
+            account_plan,
+            proxy_rss_bytes,
         }
     }
 }
@@ -258,7 +265,14 @@ impl ServerHandler for CompanionUiServer {
 }
 
 pub async fn serve_stdio(config_path: PathBuf) -> Result<(), UiMcpError> {
-    let server = CompanionUiServer::new(config_path)?;
+    serve_stdio_with_options(config_path, UiServerOptions::default()).await
+}
+
+pub async fn serve_stdio_with_options(
+    config_path: PathBuf,
+    options: UiServerOptions,
+) -> Result<(), UiMcpError> {
+    let server = CompanionUiServer::with_options(config_path, options)?;
     let running = server
         .serve(stdio())
         .await

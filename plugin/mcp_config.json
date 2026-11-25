@@ -5,7 +5,8 @@
       "args": [
         "${PLUGIN_ROOT}/scripts/run-companion.sh",
         "ui-mcp",
-        "--data-dir=${PLUGIN_DATA}"
+        "--data-dir=${PLUGIN_DATA}",
+        "--auto-enable-launcher"
       ]
     }
   }

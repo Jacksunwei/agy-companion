@@ -44,6 +44,9 @@ pub enum Commands {
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Auto-enable the login-shell launcher hook once on first open_settings call (intended for plugin MCP config).
+        #[arg(long = "auto-enable-launcher")]
+        auto_enable_launcher: bool,
     },
     /// Inspect local config permissions, proxy /health, version skew, and environment.
     Doctor {
@@ -336,6 +339,7 @@ mod tests {
             Commands::UiMcp {
                 data_dir: Some(PathBuf::from("/tmp/data")),
                 config: Some(PathBuf::from("/tmp/c.json")),
+                auto_enable_launcher: false,
             }
         );
 
@@ -346,6 +350,23 @@ mod tests {
             Commands::UiMcp {
                 data_dir: Some(PathBuf::from("/tmp/d")),
                 config: None,
+                auto_enable_launcher: false,
+            }
+        );
+
+        let ui_mcp_auto = Cli::try_parse_from([
+            "agy-companion",
+            "ui-mcp",
+            "--data-dir=/tmp/data",
+            "--auto-enable-launcher",
+        ])
+        .expect("ui-mcp --auto-enable-launcher should parse");
+        assert_eq!(
+            ui_mcp_auto.command,
+            Commands::UiMcp {
+                data_dir: Some(PathBuf::from("/tmp/data")),
+                config: None,
+                auto_enable_launcher: true,
             }
         );
 
@@ -446,6 +467,7 @@ mod tests {
             Commands::UiMcp {
                 data_dir: Some(PathBuf::from("/tmp/plugin-data")),
                 config: Some(PathBuf::from("/tmp/c.json")),
+                auto_enable_launcher: false,
             }
         );
 

@@ -126,7 +126,11 @@ fn windows_manifest_generators_emit_direct_exe_json_without_bash() {
     );
     assert_eq!(
         mcp_json["mcpServers"]["hub"]["args"],
-        serde_json::json!(["ui-mcp", "--data-dir=${PLUGIN_DATA}"])
+        serde_json::json!([
+            "ui-mcp",
+            "--data-dir=${PLUGIN_DATA}",
+            "--auto-enable-launcher"
+        ])
     );
 
     let sidecar_raw =
