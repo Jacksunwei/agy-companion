@@ -1411,7 +1411,8 @@ pub fn merge_available_models(
         .and_then(Value::as_object)
         .is_some_and(|m| !m.is_empty());
 
-    // Deduplicate and order proxy models with default_model first.
+    // Deduplicate and order proxy models from most capable to least capable
+    // (Carbon -> Neon -> Hydrogen -> Argon -> other Gemini 4 -> Gemini 3.9+ -> 3.8 Flash).
     let mut ordered_models: Vec<String> = Vec::new();
     let mut seen_models: HashSet<String> = HashSet::new();
     let default_norm = normalize_model_id(default_model);
@@ -1428,6 +1429,10 @@ pub fn merge_available_models(
             ordered_models.push(norm);
         }
     }
+    ordered_models.sort_by(|a, b| {
+        companion_providers::model_capability_sort_key(a)
+            .cmp(&companion_providers::model_capability_sort_key(b))
+    });
 
     if ordered_models.is_empty() {
         return serde_json::to_vec(&root);
@@ -3311,5 +3316,67 @@ mod tests {
 
         daily_server.abort();
         prod_server.abort();
+    }
+
+    #[test]
+    fn merge_available_models_orders_proxy_models_from_most_to_least_capable() {
+        let upstream = json!({
+            "models": {
+                "gemini-4-carbon-medium": {
+                    "model": "MODEL_PLACEHOLDER_M460",
+                    "displayName": "Gemini 4 Carbon (Medium)"
+                }
+            },
+            "agentModelSorts": [
+                {
+                    "displayName": "Recommended",
+                    "groups": [{ "modelIds": ["gemini-4-carbon-medium"] }]
+                }
+            ]
+        });
+        let upstream_bytes = serde_json::to_vec(&upstream).unwrap();
+        let merged_bytes = merge_available_models(
+            &upstream_bytes,
+            &[
+                "gemini-3.8-flash".to_string(),
+                "gemini-4-argon".to_string(),
+                "gemini-4-hydrogen".to_string(),
+                "gemini-4-neon".to_string(),
+                "gemini-4-carbon".to_string(),
+            ],
+            "gemini-4-hydrogen",
+        )
+        .expect("merge succeeds");
+        let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+        let model_ids: Vec<&str> = merged["agentModelSorts"][0]["groups"][0]["modelIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+
+        // Extract distinct proxy base model order after the upstream model.
+        let mut proxy_base_order: Vec<&str> = Vec::new();
+        for id in model_ids.iter().skip(1) {
+            let base = id
+                .strip_prefix("companion/")
+                .unwrap()
+                .rsplit_once('-')
+                .unwrap()
+                .0;
+            if proxy_base_order.last().copied() != Some(base) {
+                proxy_base_order.push(base);
+            }
+        }
+        assert_eq!(
+            proxy_base_order,
+            vec![
+                "gemini-4-carbon",
+                "gemini-4-neon",
+                "gemini-4-hydrogen",
+                "gemini-4-argon",
+                "gemini-3.8-flash",
+            ]
+        );
     }
 }

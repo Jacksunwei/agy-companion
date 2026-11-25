@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::{CliError, load_config_checked, resolve_cli_config_path};
 
 pub const CURATED_MODELS: &[&str] = &[
+    "gemini-4-carbon",
+    "gemini-4-neon",
     "gemini-4-hydrogen",
     "gemini-4-argon",
-    "gemini-4-neon",
-    "gemini-4-carbon",
     "gemini-3.8-flash",
 ];
 
@@ -137,9 +137,12 @@ mod tests {
         );
         assert_eq!(
             models[1]["modelName"],
-            "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon"
+            "gemini-api://http://127.0.0.1:4141/models/gemini-4-carbon"
         );
-        assert_eq!(models[1]["label"], "Antigravity Companion (gemini-4-argon)");
+        assert_eq!(
+            models[1]["label"],
+            "Antigravity Companion (gemini-4-carbon)"
+        );
         assert_eq!(
             models[4]["modelName"],
             "gemini-api://http://127.0.0.1:4141/models/gemini-3.8-flash"
@@ -166,7 +169,7 @@ mod tests {
         );
         assert_eq!(
             hydrogen.custom_models_config.custom_models[1].model_name,
-            "gemini-api://http://127.0.0.1:4141/models/gemini-4-argon"
+            "gemini-api://http://127.0.0.1:4141/models/gemini-4-carbon"
         );
 
         let flash = build_custom_models_config(4141, "gemini-3.8-flash").expect("flash");
@@ -177,7 +180,7 @@ mod tests {
         );
         assert_eq!(
             flash.custom_models_config.custom_models[1].model_name,
-            "gemini-api://http://127.0.0.1:4141/models/gemini-4-hydrogen"
+            "gemini-api://http://127.0.0.1:4141/models/gemini-4-carbon"
         );
 
         let custom = build_custom_models_config(5151, "gemini-3.9-pro").expect("custom");
@@ -192,7 +195,7 @@ mod tests {
         );
         assert_eq!(
             custom.custom_models_config.custom_models[1].model_name,
-            "gemini-api://http://127.0.0.1:5151/models/gemini-4-hydrogen"
+            "gemini-api://http://127.0.0.1:5151/models/gemini-4-carbon"
         );
         assert_eq!(
             custom.custom_models_config.custom_models[5].model_name,
