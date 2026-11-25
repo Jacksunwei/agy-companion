@@ -94,7 +94,7 @@ class TestTier1F1Config(E2ETestCase):
 
         found_port, port = find_key_recursive(sc, "listen_port")
         self.assertTrue(found_port, f"Missing listen_port in {sc!r}")
-        self.assertEqual(port, 4141)
+        self.assertEqual(port, 24141)
 
         found_url, base_url = _find_any_key(sc, ("gemini_base_url", "base_url"))
         self.assertTrue(found_url, f"Missing gemini_base_url in {sc!r}")
@@ -1227,7 +1227,7 @@ class TestTier1F9CliBinary(E2ETestCase):
             self.assertIn(subcmd, res.stdout)
 
     def test_t1_f9_models_json_emits_valid_custom_models_config(self) -> None:
-        """agy-companion models --json emits valid JSON pointing to 127.0.0.1:4141."""
+        """agy-companion models --json emits valid JSON pointing to 127.0.0.1:24141."""
         binary = self.require_binary()
         env = self.make_env()
         res = run_cli([str(binary), "models", "--json"], env=env.build_env())
@@ -1237,10 +1237,10 @@ class TestTier1F9CliBinary(E2ETestCase):
         self.assertGreater(len(models), 0, f"Expected customModels entries in {data!r}")
         self.assertTrue(
             any(
-                "gemini-api://http://127.0.0.1:4141/models/" in str(m.get("modelName", ""))
+                "gemini-api://http://127.0.0.1:24141/models/" in str(m.get("modelName", ""))
                 for m in models
             ),
-            f"Expected gemini-api://http://127.0.0.1:4141/models/ in {models!r}",
+            f"Expected gemini-api://http://127.0.0.1:24141/models/ in {models!r}",
         )
         for m in models:
             label = str(m.get("label", ""))
@@ -1251,12 +1251,12 @@ class TestTier1F9CliBinary(E2ETestCase):
             self.assertNotIn("AGY Companion", label)
 
     def test_t1_f9_models_human_output_succeeds(self) -> None:
-        """agy-companion models prints human-readable output referencing 127.0.0.1:4141 and gemini-api://."""
+        """agy-companion models prints human-readable output referencing 127.0.0.1:24141 and gemini-api://."""
         binary = self.require_binary()
         env = self.make_env()
         res = run_cli([str(binary), "models"], env=env.build_env())
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("127.0.0.1:4141", res.stdout)
+        self.assertIn("127.0.0.1:24141", res.stdout)
         self.assertIn("gemini-api://", res.stdout)
 
     def test_t1_f9_serve_accepts_port_and_config_flags(self) -> None:

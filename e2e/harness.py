@@ -484,7 +484,7 @@ class IsolatedEnv:
         self,
         *,
         listen_host: str = "127.0.0.1",
-        listen_port: int = 4141,
+        listen_port: int = 24141,
         base_url: str = "https://generativelanguage.googleapis.com",
         api_key: str | None = None,
         default_model: str = "gemini-4-hydrogen",

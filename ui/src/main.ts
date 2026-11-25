@@ -123,7 +123,7 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const DEFAULT_CONFIG: RedactedConfig = {
   schema_version: 1,
   listen_host: "127.0.0.1",
-  listen_port: 4141,
+  listen_port: 24141,
   gemini_base_url: "https://generativelanguage.googleapis.com",
   gemini_default_model: "gemini-4-hydrogen",
   gemini_timeout_secs: 900,

@@ -92,8 +92,8 @@ The plugin `"agy-companion"` combined with server key `"hub"` in `plugin/mcp_con
   ```
 - **Probe endpoints directly:**
   ```bash
-  curl -s http://127.0.0.1:4141/health
-  curl -s http://127.0.0.1:4141/api/stats
+  curl -s http://127.0.0.1:24141/health
+  curl -s http://127.0.0.1:24141/api/stats
   ```
 
 ## 6. Live E2E Testing with `agy` CLI & XDG Isolation
@@ -118,7 +118,7 @@ kill "${PROXY_PID}"
 rm -rf "${TMP_DEV}"
 ```
 
-On the default port (`4141`), use `GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:4141"`, `agy-companion doctor`, and `agy-companion models --json`.
+On the default port (`24141`), use `GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:24141"`, `agy-companion doctor`, and `agy-companion models --json`.
 
 ## 7. Safety & Secret Hygiene
 
