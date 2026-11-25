@@ -1058,3 +1058,46 @@ async fn hot_reload_retains_active_provider_on_oversized_config_and_recovers() {
     );
     assert!(!recovered.has_configured_api_key);
 }
+
+#[tokio::test]
+async fn hot_reload_updates_enabled_models_immediately_and_preserves_cloudcode_client_arc() {
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.json");
+
+    let mut cfg = Config::default();
+    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaEnabledReloadTest11").unwrap());
+    cfg.save_secure(&config_path).unwrap();
+
+    let state = ProxyState::from_config_with_options(
+        cfg.clone(),
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: Some(config_path.clone()),
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+
+    let initial = state.active_provider().await;
+    assert_eq!(
+        initial.enabled_models,
+        companion_core::default_enabled_gemini_models()
+    );
+
+    // Pause all models (enabled_models: []) -> updates immediately while preserving CloudCodeClient Arc.
+    cfg.providers.gemini.enabled_models = Vec::new();
+    cfg.save_secure(&config_path).unwrap();
+    let paused = state.active_provider().await;
+    assert!(paused.enabled_models.is_empty());
+    assert!(
+        Arc::ptr_eq(&initial.cloudcode, &paused.cloudcode),
+        "enabled_models hot-reload must preserve CloudCodeClient routing cache"
+    );
+
+    // Enable Argon -> updates immediately while preserving CloudCodeClient Arc.
+    cfg.providers.gemini.enabled_models = vec!["gemini-4-argon".to_string()];
+    cfg.save_secure(&config_path).unwrap();
+    let updated = state.active_provider().await;
+    assert_eq!(updated.enabled_models, vec!["gemini-4-argon".to_string()]);
+    assert!(Arc::ptr_eq(&initial.cloudcode, &updated.cloudcode));
+}

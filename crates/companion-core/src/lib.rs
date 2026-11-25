@@ -24,13 +24,16 @@ pub use fs_safe::{
     write_atomic, write_atomic_secure,
 };
 pub use integration::{
-    DEFAULT_RESTORE_PREFIX, HOOK_BEGIN_MARKER, HOOK_END_MARKER, IntegrationOptions,
-    IntegrationPaths, IntegrationState, IntegrationStatus, ShellKind, StripReport,
+    AutoEnableOutcome, DEFAULT_RESTORE_PREFIX, HOOK_BEGIN_MARKER, HOOK_END_MARKER,
+    INTEGRATION_LOCK_FILENAME, IntegrationLock, IntegrationOptions, IntegrationPaths,
+    IntegrationState, IntegrationStatus, ShellKind, StripReport, disable_and_persist,
+    enable_and_persist, ensure_first_run_launcher_enabled, set_launcher_auto_start_locked,
 };
 pub use models::{
-    CURATED_GEMINI_MODELS, CuratedGeminiModel, DEFAULT_GEMINI_MODEL, ModelPreset,
-    curated_model_presets, is_discoverable_chat_model, is_supported_gemini_model,
-    model_capability_sort_key, parse_gemini_version_pair, validate_gemini_model,
+    CURATED_GEMINI_MODELS, CuratedGeminiModel, DEFAULT_ENABLED_GEMINI_MODELS, DEFAULT_GEMINI_MODEL,
+    ModelPreset, curated_model_presets, default_enabled_gemini_models, is_discoverable_chat_model,
+    is_supported_gemini_model, model_capability_sort_key, normalize_enabled_gemini_models,
+    parse_gemini_version_pair, validate_gemini_model,
 };
 pub use protocol::{
     CloudCodeStatsSnapshot, CloudCodeStatus, HealthResponse, HostPlatform, PROTOCOL_VERSION,

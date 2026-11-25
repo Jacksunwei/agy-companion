@@ -1,10 +1,36 @@
 use std::cmp::Reverse;
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::CoreError;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
+
+/// Default enabled Gemini models injected into Antigravity's model picker (11/32 placeholder slots).
+pub const DEFAULT_ENABLED_GEMINI_MODELS: &[&str] =
+    &["gemini-4-carbon", "gemini-4-neon", "gemini-4-hydrogen"];
+
+pub fn default_enabled_gemini_models() -> Vec<String> {
+    DEFAULT_ENABLED_GEMINI_MODELS
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect()
+}
+
+/// Validates every model ID in `models` via [`validate_gemini_model`] and deduplicates entries
+/// while preserving first-seen order. An empty list is valid (non-destructive pause).
+pub fn normalize_enabled_gemini_models(models: Vec<String>) -> Result<Vec<String>, CoreError> {
+    let mut seen = HashSet::with_capacity(models.len());
+    let mut normalized = Vec::with_capacity(models.len());
+    for model in models {
+        validate_gemini_model(&model)?;
+        if seen.insert(model.clone()) {
+            normalized.push(model);
+        }
+    }
+    Ok(normalized)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CuratedGeminiModel {
@@ -513,6 +539,63 @@ mod tests {
             assert!(
                 matches!(cfg.validate(), Err(CoreError::InvalidModel { .. })),
                 "expected Config::validate to reject '{old_model}'"
+            );
+        }
+    }
+
+    #[test]
+    fn default_enabled_gemini_models_and_normalization_preserve_order_and_reject_invalid() {
+        assert_eq!(
+            DEFAULT_ENABLED_GEMINI_MODELS,
+            &["gemini-4-carbon", "gemini-4-neon", "gemini-4-hydrogen"]
+        );
+        let defaults = default_enabled_gemini_models();
+        assert_eq!(defaults.len(), 3);
+        for model in &defaults {
+            assert!(validate_gemini_model(model).is_ok());
+        }
+
+        // Empty list is valid (non-destructive pause).
+        assert_eq!(
+            normalize_enabled_gemini_models(Vec::new()).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // Duplicates are deduplicated preserving first-seen order.
+        let deduped = normalize_enabled_gemini_models(vec![
+            "gemini-4-neon".to_string(),
+            "gemini-4-carbon".to_string(),
+            "gemini-4-neon".to_string(),
+            "gemini-3.8-flash".to_string(),
+            "gemini-4-carbon".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            deduped,
+            vec![
+                "gemini-4-neon".to_string(),
+                "gemini-4-carbon".to_string(),
+                "gemini-3.8-flash".to_string(),
+            ]
+        );
+
+        // Invalid model IDs fail closed with InvalidModel.
+        for bad in [
+            "gemini-2.5-pro",
+            "../evil",
+            "",
+            "gemini-5",
+            " gemini-4-carbon",
+        ] {
+            assert!(
+                matches!(
+                    normalize_enabled_gemini_models(vec![
+                        "gemini-4-carbon".to_string(),
+                        bad.to_string(),
+                    ]),
+                    Err(CoreError::InvalidModel { .. })
+                ),
+                "expected InvalidModel for '{bad}'"
             );
         }
     }

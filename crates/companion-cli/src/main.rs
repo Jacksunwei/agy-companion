@@ -47,6 +47,7 @@ async fn main() -> ExitCode {
             port,
             config,
             adopt_running,
+            auto_enable_launcher,
             idle_shutdown_secs,
         } => {
             let log_target = ServeLogTarget::default();
@@ -55,6 +56,7 @@ async fn main() -> ExitCode {
                 port_override: port,
                 config_override: config,
                 adopt_running,
+                auto_enable_launcher,
                 idle_shutdown_secs,
                 log_target: Some(log_target),
             })

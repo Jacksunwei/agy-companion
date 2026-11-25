@@ -1,17 +1,16 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{OriginalUri, Request, State};
 use axum::response::Response;
 use bytes::Bytes;
-use companion_providers::{curated_gemini_models, filter_and_order_models};
 use http::{HeaderMap, Method, StatusCode, header};
 
+use crate::ProxyState;
 use crate::cloudcode::{
     CloudCodeError, is_cloudcode_path, merge_available_models, validate_cloudcode_path,
 };
-use crate::{ActiveProvider, ProxyState};
 
 use super::middleware::{
     body_read_error_response, not_found_handler, read_bounded_request_body, unwrap_bytes_body,
@@ -20,41 +19,12 @@ use super::middleware::{
 use super::tee::TrackedStream;
 use super::{MAX_PROXY_BODY_BYTES, json_error_response};
 
-const CLOUDCODE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
-
 fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
-}
-
-async fn resolve_proxy_model_ids(active: &ActiveProvider) -> Vec<String> {
-    let curated = curated_gemini_models(Some(&active.default_model));
-    let mut ids: Vec<String> = curated.models.into_iter().map(|m| m.name).collect();
-
-    if active.has_configured_api_key
-        && let Ok(Ok(list)) = tokio::time::timeout(
-            CLOUDCODE_MODEL_DISCOVERY_TIMEOUT,
-            active.provider.list_models(None),
-        )
-        .await
-    {
-        let ordered = filter_and_order_models(list.models, Some(&active.default_model));
-        if !ordered.models.is_empty() {
-            // Keep default_model and curated Gemini 4/3.8 models prioritized ahead of
-            // additional discovered models so the 32-slot placeholder pool always carries
-            // the primary models first.
-            for model in ordered.models {
-                if !ids.contains(&model.name) {
-                    ids.push(model.name);
-                }
-            }
-        }
-    }
-
-    ids
 }
 
 pub(super) async fn fetch_available_models_handler(
@@ -114,7 +84,7 @@ pub(super) async fn fetch_available_models_handler(
     }
 
     let refresh_ts_ms = unix_timestamp_ms();
-    if !active.has_configured_api_key {
+    if !active.has_configured_api_key || active.enabled_models.is_empty() {
         state.stats().record_catalog_refresh(refresh_ts_ms, false);
         let mut builder = Response::builder()
             .status(StatusCode::OK)
@@ -131,10 +101,9 @@ pub(super) async fn fetch_available_models_handler(
         });
     }
 
-    let proxy_model_ids = resolve_proxy_model_ids(&active).await;
     let (final_body, was_merged) = match merge_available_models(
         &upstream.body,
-        &proxy_model_ids,
+        &active.enabled_models,
         &active.default_model,
     ) {
         Ok(merged) => (Bytes::from(merged), true),

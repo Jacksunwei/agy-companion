@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::fs_safe::{self, FsError, SymlinkPolicy};
-use crate::models::{DEFAULT_GEMINI_MODEL, validate_gemini_model};
+use crate::models::{
+    DEFAULT_GEMINI_MODEL, default_enabled_gemini_models, normalize_enabled_gemini_models,
+    validate_gemini_model,
+};
 use crate::redaction::{
     RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig, api_key_hint,
 };
@@ -229,6 +232,8 @@ pub struct GeminiConfig {
     #[serde(default, deserialize_with = "deserialize_optional_api_key")]
     pub api_key: Option<ApiKey>,
     pub default_model: String,
+    #[serde(default = "default_enabled_gemini_models")]
+    pub enabled_models: Vec<String>,
     pub timeout_secs: u64,
 }
 
@@ -238,6 +243,7 @@ impl Default for GeminiConfig {
             base_url: DEFAULT_GEMINI_BASE_URL.to_string(),
             api_key: None,
             default_model: DEFAULT_GEMINI_MODEL.to_string(),
+            enabled_models: default_enabled_gemini_models(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -257,6 +263,8 @@ pub struct Config {
     pub cloudcode: CloudCodeConfig,
     pub providers: ProvidersConfig,
     pub usage_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub launcher_auto_start: Option<bool>,
 }
 
 impl Default for Config {
@@ -267,6 +275,7 @@ impl Default for Config {
             cloudcode: CloudCodeConfig::default(),
             providers: ProvidersConfig::default(),
             usage_dir: None,
+            launcher_auto_start: None,
         }
     }
 }
@@ -306,6 +315,7 @@ pub struct GeminiConfigPatch {
     pub api_key: Option<ApiKeyPatch>,
     pub base_url: Option<String>,
     pub default_model: Option<String>,
+    pub enabled_models: Option<Vec<String>>,
     pub timeout_secs: Option<u64>,
 }
 
@@ -319,6 +329,7 @@ pub struct ConfigPatch {
     pub proxy: Option<ProxyConfigPatch>,
     pub cloudcode: Option<CloudCodeConfigPatch>,
     pub providers: Option<ProvidersConfigPatch>,
+    pub launcher_auto_start: Option<Option<bool>>,
 }
 
 #[derive(Deserialize)]
@@ -357,6 +368,7 @@ struct RawGeminiConfig {
     base_url: String,
     api_key: Option<String>,
     default_model: String,
+    enabled_models: Vec<String>,
     timeout_secs: u64,
 }
 
@@ -366,6 +378,7 @@ impl Default for RawGeminiConfig {
             base_url: DEFAULT_GEMINI_BASE_URL.to_string(),
             api_key: None,
             default_model: DEFAULT_GEMINI_MODEL.to_string(),
+            enabled_models: default_enabled_gemini_models(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
@@ -385,6 +398,7 @@ struct RawConfig {
     cloudcode: RawCloudCodeConfig,
     providers: RawProvidersConfig,
     usage_dir: Option<PathBuf>,
+    launcher_auto_start: Option<bool>,
 }
 
 impl Default for RawConfig {
@@ -395,6 +409,7 @@ impl Default for RawConfig {
             cloudcode: RawCloudCodeConfig::default(),
             providers: RawProvidersConfig::default(),
             usage_dir: None,
+            launcher_auto_start: None,
         }
     }
 }
@@ -724,6 +739,9 @@ impl Config {
         }
 
         validate_gemini_model(&self.providers.gemini.default_model)?;
+        for model in &self.providers.gemini.enabled_models {
+            validate_gemini_model(model)?;
+        }
         validate_upstream_url(&self.providers.gemini.base_url)?;
         if let CloudCodeUpstream::Fixed(ref url) = self.cloudcode.upstream {
             validate_upstream_url(url)?;
@@ -754,11 +772,13 @@ impl Config {
                 gemini: RedactedGeminiConfig {
                     base_url: self.providers.gemini.base_url.clone(),
                     default_model: self.providers.gemini.default_model.clone(),
+                    enabled_models: self.providers.gemini.enabled_models.clone(),
                     timeout_secs: self.providers.gemini.timeout_secs,
                     api_key_configured: hint.is_some(),
                     api_key_hint: hint,
                 },
             },
+            launcher_auto_start: self.launcher_auto_start,
         }
     }
 
@@ -787,6 +807,8 @@ impl Config {
             Some(ref k) => ApiKey::parse_from_disk(k)?,
             None => None,
         };
+        let enabled_models =
+            normalize_enabled_gemini_models(raw_cfg.providers.gemini.enabled_models)?;
 
         let config = Config {
             schema_version: raw_cfg.schema_version,
@@ -797,10 +819,12 @@ impl Config {
                     base_url: raw_cfg.providers.gemini.base_url,
                     api_key,
                     default_model: raw_cfg.providers.gemini.default_model,
+                    enabled_models,
                     timeout_secs: raw_cfg.providers.gemini.timeout_secs,
                 },
             },
             usage_dir: raw_cfg.usage_dir,
+            launcher_auto_start: raw_cfg.launcher_auto_start,
         };
         config.validate()?;
         Ok(config)
@@ -863,6 +887,15 @@ impl Config {
                 validate_gemini_model(&trimmed)?;
                 next.providers.gemini.default_model = trimmed;
             }
+            if let Some(raw_models) = gemini.enabled_models {
+                let mut trimmed_models = Vec::with_capacity(raw_models.len());
+                for raw_model in raw_models {
+                    let trimmed = validate_trimmed_ascii_field(&raw_model, "enabled_models")?;
+                    trimmed_models.push(trimmed);
+                }
+                next.providers.gemini.enabled_models =
+                    normalize_enabled_gemini_models(trimmed_models)?;
+            }
             if let Some(raw_base_url) = gemini.base_url {
                 let trimmed = validate_trimmed_ascii_field(&raw_base_url, "base_url")?;
                 validate_upstream_url(&trimmed)?;
@@ -891,6 +924,10 @@ impl Config {
             if let Some(port) = proxy.port {
                 next.proxy.port = NonZeroU16::new(port).ok_or(CoreError::InvalidListenPort)?;
             }
+        }
+
+        if let Some(auto_start) = patch.launcher_auto_start {
+            next.launcher_auto_start = auto_start;
         }
 
         next.validate()?;
@@ -1239,9 +1276,11 @@ mod tests {
                         "  https://generativelanguage.googleapis.com/v1beta  ".to_string(),
                     ),
                     default_model: Some("  gemini-5-pro  ".to_string()),
+                    enabled_models: None,
                     timeout_secs: Some(600),
                 }),
             }),
+            launcher_auto_start: None,
         })
         .expect("valid patch succeeds");
 
@@ -1273,6 +1312,7 @@ mod tests {
                         ..Default::default()
                     }),
                 }),
+                launcher_auto_start: None,
             })
             .expect_err("placeholder must fail");
         assert!(matches!(err, CoreError::PlaceholderApiKey));
@@ -2404,5 +2444,136 @@ mod tests {
             ),
             Err(CoreError::Fs(FsError::ParentDirTraversal))
         ));
+    }
+
+    #[test]
+    fn enabled_models_and_launcher_auto_start_defaults_dedup_validation_and_roundtrip() {
+        // Legacy v1 JSON omitting enabled_models and launcher_auto_start loads defaults.
+        let legacy_json = r#"{
+            "schema_version": 1,
+            "proxy": { "host": "127.0.0.1", "port": 24141 },
+            "providers": { "gemini": { "default_model": "gemini-4-hydrogen" } }
+        }"#;
+        let legacy = Config::from_json_str(legacy_json, Path::new("legacy.json")).unwrap();
+        assert_eq!(
+            legacy.providers.gemini.enabled_models,
+            default_enabled_gemini_models()
+        );
+        assert_eq!(legacy.launcher_auto_start, None);
+        let redacted = legacy.redacted();
+        assert_eq!(
+            redacted.providers.gemini.enabled_models,
+            default_enabled_gemini_models()
+        );
+        assert_eq!(redacted.launcher_auto_start, None);
+
+        // Deduplicates preserving order and supports launcher_auto_start = true / false / null.
+        let dedup_json = r#"{
+            "schema_version": 1,
+            "launcher_auto_start": false,
+            "providers": {
+                "gemini": {
+                    "enabled_models": ["gemini-4-neon", "gemini-4-carbon", "gemini-4-neon"]
+                }
+            }
+        }"#;
+        let dedup_cfg = Config::from_json_str(dedup_json, Path::new("dedup.json")).unwrap();
+        assert_eq!(
+            dedup_cfg.providers.gemini.enabled_models,
+            vec!["gemini-4-neon".to_string(), "gemini-4-carbon".to_string()]
+        );
+        assert_eq!(dedup_cfg.launcher_auto_start, Some(false));
+        assert_eq!(dedup_cfg.redacted().launcher_auto_start, Some(false));
+
+        // Empty enabled_models is allowed and round-trips through save_secure / load_or_default.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        let mut roundtrip = Config::default();
+        roundtrip.providers.gemini.enabled_models = Vec::new();
+        roundtrip.launcher_auto_start = Some(true);
+        roundtrip.save_secure(&path).unwrap();
+        let reloaded = Config::load_or_default(&path).unwrap();
+        assert!(reloaded.providers.gemini.enabled_models.is_empty());
+        assert_eq!(reloaded.launcher_auto_start, Some(true));
+
+        // Invalid model in enabled_models fails closed; malformed launcher_auto_start yields ParseConfig.
+        let bad_model_json = r#"{
+            "schema_version": 1,
+            "providers": { "gemini": { "enabled_models": ["gemini-4-carbon", "gemini-2.5-pro"] } }
+        }"#;
+        assert!(matches!(
+            Config::from_json_str(bad_model_json, Path::new("bad.json")),
+            Err(CoreError::InvalidModel { .. })
+        ));
+        let bad_flag_json = r#"{ "schema_version": 1, "launcher_auto_start": "yes" }"#;
+        assert!(matches!(
+            Config::from_json_str(bad_flag_json, Path::new("bad.json")),
+            Err(CoreError::ParseConfig { .. })
+        ));
+
+        // Config::validate also rejects invalid enabled_models set directly on struct.
+        let mut direct = Config::default();
+        direct.providers.gemini.enabled_models = vec!["../evil".to_string()];
+        assert!(matches!(
+            direct.validate(),
+            Err(CoreError::InvalidModel { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_patch_updates_enabled_models_and_launcher_auto_start_transactionally() {
+        let mut cfg = Config::default();
+        cfg.apply_patch(ConfigPatch {
+            providers: Some(ProvidersConfigPatch {
+                gemini: Some(GeminiConfigPatch {
+                    enabled_models: Some(vec![
+                        "  gemini-4-argon  ".to_string(),
+                        "gemini-4-carbon".to_string(),
+                        "gemini-4-argon".to_string(),
+                    ]),
+                    ..Default::default()
+                }),
+            }),
+            launcher_auto_start: Some(Some(false)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            cfg.providers.gemini.enabled_models,
+            vec!["gemini-4-argon".to_string(), "gemini-4-carbon".to_string()]
+        );
+        assert_eq!(cfg.launcher_auto_start, Some(false));
+
+        // Empty enabled_models clears the list; launcher_auto_start: None leaves it unchanged.
+        cfg.apply_patch(ConfigPatch {
+            providers: Some(ProvidersConfigPatch {
+                gemini: Some(GeminiConfigPatch {
+                    enabled_models: Some(Vec::new()),
+                    ..Default::default()
+                }),
+            }),
+            launcher_auto_start: None,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(cfg.providers.gemini.enabled_models.is_empty());
+        assert_eq!(cfg.launcher_auto_start, Some(false));
+
+        // Invalid model in patch rolls back completely (including launcher_auto_start).
+        let before = cfg.clone();
+        let err = cfg
+            .apply_patch(ConfigPatch {
+                providers: Some(ProvidersConfigPatch {
+                    gemini: Some(GeminiConfigPatch {
+                        enabled_models: Some(vec!["gemini-2.5-pro".to_string()]),
+                        ..Default::default()
+                    }),
+                }),
+                launcher_auto_start: Some(Some(true)),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidModel { .. }));
+        assert_eq!(cfg, before);
     }
 }

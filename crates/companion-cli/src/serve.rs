@@ -21,6 +21,7 @@ pub struct ServeOptions {
     pub port_override: Option<u16>,
     pub config_override: Option<PathBuf>,
     pub adopt_running: bool,
+    pub auto_enable_launcher: bool,
     pub idle_shutdown_secs: Option<u64>,
     pub log_target: Option<ServeLogTarget>,
 }
@@ -41,6 +42,7 @@ pub async fn run_serve_with_options(
         port_override,
         config_override,
         adopt_running,
+        auto_enable_launcher: false,
         idle_shutdown_secs: None,
         log_target: None,
     })
@@ -63,6 +65,35 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
     precheck_existing_data_dir(&usage_dir)?;
     let runtime_data_dir = resolve_runtime_data_dir(&config)?;
     precheck_existing_data_dir(&runtime_data_dir)?;
+
+    if options.auto_enable_launcher {
+        let auto_cfg_path = config_path.clone();
+        match tokio::task::spawn_blocking(move || {
+            companion_core::integration::ensure_first_run_launcher_enabled(
+                &auto_cfg_path,
+                &companion_core::integration::IntegrationOptions::default(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(outcome)) => {
+                tracing::info!(?outcome, "first-run launcher auto-enable completed");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "first-run launcher auto-enable failed; continuing proxy startup"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "first-run launcher auto-enable task panicked; continuing proxy startup"
+                );
+            }
+        }
+    }
+
     let usage_sink: Arc<dyn UsageSink> = Arc::new(SqliteUsageSink::new(usage_dir)?);
 
     // Pre-register SIGTERM and SIGHUP before binding so host-restart signals are never missed.

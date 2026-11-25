@@ -66,8 +66,8 @@ Every viewport renders the exact same single-column DOM structure centered at `m
 |               "Not recommended — Antigravity needs...")       |
 |                                                               |
 +---------------------------------------------------------------+
-|  ● Live                                                       | <- Pinned Footer (36px)
-|  ^ hover/focus/click diagnostics popover (zero Refresh btn)   |
+|  ● Live                                            18 MB RAM  | <- Pinned Footer (36px)
+|  ^ hover/focus/click health popover         RAM (when live)   |
 +---------------------------------------------------------------+
 ```
 
@@ -76,7 +76,7 @@ Every viewport renders the exact same single-column DOM structure centered at `m
   1. **Monitor** (pulse icon) — live current-session view.
   2. **Usage** (bar-chart icon) — historical SQLite `usage.db` view.
   3. **Settings** (gear icon) — providers + collapsed Advanced. Shows a subtle amber attention dot when not active and any action is needed (API key unset, proxy disabled, manual symlink step, or reopen required).
-- **CUJ-adaptive landing:** Opens on **Settings** on Day-0 (`!api_key_configured`); opens on **Monitor** on Day-N (`api_key_configured`).
+- **CUJ-adaptive landing:** Opens on **Monitor** whenever `hybrid_active` is true (even without a Google AI Studio API key configured) or `api_key_configured` is true; opens on **Settings** on Day-0 before Hybrid Mode is active and no API key is configured (`!hybrid_active && !api_key_configured`).
 
 ### Responsive Padding (`max-width: 560px` centered)
 - **Narrow aux pane (`320px–400px`):** `padding: 12px`; chips wrap naturally (`gap: 6px`); tooltips clamp within `[10px, width - tipWidth - 10px]`.
@@ -101,10 +101,12 @@ Rendered above the active tab's content whenever attention is needed, in strict 
 
 ### 4.2 Tab 1 — Monitor (Live Session)
 
-- **Idle state (`requests === 0`):** Single calm card (`Waiting for requests`) explaining to select an enabled `(Proxy)` model in Antigravity (or showing an **`Open Settings`** button if no API key is configured yet). No fake `0 / 0 / 0` tiles.
-- **Active state (`requests > 0`):**
+- **Idle states (`requests === 0`):** Never asks the user to add a Google AI Studio API key and never shows an **`Open Settings`** button (live monitoring works for built-in Antigravity models even without an API key). No fake `0 / 0 / 0` tiles:
+  - **`!hybrid_active`:** Single calm card titled **`Waiting for Antigravity to connect`** explaining to quit and reopen Antigravity (platform-aware: `⌘Q` on macOS only; Start Menu `"Antigravity (Companion)"` shortcut on Windows) so requests route through the local proxy, noting that live monitoring works for built-in Antigravity models even without an API key.
+  - **`hybrid_active`:** Single calm card titled **`Waiting for requests`** explaining to send a message in Antigravity to see live context usage, cache hit health, and cost estimates (for built-in Antigravity models as well as your own API keys).
+- **Active state (`requests > 0`):** Tracks both built-in Antigravity models (`provider = "antigravity"`, `source = "builtin"`) passively teed on `/v1internal:*` pass-through and BYOM models (`provider = "gemini"`, `source = "proxy"`).
   1. **Live Session Card:**
-     - Header: Provider badge (`Gemini` / future `Codex`) + latest active model (`Gemini 4 Neon (Proxy)`) + latest call time (`HH:MM`).
+     - Header: Provider badge (`Antigravity` built-in / `Gemini` BYOM / future `Codex`) + latest active model + latest call time (`HH:MM`).
      - **Latest prompt bar:** Hero input token count (`148K of 1M` · `15%`) + proportional stacked bar (**from cache** green · **new input** amber · **output** blue) + concise legend.
      - **Call health strip:** `Last N calls` + compact pill strip (green = cache hit, amber = cold prompt / cache break) + summary (`no breaks` or `N breaks`).
      - **3 borderless recessed `.tile` cells (`tabular-nums`):**
@@ -117,7 +119,7 @@ Rendered above the active tab's content whenever attention is needed, in strict 
 
 ### 4.3 Tab 2 — Usage (Historical Analytics via SQLite `usage.db`)
 
-Backed directly by `crates/companion-core/src/usage/sqlite.rs` (`usage_events` table: `timestamp_utc`, `provider`, `model`, `input_tokens`, `output_tokens`, `cached_tokens`, `reasoning_tokens`, `latency_ms`).
+Backed directly by `crates/companion-core/src/usage/sqlite.rs` (`usage_events` table: `timestamp_utc`, `provider`, `source`, `model`, `input_tokens`, `output_tokens`, `cached_tokens`, `reasoning_tokens`, `latency_ms`), recording both built-in Antigravity models (`provider = "antigravity"`, `source = "builtin"`) and BYOM models (`provider = "gemini"`, `source = "proxy"`).
 
 1. **Filter row:** Range segmented control (**`Today`** \| **`7 days`** \| **`30 days`**) + unit toggle (**`$` \| `Tokens`**).
 2. **Summary & Daily Chart Card:**
@@ -164,7 +166,8 @@ Closed by default; contains **only** two controls:
 - **Left status trigger (`<button aria-expanded aria-controls="status-popover">`):**
   - Healthy: green dot + **`Live`** (no port string, no `Auto → Workspace`).
   - Unhealthy / disabled: amber dot + concise status (**`Proxy offline · Retrying…`**, **`Proxy disabled`**, or **`Update pending`**).
-  - Hover, keyboard focus, or click opens an anchored **Proxy diagnostics** popover (keeping keyboard focus stable without rebuilding the footer DOM) showing: `Endpoint` (`127.0.0.1:<port>` read-only), `Enabled models`, `Antigravity plan`, `Proxy / CLI` versions, `Platform`, and `Session` summary.
+  - Hover, keyboard focus, or click opens an anchored **Proxy health** popover (keeping keyboard focus stable without rebuilding the footer DOM) strictly focused on proxy health, showing ONLY: `Endpoint` (`127.0.0.1:<port>` read-only), `Antigravity plan` (`Auto (Organization)` / `Auto` / `Personal` / `Organization`), `Proxy / CLI` versions (`v0.1.0 / v0.1.0`), `Memory` (`XX MB RAM` or `—`), and `Issue` (only when unhealthy). Do **not** include `Enabled models`, `Session`, or `Platform` rows.
+- **Right-side memory indicator:** Quiet `XX MB RAM` displayed on the right side of the pinned footer when the proxy is reachable and `proxy_rss_bytes` is available (hidden when offline).
 - **No Refresh button:** Replaced by mutation-returned snapshots + visibility-aware background polling (`10s` healthy while visible, paused while hidden, throttled re-check on focus/visibility, `3s → 5s → 10s` unhealthy backoff), preserving `snapshotEpoch` and write lockout.
 
 ---
@@ -178,7 +181,7 @@ Closed by default; contains **only** two controls:
 | **`Upstream base URL` input** | Google AI Studio–specific and effectively read-only for end users. | `config.gemini.base_url` and partial-update `save_settings` remain supported for tests/power users. |
 | **`Custom` plan & `Custom` model pills** | No end user knows internal routing URLs or arbitrary unverified model IDs. | `config.cloudcode_upstream_url` and custom model IDs in `config.json` / CLI remain supported. |
 | **`CLI & manual setup` section** | Desktop plugin users don't need launch/JSON snippets once the local proxy hook is enabled by default. | `agy-companion launch` and `agy-companion models --json` stay intact in CLI. |
-| **Bottom-right `Refresh` button & `Auto → Workspace` footer text** | Polling handles freshness automatically; routing mode belongs inside diagnostics popover / Advanced. | N/A (UI only) |
+| **Bottom-right `Refresh` button & `Auto → Workspace` footer text** | Polling handles freshness automatically; routing mode belongs inside health popover / Advanced. | N/A (UI only) |
 | **Internal codenames & raw URLs in UI** | Open-source hygiene — never expose internal codenames or `*-pa.googleapis.com` URLs in `ui/`. | MCP server maps semantic `account_plan` ↔ upstream URLs server-side. |
 
 ---
@@ -205,14 +208,14 @@ Live Hybrid Mode detection continues to use `stats.last_catalog_refresh_at_ms.is
 | Crate / Area | Additive Changes |
 | --- | --- |
 | **`companion-core`** (`config.rs`, `integration.rs`, `usage/sqlite.rs`, `protocol.rs`) | 1) Add `gemini.enabled_models: Vec<String>` (default `["gemini-4-carbon", "gemini-4-neon", "gemini-4-hydrogen"]`) and `launcher_auto_start: Option<bool>` (`None`), keeping `default_model` backward-compatible on deserialization. 2) Add cross-process `<data_dir>/integration.lock` (`0600`). 3) Add read-only SQLite aggregation queries (`query_usage_summary(range)` by day, model, provider) over existing `usage_events` table. |
-| **`companion-proxy`** (`routes/`, `cloudcode/catalog.rs`, `stats.rs`) | 1) Filter injected `(Proxy)` catalog models strictly to `active.enabled_models` (allowing `[]` for 0 injected models; default 3 models use 11/32 slots in `M334..=M365`). 2) Track a bounded in-memory ring buffer of recent calls (`model`, `provider`, `input`, `cached`, `output`, `thinking`, `timestamp_ms`, `cache_break`) plus per-model session rollups on `/api/stats` (or `/api/usage`). |
-| **`companion-cli`** (`cli.rs`, `install.rs`, `integration.rs`, `plugin/sidecars/proxy/sidecar.json`) | Add `serve --auto-enable-launcher` (used by `sidecar.json` only) and persist `launcher_auto_start` on `install --no-launcher-hook` and `integration enable\|disable`. |
-| **`companion-ui-mcp`** (`server.rs`) | 1) Accept `enabled_models` and semantic `account_plan` (`auto \| personal \| organization`) in `save_settings`. 2) Expose semantic `account_plan`, `enabled_models`, live Monitor session metrics, and historical `get_usage(range)` tool/payload backed by `usage.db`. 3) Keep `open_settings` as idempotent locked first-run auto-enable fallback. |
-| **`ui/`** (`index.html`, `src/style.css`, `src/main.ts`) | Implement single-column 3-tab UI (**Monitor** \| **Usage** \| **Settings**), `Google AI Studio` provider card + `app.openLink`, multi-select `Enabled models` + clamped tooltips, streamlined `Advanced` (`Antigravity plan` + right-aligned `Disable proxy`), minimal `● Live` footer + popover, visibility-aware polling, and WCAG AA Light-mode `--brand: #1558b0`. |
+| **`companion-proxy`** (`routes/`, `cloudcode/catalog.rs`, `stats.rs`, `rss.rs`) | 1) Filter injected `(Proxy)` catalog models strictly to `active.enabled_models` (allowing `[]` for 0 injected models; default 3 models use 11/32 slots in `M334..=M365`). 2) Track a bounded in-memory ring buffer of recent calls (`model`, `provider`, `source`, `input`, `cached`, `output`, `thinking`, `timestamp_ms`, `latency_ms`, `cache_break`) plus per-model session rollups on `/api/stats`. 3) Passively tee `usageMetadata` and model ID on `POST /v1internal:streamGenerateContent` and `POST /v1internal:generateContent` (`provider = "antigravity"`, `source = "builtin"`), strictly skipping compressed (`Content-Encoding != identity`) responses per S4, recording into both `ProxyStats` and SQLite `usage.db`. 4) Measure proxy RSS in pure safe Rust (`#![forbid(unsafe_code)]`, ~10–30s TTL cache) and expose `proxy_rss_bytes: Option<u64>` in `/api/stats`. |
+| **`companion-cli`** (`cli.rs`, `install/`, `integration.rs`, `serve.rs`, `plugin/sidecars/proxy/sidecar.json`, `plugin/mcp_config.json`) | Add `serve --auto-enable-launcher` (used by `sidecar.json` only), `ui-mcp --auto-enable-launcher` (used by `mcp_config.json` only), optional `--config <PATH>` on `integration {enable,disable,status}`, and persist `launcher_auto_start` on `install [--no-launcher-hook]` and `integration enable\|disable` under `integration.lock`. |
+| **`companion-ui-mcp`** (`types.rs`, `tools.rs`, `server.rs`) | 1) Accept `enabled_models` and semantic `account_plan` (`auto \| personal \| organization`) in `save_settings`. 2) Expose semantic `account_plan`, `enabled_models`, `proxy_rss_bytes`, live Monitor session metrics (built-in + BYOM), and historical `get_usage(range)` tool backed by `usage.db` (optional `sqlite` feature). 3) Persist `launcher_auto_start` in `set_launcher_integration` and gate locked `open_settings` first-run auto-enable fallback on `UiServerOptions::auto_enable_launcher` (default `false`). |
+| **`ui/`** (`index.html`, `src/style.css`, `src/*.ts`) | Implement single-column 3-tab UI (**Monitor** \| **Usage** \| **Settings**), `hybrid_active`-first landing tab, built-in + BYOM Monitor/Usage views (zero API key prompt or `Open Settings` button in Monitor idle states), `Google AI Studio` provider card + `app.openLink`, multi-select `Enabled models` + clamped tooltips, streamlined `Advanced` (`Antigravity plan` + right-aligned `Disable proxy`), minimal `● Live` footer with strict health-only popover + right-side `XX MB RAM` when reachable, visibility-aware polling, and WCAG AA Light-mode `--brand: #1558b0`. |
 
 ### Incremental PR Sequence
-1. **PR A — Config, Enabled Models & First-Run Auto-Enable (`companion-core`, `companion-proxy`, `companion-cli`):** `enabled_models`, `launcher_auto_start`, `<data_dir>/integration.lock`, catalog filtering, `serve --auto-enable-launcher`, CLI opt-out parity.
-2. **PR B — Usage Query API & Semantic MCP Contract (`companion-core`, `companion-proxy`, `companion-ui-mcp`):** SQLite `usage.db` range aggregations, session recent-calls ring buffer, semantic `account_plan` mapping, and locked `open_settings` fallback.
+1. **PR A — Config, Enabled Models, First-Run Auto-Enable & Spec Sync (`companion-core`, `companion-proxy`, `companion-cli`, `docs/design/ui-ux-v2.md`):** `enabled_models`, `launcher_auto_start`, `<data_dir>/integration.lock`, catalog filtering, `serve --auto-enable-launcher`, CLI opt-out parity, and spec sync.
+2. **PR B — Usage Query API, Proxy RSS, Built-in Usage Tee & Semantic MCP Contract (`companion-core`, `companion-proxy`, `companion-ui-mcp`, `plugin/mcp_config.json`):** `proxy_rss_bytes`, passive `/v1internal:*` built-in usage tee (S4 compressed-response skip), SQLite `usage.db` range aggregations, session recent-calls ring buffer, semantic `account_plan` mapping, `get_usage`, and locked `open_settings` fallback (`ui-mcp --auto-enable-launcher`).
 3. **PR C — UX v2 Single-Column 3-Tab UI (`ui/`, `e2e/`):** Implement **Monitor**, **Usage**, and **Settings** tabs, rebuild `ui/dist/index.html` (`< 512 KB`, 0 S5 sinks/external tags, 0 internal codenames), and update E2E UI contract assertions.
 4. **PR D — Open-Source Copy Hygiene (`plugin/README.md`, `plugin/skills/companion/SKILL.md`):** Scrub remaining user-facing internal codenames and raw backend URLs from plugin docs.
 

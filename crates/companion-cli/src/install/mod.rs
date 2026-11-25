@@ -201,6 +201,8 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
                 }),
             ));
         }
+        let lock_path = data_dir.join(companion_core::integration::INTEGRATION_LOCK_FILENAME);
+        companion_core::fs_safe::inspect_regular_file_if_exists(&lock_path, None)?;
     }
     #[cfg(not(windows))]
     if !opts.no_launcher_hook
@@ -337,16 +339,25 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut windows_shortcut: Option<PathBuf> = None;
 
-    if !opts.no_launcher_hook {
+    if opts.no_launcher_hook {
+        companion_core::integration::set_launcher_auto_start_locked(
+            &config_path,
+            Some(&data_dir),
+            false,
+        )?;
+    } else {
         #[cfg(not(windows))]
         {
-            let status = companion_core::integration::enable(&IntegrationOptions {
-                shell: None,
-                rc_file: None,
-                binary_path: Some(stable_bin.clone()),
-                data_dir: None,
-                follow_rc_symlink: false,
-            })?;
+            let status = companion_core::integration::enable_and_persist(
+                &config_path,
+                &IntegrationOptions {
+                    shell: None,
+                    rc_file: None,
+                    binary_path: Some(stable_bin.clone()),
+                    data_dir: None,
+                    follow_rc_symlink: false,
+                },
+            )?;
             launcher_integration = Some(status);
         }
         #[cfg(windows)]

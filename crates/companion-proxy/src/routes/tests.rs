@@ -2705,3 +2705,193 @@ async fn read_bounded_request_body_enforces_exact_boundary_and_stream_errors() {
         Err(BodyReadError::ReadFailed)
     );
 }
+
+#[tokio::test]
+async fn cloudcode_fetch_available_models_empty_enabled_models_returns_upstream_untouched() {
+    let raw_upstream = r#"{"models":{"gemini-4-carbon-high":{"model":"MODEL_PLACEHOLDER_M427","displayName":"Gemini 4 Carbon (High)"}},"defaultAgentModelId":"gemini-4-carbon-high"}"#;
+    let mock_ccpa = Router::new().route(
+        "/v1internal:fetchAvailableModels",
+        axum::routing::post(move || async move {
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                    (header::CONTENT_ENCODING, "gzip"),
+                ],
+                raw_upstream,
+            )
+        }),
+    );
+    let ccpa_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ccpa_addr = ccpa_listener.local_addr().unwrap();
+    let ccpa_server = tokio::spawn(async move {
+        let _ = axum::serve(ccpa_listener, mock_ccpa).await;
+    });
+
+    let mut cfg = companion_core::Config::default();
+    cfg.cloudcode.upstream =
+        companion_core::CloudCodeUpstream::Fixed(format!("http://{ccpa_addr}"));
+    cfg.providers.gemini.base_url = format!("http://{ccpa_addr}");
+    cfg.providers.gemini.api_key =
+        Some(companion_core::ApiKey::parse_strict("AIzaSyEmptyEnabledTest12").unwrap());
+    cfg.providers.gemini.enabled_models = Vec::new();
+
+    let state = ProxyState::from_config_with_options(
+        cfg,
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: None,
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:fetchAvailableModels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_security_headers(resp.headers());
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip")
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), raw_upstream.as_bytes());
+    assert!(!String::from_utf8_lossy(&body).contains("companion/"));
+
+    let stats_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let stats_body = axum::body::to_bytes(stats_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let snap: crate::StatsSnapshot = serde_json::from_slice(&stats_body).unwrap();
+    assert!(snap.cloudcode.last_catalog_refresh_at_ms.is_some());
+    assert_eq!(
+        snap.cloudcode.last_catalog_included_proxy_models,
+        Some(false)
+    );
+
+    ccpa_server.abort();
+}
+
+#[tokio::test]
+async fn cloudcode_fetch_available_models_injects_strictly_enabled_models_only() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let list_models_hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = Arc::clone(&list_models_hits);
+
+    let raw_upstream = r#"{"models":{"gemini-4-carbon-high":{"model":"MODEL_PLACEHOLDER_M427","displayName":"Gemini 4 Carbon (High)","thinkingLevel":3}},"defaultAgentModelId":"gemini-4-carbon-high"}"#;
+    let mock_server = Router::new()
+        .route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(move || async move {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    raw_upstream,
+                )
+            }),
+        )
+        .route(
+            "/v1beta/models",
+            axum::routing::get(move || {
+                let hits = Arc::clone(&hits_clone);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"models":[{"name":"models/gemini-5-pro"}]}"#,
+                    )
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_server).await;
+    });
+
+    let mut cfg = companion_core::Config::default();
+    cfg.cloudcode.upstream = companion_core::CloudCodeUpstream::Fixed(format!("http://{addr}"));
+    cfg.providers.gemini.base_url = format!("http://{addr}");
+    cfg.providers.gemini.api_key =
+        Some(companion_core::ApiKey::parse_strict("AIzaSyStrictEnabledOnly1").unwrap());
+    cfg.providers.gemini.default_model = "gemini-4-hydrogen".to_string();
+    cfg.providers.gemini.enabled_models = vec!["gemini-4-argon".to_string()];
+
+    let state = ProxyState::from_config_with_options(
+        cfg,
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: None,
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:fetchAvailableModels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mut injected: Vec<String> = parsed["models"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| k.starts_with("companion/"))
+        .cloned()
+        .collect();
+    injected.sort();
+
+    assert_eq!(
+        injected,
+        vec![
+            "companion/gemini-4-argon-high",
+            "companion/gemini-4-argon-low",
+            "companion/gemini-4-argon-medium",
+        ]
+    );
+    assert_eq!(
+        list_models_hits.load(Ordering::SeqCst),
+        0,
+        "fetchAvailableModels must never call upstream /v1beta/models discovery"
+    );
+
+    handle.abort();
+}

@@ -98,19 +98,11 @@ pub(super) fn default_fish_dir_chain(
     Ok((home.to_path_buf(), &[".config", "fish", "conf.d"]))
 }
 
-pub(super) fn validate_env_script_parent_dir(
-    env_path: &Path,
+pub(super) fn validate_data_dir_chain(
+    data_dir: &Path,
     home: Option<&Path>,
 ) -> Result<(), CoreError> {
-    let data_dir = env_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| CoreError::InvalidPath {
-            reason: format!(
-                "env script path '{}' must include a parent directory",
-                env_path.display()
-            ),
-        })?;
+    fs_safe::validate_path(data_dir)?;
     let norm_data_dir = fs_safe::normalize_path(data_dir);
     if let Some(home_dir) = home {
         let default_data_dir =
@@ -129,6 +121,22 @@ pub(super) fn validate_env_script_parent_dir(
     }
     let _ = fs_safe::inspect_existing_dir(data_dir)?;
     Ok(())
+}
+
+pub(super) fn validate_env_script_parent_dir(
+    env_path: &Path,
+    home: Option<&Path>,
+) -> Result<(), CoreError> {
+    let data_dir = env_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| CoreError::InvalidPath {
+            reason: format!(
+                "env script path '{}' must include a parent directory",
+                env_path.display()
+            ),
+        })?;
+    validate_data_dir_chain(data_dir, home)
 }
 
 pub(super) fn inspect_symlinked_dir_chain_target(

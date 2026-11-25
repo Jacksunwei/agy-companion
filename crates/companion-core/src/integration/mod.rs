@@ -1,7 +1,9 @@
+mod auto_enable;
 mod disable;
 mod enable;
 mod fs_inspect;
 mod lifecycle;
+mod lock;
 mod markers;
 mod strip;
 mod templates;
@@ -23,6 +25,11 @@ use crate::fs_safe;
 use self::lifecycle::LifecycleEnv;
 use self::templates::validate_shell_safe_path;
 
+pub use self::auto_enable::{
+    AutoEnableOutcome, disable_and_persist, enable_and_persist, ensure_first_run_launcher_enabled,
+    set_launcher_auto_start_locked,
+};
+pub use self::lock::{INTEGRATION_LOCK_FILENAME, IntegrationLock};
 pub use self::strip::strip_all_known_rc_files;
 pub use self::templates::render_rc_snippet;
 

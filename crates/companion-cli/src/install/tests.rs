@@ -153,7 +153,7 @@ fn windows_manifest_generators_emit_direct_exe_json_without_bash() {
     assert_eq!(sidecar_json["command"], bin_path.to_string_lossy().as_ref());
     assert_eq!(
         sidecar_json["args"],
-        serde_json::json!(["serve", "--adopt-running"])
+        serde_json::json!(["serve", "--adopt-running", "--auto-enable-launcher"])
     );
     assert_eq!(sidecar_json["restart_policy"], "on-failure");
     assert_eq!(sidecar_json["display_name"], "Antigravity Companion Proxy");

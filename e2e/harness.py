@@ -490,13 +490,23 @@ class IsolatedEnv:
         base_url: str = "https://generativelanguage.googleapis.com",
         api_key: str | None = None,
         default_model: str = "gemini-4-hydrogen",
+        enabled_models: list[str] | None = None,
         timeout_secs: int = 900,
         usage_dir: str | Path | None = None,
         include_usage_dir: bool = True,
         schema_version: int = 1,
         cloudcode_upstream_url: str | None = None,
+        launcher_auto_start: bool | None = None,
     ) -> dict[str, Any]:
         """Build a nested schema_version=1 config dict pointing at isolated usage_dir by default."""
+        gemini_cfg: dict[str, Any] = {
+            "base_url": base_url,
+            "api_key": api_key,
+            "default_model": default_model,
+            "timeout_secs": timeout_secs,
+        }
+        if enabled_models is not None:
+            gemini_cfg["enabled_models"] = list(enabled_models)
         cfg: dict[str, Any] = {
             "schema_version": schema_version,
             "proxy": {
@@ -507,14 +517,11 @@ class IsolatedEnv:
                 "upstream": cloudcode_upstream_url if cloudcode_upstream_url is not None else "auto",
             },
             "providers": {
-                "gemini": {
-                    "base_url": base_url,
-                    "api_key": api_key,
-                    "default_model": default_model,
-                    "timeout_secs": timeout_secs,
-                },
+                "gemini": gemini_cfg,
             },
         }
+        if launcher_auto_start is not None:
+            cfg["launcher_auto_start"] = launcher_auto_start
         if usage_dir is not None:
             cfg["usage_dir"] = str(usage_dir)
         elif include_usage_dir:

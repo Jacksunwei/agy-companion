@@ -5,8 +5,8 @@ use companion_core::integration::{
     self, IntegrationOptions, IntegrationState, IntegrationStatus, ShellKind,
 };
 
-use crate::CliError;
 use crate::cli::IntegrationCommands;
+use crate::{CliError, precheck_existing_config_file, resolve_cli_config_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntegrationActionKind {
@@ -26,8 +26,11 @@ pub fn run_integration<W: Write>(action: IntegrationCommands, out: &mut W) -> Re
             rc_file,
             binary,
             follow_rc_symlink,
+            config,
             json,
         } => {
+            let config_path = resolve_cli_config_path(config.as_deref())?;
+            precheck_existing_config_file(&config_path)?;
             let resolved_bin = resolve_integration_binary(binary.as_deref())?;
             let opts = IntegrationOptions {
                 shell: shell.map(ShellKind::from),
@@ -36,15 +39,18 @@ pub fn run_integration<W: Write>(action: IntegrationCommands, out: &mut W) -> Re
                 data_dir: None,
                 follow_rc_symlink,
             };
-            let status = integration::enable(&opts)?;
+            let status = integration::enable_and_persist(&config_path, &opts)?;
             write_integration_output(IntegrationActionKind::Enable, &status, json, out)
         }
         IntegrationCommands::Disable {
             shell,
             rc_file,
             follow_rc_symlink,
+            config,
             json,
         } => {
+            let config_path = resolve_cli_config_path(config.as_deref())?;
+            precheck_existing_config_file(&config_path)?;
             let opts = IntegrationOptions {
                 shell: shell.map(ShellKind::from),
                 rc_file,
@@ -52,14 +58,18 @@ pub fn run_integration<W: Write>(action: IntegrationCommands, out: &mut W) -> Re
                 data_dir: None,
                 follow_rc_symlink,
             };
-            let status = integration::disable(&opts)?;
+            let status = integration::disable_and_persist(&config_path, &opts)?;
             write_integration_output(IntegrationActionKind::Disable, &status, json, out)
         }
         IntegrationCommands::Status {
             shell,
             rc_file,
+            config,
             json,
         } => {
+            if config.is_some() {
+                let _ = resolve_cli_config_path(config.as_deref())?;
+            }
             let opts = IntegrationOptions {
                 shell: shell.map(ShellKind::from),
                 rc_file,

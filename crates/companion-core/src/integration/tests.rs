@@ -3390,3 +3390,518 @@ fn leaf_env_script_symlink_dir_and_fifo_fail_closed_before_rc_mutation_and_fish_
         }
     }
 }
+
+#[test]
+fn integration_lock_serializes_threads_and_rejects_unsafe_paths() {
+    use std::sync::{Arc, Barrier};
+
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+
+    // Acquiring creates 0700 data_dir and 0600 integration.lock; try_acquire sees contention.
+    let guard = IntegrationLock::acquire(&data_dir).unwrap();
+    let lock_path = guard.path().to_path_buf();
+    assert_eq!(lock_path, data_dir.join(INTEGRATION_LOCK_FILENAME));
+    assert!(lock_path.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    assert!(
+        IntegrationLock::try_acquire(&data_dir).unwrap().is_none(),
+        "second try_acquire must return Ok(None) while lock is held"
+    );
+    drop(guard);
+    assert!(
+        lock_path.is_file(),
+        "integration.lock must never be unlinked on Drop"
+    );
+    let reacquired = IntegrationLock::try_acquire(&data_dir).unwrap();
+    assert!(reacquired.is_some());
+    drop(reacquired);
+
+    // Concurrent threads serialize cleanly through IntegrationLock::acquire.
+    let counter_path = tmp.path().join("counter.txt");
+    fs::write(&counter_path, "0").unwrap();
+    let barrier = Arc::new(Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let dir = data_dir.clone();
+        let cp = counter_path.clone();
+        let b = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            let _lock = IntegrationLock::acquire(&dir).unwrap();
+            let cur: u32 = fs::read_to_string(&cp).unwrap().trim().parse().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            fs::write(&cp, format!("{}", cur + 1)).unwrap();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(fs::read_to_string(&counter_path).unwrap().trim(), "4");
+
+    // Path traversal & NUL rejected fail-closed.
+    assert!(matches!(
+        IntegrationLock::acquire(Path::new("/tmp/../escape")),
+        Err(CoreError::Fs(FsError::ParentDirTraversal))
+    ));
+    assert!(matches!(
+        IntegrationLock::acquire(Path::new("/tmp/bad\0dir")),
+        Err(CoreError::Fs(FsError::ContainsNul))
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        // Symlinked integration.lock rejected.
+        let sym_dir = tmp.path().join("sym_lock_dir");
+        fs::create_dir_all(&sym_dir).unwrap();
+        let victim = tmp.path().join("victim_lock");
+        fs::write(&victim, "keep").unwrap();
+        symlink(&victim, sym_dir.join(INTEGRATION_LOCK_FILENAME)).unwrap();
+        assert!(matches!(
+            IntegrationLock::acquire(&sym_dir),
+            Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
+        ));
+
+        // Directory integration.lock rejected.
+        let dir_lock_parent = tmp.path().join("dir_lock_parent");
+        fs::create_dir_all(dir_lock_parent.join(INTEGRATION_LOCK_FILENAME)).unwrap();
+        assert!(matches!(
+            IntegrationLock::acquire(&dir_lock_parent),
+            Err(CoreError::Fs(FsError::NotRegularFile { .. }))
+        ));
+
+        // FIFO integration.lock rejected without hanging.
+        let fifo_dir = tmp.path().join("fifo_lock_dir");
+        fs::create_dir_all(&fifo_dir).unwrap();
+        let fifo_lock = fifo_dir.join(INTEGRATION_LOCK_FILENAME);
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo_lock)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(matches!(
+            IntegrationLock::acquire(&fifo_dir),
+            Err(CoreError::Fs(FsError::NotRegularFile { .. }))
+        ));
+
+        // Symlinked data_dir rejected.
+        let victim_dir = tmp.path().join("victim_data_dir");
+        fs::create_dir_all(&victim_dir).unwrap();
+        let sym_data = tmp.path().join("sym_data_dir");
+        symlink(&victim_dir, &sym_data).unwrap();
+        assert!(matches!(
+            IntegrationLock::acquire(&sym_data),
+            Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
+        ));
+        assert!(!victim_dir.join(INTEGRATION_LOCK_FILENAME).exists());
+
+        // Symlinked $HOME/.local rejected before touching victim.
+        let fake_home = tmp.path().join("fake_home");
+        let victim_local = tmp.path().join("victim_local");
+        let victim_default_data = victim_local.join("share/agy-companion");
+        fs::create_dir_all(&fake_home).unwrap();
+        fs::create_dir_all(&victim_default_data).unwrap();
+        symlink(&victim_local, fake_home.join(".local")).unwrap();
+        let default_data = fake_home.join(".local/share/agy-companion");
+        assert!(matches!(
+            IntegrationLock::acquire_with_home(&default_data, Some(&fake_home)),
+            Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
+        ));
+        assert!(!victim_default_data.join(INTEGRATION_LOCK_FILENAME).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn integration_lock_drop_unlocks_with_duplicated_fd_and_concurrent_child_spawns() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+
+    // 1. Deterministic open-file-description proof: holding a dup'd fd (identical to a
+    //    child process inheriting the fd across fork/exec before O_CLOEXEC) MUST NOT
+    //    block reacquisition once IntegrationLock::drop calls File::unlock().
+    let guard = IntegrationLock::acquire(&data_dir).unwrap();
+    let lock_path = guard.path().to_path_buf();
+    let dup_fd = guard.try_clone_file().unwrap();
+    drop(guard);
+    assert!(
+        lock_path.is_file(),
+        "integration.lock must never be unlinked on Drop"
+    );
+    let reacquired = IntegrationLock::try_acquire(&data_dir).unwrap();
+    assert!(
+        reacquired.is_some(),
+        "Drop must explicitly unlock the open file description even while a dup fd is open"
+    );
+    drop(reacquired);
+    drop(dup_fd);
+
+    // 2. Real-world concurrent fork/exec stress: repeatedly acquire/drop/reacquire while
+    //    a sibling thread continuously spawns short-lived child processes.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_worker = Arc::clone(&stop);
+    let spawner = std::thread::spawn(move || {
+        while !stop_worker.load(Ordering::Relaxed) {
+            let status = Command::new("sh")
+                .args(["-c", ":"])
+                .status()
+                .expect("spawn sh");
+            assert!(status.success());
+        }
+    });
+
+    for iter in 0..40 {
+        let guard = IntegrationLock::acquire(&data_dir).unwrap();
+        drop(guard);
+        let reacquired = IntegrationLock::try_acquire(&data_dir).unwrap();
+        assert!(
+            reacquired.is_some(),
+            "iteration {iter}: reacquire must succeed immediately after Drop during concurrent spawns"
+        );
+        drop(reacquired);
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    spawner.join().unwrap();
+}
+
+#[test]
+fn ensure_first_run_launcher_enabled_state_machine_respects_opt_out_symlink_and_windows() {
+    use super::auto_enable::ensure_first_run_launcher_enabled_with_env;
+    use crate::config::Config;
+
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("agy-companion");
+    fs::write(&bin, "#!/bin/sh\n").unwrap();
+
+    // 1. Fresh None on Unix -> enables RC + env.sh, persists Some(true); second call is no-op.
+    {
+        let home = tmp.path().join("case1_home");
+        let data = tmp.path().join("case1_data");
+        let cfg_path = tmp.path().join("case1_cfg/config.json");
+        fs::create_dir_all(&home).unwrap();
+        let opts = make_opts(ShellKind::Zsh, None, data.clone(), bin.clone(), false);
+        let env = LifecycleEnv {
+            home: Some(&home),
+            zdotdir: Some(&home),
+            xdg_config_home: None,
+            shell_env: Some("/bin/zsh"),
+            default_data_override: Some(&data),
+            hybrid_active: false,
+            platform_supported: true,
+        };
+        let first = ensure_first_run_launcher_enabled_with_env(&cfg_path, &opts, &env).unwrap();
+        assert!(matches!(
+            first,
+            AutoEnableOutcome::Attempted { ref status } if status.enabled && status.state == IntegrationState::Enabled
+        ));
+        assert!(home.join(".zlogin").is_file());
+        assert!(data.join(ENV_SCRIPT_FILENAME).is_file());
+        assert_eq!(
+            Config::load_or_default(&cfg_path)
+                .unwrap()
+                .launcher_auto_start,
+            Some(true)
+        );
+
+        let second = ensure_first_run_launcher_enabled_with_env(&cfg_path, &opts, &env).unwrap();
+        assert_eq!(
+            second,
+            AutoEnableOutcome::AlreadyInitialized {
+                launcher_auto_start: true
+            }
+        );
+    }
+
+    // 2. Explicit opt-out Some(false) is NEVER overridden.
+    {
+        let home = tmp.path().join("case2_home");
+        let data = tmp.path().join("case2_data");
+        let cfg_path = tmp.path().join("case2_cfg/config.json");
+        fs::create_dir_all(&home).unwrap();
+        let cfg = Config {
+            launcher_auto_start: Some(false),
+            ..Default::default()
+        };
+        cfg.save_secure(&cfg_path).unwrap();
+
+        let opts = make_opts(ShellKind::Zsh, None, data.clone(), bin.clone(), false);
+        let env = LifecycleEnv {
+            home: Some(&home),
+            zdotdir: Some(&home),
+            xdg_config_home: None,
+            shell_env: Some("/bin/zsh"),
+            default_data_override: Some(&data),
+            hybrid_active: false,
+            platform_supported: true,
+        };
+        let outcome = ensure_first_run_launcher_enabled_with_env(&cfg_path, &opts, &env).unwrap();
+        assert_eq!(
+            outcome,
+            AutoEnableOutcome::AlreadyInitialized {
+                launcher_auto_start: false
+            }
+        );
+        assert!(!home.join(".zlogin").exists());
+        assert!(!data.join(ENV_SCRIPT_FILENAME).exists());
+    }
+
+    // 3. hybrid_active = true on first run -> AlreadyEnabled, persists Some(true) without writing RC.
+    {
+        let home = tmp.path().join("case3_home");
+        let data = tmp.path().join("case3_data");
+        let cfg_path = tmp.path().join("case3_cfg/config.json");
+        fs::create_dir_all(&home).unwrap();
+        let opts = make_opts(ShellKind::Zsh, None, data.clone(), bin.clone(), false);
+        let env = LifecycleEnv {
+            home: Some(&home),
+            zdotdir: Some(&home),
+            xdg_config_home: None,
+            shell_env: Some("/bin/zsh"),
+            default_data_override: Some(&data),
+            hybrid_active: true,
+            platform_supported: true,
+        };
+        let outcome = ensure_first_run_launcher_enabled_with_env(&cfg_path, &opts, &env).unwrap();
+        assert!(matches!(outcome, AutoEnableOutcome::AlreadyEnabled { .. }));
+        assert!(!home.join(".zlogin").exists());
+        assert_eq!(
+            Config::load_or_default(&cfg_path)
+                .unwrap()
+                .launcher_auto_start,
+            Some(true)
+        );
+    }
+
+    // 4. Simulated Windows (platform_supported = false) -> clean no-op, zero files touched.
+    {
+        let home = tmp.path().join("case4_home");
+        let data = tmp.path().join("case4_data");
+        let cfg_path = tmp.path().join("case4_cfg/config.json");
+        fs::create_dir_all(&home).unwrap();
+        let opts = make_opts(ShellKind::Zsh, None, data.clone(), bin.clone(), false);
+        let env = LifecycleEnv {
+            home: Some(&home),
+            zdotdir: Some(&home),
+            xdg_config_home: None,
+            shell_env: Some("/bin/zsh"),
+            default_data_override: Some(&data),
+            hybrid_active: false,
+            platform_supported: false,
+        };
+        let outcome = ensure_first_run_launcher_enabled_with_env(&cfg_path, &opts, &env).unwrap();
+        assert_eq!(outcome, AutoEnableOutcome::UnsupportedPlatform);
+        assert!(!home.join(".zlogin").exists());
+        assert!(!cfg_path.exists());
+        assert!(!data.join(INTEGRATION_LOCK_FILENAME).exists());
+    }
+
+    // 5. Symlinked RC file -> forces follow_rc_symlink=false even if caller passed true,
+    //    returns ManualRequired, leaves symlink target untouched, persists Some(true) (no retry loop).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let home = tmp.path().join("case5_home");
+        let data = tmp.path().join("case5_data");
+        let cfg_path = tmp.path().join("case5_cfg/config.json");
+        fs::create_dir_all(&home).unwrap();
+        let target_rc = tmp.path().join("case5_dotfile_zlogin");
+        fs::write(&target_rc, "# managed by nix\n").unwrap();
+        symlink(&target_rc, home.join(".zlogin")).unwrap();
+
+        // Caller deliberately passes follow_rc_symlink = true; first-run auto-enable must override to false.
+        let opts = make_opts(ShellKind::Zsh, None, data.clone(), bin.clone(), true);
+        let env = LifecycleEnv {
+            home: Some(&home),
+            zdotdir: Some(&home),
+            xdg_config_home: None,
+            shell_env: Some("/bin/zsh"),
+            default_data_override: Some(&data),
+            hybrid_active: false,
+            platform_supported: true,
+        };
+        let first = ensure_first_run_launcher_enabled_with_env(&cfg_path, &opts, &env).unwrap();
+        assert!(matches!(
+            first,
+            AutoEnableOutcome::Attempted { ref status } if status.state == IntegrationState::ManualRequired
+        ));
+        assert_eq!(
+            fs::read_to_string(&target_rc).unwrap(),
+            "# managed by nix\n",
+            "symlinked RC target must remain untouched"
+        );
+        assert_eq!(
+            Config::load_or_default(&cfg_path)
+                .unwrap()
+                .launcher_auto_start,
+            Some(true)
+        );
+        let second = ensure_first_run_launcher_enabled_with_env(&cfg_path, &opts, &env).unwrap();
+        assert_eq!(
+            second,
+            AutoEnableOutcome::AlreadyInitialized {
+                launcher_auto_start: true
+            }
+        );
+
+        // 6. Corrupt / symlinked config_path fails closed before touching RC.
+        let home6 = tmp.path().join("case6_home");
+        let data6 = tmp.path().join("case6_data");
+        let bad_cfg_target = tmp.path().join("case6_target.json");
+        let bad_cfg_sym = tmp.path().join("case6_sym.json");
+        fs::create_dir_all(&home6).unwrap();
+        fs::write(&bad_cfg_target, "{}").unwrap();
+        symlink(&bad_cfg_target, &bad_cfg_sym).unwrap();
+        let opts6 = make_opts(ShellKind::Zsh, None, data6.clone(), bin, false);
+        let env6 = LifecycleEnv {
+            home: Some(&home6),
+            zdotdir: Some(&home6),
+            xdg_config_home: None,
+            shell_env: Some("/bin/zsh"),
+            default_data_override: Some(&data6),
+            hybrid_active: false,
+            platform_supported: true,
+        };
+        assert!(ensure_first_run_launcher_enabled_with_env(&bad_cfg_sym, &opts6, &env6).is_err());
+        assert!(!home6.join(".zlogin").exists());
+    }
+}
+
+#[test]
+fn ensure_first_run_launcher_enabled_concurrent_race_executes_once_cleanly() {
+    use std::sync::{Arc, Barrier};
+
+    use super::auto_enable::ensure_first_run_launcher_enabled_with_env;
+    use crate::config::Config;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("race_home");
+    let data = tmp.path().join("race_data");
+    let cfg_path = tmp.path().join("race_cfg/config.json");
+    let bin = tmp.path().join("agy-companion");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&bin, "#!/bin/sh\n").unwrap();
+
+    let barrier = Arc::new(Barrier::new(6));
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let home = home.clone();
+        let data = data.clone();
+        let cfg_path = cfg_path.clone();
+        let bin = bin.clone();
+        let b = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            let opts = make_opts(ShellKind::Zsh, None, data.clone(), bin, false);
+            let env = LifecycleEnv {
+                home: Some(&home),
+                zdotdir: Some(&home),
+                xdg_config_home: None,
+                shell_env: Some("/bin/zsh"),
+                default_data_override: Some(&data),
+                hybrid_active: false,
+                platform_supported: true,
+            };
+            b.wait();
+            ensure_first_run_launcher_enabled_with_env(&cfg_path, &opts, &env).unwrap()
+        }));
+    }
+
+    let mut attempted = 0usize;
+    let mut already_init = 0usize;
+    for h in handles {
+        match h.join().unwrap() {
+            AutoEnableOutcome::Attempted { status } => {
+                assert!(status.enabled);
+                attempted += 1;
+            }
+            AutoEnableOutcome::AlreadyInitialized {
+                launcher_auto_start: true,
+            } => {
+                already_init += 1;
+            }
+            other => panic!("unexpected concurrent outcome: {other:?}"),
+        }
+    }
+    assert_eq!(attempted, 1, "exactly one thread must execute auto-enable");
+    assert_eq!(already_init, 5);
+    assert_eq!(
+        Config::load_or_default(&cfg_path)
+            .unwrap()
+            .launcher_auto_start,
+        Some(true)
+    );
+    let rc_content = fs::read_to_string(home.join(".zlogin")).unwrap();
+    assert_eq!(rc_content.matches(HOOK_BEGIN_MARKER).count(), 1);
+    assert_eq!(rc_content.matches(HOOK_END_MARKER).count(), 1);
+}
+
+#[test]
+fn enable_and_disable_and_persist_validate_config_before_mutating_rc() {
+    use super::auto_enable::{disable_and_persist_with_env, enable_and_persist_with_env};
+    use crate::config::Config;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("persist_home");
+    let data = tmp.path().join("persist_data");
+    let cfg_path = tmp.path().join("persist_cfg/config.json");
+    let bin = tmp.path().join("agy-companion");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&bin, "#!/bin/sh\n").unwrap();
+
+    let opts = make_opts(ShellKind::Zsh, None, data.clone(), bin, false);
+    let env = LifecycleEnv {
+        home: Some(&home),
+        zdotdir: Some(&home),
+        xdg_config_home: None,
+        shell_env: Some("/bin/zsh"),
+        default_data_override: Some(&data),
+        hybrid_active: false,
+        platform_supported: true,
+    };
+
+    // Corrupt config must fail closed BEFORE mutating RC.
+    fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+    fs::write(&cfg_path, "{ not valid json").unwrap();
+    assert!(enable_and_persist_with_env(&cfg_path, &opts, &env).is_err());
+    assert!(!home.join(".zlogin").exists());
+
+    // Valid enable persists Some(true); disable persists Some(false).
+    fs::remove_file(&cfg_path).unwrap();
+    let en = enable_and_persist_with_env(&cfg_path, &opts, &env).unwrap();
+    assert!(en.enabled);
+    assert_eq!(
+        Config::load_or_default(&cfg_path)
+            .unwrap()
+            .launcher_auto_start,
+        Some(true)
+    );
+    let dis = disable_and_persist_with_env(&cfg_path, &opts, &env).unwrap();
+    assert!(!dis.enabled);
+    assert_eq!(
+        Config::load_or_default(&cfg_path)
+            .unwrap()
+            .launcher_auto_start,
+        Some(false)
+    );
+}

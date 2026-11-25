@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CloudCodeConfig, ProxyConfig};
+use crate::models::default_enabled_gemini_models;
 use crate::validation::is_placeholder_api_key;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactedGeminiConfig {
     pub base_url: String,
     pub default_model: String,
+    #[serde(default = "default_enabled_gemini_models")]
+    pub enabled_models: Vec<String>,
     pub timeout_secs: u64,
     pub api_key_configured: bool,
     pub api_key_hint: Option<String>,
@@ -23,6 +26,8 @@ pub struct RedactedConfig {
     pub proxy: ProxyConfig,
     pub cloudcode: CloudCodeConfig,
     pub providers: RedactedProvidersConfig,
+    #[serde(default)]
+    pub launcher_auto_start: Option<bool>,
 }
 
 pub fn mask_api_key(key: &str) -> String {

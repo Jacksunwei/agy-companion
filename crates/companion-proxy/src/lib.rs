@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use companion_core::{
     CloudCodeUpstream, Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_GEMINI_MODEL,
-    DEFAULT_TIMEOUT_SECS, FsError, UsageSink,
+    DEFAULT_TIMEOUT_SECS, FsError, UsageSink, default_enabled_gemini_models,
 };
 use companion_providers::{GeminiProvider, ProviderAdapter, ProviderError};
 use thiserror::Error;
@@ -68,6 +68,7 @@ pub(crate) struct ActiveProvider {
     pub(crate) cloudcode_timeout_secs: u64,
     pub(crate) has_configured_api_key: bool,
     pub(crate) default_model: String,
+    pub(crate) enabled_models: Vec<String>,
 }
 
 enum ProviderSource {
@@ -135,6 +136,7 @@ impl ProxyState {
                     cloudcode_timeout_secs: DEFAULT_TIMEOUT_SECS,
                     has_configured_api_key,
                     default_model: DEFAULT_GEMINI_MODEL.to_string(),
+                    enabled_models: default_enabled_gemini_models(),
                 }),
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
@@ -229,6 +231,7 @@ pub(crate) fn build_active_provider(
         cloudcode_timeout_secs: config.providers.gemini.timeout_secs,
         has_configured_api_key,
         default_model: config.providers.gemini.default_model.clone(),
+        enabled_models: config.providers.gemini.enabled_models.clone(),
     })
 }
 

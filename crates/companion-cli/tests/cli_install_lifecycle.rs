@@ -637,3 +637,107 @@ fn install_and_uninstall_respect_explicit_config_flag_and_fail_closed_on_invalid
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn install_persists_launcher_auto_start_and_uninstall_purge_removes_integration_lock() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_config = temp.path().join("xdg_config");
+    let xdg_data = temp.path().join("xdg_data");
+    let plugins_dir = temp.path().join("plugins");
+    fs::create_dir_all(&home).expect("mkdir home");
+
+    // 1. `install --no-launcher-hook` persists launcher_auto_start = Some(false) and leaves RC untouched.
+    let cfg_opt_out = temp.path().join("opt_out/config.json");
+    let out_opt_out = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .env("SHELL", "/bin/zsh")
+        .args([
+            "install",
+            "--config",
+            cfg_opt_out.to_str().expect("utf8 cfg"),
+            "--plugins-dir",
+            plugins_dir.to_str().expect("utf8 plugins"),
+            "--no-launcher-hook",
+            "--no-start-proxy",
+            "--json",
+        ])
+        .output()
+        .expect("run install --no-launcher-hook");
+    assert_eq!(
+        out_opt_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out_opt_out.stderr)
+    );
+    assert!(!home.join(".zlogin").exists());
+    let loaded_opt_out = companion_core::Config::load_or_default(&cfg_opt_out).unwrap();
+    assert_eq!(loaded_opt_out.launcher_auto_start, Some(false));
+    let lock_path = xdg_data
+        .join("agy-companion")
+        .join(companion_core::INTEGRATION_LOCK_FILENAME);
+    assert!(lock_path.is_file(), "integration.lock must exist");
+
+    // 2. Default Unix `install` enables launcher hook and persists launcher_auto_start = Some(true).
+    let cfg_default = temp.path().join("default_install/config.json");
+    let out_default = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .env("SHELL", "/bin/zsh")
+        .args([
+            "install",
+            "--config",
+            cfg_default.to_str().expect("utf8 cfg"),
+            "--plugins-dir",
+            plugins_dir.to_str().expect("utf8 plugins"),
+            "--no-start-proxy",
+            "--json",
+        ])
+        .output()
+        .expect("run default install");
+    assert_eq!(
+        out_default.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out_default.stderr)
+    );
+    assert!(home.join(".zlogin").is_file());
+    let loaded_default = companion_core::Config::load_or_default(&cfg_default).unwrap();
+    assert_eq!(loaded_default.launcher_auto_start, Some(true));
+
+    // 3. `uninstall --purge` deletes integration.lock and cleans up empty data_dir.
+    let out_purge = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .env("SHELL", "/bin/zsh")
+        .args([
+            "uninstall",
+            "--config",
+            cfg_default.to_str().expect("utf8 cfg"),
+            "--plugins-dir",
+            plugins_dir.to_str().expect("utf8 plugins"),
+            "--purge",
+            "--json",
+        ])
+        .output()
+        .expect("run uninstall --purge");
+    assert_eq!(
+        out_purge.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out_purge.stderr)
+    );
+    assert!(
+        !lock_path.exists(),
+        "uninstall --purge must remove integration.lock"
+    );
+    assert!(
+        !xdg_data.join("agy-companion").exists(),
+        "empty data_dir must be removed cleanly after integration.lock is purged"
+    );
+}
