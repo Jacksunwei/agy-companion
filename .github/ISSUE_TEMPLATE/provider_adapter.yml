@@ -1,0 +1,62 @@
+name: Provider Adapter Proposal
+description: Request or volunteer to build a new BYOM ProviderAdapter backend (Ollama, OpenAI-compatible, Codex, Claude, etc.)
+labels: ["enhancement", "provider-adapter"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        New model backends plug directly into `crates/companion-providers/src/lib.rs` via the `ProviderAdapter` trait using a direct 1-hop architecture (no secondary local proxy).
+        See [CONTRIBUTING.md](https://github.com/Jacksunwei/agy-companion/blob/main/CONTRIBUTING.md) for adapter invariants (zero-compression `reqwest`, HTTPS/SSRF safety, `#![forbid(unsafe_code)]`).
+
+  - type: input
+    id: provider_name
+    attributes:
+      label: Provider Name
+      description: Name of the model provider or OpenAI-compatible gateway.
+      placeholder: "e.g., Ollama Cloud, Local Ollama, OpenRouter, Anthropic Claude, OpenAI Codex, vLLM"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: wire_format
+    attributes:
+      label: Upstream Wire Protocol
+      description: What API format does the upstream provider speak?
+      options:
+        - OpenAI Chat Completions (/v1/chat/completions)
+        - OpenAI Responses API (/v1/responses)
+        - Anthropic Messages API (/v1/messages)
+        - Google Gemini API compatible
+        - Custom / Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: auth_method
+    attributes:
+      label: Authentication Mechanism
+      description: How does the provider authenticate requests? (Never paste real keys or tokens.)
+      placeholder: "e.g., Authorization: Bearer <token>, x-api-key header, local no-auth loopback"
+    validations:
+      required: true
+
+  - type: textarea
+    id: streaming_caching
+    attributes:
+      label: Streaming, Tool Calling & Prompt Caching Details
+      description: Link to official API docs and note SSE streaming format, function/tool calling parity, thinking/reasoning tokens, and prompt caching headers or fields.
+      placeholder: |
+        - Docs URL: https://...
+        - SSE streaming: ...
+        - Tool calling & thinking support: ...
+        - Usage / prompt-cache fields: ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribute_pr
+    attributes:
+      label: Implementation Interest
+      options:
+        - label: I'm interested in implementing a PR for this adapter
+          required: false

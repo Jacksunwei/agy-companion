@@ -1,0 +1,71 @@
+name: Bug Report
+description: Report a bug in agy-companion (proxy, MCP App UI, CLI, or Dock/Launcher integration)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Security reminder:** NEVER paste real Gemini API keys, OAuth tokens, or private prompts in this form. Use redacted placeholders like `AIza...abcd`.
+        > If you found a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/Jacksunwei/agy-companion/security/advisories/new) instead.
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected Surface
+      description: Where did you encounter the bug?
+      options:
+        - Antigravity App (Dock / Launcher / Sidecar)
+        - MCP App Settings UI (aux_pane / Plugins sidebar)
+        - Antigravity CLI (agy) / Gemini SDK
+        - Installer / Uninstaller (install / uninstall / integration)
+        - Local Proxy (serve / Hybrid Mode / SSE streaming)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: agy-companion Version
+      description: Output of `agy-companion --version` (or commit SHA if built from source)
+      placeholder: "e.g., agy-companion 0.1.0 (or git commit abc1234)"
+    validations:
+      required: true
+
+  - type: input
+    id: os_shell
+    attributes:
+      label: OS, Architecture & Shell
+      placeholder: "e.g., macOS 15.x arm64 (zsh) / Ubuntu 24.04 x64 (bash) / Windows 11 x64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce & Expected Behavior
+      description: Describe what you ran, what you expected to happen, and what happened instead.
+      placeholder: |
+        1. Run `...`
+        2. Open ...
+        3. Expected: ...
+        4. Actual: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: Diagnostics (agy-companion doctor)
+      description: Paste redacted output of `agy-companion doctor` and any relevant proxy/sidecar error lines. Double-check that zero secrets are included.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: redaction_check
+    attributes:
+      label: Secret Hygiene Check
+      options:
+        - label: I confirmed this report contains no real API keys, bearer tokens, or private credentials.
+          required: true
