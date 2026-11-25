@@ -6,6 +6,7 @@ additive feature tests for F14, F15 & F16 (XDG paths).
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import importlib.util
 import json
@@ -13,6 +14,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import stat
 import tempfile
 import tomllib
@@ -22,14 +24,17 @@ from typing import Any
 from harness import (
     E2ETestCase,
     IsolatedEnv,
+    USAGE_DB_FILENAME,
     extract_models_list,
     find_free_port,
     find_key_recursive,
     http_raw_request,
     http_stream_request,
+    open_usage_db_readonly,
     poll_stats,
     poll_usage_events,
     run_cli,
+    usage_storage_files,
 )
 from mock_gemini import JsonAction, SseStreamAction, build_sse_events
 
@@ -190,7 +195,7 @@ class TestTier1F1Config(E2ETestCase):
         self.assertEqual(resp.json().get("status"), "ok")
 
     def test_t1_f1_usage_dir_config_honored(self) -> None:
-        """Configured usage_dir receives monthly JSONL events from proxy traffic."""
+        """Configured usage_dir receives SQLite usage events from proxy traffic."""
         env = self.make_env()
         mock = self.start_mock_gemini()
         custom_usage = env.root / "custom_usage"
@@ -212,9 +217,9 @@ class TestTier1F1Config(E2ETestCase):
         )
         self.assertEqual(resp.status, 200)
         files, events = poll_usage_events(custom_usage, min_count=1)
-        self.assertEqual(len(files), 1, f"Expected 1 monthly JSONL file in {custom_usage}, got {files}")
+        self.assertEqual(len(files), 1, f"Expected 1 SQLite DB file in {custom_usage}, got {files}")
         self.assertEqual(len(events), 1)
-        self.assertRegex(files[0].name, r"^\d{4}-\d{2}\.jsonl$")
+        self.assertEqual(files[0].name, USAGE_DB_FILENAME)
 
 
 class TestTier1F2Redaction(E2ETestCase):
@@ -324,7 +329,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
     FEATURE = "F3"
 
     def test_t1_f3_parses_all_four_token_fields_unary(self) -> None:
-        """Unary :generateContent usageMetadata maps all four token counts to JSONL."""
+        """Unary :generateContent usageMetadata maps all four token counts to SQLite."""
         env = self.make_env()
         mock = self.start_mock_gemini(
             default_usage={
@@ -355,7 +360,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
         self.assertEqual(ev["reasoning_tokens"], 120)
 
     def test_t1_f3_parses_all_four_token_fields_sse(self) -> None:
-        """Streaming :streamGenerateContent?alt=sse usageMetadata maps all four fields to JSONL."""
+        """Streaming :streamGenerateContent?alt=sse usageMetadata maps all four fields to SQLite."""
         env = self.make_env()
         mock = self.start_mock_gemini(
             default_usage={
@@ -385,7 +390,7 @@ class TestTier1F3UsageSeam(E2ETestCase):
         self.assertEqual(ev["reasoning_tokens"], 50)
 
     def test_t1_f3_usage_event_contains_all_canonical_fields(self) -> None:
-        """JSONL UsageEvent contains all 10 canonical fields with valid types."""
+        """SQLite UsageEvent row contains all 10 canonical fields with valid types."""
         env = self.make_env()
         mock = self.start_mock_gemini()
         cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyCanonicalFields1"))
@@ -423,11 +428,11 @@ class TestTier1F3UsageSeam(E2ETestCase):
         self.assertGreaterEqual(ev["latency_ms"], 0)
         self.assertEqual(ev["source"], "proxy")
 
-    def test_t1_f3_jsonl_written_to_monthly_filename(self) -> None:
-        """Usage file name matches UTC YYYY-MM.jsonl matching event timestamp_utc."""
+    def test_t1_f3_sqlite_db_filename_schema_and_wal_mode(self) -> None:
+        """Usage database uses usage.db with PRAGMA user_version=1, WAL mode, indexes, and zero *.jsonl files."""
         env = self.make_env()
         mock = self.start_mock_gemini()
-        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyMonthlyFile1234"))
+        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSySqliteSchema123"))
         proxy = self.start_proxy(env, config_path=cfg)
         resp = http_raw_request(
             "127.0.0.1",
@@ -440,16 +445,32 @@ class TestTier1F3UsageSeam(E2ETestCase):
         self.assertEqual(resp.status, 200)
         files, events = poll_usage_events(env.usage_dir, min_count=1)
         self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].name, USAGE_DB_FILENAME)
+        self.assertEqual(list(env.usage_dir.glob("*.jsonl")), [])
         expected_ym = str(events[0]["timestamp_utc"])[:7]
         current_ym = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
-        self.assertEqual(files[0].name, f"{expected_ym}.jsonl")
         self.assertEqual(expected_ym, current_ym)
 
-    def test_t1_f3_jsonl_created_with_mode_0600(self) -> None:
-        """Newly created monthly JSONL usage log enforces strict 0600 permissions (S3)."""
+        with contextlib.closing(open_usage_db_readonly(files[0])) as conn:
+            user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            objects = {
+                (row[0], row[1])
+                for row in conn.execute("SELECT type, name FROM sqlite_master").fetchall()
+            }
+        self.assertEqual(user_version, 1)
+        self.assertEqual(journal_mode, "wal")
+        self.assertEqual(integrity, "ok")
+        self.assertIn(("table", "usage_events"), objects)
+        self.assertIn(("index", "idx_usage_events_timestamp_utc"), objects)
+        self.assertIn(("index", "idx_usage_events_provider_model"), objects)
+
+    def test_t1_f3_sqlite_db_created_with_mode_0600(self) -> None:
+        """Newly created SQLite usage.db and sidecars enforce strict 0600 permissions (S2)."""
         env = self.make_env()
         mock = self.start_mock_gemini()
-        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyJsonlPerm06001"))
+        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSySqlitePerm06001"))
         proxy = self.start_proxy(env, config_path=cfg)
         resp = http_raw_request(
             "127.0.0.1",
@@ -462,8 +483,11 @@ class TestTier1F3UsageSeam(E2ETestCase):
         self.assertEqual(resp.status, 200)
         files, _ = poll_usage_events(env.usage_dir, min_count=1)
         self.assertEqual(len(files), 1)
-        mode = stat.S_IMODE(os.stat(files[0]).st_mode)
-        self.assertEqual(mode, 0o600, f"Expected 0600 for {files[0]}, got {oct(mode)}")
+        storage_files = usage_storage_files(env.usage_dir)
+        self.assertIn(files[0], storage_files)
+        for sf in storage_files:
+            mode = stat.S_IMODE(os.stat(sf).st_mode)
+            self.assertEqual(mode, 0o600, f"Expected 0600 for {sf}, got {oct(mode)}")
 
     def test_t1_f3_distinct_request_ids_per_request(self) -> None:
         """Sequential requests emit distinct non-empty request_id values."""
@@ -1769,7 +1793,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
         self.assertTrue(found_h and hint == "AIza...st12", f"Bad hint in {sc!r}")
 
     def test_t1_f16_xdg_data_home_honored_when_usage_dir_omitted(self) -> None:
-        """XDG_DATA_HOME/agy-companion/usage receives JSONL usage logs when config.usage_dir is omitted."""
+        """XDG_DATA_HOME/agy-companion/usage receives SQLite usage.db when config.usage_dir is omitted."""
         env = self.make_env()
         mock = self.start_mock_gemini(
             default_usage={
@@ -1806,11 +1830,12 @@ class TestTier1F16XdgPaths(E2ETestCase):
         self.assertEqual(resp.status, 200, resp.text)
 
         files, events = poll_usage_events(expected_usage_dir, min_count=1, timeout=3.0)
-        self.assertGreaterEqual(len(files), 1, f"Expected JSONL under {expected_usage_dir}")
+        self.assertGreaterEqual(len(files), 1, f"Expected SQLite usage.db under {expected_usage_dir}")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["input_tokens"], 420)
         self.assertEqual(events[0]["cached_tokens"], 120)
-        self.assertEqual(stat.S_IMODE(os.stat(files[0]).st_mode), 0o600)
+        for sf in usage_storage_files(expected_usage_dir):
+            self.assertEqual(stat.S_IMODE(os.stat(sf).st_mode), 0o600)
         # Default IsolatedEnv usage_dir and $HOME/.local/share must remain untouched.
         self.assertEqual(env.usage_files(), [])
         self.assertEqual(env.usage_files(env.home_dir / ".local" / "share" / "agy-companion" / "usage"), [])

@@ -26,7 +26,9 @@ from harness import (
     http_raw_request,
     poll_stats,
     poll_usage_events,
+    read_usage_raw_bytes,
     run_cli,
+    usage_storage_files,
 )
 from mcp_client import McpStdioClient
 from mock_gemini import JsonAction, MockGeminiServer, SseStreamAction, build_sse_events
@@ -37,7 +39,7 @@ class TestTier4Scenarios(E2ETestCase):
     FEATURE = "SCENARIO"
 
     def test_t4_01_full_onboarding_and_cached_conversation_lifecycle(self) -> None:
-        """Brand-new user onboarding -> 3-turn cached SSE chat -> stats, MCP, doctor, and 0600 JSONL audit."""
+        """Brand-new user onboarding -> 3-turn cached SSE chat -> stats, MCP, doctor, and 0600 SQLite audit."""
         binary = self.require_binary()
         env = self.make_env()
         api_key = "AIzaSyOnboardingUser1234"
@@ -136,16 +138,18 @@ class TestTier4Scenarios(E2ETestCase):
         r_doc = run_cli([str(binary), "doctor", "--config", str(cfg), "--port", str(proxy.port)], env=doc_env)
         self.assertEqual(r_doc.returncode, 0, f"{r_doc.stdout}\n{r_doc.stderr}")
 
-        # 6. Audit JSONL file perms (0600) and zero secret/body leaks.
+        # 6. Audit SQLite DB & sidecar perms (0600) and zero secret/body leaks.
         files, events = poll_usage_events(env.usage_dir, min_count=3)
         self.assertEqual(len(files), 1)
         self.assertEqual(len(events), 3)
-        self.assertEqual(stat.S_IMODE(os.stat(files[0]).st_mode), 0o600)
-        raw_jsonl = files[0].read_text(encoding="utf-8")
-        self.assertNotIn(api_key, raw_jsonl)
+        for sf in usage_storage_files(env.usage_dir):
+            self.assertEqual(stat.S_IMODE(os.stat(sf).st_mode), 0o600)
+        raw_sqlite = read_usage_raw_bytes(env.usage_dir)
+        self.assertGreater(len(raw_sqlite), 0)
+        self.assertNotIn(api_key.encode("utf-8"), raw_sqlite)
         for _, _, _, _, prompt_txt, resp_txt in turns:
-            self.assertNotIn(prompt_txt, raw_jsonl)
-            self.assertNotIn(resp_txt, raw_jsonl)
+            self.assertNotIn(prompt_txt.encode("utf-8"), raw_sqlite)
+            self.assertNotIn(resp_txt.encode("utf-8"), raw_sqlite)
 
     def test_t4_02_live_api_key_rotation_and_revocation_without_restart(self) -> None:
         """Zero-downtime key rotation, preservation across unrelated saves, and clean revocation."""
@@ -413,7 +417,7 @@ class TestTier4Scenarios(E2ETestCase):
         self.assertEqual(stats["reasoning_tokens"], expected_think)
 
     def test_t4_05_end_to_end_security_and_privacy_audit_s1_to_s8(self) -> None:
-        """Full-stack S1–S8 security & canary privacy audit across HTTP, MCP, CLI, JSONL, UI, plugin, and npm."""
+        """Full-stack S1–S8 security & canary privacy audit across HTTP, MCP, CLI, SQLite, UI, plugin, and npm."""
         binary = self.require_binary()
         env = self.make_env()
         canary_key = "AIzaSyCANARY_PRIVACY_987654"
@@ -498,8 +502,11 @@ class TestTier4Scenarios(E2ETestCase):
 
         files, events = poll_usage_events(env.usage_dir, min_count=1)
         self.assertEqual(len(events), 1)
-        self.assertEqual(stat.S_IMODE(os.stat(files[0]).st_mode), 0o600)
-        raw_jsonl = files[0].read_text(encoding="utf-8")
+        self.assertEqual(len(files), 1)
+        for sf in usage_storage_files(env.usage_dir):
+            self.assertEqual(stat.S_IMODE(os.stat(sf).st_mode), 0o600)
+        raw_sqlite = read_usage_raw_bytes(env.usage_dir)
+        self.assertGreater(len(raw_sqlite), 0)
 
         # S2: Zero canary leaks across ALL observable surfaces.
         surfaces = {
@@ -512,16 +519,18 @@ class TestTier4Scenarios(E2ETestCase):
             "doctor_out": r_doc.stdout + r_doc.stderr,
             "proxy_stderr": proxy.stderr_text,
             "mcp_stderr": mcp.stderr_text,
-            "jsonl": raw_jsonl,
         }
         for name, text in surfaces.items():
             self.assertNotIn(canary_key, text, f"S2 VIOLATION: canary_key leaked in {name}")
+        self.assertNotIn(canary_key.encode("utf-8"), raw_sqlite, "S2 VIOLATION: canary_key leaked in sqlite")
         for req in mock.requests:
             self.assertNotIn(canary_key, req.raw_target)
             self.assertNotIn("LEAK_ATTEMPT", req.raw_target)
-        for name in ("jsonl", "proxy_stderr", "mcp_stderr", "stats"):
+        for name in ("proxy_stderr", "mcp_stderr", "stats"):
             self.assertNotIn(canary_prompt, surfaces[name], f"S2 VIOLATION: prompt leaked in {name}")
             self.assertNotIn(canary_resp, surfaces[name], f"S2 VIOLATION: response leaked in {name}")
+        self.assertNotIn(canary_prompt.encode("utf-8"), raw_sqlite, "S2 VIOLATION: prompt leaked in sqlite")
+        self.assertNotIn(canary_resp.encode("utf-8"), raw_sqlite, "S2 VIOLATION: response leaked in sqlite")
 
         # S4: UI XSS scan.
         ui_src = self.repo_root / "ui" / "src"

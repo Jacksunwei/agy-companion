@@ -1,4 +1,4 @@
-"""Pure-Python harness self-tests (`SELF-01` .. `SELF-25`).
+"""Pure-Python harness self-tests (`SELF-01` .. `SELF-26`).
 
 Runs via `python3 e2e/run_e2e.py --self-test` with zero external dependencies
 and without requiring the compiled `agy-companion` binary.
@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -32,13 +33,19 @@ from harness import (
     IsolatedEnv,
     MockConnectProxy,
     STRIPPED_ENV_VARS,
+    USAGE_DB_FILENAME,
     find_free_port,
     http_raw_request,
     http_stream_request,
+    open_usage_db_readonly,
+    poll_usage_events,
+    read_usage_raw_bytes,
     reap_pidfile_daemon,
     register_pidfile_cleanup,
     resolve_binary,
     run_cli,
+    usage_files,
+    usage_storage_files,
 )
 from mcp_client import (
     McpEofError,
@@ -1300,3 +1307,105 @@ class TestHarnessSelfTests(E2ETestCase):
         with self.assertRaises(OSError):
             with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.5):
                 pass
+
+    def test_self_26_sqlite_usage_harness_helpers(self) -> None:
+        """SELF-26: SQLite usage harness helpers handle empty dirs, missing tables, WAL reads, raw bytes, and symlinks."""
+        env = self.make_env()
+
+        # 1. Missing and empty directories return empty without creating usage.db.
+        missing_dir = env.root / "no_such_usage"
+        self.assertEqual(usage_files(missing_dir), [])
+        self.assertEqual(usage_storage_files(missing_dir), [])
+        self.assertEqual(read_usage_raw_bytes(missing_dir), b"")
+        files_m, events_m = poll_usage_events(missing_dir, min_count=1, timeout=0.1, interval=0.02)
+        self.assertEqual((files_m, events_m), ([], []))
+        self.assertFalse(missing_dir.exists())
+
+        empty_dir = env.root / "empty_usage"
+        empty_dir.mkdir()
+        self.assertEqual(env.read_usage_events(empty_dir), [])
+        self.assertFalse((empty_dir / USAGE_DB_FILENAME).exists())
+
+        # 2. Empty/schema-less DB file does not crash poll_usage_events.
+        init_dir = env.root / "initializing_usage"
+        init_dir.mkdir()
+        (init_dir / USAGE_DB_FILENAME).write_bytes(b"")
+        files_i, events_i = poll_usage_events(init_dir, min_count=1, timeout=0.1, interval=0.02)
+        self.assertEqual(files_i, [init_dir / USAGE_DB_FILENAME])
+        self.assertEqual(events_i, [])
+
+        # 3. WAL-mode usage.db with open writer connection exposes rows in id ASC order + raw WAL bytes.
+        wal_dir = env.root / "wal_usage"
+        wal_dir.mkdir()
+        db_path = wal_dir / USAGE_DB_FILENAME
+        with contextlib.closing(sqlite3.connect(str(db_path))) as writer:
+            writer.execute("PRAGMA journal_mode = WAL")
+            writer.execute(
+                """
+                CREATE TABLE usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_utc TEXT NOT NULL,
+                    request_id TEXT NOT NULL UNIQUE,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    cached_tokens INTEGER NOT NULL,
+                    reasoning_tokens INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL,
+                    source TEXT NOT NULL
+                )
+                """
+            )
+            writer.execute("PRAGMA user_version = 1")
+            writer.execute(
+                "INSERT INTO usage_events (timestamp_utc, request_id, provider, model, "
+                "input_tokens, output_tokens, cached_tokens, reasoning_tokens, latency_ms, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("2026-11-25T00:00:00Z", "req-wal-1", "gemini", "gemini-4-hydrogen", 100, 20, 50, 5, 42, "proxy"),
+            )
+            writer.execute(
+                "INSERT INTO usage_events (timestamp_utc, request_id, provider, model, "
+                "input_tokens, output_tokens, cached_tokens, reasoning_tokens, latency_ms, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("2026-11-25T00:00:00Z", "req-wal-2", "gemini", "gemini-4-hydrogen", 200, 30, 80, 10, 64, "proxy"),
+            )
+            writer.commit()
+
+            self.assertEqual(usage_files(wal_dir), [db_path])
+            storage = usage_storage_files(wal_dir)
+            self.assertIn(db_path, storage)
+            self.assertIn(wal_dir / "usage.db-wal", storage)
+            raw = read_usage_raw_bytes(wal_dir)
+            self.assertIn(b"req-wal-1", raw)
+            self.assertIn(b"req-wal-2", raw)
+
+            files_w, events_w = poll_usage_events(wal_dir, min_count=2, timeout=1.0)
+            self.assertEqual(files_w, [db_path])
+            self.assertEqual([e["request_id"] for e in events_w], ["req-wal-1", "req-wal-2"])
+            self.assertEqual(
+                set(events_w[0].keys()),
+                {
+                    "timestamp_utc",
+                    "request_id",
+                    "provider",
+                    "model",
+                    "input_tokens",
+                    "output_tokens",
+                    "cached_tokens",
+                    "reasoning_tokens",
+                    "latency_ms",
+                    "source",
+                },
+            )
+            self.assertEqual(env.read_usage_events(wal_dir), events_w)
+            with contextlib.closing(open_usage_db_readonly(db_path)) as ro_conn:
+                self.assertEqual(ro_conn.execute("PRAGMA user_version").fetchone()[0], 1)
+
+        # 4. Symlinked usage.db is excluded by usage_files and usage_storage_files.
+        if os.name != "nt":
+            sym_dir = env.root / "sym_usage"
+            sym_dir.mkdir()
+            os.symlink(db_path, sym_dir / USAGE_DB_FILENAME)
+            self.assertEqual(usage_files(sym_dir), [])
+            self.assertEqual(usage_storage_files(sym_dir), [])

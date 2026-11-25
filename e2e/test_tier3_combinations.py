@@ -27,7 +27,9 @@ from harness import (
     http_raw_request,
     poll_stats,
     poll_usage_events,
+    read_usage_raw_bytes,
     run_cli,
+    usage_storage_files,
 )
 from mock_gemini import JsonAction, SseStreamAction, build_sse_events
 
@@ -75,8 +77,8 @@ class TestTier3Combinations(E2ETestCase):
         self.assertEqual(r2.status, 200)
         self.assertEqual(mock.requests[1].header("x-goog-api-key"), key_b)
 
-    def test_t3_02_sse_stream_updates_stats_jsonl_and_get_settings(self) -> None:
-        """F5+F6+F3+F8: SSE stream updates /api/stats, JSONL usage file, and ui-mcp get_settings consistently."""
+    def test_t3_02_sse_stream_updates_stats_sqlite_and_get_settings(self) -> None:
+        """F5+F6+F3+F8: SSE stream updates /api/stats, SQLite usage.db, and ui-mcp get_settings consistently."""
         env = self.make_env()
         mock = self.start_mock_gemini(
             default_usage={
@@ -256,8 +258,8 @@ class TestTier3Combinations(E2ETestCase):
         self.assertEqual(r2.status, 200)
         self.assertEqual(mock.requests[1].header("x-goog-api-key"), cfg_key)
 
-    def test_t3_08_key_redaction_consistent_across_save_get_open_and_jsonl(self) -> None:
-        """F2+F8+F3: Masked hint AIza...5555 matches across all MCP tools and zero secret appears in JSONL/stderr."""
+    def test_t3_08_key_redaction_consistent_across_save_get_open_and_sqlite(self) -> None:
+        """F2+F8+F3: Masked hint AIza...5555 matches across all MCP tools and zero secret appears in SQLite/stderr."""
         env = self.make_env()
         sentinel = "AIzaSyCrossSurfaceKey5555"
         mock = self.start_mock_gemini()
@@ -287,14 +289,16 @@ class TestTier3Combinations(E2ETestCase):
             headers={"Content-Type": "application/json"},
         )
         self.assertEqual(r.status, 200)
-        files, events = poll_usage_events(env.usage_dir, min_count=1)
+        _, events = poll_usage_events(env.usage_dir, min_count=1)
         self.assertEqual(len(events), 1)
-        self.assertNotIn(sentinel, files[0].read_text(encoding="utf-8"))
+        raw_sqlite = read_usage_raw_bytes(env.usage_dir)
+        self.assertGreater(len(raw_sqlite), 0)
+        self.assertNotIn(sentinel.encode("utf-8"), raw_sqlite)
         self.assertNotIn(sentinel, mcp.stderr_text)
         self.assertNotIn(sentinel, proxy.stderr_text)
 
     def test_t3_09_concurrent_generate_and_stream_with_query_key_stripping(self) -> None:
-        """F5+F4+F3: 4 concurrent unary+SSE requests strip ?key=, preserve alt=sse, and write 4 valid JSONL lines."""
+        """F5+F4+F3: 4 concurrent unary+SSE requests strip ?key=, preserve alt=sse, and write 4 valid SQLite rows."""
         env = self.make_env()
         mock = self.start_mock_gemini()
         cfg_key = "AIzaSyConcurrentKey1234"
@@ -434,8 +438,8 @@ class TestTier3Combinations(E2ETestCase):
         r_doc = run_cli([str(binary), "doctor"], env=doc_env)
         self.assertEqual(r_doc.returncode, 0, f"{r_doc.stdout}\n{r_doc.stderr}")
 
-    def test_t3_13_proxy_non_streaming_generate_updates_stats_and_jsonl_accurately(self) -> None:
-        """F4+F5+F6+F3: 3 unary requests with varying cached/thoughts produce exact matching /api/stats and JSONL sums."""
+    def test_t3_13_proxy_non_streaming_generate_updates_stats_and_sqlite_accurately(self) -> None:
+        """F4+F5+F6+F3: 3 unary requests with varying cached/thoughts produce exact matching /api/stats and SQLite sums."""
         env = self.make_env()
         mock = self.start_mock_gemini()
         usages = [
@@ -628,7 +632,7 @@ class TestTier3Combinations(E2ETestCase):
             set_config_env=False,
         )
 
-        # 3. Stream SSE through proxy; verify response, /api/stats, and JSONL under XDG_DATA_HOME.
+        # 3. Stream SSE through proxy; verify response, /api/stats, and SQLite usage.db under XDG_DATA_HOME.
         resp = http_raw_request(
             "127.0.0.1",
             proxy.port,
@@ -648,12 +652,13 @@ class TestTier3Combinations(E2ETestCase):
         self.assertEqual(stats.get("reasoning_tokens"), 8)
 
         files, events = poll_usage_events(expected_usage_dir, min_count=1, timeout=3.0)
-        self.assertGreaterEqual(len(files), 1, f"Expected JSONL under {expected_usage_dir}")
+        self.assertGreaterEqual(len(files), 1, f"Expected SQLite usage.db under {expected_usage_dir}")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["input_tokens"], 500)
         self.assertEqual(events[0]["cached_tokens"], 300)
         self.assertEqual(events[0]["output_tokens"], 25)
-        self.assertEqual(stat.S_IMODE(os.stat(files[0]).st_mode), 0o600)
+        for sf in usage_storage_files(expected_usage_dir):
+            self.assertEqual(stat.S_IMODE(os.stat(sf).st_mode), 0o600)
 
         # 4. ui-mcp get_settings sees live proxy reachable + stats + redacted key (never plaintext).
         get_res = mcp.call_tool("get_settings", {})

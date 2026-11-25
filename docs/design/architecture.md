@@ -131,7 +131,7 @@ If a second inbound format is ever added later, shared types can be factored int
 #### A. Proxy & Implicit Context Caching (Raw HTTP Pass-Through)
 - **Endpoint, Auth & Client:** Official Gemini API (`https://generativelanguage.googleapis.com/v1beta`, `x-goog-api-key` header — never `?key=` in URLs) via raw `reqwest` + `rustls` streaming with a 15-minute streaming timeout (matching Gemini 4 guidance for long thinking turns).
 - **Byte-for-Byte Implicit Cache Preservation:** Gemini 2.5, 3, and 4 enable **implicit caching by default** (95% discount on Gemini 4 cache hits; explicit `cachedContents` is not supported on Gemini 4 Argon and onward). Forwarding the request bytes untouched keeps `systemInstruction`, `tools`, and conversation prefix byte-for-byte deterministic across turns and passes through any client-provided `cachedContent` for older Gemini 2.5/3 callers.
-- **Zero-Buffering Usage & Cache Observability:** Stream SSE chunks directly to `agy` while tee-ing `usageMetadata` (`promptTokenCount`, `candidatesTokenCount`, `cachedContentTokenCount`, `thoughtsTokenCount`) into in-memory rolling stats (`GET /api/stats`) and the non-blocking `UsageSink` JSONL writer.
+- **Zero-Buffering Usage & Cache Observability:** Stream SSE chunks directly to `agy` while tee-ing `usageMetadata` (`promptTokenCount`, `candidatesTokenCount`, `cachedContentTokenCount`, `thoughtsTokenCount`) into in-memory rolling stats (`GET /api/stats`) and the WAL-mode `SqliteUsageSink` (`usage.db`).
 - **Live End-to-End Verification:** Verify live against the local `agy` binary via `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>`.
 
 #### B. Aux Panel Settings UI (`companion-ui-mcp` via `rmcp` + `ui/`)
@@ -152,7 +152,7 @@ Path resolution lives in pure, deterministic helpers in `companion-core` and app
 | Artifact | Precedence (Highest → Lowest) | Validation & XDG Rules |
 | --- | --- | --- |
 | **Config file** | 1. `--config <path>` CLI flag<br>2. `AGY_COMPANION_CONFIG` env var<br>3. `$XDG_CONFIG_HOME/agy-companion/config.json`<br>4. Platform default (table below) | Explicit overrides (`--config`, `AGY_COMPANION_CONFIG`) and `XDG_CONFIG_HOME` values are validated via `validate_path` and platform-aware traversal/NUL checks (any `..` traversal or NUL byte fails closed with `InvalidPath`, even on relative traversal payloads). Per the XDG Base Directory Specification, unset, empty/whitespace, or benign relative `XDG_CONFIG_HOME` values (without `..` or NUL) are ignored and fall back to the platform default. Higher-precedence valid overrides short-circuit lower tiers. |
-| **Usage data directory** | 1. `config.usage_dir`<br>2. `$XDG_DATA_HOME/agy-companion/usage`<br>3. Platform default (table below) | `config.usage_dir` and `XDG_DATA_HOME` values reject `..` traversal and NUL bytes fail-closed with `InvalidPath` (even on relative traversal payloads). Unset, empty/whitespace, or benign relative `XDG_DATA_HOME` values are ignored and fall back to the platform default. Writes append-only `YYYY-MM.jsonl` files inside the resolved directory. |
+| **Usage data directory** | 1. `config.usage_dir`<br>2. `$XDG_DATA_HOME/agy-companion/usage`<br>3. Platform default (table below) | `config.usage_dir` and `XDG_DATA_HOME` values reject `..` traversal and NUL bytes fail-closed with `InvalidPath` (even on relative traversal payloads). Unset, empty/whitespace, or benign relative `XDG_DATA_HOME` values are ignored and fall back to the platform default. Stores a WAL-mode SQLite database (`usage.db`, `PRAGMA user_version = 1`) inside the resolved directory. |
 
 **Platform Defaults:**
 
@@ -163,7 +163,7 @@ Path resolution lives in pure, deterministic helpers in `companion-core` and app
 
 **Atomic Persistence & Platform Hardening (`Config::save_secure`):**
 - Writes JSON to a unique sibling temp file, flushes with `sync_all()`, closes the handle, and atomically replaces the target via `fs::rename` (cleaning up the temp file on any error).
-- **Unix (`#[cfg(unix)]`):** Creates missing parent directories with mode `0700` and enforces mode `0600` on config files and JSONL usage logs.
+- **Unix (`#[cfg(unix)]`):** Creates missing parent directories with mode `0700` and enforces mode `0600` on config files and SQLite usage database files (`usage.db`, `-wal`, `-shm`).
 - **Windows (`#[cfg(windows)]`):** Relies on NTFS user-profile ACLs under `%APPDATA%` / `%LOCALAPPDATA%` and wraps `fs::rename` in a bounded retry (`3` attempts total with `25ms` → `50ms` backoff) retrying **only** on transient `ErrorKind::PermissionDenied` (such as concurrent reads or Windows Defender scans), immediately returning all other errors and removing the temp file only after failure.
 
 ### Milestones 2 & 3 (Deferred Until After M1): Codex Pro & Claude Subscriptions
@@ -182,7 +182,7 @@ Path resolution lives in pure, deterministic helpers in `companion-core` and app
 
 ## 6. Deferred Work (TODOs) & Day-1 Seams
 
-- **Usage & Cost Tracking Shim:** See [`docs/design/usage-tracking-todo.md`](usage-tracking-todo.md). Day-1 seam: `UsageEvent` struct + non-blocking `UsageSink` trait + append-only JSONL writer (`YYYY-MM.jsonl` under the resolved usage directory: `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → `~/.local/share/agy-companion/usage` on macOS/Linux or `%LOCALAPPDATA%\agy-companion\usage` on Windows; see Section 5.C).
+- **Usage & Cost Tracking Shim:** See [`docs/design/usage-tracking-todo.md`](usage-tracking-todo.md). Day-1 seam: `UsageEvent` struct + `UsageSink` trait + WAL-mode SQLite writer (`SqliteUsageSink`, storing `usage.db` under the resolved usage directory: `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → `~/.local/share/agy-companion/usage` on macOS/Linux or `%LOCALAPPDATA%\agy-companion\usage` on Windows; see Section 5.C).
 - **User Version Upgrades:** See [`docs/design/upgrade-lifecycle-todo.md`](upgrade-lifecycle-todo.md). Day-1 seams: single version source of truth (`Cargo.toml`), config `schema_version = 1`, and `GET /health` returning `{ "version", "protocol_version" }`.
 
 ---

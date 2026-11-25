@@ -730,7 +730,7 @@ mod tests {
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::post;
-    use companion_core::{JsonlUsageSink, NoopUsageSink, UsageEvent};
+    use companion_core::{NoopUsageSink, SqliteUsageSink, USAGE_DB_FILENAME};
     use http::{HeaderMap, StatusCode, header};
     use tempfile::TempDir;
     use tokio::sync::oneshot;
@@ -852,7 +852,8 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let usage_dir = tmp.path().join("usage");
-        let sink = Arc::new(JsonlUsageSink::new(&usage_dir).unwrap());
+        let sink = Arc::new(SqliteUsageSink::new(&usage_dir).unwrap());
+        let sink_reader = Arc::clone(&sink);
 
         let mut cfg = Config::default();
         cfg.gemini.base_url = format!("http://{upstream_addr}");
@@ -931,18 +932,35 @@ mod tests {
         assert_eq!(snap.output_tokens, 10);
         assert!((snap.cache_hit_ratio - 0.5).abs() < 1e-12);
 
-        // 4. JsonlUsageSink persisted 1 event with zero secrets and 0600 permissions.
-        let mut jsonl_files: Vec<PathBuf> = fs::read_dir(&usage_dir)
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
-        assert_eq!(jsonl_files.len(), 1);
-        let jsonl_path = jsonl_files.pop().unwrap();
-        let jsonl_contents = fs::read_to_string(&jsonl_path).unwrap();
-        assert!(!jsonl_contents.contains("AIzaLiveLoopbackKey12345"));
-        let lines: Vec<&str> = jsonl_contents.lines().collect();
-        assert_eq!(lines.len(), 1);
-        let event: UsageEvent = serde_json::from_str(lines[0]).unwrap();
+        // 4. SqliteUsageSink persisted 1 event with zero secrets and 0600 permissions.
+        let db_path = usage_dir.join(USAGE_DB_FILENAME);
+        assert!(
+            db_path.is_file(),
+            "expected usage.db at {}",
+            db_path.display()
+        );
+
+        let mut raw_bytes = Vec::new();
+        for name in [
+            "usage.db",
+            "usage.db-wal",
+            "usage.db-shm",
+            "usage.db-journal",
+        ] {
+            let path = usage_dir.join(name);
+            if path.is_file() {
+                raw_bytes.extend_from_slice(&fs::read(&path).unwrap());
+            }
+        }
+        let secret = b"AIzaLiveLoopbackKey12345";
+        assert!(
+            !raw_bytes.windows(secret.len()).any(|w| w == secret),
+            "API key must never appear in SQLite storage bytes"
+        );
+
+        let events = sink_reader.read_all_events().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
         assert_eq!(event.model, "gemini-4-hydrogen");
         assert_eq!(event.input_tokens, 40);
         assert_eq!(event.cached_tokens, 20);
@@ -950,8 +968,13 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&jsonl_path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
+            for name in ["usage.db", "usage.db-wal", "usage.db-shm"] {
+                let path = usage_dir.join(name);
+                if path.exists() {
+                    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600, "expected 0600 on {name}, got {mode:o}");
+                }
+            }
         }
 
         let _ = tx_shutdown.send(());

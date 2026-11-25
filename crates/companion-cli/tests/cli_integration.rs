@@ -2284,7 +2284,9 @@ fn install_and_uninstall_full_isolated_lifecycle_respects_symlink_guard_dry_run_
     let cfg_path = xdg_config.join("agy-companion").join("config.json");
     let usage_dir = xdg_data.join("agy-companion").join("usage");
     fs::create_dir_all(&usage_dir).expect("mkdir usage");
-    fs::write(usage_dir.join("2026-11.jsonl"), "{}\n").expect("write usage");
+    fs::write(usage_dir.join("usage.db"), b"SQLite format 3\0").expect("write usage db");
+    fs::write(usage_dir.join("usage.db-wal"), b"wal-canary").expect("write usage wal");
+    fs::write(usage_dir.join("2026-11.jsonl"), "{}\n").expect("write legacy usage jsonl");
     let cfg = Config {
         listen_port: free_loopback_port(),
         ..Default::default()
@@ -2737,7 +2739,7 @@ fn uninstall_refuses_to_traverse_symlinked_runtime_data_dir_and_usage_dir() {
         let victim_pid = victim_dir.join(companion_cli::daemon::PROXY_PID_FILENAME);
         let victim_log = victim_dir.join(companion_cli::daemon::PROXY_LOG_FILENAME);
         let victim_log1 = victim_dir.join(companion_cli::daemon::PROXY_LOG_ROTATED_FILENAME);
-        let victim_jsonl = victim_dir.join("2026-11.jsonl");
+        let victim_db = victim_dir.join("usage.db");
         let dead_pid = companion_cli::daemon::ProxyPidInfo {
             pid: 999_999,
             port: free_loopback_port(),
@@ -2748,7 +2750,7 @@ fn uninstall_refuses_to_traverse_symlinked_runtime_data_dir_and_usage_dir() {
         fs::write(&victim_pid, serde_json::to_vec(&dead_pid).unwrap()).expect("write pid");
         fs::write(&victim_log, "VICTIM_LOG\n").expect("write log");
         fs::write(&victim_log1, "VICTIM_LOG1\n").expect("write log1");
-        fs::write(&victim_jsonl, "{}\n").expect("write jsonl");
+        fs::write(&victim_db, b"SQLite format 3\0").expect("write usage db");
 
         let sym_custom_usage = temp.path().join("sym_custom_usage");
         symlink(&victim_dir, &sym_custom_usage).expect("symlink custom usage");
@@ -2820,8 +2822,8 @@ fn uninstall_refuses_to_traverse_symlinked_runtime_data_dir_and_usage_dir() {
                 "case(a) dry_run={dry_run}: victim proxy.log.1 must remain"
             );
             assert!(
-                victim_jsonl.is_file(),
-                "case(a) dry_run={dry_run}: victim usage jsonl must remain"
+                victim_db.is_file(),
+                "case(a) dry_run={dry_run}: victim usage.db must remain"
             );
             assert!(
                 fs::symlink_metadata(&sym_custom_usage)
@@ -2849,7 +2851,7 @@ fn uninstall_refuses_to_traverse_symlinked_runtime_data_dir_and_usage_dir() {
         let victim_pid = victim_parent.join(companion_cli::daemon::PROXY_PID_FILENAME);
         let victim_log = victim_parent.join(companion_cli::daemon::PROXY_LOG_FILENAME);
         let victim_log1 = victim_parent.join(companion_cli::daemon::PROXY_LOG_ROTATED_FILENAME);
-        let victim_jsonl = victim_usage.join("2026-11.jsonl");
+        let victim_db = victim_usage.join("usage.db");
         let dead_pid = companion_cli::daemon::ProxyPidInfo {
             pid: 999_998,
             port: free_loopback_port(),
@@ -2860,7 +2862,7 @@ fn uninstall_refuses_to_traverse_symlinked_runtime_data_dir_and_usage_dir() {
         fs::write(&victim_pid, serde_json::to_vec(&dead_pid).unwrap()).expect("write pid");
         fs::write(&victim_log, "VICTIM_LOG\n").expect("write log");
         fs::write(&victim_log1, "VICTIM_LOG1\n").expect("write log1");
-        fs::write(&victim_jsonl, "{}\n").expect("write jsonl");
+        fs::write(&victim_db, b"SQLite format 3\0").expect("write usage db");
 
         let sym_parent = temp.path().join("sym_parent");
         symlink(&victim_parent, &sym_parent).expect("symlink parent");
@@ -2931,8 +2933,8 @@ fn uninstall_refuses_to_traverse_symlinked_runtime_data_dir_and_usage_dir() {
                 "case(b) dry_run={dry_run}: victim proxy.log.1 must remain"
             );
             assert!(
-                victim_jsonl.is_file(),
-                "case(b) dry_run={dry_run}: victim usage/2026-11.jsonl must remain"
+                victim_db.is_file(),
+                "case(b) dry_run={dry_run}: victim usage/usage.db must remain"
             );
             assert!(
                 fs::symlink_metadata(&sym_parent)
@@ -3193,11 +3195,11 @@ fn install_and_uninstall_refuse_symlinked_default_xdg_home_ancestors() {
         fs::create_dir_all(&victim_usage).expect("mkdir victim usage");
         fs::create_dir_all(&victim_bin_dir).expect("mkdir victim bin");
         fs::create_dir_all(&victim_local_bin).expect("mkdir victim local/bin");
-        let victim_jsonl = victim_usage.join("precious.jsonl");
+        let victim_db = victim_usage.join("usage.db");
         let victim_env = victim_app.join("env.sh");
         let victim_bin = victim_bin_dir.join("agy-companion");
         let victim_log = victim_app.join(companion_cli::daemon::PROXY_LOG_FILENAME);
-        fs::write(&victim_jsonl, "{\"keep\":true}\n").expect("write precious.jsonl");
+        fs::write(&victim_db, b"SQLite format 3\0").expect("write usage.db");
         fs::write(&victim_env, "# KEEP_ENV\n").expect("write env.sh");
         fs::write(&victim_bin, "KEEP_BIN\n").expect("write bin");
         fs::write(&victim_log, "KEEP_LOG\n").expect("write log");
@@ -3281,7 +3283,7 @@ fn install_and_uninstall_refuse_symlinked_default_xdg_home_ancestors() {
                 purged.is_empty(),
                 "~/.local dry_run={dry_run}: nothing should be purged through symlinked ~/.local, got {purged:?}"
             );
-            assert!(victim_jsonl.is_file(), "precious.jsonl must survive");
+            assert!(victim_db.is_file(), "usage.db must survive");
             assert!(victim_env.is_file(), "env.sh must survive");
             assert!(victim_bin.is_file(), "bin/agy-companion must survive");
             assert!(victim_log.is_file(), "proxy.log must survive");
@@ -3307,9 +3309,9 @@ fn install_and_uninstall_refuse_symlinked_default_xdg_home_ancestors() {
         let victim_app = victim_share.join("agy-companion");
         let victim_usage = victim_app.join("usage");
         fs::create_dir_all(&victim_usage).expect("mkdir victim usage");
-        let victim_jsonl = victim_usage.join("precious.jsonl");
+        let victim_db = victim_usage.join("usage.db");
         let victim_env = victim_app.join("env.sh");
-        fs::write(&victim_jsonl, "{\"keep\":true}\n").expect("write precious.jsonl");
+        fs::write(&victim_db, b"SQLite format 3\0").expect("write usage.db");
         fs::write(&victim_env, "# KEEP_ENV\n").expect("write env.sh");
 
         symlink(&victim_share, home.join(".local").join("share")).expect("symlink .local/share");
@@ -3376,7 +3378,7 @@ fn install_and_uninstall_refuse_symlinked_default_xdg_home_ancestors() {
                 }),
                 "~/.local/share dry_run={dry_run}: expected data directory warning, got {warnings:?}"
             );
-            assert!(victim_jsonl.is_file(), "precious.jsonl must survive");
+            assert!(victim_db.is_file(), "usage.db must survive");
             assert!(victim_env.is_file(), "env.sh must survive");
         }
     }

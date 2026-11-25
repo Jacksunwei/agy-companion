@@ -7,6 +7,7 @@ Security Invariants S1–S8 and Ambiguity Guards A1–A15.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -19,19 +20,24 @@ import stat
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
 
 from harness import (
     E2ETestCase,
+    USAGE_DB_FILENAME,
     extract_models_list,
     find_free_port,
     find_key_recursive,
     http_raw_request,
+    open_usage_db_readonly,
     poll_stats,
     poll_usage_events,
+    read_usage_raw_bytes,
     run_cli,
+    usage_storage_files,
 )
 from mcp_client import McpStdioClient
 from mock_gemini import (
@@ -530,13 +536,12 @@ class TestTier2F3UsageBoundaries(E2ETestCase):
         self.assertEqual(r2.status, 200)
         files, events = poll_usage_events(env.usage_dir, min_count=1)
         self.assertGreaterEqual(len(events), 1)
-        for fpath in files:
-            for line in fpath.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    json.loads(line)
+        self.assertEqual(len(files), 1)
+        with contextlib.closing(open_usage_db_readonly(files[0])) as conn:
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
 
     def test_t2_f3_multiple_events_append_without_overwriting(self) -> None:
-        """5 sequential requests append 5 distinct ordered JSONL lines without truncation."""
+        """5 sequential requests insert 5 distinct ordered SQLite rows without truncation."""
         env = self.make_env()
         mock = self.start_mock_gemini()
         expected_prompts = [10, 20, 30, 40, 50]
@@ -566,8 +571,8 @@ class TestTier2F3UsageBoundaries(E2ETestCase):
         self.assertEqual(len(files), 1)
         self.assertEqual([e["input_tokens"] for e in events], expected_prompts)
 
-    def test_t2_f3_jsonl_file_permissions_remain_0600_after_appends(self) -> None:
-        """Monthly JSONL file retains mode 0600 across multiple appends (S3)."""
+    def test_t2_f3_sqlite_db_permissions_remain_0600_after_writes(self) -> None:
+        """SQLite usage.db and sidecars retain mode 0600 across multiple writes (S2)."""
         env = self.make_env()
         mock = self.start_mock_gemini()
         cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyPermAfterAppend1"))
@@ -585,12 +590,16 @@ class TestTier2F3UsageBoundaries(E2ETestCase):
         files, events = poll_usage_events(env.usage_dir, min_count=3)
         self.assertEqual(len(events), 3)
         self.assertEqual(len(files), 1)
-        self.assertEqual(stat.S_IMODE(os.stat(files[0]).st_mode), 0o600)
+        storage_files = usage_storage_files(env.usage_dir)
+        self.assertIn(files[0], storage_files)
+        for sf in storage_files:
+            mode = stat.S_IMODE(os.stat(sf).st_mode)
+            self.assertEqual(mode, 0o600, f"Expected 0600 on {sf}, got {oct(mode)}")
 
-    def test_t2_f3_zero_prompt_response_or_key_in_jsonl(self) -> None:
-        """JSONL file contains zero API keys, prompt text, or response text (S2)."""
+    def test_t2_f3_zero_prompt_response_or_key_in_sqlite(self) -> None:
+        """SQLite usage.db and WAL/SHM bytes contain zero API keys, prompt text, or response text (S2)."""
         env = self.make_env()
-        secret_key = "AIzaSyJsonlNoLeakKey7777"
+        secret_key = "AIzaSySqliteNoLeakKey77"
         prompt_marker = "SECRET_PROMPT_MARKER_9911"
         resp_marker = "SECRET_RESPONSE_MARKER_8822"
         mock = self.start_mock_gemini()
@@ -615,12 +624,142 @@ class TestTier2F3UsageBoundaries(E2ETestCase):
             headers={"Content-Type": "application/json"},
         )
         self.assertEqual(r.status, 200)
-        files, events = poll_usage_events(env.usage_dir, min_count=1)
+        _, events = poll_usage_events(env.usage_dir, min_count=1)
         self.assertEqual(len(events), 1)
-        raw_jsonl = files[0].read_text(encoding="utf-8")
-        self.assertNotIn(secret_key, raw_jsonl)
-        self.assertNotIn(prompt_marker, raw_jsonl)
-        self.assertNotIn(resp_marker, raw_jsonl)
+        raw_sqlite = read_usage_raw_bytes(env.usage_dir)
+        self.assertGreater(len(raw_sqlite), 0)
+        self.assertNotIn(secret_key.encode("utf-8"), raw_sqlite)
+        self.assertNotIn(prompt_marker.encode("utf-8"), raw_sqlite)
+        self.assertNotIn(resp_marker.encode("utf-8"), raw_sqlite)
+
+    def test_t2_f3_symlink_and_fifo_usage_db_rejected_fail_closed(self) -> None:
+        """Symlinked or FIFO usage.db is rejected fail-closed without mutating victim or hanging proxy (S2/S6)."""
+        if os.name == "nt":
+            self.skipTest("Unix symlink/FIFO boundary test")
+
+        # 1. Symlinked usage.db -> victim file must remain untouched (contents & 0644 mode) while proxy stays healthy.
+        env_sym = self.make_env()
+        mock_sym = self.start_mock_gemini()
+        victim = env_sym.root / "victim.txt"
+        victim.write_text("DO_NOT_TOUCH\n", encoding="utf-8")
+        os.chmod(victim, 0o644)
+        os.symlink(victim, env_sym.usage_dir / USAGE_DB_FILENAME)
+        cfg_sym = env_sym.write_config(
+            env_sym.make_config_dict(base_url=mock_sym.base_url, api_key="AIzaSySymUsageDb12345")
+        )
+        proxy_sym = self.start_proxy(env_sym, config_path=cfg_sym)
+        r_sym = http_raw_request(
+            "127.0.0.1",
+            proxy_sym.port,
+            "POST",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
+            body=b'{"contents":[]}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(r_sym.status, 200)
+        self.assertEqual(http_raw_request("127.0.0.1", proxy_sym.port, "GET", "/health").status, 200)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "DO_NOT_TOUCH\n")
+        self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode), 0o644)
+
+        # 2. FIFO at usage.db must fail fast without hanging the proxy response or /health.
+        env_fifo = self.make_env()
+        mock_fifo = self.start_mock_gemini()
+        fifo_path = env_fifo.usage_dir / USAGE_DB_FILENAME
+        os.mkfifo(fifo_path)
+        cfg_fifo = env_fifo.write_config(
+            env_fifo.make_config_dict(base_url=mock_fifo.base_url, api_key="AIzaSyFifoUsageDb1234")
+        )
+        proxy_fifo = self.start_proxy(env_fifo, config_path=cfg_fifo)
+        t0 = time.monotonic()
+        r_fifo = http_raw_request(
+            "127.0.0.1",
+            proxy_fifo.port,
+            "POST",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
+            body=b'{"contents":[]}',
+            headers={"Content-Type": "application/json"},
+            timeout=3.0,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(r_fifo.status, 200)
+        self.assertLess(elapsed, 2.0, f"Proxy appeared to block on FIFO usage.db ({elapsed:.2f}s)")
+        self.assertEqual(http_raw_request("127.0.0.1", proxy_fifo.port, "GET", "/health").status, 200)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo_path).st_mode))
+
+    def test_t2_f3_legacy_jsonl_coexistence_preserved(self) -> None:
+        """Pre-existing legacy YYYY-MM.jsonl files remain untouched while SQLite usage.db records new events."""
+        env = self.make_env()
+        legacy_path = env.usage_dir / "2026-10.jsonl"
+        legacy_payload = '{"legacy":true,"input_tokens":7}\n'
+        legacy_path.write_text(legacy_payload, encoding="utf-8")
+
+        mock = self.start_mock_gemini()
+        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyLegacyCoexist12"))
+        proxy = self.start_proxy(env, config_path=cfg)
+        r = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1beta/models/gemini-4-hydrogen:generateContent",
+            body=b'{"contents":[]}',
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(r.status, 200)
+        files, events = poll_usage_events(env.usage_dir, min_count=1)
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].name, USAGE_DB_FILENAME)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(legacy_path.read_text(encoding="utf-8"), legacy_payload)
+
+    def test_t2_f3_persistence_across_proxy_restart(self) -> None:
+        """Rows persisted in usage.db survive proxy shutdown and accumulate cleanly across restart."""
+        env = self.make_env()
+        mock = self.start_mock_gemini()
+        prompts = [11, 22, 33, 44]
+        for p in prompts:
+            mock.enqueue(
+                JsonAction(
+                    status=200,
+                    payload={
+                        "candidates": [{"content": {"parts": [{"text": f"p={p}"}]}}],
+                        "usageMetadata": {"promptTokenCount": p, "candidatesTokenCount": 3},
+                    },
+                )
+            )
+        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyPersistRestart1"))
+
+        proxy1 = self.start_proxy(env, config_path=cfg)
+        for _ in range(2):
+            r = http_raw_request(
+                "127.0.0.1",
+                proxy1.port,
+                "POST",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
+                body=b'{"contents":[]}',
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(r.status, 200)
+        _, events1 = poll_usage_events(env.usage_dir, min_count=2)
+        self.assertEqual([e["input_tokens"] for e in events1], [11, 22])
+        proxy1.stop()
+
+        proxy2 = self.start_proxy(env, config_path=cfg)
+        for _ in range(2):
+            r = http_raw_request(
+                "127.0.0.1",
+                proxy2.port,
+                "POST",
+                "/v1beta/models/gemini-4-hydrogen:generateContent",
+                body=b'{"contents":[]}',
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(r.status, 200)
+        files, events2 = poll_usage_events(env.usage_dir, min_count=4)
+        self.assertEqual(len(files), 1)
+        self.assertEqual([e["input_tokens"] for e in events2], prompts)
+        self.assertEqual(len({e["request_id"] for e in events2}), 4)
+        with contextlib.closing(open_usage_db_readonly(files[0])) as conn:
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
 
 
 class TestTier2F4ProviderBoundaries(E2ETestCase):

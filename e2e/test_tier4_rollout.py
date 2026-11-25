@@ -121,8 +121,12 @@ class TestTier4RolloutScenarios(E2ETestCase):
                 cloudcode_upstream_url=mock_ccpa.base_url,
             )
         )
-        usage_canary = env.usage_dir / "2026-11.jsonl"
-        usage_canary.write_text('{"ts":"2026-11-24T00:00:00Z"}\n', encoding="utf-8")
+        usage_canary = env.usage_dir / "usage.db"
+        usage_canary.write_bytes(b"SQLite format 3\x00")
+        usage_wal_canary = env.usage_dir / "usage.db-wal"
+        usage_wal_canary.write_bytes(b"wal-canary")
+        legacy_jsonl_canary = env.usage_dir / "2026-11.jsonl"
+        legacy_jsonl_canary.write_text('{"ts":"2026-11-24T00:00:00Z"}\n', encoding="utf-8")
         gemini_cfg = env.home_dir / ".gemini" / "config" / "config.json"
         gemini_cfg.parent.mkdir(parents=True, exist_ok=True)
         gemini_cfg.write_text('{"antigravity":"untouched"}\n', encoding="utf-8")
@@ -241,7 +245,9 @@ class TestTier4RolloutScenarios(E2ETestCase):
         self.assertFalse((plugins_dir / "agy-companion").exists())
         self.assertFalse((env.data_dir / "env.sh").exists())
         self.assertTrue(cfg.is_file(), "Default uninstall must preserve config.json")
-        self.assertTrue(usage_canary.is_file(), "Default uninstall must preserve usage/")
+        self.assertTrue(usage_canary.is_file(), "Default uninstall must preserve usage/usage.db")
+        self.assertTrue(usage_wal_canary.is_file(), "Default uninstall must preserve usage/usage.db-wal")
+        self.assertTrue(legacy_jsonl_canary.is_file(), "Default uninstall must preserve legacy usage files")
 
         un2 = run_cli(
             [str(binary), "uninstall", "--plugins-dir", str(plugins_dir), "--purge", "--json"],
@@ -249,7 +255,9 @@ class TestTier4RolloutScenarios(E2ETestCase):
         )
         self.assertEqual(un2.returncode, 0, un2.stderr)
         self.assertFalse(cfg.exists(), "--purge must remove config.json")
-        self.assertFalse(usage_canary.exists(), "--purge must remove usage/")
+        self.assertFalse(usage_canary.exists(), "--purge must remove usage/usage.db")
+        self.assertFalse(usage_wal_canary.exists(), "--purge must remove usage/usage.db-wal")
+        self.assertFalse(legacy_jsonl_canary.exists(), "--purge must remove legacy usage files")
         self.assertEqual(gemini_cfg.read_text(encoding="utf-8"), '{"antigravity":"untouched"}\n')
 
     def test_t4_r02_cloudcode_pro_enterprise_403_strip_hot_reload_slots_and_400_hint(self) -> None:

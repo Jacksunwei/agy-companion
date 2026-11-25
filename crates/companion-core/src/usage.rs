@@ -1,14 +1,48 @@
+use std::ffi::OsString;
+use std::fmt;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
-use chrono::{DateTime, Datelike, SecondsFormat, Utc};
+use chrono::{SecondsFormat, Utc};
+use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::config::{CoreError, validate_path};
+
+pub const USAGE_DB_FILENAME: &str = "usage.db";
+pub const USAGE_DB_SCHEMA_VERSION: u32 = 1;
+
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+const SQLITE_INIT_BUSY_RETRIES: u32 = 16;
+
+const SCHEMA_V1_DDL: &str = "
+CREATE TABLE IF NOT EXISTS usage_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp_utc    TEXT    NOT NULL,
+    request_id       TEXT    NOT NULL UNIQUE,
+    provider         TEXT    NOT NULL,
+    model            TEXT    NOT NULL,
+    input_tokens     INTEGER NOT NULL CHECK (input_tokens >= 0),
+    output_tokens    INTEGER NOT NULL CHECK (output_tokens >= 0),
+    cached_tokens    INTEGER NOT NULL CHECK (cached_tokens >= 0),
+    reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
+    latency_ms       INTEGER NOT NULL CHECK (latency_ms >= 0),
+    source           TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp_utc
+    ON usage_events (timestamp_utc);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_provider_model
+    ON usage_events (provider, model);
+
+PRAGMA user_version = 1;
+";
 
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -111,17 +145,126 @@ impl UsageSink for NoopUsageSink {
     fn record(&self, _event: UsageEvent) {}
 }
 
-#[derive(Debug)]
-pub struct JsonlUsageSink {
+pub struct SqliteUsageSink {
     usage_dir: PathBuf,
-    write_lock: Mutex<()>,
+    db_path: PathBuf,
+    conn: Mutex<Option<Connection>>,
 }
 
-impl JsonlUsageSink {
+impl fmt::Debug for SqliteUsageSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqliteUsageSink")
+            .field("usage_dir", &self.usage_dir)
+            .field("db_path", &self.db_path)
+            .finish_non_exhaustive()
+    }
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    // Normalizing trailing separators prevents POSIX lstat(2) from following a
+    // trailing-slash symlink path.
+    path.components().collect()
+}
+
+fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = OsString::from(path.as_os_str());
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn u64_to_sqlite_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn sqlite_i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+fn is_busy_or_locked(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn should_invalidate_connection(err: &rusqlite::Error) -> bool {
+    !matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::ConstraintViolation)
+    )
+}
+
+fn validate_regular_file_if_exists(path: &Path) -> Result<Option<fs::Metadata>, CoreError> {
+    let check_path = normalized_path(path);
+    match fs::symlink_metadata(&check_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(CoreError::InvalidPath {
+                    reason: "symbolic links are not allowed for usage database files".to_string(),
+                });
+            }
+            if !meta.file_type().is_file() {
+                return Err(CoreError::InvalidPath {
+                    reason: "usage database path must be a regular file".to_string(),
+                });
+            }
+            Ok(Some(meta))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn tighten_regular_file_mode_0600(path: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Some(lstat_meta) = validate_regular_file_if_exists(path)? else {
+        return Ok(());
+    };
+    if (lstat_meta.permissions().mode() & 0o777) == 0o600 {
+        return Ok(());
+    }
+
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(CoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let open_meta = file.metadata().map_err(|source| CoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !open_meta.file_type().is_file()
+        || open_meta.dev() != lstat_meta.dev()
+        || open_meta.ino() != lstat_meta.ino()
+    {
+        return Err(CoreError::InvalidPath {
+            reason: "usage database file changed concurrently during permission hardening"
+                .to_string(),
+        });
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| CoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(())
+}
+
+impl SqliteUsageSink {
     pub fn new(usage_dir: impl Into<PathBuf>) -> Result<Self, CoreError> {
         let usage_dir = usage_dir.into();
         validate_path(&usage_dir)?;
-        let check_dir: PathBuf = usage_dir.components().collect();
+        let check_dir = normalized_path(&usage_dir);
         match fs::symlink_metadata(&check_dir) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(CoreError::InvalidPath {
@@ -137,9 +280,11 @@ impl JsonlUsageSink {
                 });
             }
         }
+        let db_path = usage_dir.join(USAGE_DB_FILENAME);
         Ok(Self {
             usage_dir,
-            write_lock: Mutex::new(()),
+            db_path,
+            conn: Mutex::new(None),
         })
     }
 
@@ -147,31 +292,28 @@ impl JsonlUsageSink {
         &self.usage_dir
     }
 
-    fn month_bucket(timestamp_utc: &str) -> String {
-        DateTime::parse_from_rfc3339(timestamp_utc)
-            .map(|dt| dt.with_timezone(&Utc))
-            .ok()
-            .filter(|dt| (1970..=9999).contains(&dt.year()))
-            .unwrap_or_else(Utc::now)
-            .format("%Y-%m")
-            .to_string()
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
-    pub fn record_checked(&self, event: &UsageEvent) -> Result<PathBuf, CoreError> {
-        let month = Self::month_bucket(&event.timestamp_utc);
-        let file_path = self.usage_dir.join(format!("{month}.jsonl"));
-
-        let mut line = serde_json::to_string(event).map_err(|err| CoreError::SerializeUsage {
+    fn db_error(&self, err: impl fmt::Display) -> CoreError {
+        CoreError::UsageDatabase {
+            path: self.db_path.clone(),
             reason: err.to_string(),
-        })?;
-        line.push('\n');
+        }
+    }
 
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn sqlite_related_paths(&self) -> [PathBuf; 4] {
+        [
+            self.db_path.clone(),
+            append_os_suffix(&self.db_path, "-wal"),
+            append_os_suffix(&self.db_path, "-shm"),
+            append_os_suffix(&self.db_path, "-journal"),
+        ]
+    }
 
-        let check_usage_dir: PathBuf = self.usage_dir.components().collect();
+    fn ensure_usage_dir(&self) -> Result<(), CoreError> {
+        let check_usage_dir = normalized_path(&self.usage_dir);
         match fs::symlink_metadata(&check_usage_dir) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
@@ -218,67 +360,98 @@ impl JsonlUsageSink {
                 });
             }
         }
+        Ok(())
+    }
 
-        let check_file_path: PathBuf = file_path.components().collect();
-        let pre_open_meta = match fs::symlink_metadata(&check_file_path) {
+    fn check_existing_usage_dir(&self) -> Result<bool, CoreError> {
+        let check_usage_dir = normalized_path(&self.usage_dir);
+        match fs::symlink_metadata(&check_usage_dir) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     return Err(CoreError::InvalidPath {
-                        reason: "symbolic links are not allowed for usage files".to_string(),
+                        reason: "symbolic links are not allowed for usage directories".to_string(),
                     });
                 }
-                if !meta.file_type().is_file() {
+                if !meta.file_type().is_dir() {
                     return Err(CoreError::InvalidPath {
-                        reason: "usage file path must be a regular file".to_string(),
+                        reason: "usage directory path must be a directory".to_string(),
                     });
                 }
-                Some(meta)
+                Ok(true)
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(CoreError::Io {
-                    path: file_path.clone(),
-                    source,
-                });
-            }
-        };
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(CoreError::Io {
+                path: self.usage_dir.clone(),
+                source,
+            }),
+        }
+    }
 
+    fn validate_sqlite_paths(&self) -> Result<Option<fs::Metadata>, CoreError> {
+        let paths = self.sqlite_related_paths();
+        let db_meta = validate_regular_file_if_exists(&paths[0])?;
+        for sidecar in &paths[1..] {
+            let _ = validate_regular_file_if_exists(sidecar)?;
+        }
+        Ok(db_meta)
+    }
+
+    #[cfg(unix)]
+    fn tighten_sqlite_file_permissions(&self) -> Result<(), CoreError> {
+        for path in self.sqlite_related_paths() {
+            tighten_regular_file_mode_0600(&path)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn tighten_sqlite_file_permissions(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn precreate_and_verify_db_file(
+        &self,
+        pre_open_meta: Option<fs::Metadata>,
+    ) -> Result<(), CoreError> {
+        let check_db_path = normalized_path(&self.db_path);
         let mut open_opts = fs::OpenOptions::new();
-        open_opts.create(true).append(true);
+        open_opts.read(true).write(true).create(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             open_opts.mode(0o600);
         }
 
-        let mut file = open_opts.open(&file_path).map_err(|source| CoreError::Io {
-            path: file_path.clone(),
-            source,
-        })?;
+        let file = open_opts
+            .open(&self.db_path)
+            .map_err(|source| CoreError::Io {
+                path: self.db_path.clone(),
+                source,
+            })?;
 
         let open_meta = file.metadata().map_err(|source| CoreError::Io {
-            path: file_path.clone(),
+            path: self.db_path.clone(),
             source,
         })?;
         if !open_meta.file_type().is_file() {
             return Err(CoreError::InvalidPath {
-                reason: "usage file path must be a regular file".to_string(),
+                reason: "usage database path must be a regular file".to_string(),
             });
         }
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
             if let Some(lstat_meta) = pre_open_meta {
                 if open_meta.dev() != lstat_meta.dev() || open_meta.ino() != lstat_meta.ino() {
                     return Err(CoreError::InvalidPath {
-                        reason: "usage file changed concurrently during open".to_string(),
+                        reason: "usage database file changed concurrently during open".to_string(),
                     });
                 }
             } else {
                 let post_lstat =
-                    fs::symlink_metadata(&check_file_path).map_err(|source| CoreError::Io {
-                        path: file_path.clone(),
+                    fs::symlink_metadata(&check_db_path).map_err(|source| CoreError::Io {
+                        path: self.db_path.clone(),
                         source,
                     })?;
                 if post_lstat.file_type().is_symlink()
@@ -287,42 +460,269 @@ impl JsonlUsageSink {
                     || post_lstat.ino() != open_meta.ino()
                 {
                     return Err(CoreError::InvalidPath {
-                        reason: "usage file changed concurrently during open".to_string(),
+                        reason: "usage database file changed concurrently during open".to_string(),
                     });
                 }
             }
-        }
-        #[cfg(not(unix))]
-        let _ = pre_open_meta;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o600))
                 .map_err(|source| CoreError::Io {
-                    path: file_path.clone(),
+                    path: self.db_path.clone(),
                     source,
                 })?;
         }
+        #[cfg(not(unix))]
+        let _ = (check_db_path, pre_open_meta);
 
-        file.write_all(line.as_bytes())
-            .map_err(|source| CoreError::Io {
-                path: file_path.clone(),
-                source,
-            })?;
-        file.flush().map_err(|source| CoreError::Io {
-            path: file_path.clone(),
-            source,
-        })?;
+        Ok(())
+    }
 
-        Ok(file_path)
+    fn check_schema_version(&self, version: u32) -> Result<(), CoreError> {
+        if version > USAGE_DB_SCHEMA_VERSION {
+            return Err(CoreError::UsageDatabase {
+                path: self.db_path.clone(),
+                reason: format!(
+                    "unsupported usage database schema version {version} (supported: {USAGE_DB_SCHEMA_VERSION})"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn read_user_version(&self, conn: &Connection) -> Result<u32, CoreError> {
+        let raw: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|err| self.db_error(err))?;
+        u32::try_from(raw).map_err(|_| {
+            self.db_error(format!(
+                "invalid negative or out-of-range user_version {raw}"
+            ))
+        })
+    }
+
+    fn read_user_version_with_busy_retry(&self, conn: &Connection) -> Result<u32, CoreError> {
+        let mut last_busy = None;
+        for attempt in 0..SQLITE_INIT_BUSY_RETRIES {
+            match conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)) {
+                Ok(raw) => {
+                    return u32::try_from(raw).map_err(|_| {
+                        self.db_error(format!(
+                            "invalid negative or out-of-range user_version {raw}"
+                        ))
+                    });
+                }
+                Err(err) if is_busy_or_locked(&err) => {
+                    last_busy = Some(err);
+                    std::thread::sleep(Duration::from_millis(5 * u64::from(attempt + 1)));
+                }
+                Err(err) => return Err(self.db_error(err)),
+            }
+        }
+        Err(self.db_error(last_busy.expect("SQLITE_INIT_BUSY_RETRIES > 0 guarantees a busy error")))
+    }
+
+    fn configure_and_migrate(&self, conn: &mut Connection) -> Result<(), CoreError> {
+        conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+            .map_err(|err| self.db_error(err))?;
+
+        // Validate schema version BEFORE executing any mutating PRAGMA (such as
+        // `PRAGMA journal_mode = WAL`) so unsupported future or negative
+        // user_version databases are rejected fail-closed with zero on-disk mutation.
+        let pre_version = self.read_user_version_with_busy_retry(conn)?;
+        self.check_schema_version(pre_version)?;
+
+        // Two concurrent cold-start connections upgrading an empty DB into WAL mode
+        // can receive an immediate SQLITE_BUSY deadlock-avoidance error from SQLite;
+        // retry briefly so multi-instance writers initialize cleanly.
+        let mut last_busy = None;
+        for attempt in 0..SQLITE_INIT_BUSY_RETRIES {
+            match conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA temp_store = MEMORY;",
+            ) {
+                Ok(()) => {
+                    last_busy = None;
+                    break;
+                }
+                Err(err) if is_busy_or_locked(&err) => {
+                    last_busy = Some(err);
+                    std::thread::sleep(Duration::from_millis(5 * u64::from(attempt + 1)));
+                }
+                Err(err) => return Err(self.db_error(err)),
+            }
+        }
+        if let Some(err) = last_busy {
+            return Err(self.db_error(err));
+        }
+
+        let version = self.read_user_version(conn)?;
+        self.check_schema_version(version)?;
+        if version == 0 {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|err| self.db_error(err))?;
+            let tx_version = self.read_user_version(&tx)?;
+            self.check_schema_version(tx_version)?;
+            if tx_version == 0 {
+                tx.execute_batch(SCHEMA_V1_DDL)
+                    .map_err(|err| self.db_error(err))?;
+            }
+            tx.commit().map_err(|err| self.db_error(err))?;
+        }
+
+        Ok(())
+    }
+
+    fn open_rw_connection(&self) -> Result<Connection, CoreError> {
+        self.ensure_usage_dir()?;
+        let pre_open_meta = self.validate_sqlite_paths()?;
+        self.precreate_and_verify_db_file(pre_open_meta)?;
+
+        // Explicitly omit SQLITE_OPEN_CREATE and SQLITE_OPEN_URI so SQLite only
+        // opens the pre-verified regular file path verbatim.
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut conn =
+            Connection::open_with_flags(&self.db_path, flags).map_err(|err| self.db_error(err))?;
+        self.configure_and_migrate(&mut conn)?;
+        self.tighten_sqlite_file_permissions()?;
+        Ok(conn)
+    }
+
+    fn query_all_from_connection(&self, conn: &Connection) -> Result<Vec<UsageEvent>, CoreError> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT timestamp_utc, request_id, provider, model, \
+                 input_tokens, output_tokens, cached_tokens, reasoning_tokens, \
+                 latency_ms, source \
+                 FROM usage_events \
+                 ORDER BY id ASC",
+            )
+            .map_err(|err| self.db_error(err))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UsageEvent {
+                    timestamp_utc: row.get(0)?,
+                    request_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    model: row.get(3)?,
+                    input_tokens: sqlite_i64_to_u64(row.get(4)?),
+                    output_tokens: sqlite_i64_to_u64(row.get(5)?),
+                    cached_tokens: sqlite_i64_to_u64(row.get(6)?),
+                    reasoning_tokens: sqlite_i64_to_u64(row.get(7)?),
+                    latency_ms: sqlite_i64_to_u64(row.get(8)?),
+                    source: row.get(9)?,
+                })
+            })
+            .map_err(|err| self.db_error(err))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(|err| self.db_error(err))?);
+        }
+        Ok(events)
+    }
+
+    pub fn record_checked(&self, event: &UsageEvent) -> Result<PathBuf, CoreError> {
+        let mut conn_guard = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if conn_guard.is_none() {
+            *conn_guard = Some(self.open_rw_connection()?);
+        }
+
+        let insert_res = {
+            let conn = conn_guard
+                .as_ref()
+                .expect("connection initialized immediately above");
+            conn.execute(
+                "INSERT INTO usage_events (
+                    timestamp_utc,
+                    request_id,
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    reasoning_tokens,
+                    latency_ms,
+                    source
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    &event.timestamp_utc,
+                    &event.request_id,
+                    &event.provider,
+                    &event.model,
+                    u64_to_sqlite_i64(event.input_tokens),
+                    u64_to_sqlite_i64(event.output_tokens),
+                    u64_to_sqlite_i64(event.cached_tokens),
+                    u64_to_sqlite_i64(event.reasoning_tokens),
+                    u64_to_sqlite_i64(event.latency_ms),
+                    &event.source,
+                ],
+            )
+        };
+
+        if let Err(err) = insert_res {
+            if should_invalidate_connection(&err) {
+                *conn_guard = None;
+            }
+            return Err(self.db_error(err));
+        }
+
+        if let Err(err) = self.tighten_sqlite_file_permissions() {
+            *conn_guard = None;
+            return Err(err);
+        }
+
+        Ok(self.db_path.clone())
+    }
+
+    pub fn read_all_events(&self) -> Result<Vec<UsageEvent>, CoreError> {
+        let mut conn_guard = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(ref conn) = *conn_guard {
+            return match self.query_all_from_connection(conn) {
+                Ok(events) => Ok(events),
+                Err(err) => {
+                    *conn_guard = None;
+                    Err(err)
+                }
+            };
+        }
+
+        if !self.check_existing_usage_dir()? {
+            return Ok(Vec::new());
+        }
+        let Some(_) = self.validate_sqlite_paths()? else {
+            return Ok(Vec::new());
+        };
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn =
+            Connection::open_with_flags(&self.db_path, flags).map_err(|err| self.db_error(err))?;
+        conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+            .map_err(|err| self.db_error(err))?;
+
+        let version = self.read_user_version(&conn)?;
+        self.check_schema_version(version)?;
+        let events = self.query_all_from_connection(&conn)?;
+        drop(conn);
+        self.tighten_sqlite_file_permissions()?;
+        Ok(events)
     }
 }
 
-impl UsageSink for JsonlUsageSink {
+impl UsageSink for SqliteUsageSink {
     fn record(&self, event: UsageEvent) {
         if let Err(err) = self.record_checked(&event) {
-            tracing::warn!(error = %err, "failed to append usage event to JSONL sink");
+            tracing::warn!(error = %err, "failed to record usage event to SQLite sink");
         }
     }
 }
@@ -330,6 +730,7 @@ impl UsageSink for JsonlUsageSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -347,6 +748,26 @@ mod tests {
             latency_ms: 842,
             source: "proxy".to_string(),
         }
+    }
+
+    fn read_all_sqlite_raw_bytes(usage_dir: &Path) -> Vec<u8> {
+        let mut combined = Vec::new();
+        for name in [
+            "usage.db",
+            "usage.db-wal",
+            "usage.db-shm",
+            "usage.db-journal",
+        ] {
+            let path = usage_dir.join(name);
+            if path.is_file() {
+                combined.extend_from_slice(&fs::read(&path).expect("read sqlite file bytes"));
+            }
+        }
+        combined
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test]
@@ -372,36 +793,65 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_sink_appends_without_body_content() {
+    fn sqlite_sink_round_trips_all_ten_fields_without_body_or_secret_content() {
         let tmp = TempDir::new().expect("temp dir");
-        let sink = JsonlUsageSink::new(tmp.path()).expect("sink init");
+        let sink = SqliteUsageSink::new(tmp.path()).expect("sink init");
         assert_eq!(sink.usage_dir(), tmp.path());
+        assert_eq!(sink.db_path(), tmp.path().join(USAGE_DB_FILENAME));
+        // Lazy init: construction must not create usage.db.
+        assert!(!sink.db_path().exists());
 
         let e1 = sample_event("2026-11-22T22:00:00Z", "req-1");
         let e2 = sample_event("2026-11-22T22:05:00Z", "req-2");
         sink.record(e1.clone());
         sink.record(e2.clone());
 
-        let file_path = tmp.path().join("2026-11.jsonl");
-        let contents = fs::read_to_string(&file_path).expect("read jsonl");
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert!(sink.db_path().is_file());
+        let events = sink.read_all_events().expect("read events");
+        assert_eq!(events, vec![e1, e2]);
 
-        let parsed_1: UsageEvent = serde_json::from_str(lines[0]).expect("parse line 1");
-        let parsed_2: UsageEvent = serde_json::from_str(lines[1]).expect("parse line 2");
-        assert_eq!(parsed_1, e1);
-        assert_eq!(parsed_2, e2);
+        let raw_bytes = read_all_sqlite_raw_bytes(tmp.path());
+        assert!(!raw_bytes.is_empty());
+        assert!(!contains_bytes(&raw_bytes, b"AIza"));
+        assert!(!contains_bytes(&raw_bytes, b"prompt"));
+        assert!(!contains_bytes(&raw_bytes, b"response"));
+        assert!(!contains_bytes(&raw_bytes, b"api_key"));
 
-        for line in &lines {
-            let obj: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(line).expect("json object");
-            assert_eq!(obj.len(), 10);
-            assert!(!obj.contains_key("prompt"));
-            assert!(!obj.contains_key("response"));
-            assert!(!obj.contains_key("body"));
-            assert!(!obj.contains_key("api_key"));
-        }
-        assert!(!contents.contains("AIza"));
+        // Verify PRAGMA user_version, WAL mode, and schema columns directly.
+        let conn = Connection::open(sink.db_path()).expect("open db");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, USAGE_DB_SCHEMA_VERSION);
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(usage_events)")
+            .expect("table_info");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .expect("query columns")
+            .map(|r| r.expect("col name"))
+            .collect();
+        assert_eq!(
+            columns,
+            vec![
+                "id",
+                "timestamp_utc",
+                "request_id",
+                "provider",
+                "model",
+                "input_tokens",
+                "output_tokens",
+                "cached_tokens",
+                "reasoning_tokens",
+                "latency_ms",
+                "source",
+            ]
+        );
     }
 
     #[test]
@@ -437,10 +887,10 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_sink_enforces_0600_and_concurrent_thread_safe_appends() {
+    fn sqlite_sink_enforces_0600_and_concurrent_thread_safe_writes() {
         let tmp = TempDir::new().expect("temp dir");
         let usage_subdir = tmp.path().join("nested").join("usage");
-        let sink = Arc::new(JsonlUsageSink::new(&usage_subdir).expect("sink init"));
+        let sink = Arc::new(SqliteUsageSink::new(&usage_subdir).expect("sink init"));
         let dyn_sink: Arc<dyn UsageSink> = sink.clone();
 
         let mut handles = Vec::new();
@@ -457,35 +907,34 @@ mod tests {
             handle.join().expect("thread join");
         }
 
-        dyn_sink.record(sample_event("2025-12-01T00:00:00Z", "dec-1"));
+        let events = sink.read_all_events().expect("read 80 events");
+        assert_eq!(events.len(), 80);
+        let ids: HashSet<&str> = events.iter().map(|e| e.request_id.as_str()).collect();
+        assert_eq!(ids.len(), 80);
 
-        let nov_path = usage_subdir.join("2025-11.jsonl");
-        let dec_path = usage_subdir.join("2025-12.jsonl");
-        assert!(nov_path.exists());
-        assert!(dec_path.exists());
-
-        let nov_lines: Vec<UsageEvent> = fs::read_to_string(&nov_path)
-            .expect("read nov")
-            .lines()
-            .map(|l| serde_json::from_str(l).expect("valid jsonl line"))
-            .collect();
-        assert_eq!(nov_lines.len(), 80);
-
-        let dec_lines: Vec<UsageEvent> = fs::read_to_string(&dec_path)
-            .expect("read dec")
-            .lines()
-            .map(|l| serde_json::from_str(l).expect("valid jsonl line"))
-            .collect();
-        assert_eq!(dec_lines.len(), 1);
-        assert_eq!(dec_lines[0].request_id, "dec-1");
-
-        // Malformed/traversal timestamp must fall back safely to UTC current month inside usage_dir
-        let fallback_dir = tmp.path().join("fallback");
-        let fallback_sink = JsonlUsageSink::new(&fallback_dir).expect("fallback sink init");
-        let fallback_path = fallback_sink
-            .record_checked(&sample_event("../../etc/passwd", "bad-ts"))
-            .expect("invalid timestamp falls back to current UTC month");
-        assert_eq!(fallback_path.parent(), Some(fallback_dir.as_path()));
+        // Multi-instance concurrent writers against the same usage_dir.
+        let multi_dir = tmp.path().join("multi_instance");
+        let mut multi_handles = Vec::new();
+        for w in 0..4 {
+            let dir = multi_dir.clone();
+            multi_handles.push(std::thread::spawn(move || {
+                let writer = SqliteUsageSink::new(&dir).expect("writer init");
+                for i in 0..10 {
+                    writer
+                        .record_checked(&sample_event(
+                            "2026-11-22T22:20:00Z",
+                            &format!("w{w}-i{i}"),
+                        ))
+                        .expect("multi-instance record");
+                }
+            }));
+        }
+        for handle in multi_handles {
+            handle.join().expect("multi writer join");
+        }
+        let reader = SqliteUsageSink::new(&multi_dir).expect("reader init");
+        let multi_events = reader.read_all_events().expect("read multi events");
+        assert_eq!(multi_events.len(), 40);
 
         #[cfg(unix)]
         {
@@ -497,17 +946,188 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(dir_mode, 0o700);
-            let nov_mode = fs::metadata(&nov_path).expect("meta").permissions().mode() & 0o777;
-            assert_eq!(nov_mode, 0o600);
-            let dec_mode = fs::metadata(&dec_path).expect("meta").permissions().mode() & 0o777;
-            assert_eq!(dec_mode, 0o600);
+            // Verify 4-file symmetry: an existing loose-mode usage.db-journal is also tightened to 0600.
+            let journal_path = usage_subdir.join("usage.db-journal");
+            fs::write(&journal_path, b"").expect("create journal sidecar");
+            fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o644))
+                .expect("set 0644 on journal");
+            sink.record_checked(&sample_event("2025-11-22T22:15:00Z", "journal-tighten"))
+                .expect("record tightens sidecar permissions");
+            for name in [
+                "usage.db",
+                "usage.db-wal",
+                "usage.db-shm",
+                "usage.db-journal",
+            ] {
+                let path = usage_subdir.join(name);
+                if path.exists() {
+                    let mode = fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600, "expected 0600 on {name}, got {mode:o}");
+                }
+            }
         }
     }
 
     #[test]
-    fn jsonl_sink_handles_io_failure_without_panicking() {
+    fn read_all_events_on_missing_db_does_not_create_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let missing_dir = tmp.path().join("nonexistent_usage");
+        let sink = SqliteUsageSink::new(&missing_dir).expect("sink init");
+        assert_eq!(
+            sink.read_all_events().expect("read missing dir"),
+            Vec::new()
+        );
+        assert!(!missing_dir.exists());
+
+        let empty_dir = tmp.path().join("empty_usage");
+        fs::create_dir(&empty_dir).expect("mkdir empty_usage");
+        let empty_sink = SqliteUsageSink::new(&empty_dir).expect("empty sink init");
+        assert_eq!(
+            empty_sink.read_all_events().expect("read empty dir"),
+            Vec::new()
+        );
+        assert!(!empty_dir.join(USAGE_DB_FILENAME).exists());
+    }
+
+    #[test]
+    fn sqlite_sink_rejects_future_schema_version_fail_closed() {
+        for (raw_version, expected_err_substr) in [
+            (2_i64, "schema version 2"),
+            (-1_i64, "invalid negative or out-of-range user_version -1"),
+        ] {
+            let tmp = TempDir::new().expect("temp dir");
+            let db_path = tmp.path().join(USAGE_DB_FILENAME);
+            {
+                let conn = Connection::open(&db_path).expect("create unsupported db");
+                conn.execute_batch(
+                    "PRAGMA journal_mode = DELETE;
+                     CREATE TABLE future_schema_data (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
+                     INSERT INTO future_schema_data (note) VALUES ('preserve-me');",
+                )
+                .expect("seed future schema db");
+                conn.pragma_update(None, "user_version", raw_version)
+                    .expect("set unsupported user_version");
+            }
+
+            let before_bytes = fs::read(&db_path).expect("read db bytes before");
+            assert!(
+                before_bytes.len() >= 20 && &before_bytes[18..20] == b"\x01\x01",
+                "expected DELETE-mode SQLite header bytes [1, 1] for user_version={raw_version}"
+            );
+
+            let sink = SqliteUsageSink::new(tmp.path()).expect("sink init");
+            let write_err = sink
+                .record_checked(&sample_event("2026-11-22T22:00:00Z", "future-write"))
+                .expect_err("unsupported schema version must fail write");
+            assert!(
+                matches!(write_err, CoreError::UsageDatabase { .. }),
+                "expected UsageDatabase error, got {write_err:?}"
+            );
+            assert!(
+                write_err.to_string().contains(expected_err_substr),
+                "unexpected error text for user_version={raw_version}: {write_err}"
+            );
+
+            let read_err = sink
+                .read_all_events()
+                .expect_err("unsupported schema version must fail read");
+            assert!(
+                matches!(read_err, CoreError::UsageDatabase { .. }),
+                "expected UsageDatabase error on read, got {read_err:?}"
+            );
+
+            let after_bytes = fs::read(&db_path).expect("read db bytes after");
+            assert_eq!(
+                after_bytes, before_bytes,
+                "unsupported user_version={raw_version} database must remain byte-for-byte unchanged"
+            );
+            assert_eq!(&after_bytes[18..20], b"\x01\x01");
+            assert!(
+                !tmp.path().join("usage.db-wal").exists(),
+                "no -wal sidecar should be created for unsupported user_version={raw_version}"
+            );
+            assert!(
+                !tmp.path().join("usage.db-shm").exists(),
+                "no -shm sidecar should be created for unsupported user_version={raw_version}"
+            );
+
+            let verify_conn = Connection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .expect("open db read-only for verification");
+            let after_jm: String = verify_conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .expect("read after journal_mode");
+            assert_eq!(after_jm.to_ascii_lowercase(), "delete");
+        }
+    }
+
+    #[test]
+    fn sqlite_sink_clamps_u64_max_handles_extreme_timestamps_and_duplicate_request_id() {
+        let tmp = TempDir::new().expect("temp dir");
+        let sink = SqliteUsageSink::new(tmp.path()).expect("sink init");
+
+        let max_event = UsageEvent {
+            timestamp_utc: "9999-12-31T23:59:59Z".to_string(),
+            request_id: "max-u64".to_string(),
+            provider: "gemini".to_string(),
+            model: "gemini-4-hydrogen".to_string(),
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cached_tokens: u64::MAX,
+            reasoning_tokens: u64::MAX,
+            latency_ms: u64::MAX,
+            source: "proxy".to_string(),
+        };
+        sink.record_checked(&max_event)
+            .expect("u64::MAX clamped safely");
+
+        for (ts, req_id) in [
+            ("0000-01-01T00:00:00+05:00", "year-underflow"),
+            ("1969-12-31T23:59:59Z", "pre-epoch"),
+            ("../../etc/passwd", "weird-ts"),
+        ] {
+            let path = sink
+                .record_checked(&sample_event(ts, req_id))
+                .expect("extreme timestamp stored as opaque text");
+            assert_eq!(path, tmp.path().join(USAGE_DB_FILENAME));
+        }
+
+        // Duplicate request_id must error in record_checked without panicking in record().
+        let dup_err = sink
+            .record_checked(&sample_event("2026-11-22T22:00:00Z", "max-u64"))
+            .expect_err("duplicate request_id must fail");
+        assert!(matches!(dup_err, CoreError::UsageDatabase { .. }));
+        sink.record(sample_event("2026-11-22T22:00:00Z", "max-u64"));
+
+        // Healthy connection remains usable after a constraint violation.
+        sink.record_checked(&sample_event("2026-11-22T22:01:00Z", "after-dup"))
+            .expect("subsequent unique write succeeds");
+
+        let events = sink.read_all_events().expect("read events");
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0].input_tokens, i64::MAX as u64);
+        assert_eq!(events[0].output_tokens, i64::MAX as u64);
+        assert_eq!(events[0].cached_tokens, i64::MAX as u64);
+        assert_eq!(events[0].reasoning_tokens, i64::MAX as u64);
+        assert_eq!(events[0].latency_ms, i64::MAX as u64);
+        assert_eq!(events[4].request_id, "after-dup");
+
+        let db_err = CoreError::UsageDatabase {
+            path: PathBuf::from("/tmp/usage.db"),
+            reason: "boom".to_string(),
+        };
+        assert_eq!(
+            db_err.to_string(),
+            "usage database error at '/tmp/usage.db': boom"
+        );
+    }
+
+    #[test]
+    fn sqlite_sink_handles_io_failure_without_panicking() {
         assert!(matches!(
-            JsonlUsageSink::new("../escape"),
+            SqliteUsageSink::new("../escape"),
             Err(CoreError::InvalidPath { .. })
         ));
 
@@ -515,7 +1135,7 @@ mod tests {
         let blocker_file = tmp.path().join("not-a-dir");
         fs::write(&blocker_file, "occupied").expect("write blocker");
 
-        let sink = JsonlUsageSink::new(&blocker_file).expect("valid path");
+        let sink = SqliteUsageSink::new(&blocker_file).expect("valid path");
         let event = sample_event("2026-11-22T22:15:00Z", "io-err");
         assert!(sink.record_checked(&event).is_err());
 
@@ -544,145 +1164,163 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_sink_clamps_extreme_year_boundary_timestamps_to_four_digit_month_files() {
+    fn sqlite_sink_leaves_legacy_jsonl_files_untouched() {
         let tmp = TempDir::new().expect("temp dir");
-        let sink = JsonlUsageSink::new(tmp.path()).expect("sink init");
+        let legacy_path = tmp.path().join("2026-10.jsonl");
+        let legacy_content = "{\"legacy\":true}\n";
+        fs::write(&legacy_path, legacy_content).expect("write legacy jsonl");
 
-        for (ts, req_id) in [
-            ("0000-01-01T00:00:00+05:00", "year-underflow"),
-            ("9999-12-31T23:59:59-05:00", "year-overflow"),
-            ("1969-12-31T23:59:59Z", "pre-epoch"),
-        ] {
-            let path = sink
-                .record_checked(&sample_event(ts, req_id))
-                .expect("fallback write succeeds");
-            assert_eq!(path.parent(), Some(tmp.path()));
+        let sink = SqliteUsageSink::new(tmp.path()).expect("sink init");
+        sink.record_checked(&sample_event("2026-11-23T08:00:00Z", "coexist-1"))
+            .expect("sqlite write succeeds alongside legacy jsonl");
 
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .expect("utf-8 filename");
-            assert_eq!(
-                file_name.len(),
-                13,
-                "expected YYYY-MM.jsonl filename, got '{file_name}'"
-            );
-            assert!(
-                file_name.ends_with(".jsonl"),
-                "expected .jsonl suffix, got '{file_name}'"
-            );
-            let bytes = file_name.as_bytes();
-            assert!(
-                bytes[0..4].iter().all(u8::is_ascii_digit)
-                    && bytes[4] == b'-'
-                    && bytes[5..7].iter().all(u8::is_ascii_digit),
-                "filename must match [0-9]{{4}}-[0-9]{{2}}.jsonl, got '{file_name}'"
-            );
+        assert_eq!(
+            fs::read_to_string(&legacy_path).expect("read legacy"),
+            legacy_content
+        );
+        let events = sink.read_all_events().expect("read events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].request_id, "coexist-1");
+    }
+
+    #[test]
+    fn sqlite_sink_invalidates_cached_connection_on_readonly_error_and_recovers() {
+        let tmp = TempDir::new().expect("temp dir");
+        let sink = SqliteUsageSink::new(tmp.path()).expect("sink init");
+
+        sink.record_checked(&sample_event("2026-11-23T08:00:00Z", "before-err"))
+            .expect("initial write");
+
+        // Force a SQLITE_READONLY error on the cached connection to exercise invalidation.
+        {
+            let guard = sink.conn.lock().expect("lock conn");
+            let conn = guard.as_ref().expect("cached conn present");
+            conn.pragma_update(None, "query_only", true)
+                .expect("set query_only");
         }
 
-        // Valid 4-digit UTC boundary years 1970..=9999 remain intact.
-        let epoch_path = sink
-            .record_checked(&sample_event("1970-01-01T00:00:00Z", "epoch-start"))
-            .expect("1970 write succeeds");
-        assert_eq!(
-            epoch_path.file_name().and_then(|n| n.to_str()),
-            Some("1970-01.jsonl")
+        let err = sink
+            .record_checked(&sample_event("2026-11-23T08:01:00Z", "during-err"))
+            .expect_err("readonly connection must fail");
+        assert!(matches!(err, CoreError::UsageDatabase { .. }));
+        assert!(
+            sink.conn.lock().expect("lock conn").is_none(),
+            "cached connection must be invalidated after fatal/readonly SQLite error"
         );
 
-        let max_year_path = sink
-            .record_checked(&sample_event("9999-12-31T23:59:59Z", "year-9999"))
-            .expect("9999 write succeeds");
-        assert_eq!(
-            max_year_path.file_name().and_then(|n| n.to_str()),
-            Some("9999-12.jsonl")
-        );
+        // Next write must reopen, re-validate paths, and succeed cleanly.
+        sink.record_checked(&sample_event("2026-11-23T08:02:00Z", "after-recover"))
+            .expect("recovery write succeeds");
+        let events = sink.read_all_events().expect("read recovered events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].request_id, "before-err");
+        assert_eq!(events[1].request_id, "after-recover");
 
-        let serialize_err = CoreError::SerializeUsage {
-            reason: "boom".to_string(),
-        };
-        assert_eq!(
-            serialize_err.to_string(),
-            "failed to serialize usage event: boom"
+        // Force a query error on the cached connection and verify read_all_events
+        // invalidates the broken handle so a subsequent read recovers cleanly.
+        {
+            let mut guard = sink.conn.lock().expect("lock conn");
+            *guard = Some(Connection::open_in_memory().expect("open empty in-memory db"));
+        }
+        let read_err = sink
+            .read_all_events()
+            .expect_err("query against broken cached connection must fail");
+        assert!(matches!(read_err, CoreError::UsageDatabase { .. }));
+        assert!(
+            sink.conn.lock().expect("lock conn").is_none(),
+            "cached connection must be invalidated after read_all_events error"
         );
+        let recovered_events = sink
+            .read_all_events()
+            .expect("read recovers against on-disk usage.db after invalidation");
+        assert_eq!(recovered_events.len(), 2);
     }
 
     #[cfg(unix)]
     #[test]
-    fn jsonl_sink_rejects_symlink_jsonl_file_without_modifying_target_or_permissions() {
+    fn sqlite_sink_rejects_symlink_db_and_sidecars_without_modifying_victim() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let tmp = TempDir::new().expect("temp dir");
-        let usage_dir = tmp.path().join("usage");
-        fs::create_dir(&usage_dir).expect("mkdir usage");
+        for file_name in [
+            "usage.db",
+            "usage.db-wal",
+            "usage.db-shm",
+            "usage.db-journal",
+        ] {
+            let tmp = TempDir::new().expect("temp dir");
+            let usage_dir = tmp.path().join("usage");
+            fs::create_dir(&usage_dir).expect("mkdir usage");
 
-        let victim = tmp.path().join("victim.txt");
-        fs::write(&victim, "DO_NOT_TOUCH\n").expect("write victim");
-        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+            let victim = tmp.path().join("victim.txt");
+            fs::write(&victim, "DO_NOT_TOUCH\n").expect("write victim");
+            fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
 
-        let link_path = usage_dir.join("2026-11.jsonl");
-        symlink(&victim, &link_path).expect("symlink jsonl");
+            let link_path = usage_dir.join(file_name);
+            symlink(&victim, &link_path).expect("symlink sqlite file");
 
-        let sink = JsonlUsageSink::new(&usage_dir).expect("sink init");
-        let err = sink
-            .record_checked(&sample_event("2026-11-23T08:00:00Z", "sym-jsonl"))
-            .expect_err("symlinked JSONL file must fail");
-        assert!(
-            matches!(err, CoreError::InvalidPath { .. }),
-            "expected InvalidPath for symlinked JSONL, got {err:?}"
-        );
+            let sink = SqliteUsageSink::new(&usage_dir).expect("sink init");
+            let write_err = sink
+                .record_checked(&sample_event("2026-11-23T08:00:00Z", "sym-db"))
+                .expect_err("symlinked sqlite file must fail write");
+            assert!(
+                matches!(write_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for symlinked {file_name}, got {write_err:?}"
+            );
 
-        assert_eq!(
-            fs::read_to_string(&victim).expect("read victim"),
-            "DO_NOT_TOUCH\n",
-            "victim file contents must remain untouched"
-        );
-        let mode = fs::metadata(&victim)
-            .expect("victim meta")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o644, "victim file permissions must remain 0644");
+            let read_err = sink
+                .read_all_events()
+                .expect_err("symlinked sqlite file must fail read");
+            assert!(
+                matches!(read_err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath on read for symlinked {file_name}, got {read_err:?}"
+            );
+
+            assert_eq!(
+                fs::read_to_string(&victim).expect("read victim"),
+                "DO_NOT_TOUCH\n",
+                "victim file contents must remain untouched for {file_name}"
+            );
+            let mode = fs::metadata(&victim)
+                .expect("victim meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o644,
+                "victim file permissions must remain 0644 for {file_name}"
+            );
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn jsonl_sink_rejects_symlink_usage_dir_and_fifo_without_blocking() {
+    fn sqlite_sink_rejects_symlink_usage_dir_and_fifos_without_blocking() {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().expect("temp dir");
 
-        // 1. Symlinked usage_dir must be rejected without writing into target dir.
+        // 1. Symlinked usage_dir must be rejected both on construction and on post-construction swap.
         let target_dir = tmp.path().join("target_dir");
         fs::create_dir(&target_dir).expect("mkdir target_dir");
         let sym_usage_dir = tmp.path().join("sym_usage");
         symlink(&target_dir, &sym_usage_dir).expect("symlink usage_dir");
 
-        // Both construction and post-construction swap must reject symlinks.
-        match JsonlUsageSink::new(&sym_usage_dir) {
-            Err(CoreError::InvalidPath { .. }) => {}
-            Ok(sink) => {
-                let err = sink
-                    .record_checked(&sample_event("2026-11-23T08:00:00Z", "sym-dir"))
-                    .expect_err("symlinked usage_dir must fail on record");
-                assert!(
-                    matches!(err, CoreError::InvalidPath { .. }),
-                    "expected InvalidPath, got {err:?}"
-                );
-            }
-            Err(other) => panic!("unexpected error for symlinked usage_dir: {other:?}"),
-        }
+        assert!(matches!(
+            SqliteUsageSink::new(&sym_usage_dir),
+            Err(CoreError::InvalidPath { .. })
+        ));
 
-        // Also test post-construction swap of usage_dir to a symlink.
         let swapped_dir = tmp.path().join("swapped_usage");
-        let swapped_sink = JsonlUsageSink::new(&swapped_dir).expect("missing usage_dir allowed");
+        let swapped_sink = SqliteUsageSink::new(&swapped_dir).expect("missing usage_dir allowed");
         symlink(&target_dir, &swapped_dir).expect("swap usage_dir to symlink");
         let swap_err = swapped_sink
             .record_checked(&sample_event("2026-11-23T08:00:00Z", "swapped-dir"))
             .expect_err("post-construction symlinked usage_dir must fail");
-        assert!(
-            matches!(swap_err, CoreError::InvalidPath { .. }),
-            "expected InvalidPath, got {swap_err:?}"
-        );
+        assert!(matches!(swap_err, CoreError::InvalidPath { .. }));
+        assert!(matches!(
+            swapped_sink.read_all_events(),
+            Err(CoreError::InvalidPath { .. })
+        ));
         assert!(
             fs::read_dir(&target_dir)
                 .expect("read target_dir")
@@ -691,30 +1329,33 @@ mod tests {
             "target_dir must remain completely empty"
         );
 
-        // 2. FIFO at YYYY-MM.jsonl must fail fast (< 1s) without blocking.
-        let fifo_usage_dir = tmp.path().join("fifo_usage");
-        fs::create_dir(&fifo_usage_dir).expect("mkdir fifo_usage");
-        let fifo_jsonl = fifo_usage_dir.join("2026-11.jsonl");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo_jsonl)
-            .status()
-            .expect("run mkfifo");
-        assert!(status.success(), "mkfifo failed");
+        // 2. FIFO at usage.db and usage.db-wal must fail fast (< 1s) without blocking.
+        for fifo_name in ["usage.db", "usage.db-wal"] {
+            let fifo_usage_dir = tmp.path().join(format!("fifo_{fifo_name}"));
+            fs::create_dir(&fifo_usage_dir).expect("mkdir fifo_usage");
+            let fifo_path = fifo_usage_dir.join(fifo_name);
+            let status = std::process::Command::new("mkfifo")
+                .arg(&fifo_path)
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success(), "mkfifo failed for {fifo_name}");
 
-        let fifo_sink = JsonlUsageSink::new(&fifo_usage_dir).expect("sink init");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let res = fifo_sink.record_checked(&sample_event("2026-11-23T08:00:00Z", "fifo-req"));
-            let _ = tx.send(res);
-        });
-        let res = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("record_checked hung on FIFO");
-        handle.join().expect("thread join");
-        let err = res.expect_err("FIFO JSONL must fail");
-        assert!(
-            matches!(err, CoreError::InvalidPath { .. }),
-            "expected InvalidPath for FIFO JSONL, got {err:?}"
-        );
+            let fifo_sink = SqliteUsageSink::new(&fifo_usage_dir).expect("sink init");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let res =
+                    fifo_sink.record_checked(&sample_event("2026-11-23T08:00:00Z", "fifo-req"));
+                let _ = tx.send(res);
+            });
+            let res = rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("record_checked hung on FIFO");
+            handle.join().expect("thread join");
+            let err = res.expect_err("FIFO sqlite path must fail");
+            assert!(
+                matches!(err, CoreError::InvalidPath { .. }),
+                "expected InvalidPath for FIFO {fifo_name}, got {err:?}"
+            );
+        }
     }
 }
