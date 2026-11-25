@@ -20,4 +20,7 @@ pub use integration::{
     IntegrationState, IntegrationStatus, ShellKind, StripReport,
 };
 pub use redaction::{RedactedConfig, api_key_hint, mask_api_key};
-pub use usage::{GeminiUsageMetadata, JsonlUsageSink, NoopUsageSink, UsageEvent, UsageSink};
+pub use usage::{
+    GeminiUsageMetadata, NoopUsageSink, SqliteUsageSink, USAGE_DB_FILENAME,
+    USAGE_DB_SCHEMA_VERSION, UsageEvent, UsageSink,
+};

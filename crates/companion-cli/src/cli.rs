@@ -128,7 +128,7 @@ pub enum Commands {
         /// Override Antigravity plugins directory (defaults to ~/.gemini/config/plugins).
         #[arg(long = "plugins-dir")]
         plugins_dir: Option<PathBuf>,
-        /// Also delete config.json, usage/ logs, proxy.log, and sidecar_data/agy-companion.
+        /// Also delete config.json, usage/ database, proxy.log, and sidecar_data/agy-companion.
         #[arg(long)]
         purge: bool,
         /// Report what would be removed without modifying any files or stopping processes.

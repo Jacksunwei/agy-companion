@@ -9,7 +9,7 @@ Bring your own models (BYOM) and track token usage and implicit cache hit rates 
 - **Google AI Pro, PayGo & Enterprise CloudCode Transparency:** `cloudcode_upstream_url` defaults to `"auto"`, using an 8-entry per-account 128-bit SipHash-1-3 LRU preserved across config hot-reloads to keep Personal Google AI Pro (`daily-cloudcode-pa.googleapis.com`), PayGo, and Enterprise (`cloudcode-pa.googleapis.com` with metadata-only `403` `x-goog-user-project` stripping) working seamlessly. On Day-0 (before an API key is saved), the native Google model picker is returned completely untouched.
 - **Loopback-Only Rust Proxy Sidecar (`agy-companion serve`):** Listens exclusively on `127.0.0.1` (default port `24141`, with fresh-install `24141..=24150` fallback), forwards `/v1beta/models/*:generateContent` and `:streamGenerateContent` byte-for-byte to preserve Gemini implicit context caching, authenticates upstream via `x-goog-api-key` (never `?key=`), and supports `--adopt-running` (`500ms` takeover) and `--idle-shutdown-secs`.
 - **Embedded MCP App Settings UI (`agy-companion ui-mcp`):** Native Antigravity panel (`ui://companion/settings.html`) accessible from the side panel (`aux_pane`) and left sidebar **Plugins** view (`global`). Includes a live Proxy Status Bar, CloudCode active-upstream badge, **Dock / Launcher Auto-Start** toggle (`set_launcher_integration`), write-only Gemini Settings form with post-save auto-verify and 5-minute model-refresh countdown, copyable `customModelsConfig` snippet, and live Usage & Cache Telemetry — with zero external network fetches and redacted API key handling.
-- **Usage & Cache Observability:** Tees `usageMetadata` from unary JSON and SSE responses into `GET /api/stats` and append-only monthly JSONL logs (`YYYY-MM.jsonl`, Unix mode `0600`) containing only token counts and latency metadata (zero prompt/response bodies or secrets).
+- **Usage & Cache Observability:** Tees `usageMetadata` from unary JSON and SSE responses into `GET /api/stats` and a WAL-mode SQLite database (`usage.db`, Unix mode `0600`) containing only token counts and latency metadata (zero prompt/response bodies or secrets).
 
 ## Installation & Quick Setup
 
@@ -100,7 +100,7 @@ export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:24141"
 | Purpose | Precedence / Path | Notes |
 | --- | --- | --- |
 | **Config file** | `--config <path>` → `AGY_COMPANION_CONFIG` → `$XDG_CONFIG_HOME/agy-companion/config.json` → Platform default | JSON (`schema_version: 1`); atomic temp+rename (Unix `0600`, parent `0700`; Windows bounded `3`-attempt `25ms` → `50ms` retry on transient `PermissionDenied`); symlinks, NUL bytes, and `..` traversal rejected |
-| **Usage JSONL logs** | `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → Platform default (writes `YYYY-MM.jsonl`) | Append-only, Unix mode `0600`; metadata only (zero prompt text or keys); NUL bytes and `..` traversal rejected |
+| **Usage database** | `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → Platform default (stores `usage.db`) | WAL-mode SQLite, Unix mode `0600` (`usage.db`, `-wal`, `-shm`); metadata only (zero prompt text or keys); symlinks, FIFOs, NUL bytes, and `..` traversal rejected |
 | **Launcher hook & daemon files** | `$XDG_DATA_HOME/agy-companion/{env.sh,proxy.pid,proxy.log}` (default `~/.local/share/agy-companion/`) | `0600` zero-`eval` `env.sh`, structured `proxy.pid`, and rotating `5 MiB` `proxy.log` |
 | **Sidecar logs** | `~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/` | Managed by Antigravity App for the `proxy` sidecar |
 | **Cached / installed binary** | `${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-${XDG_DATA_HOME:-~/.local/share}/agy-companion}/bin/agy-companion` | Version-matched cache checked **before** unversioned `$PATH` in `scripts/run-companion.sh` |
@@ -168,5 +168,5 @@ When developing from a local checkout:
 
 - Proxy binds strictly to loopback (`127.0.0.1` or `localhost`) and rejects non-loopback hosts.
 - Remote upstream URLs require `https://` (`http://` is restricted to `127.0.0.1` and `localhost`).
-- API keys are stored atomically (Unix mode `0600`, parent dir `0700`; Windows user-profile ACLs with bounded `3`-attempt `25ms` → `50ms` retry on transient `PermissionDenied`), sent via `x-goog-api-key` (never `?key=`), never returned in plaintext by MCP tools (`get_settings` returns masked hints only), and never written to logs or usage JSONL files.
+- API keys are stored atomically (Unix mode `0600`, parent dir `0700`; Windows user-profile ACLs with bounded `3`-attempt `25ms` → `50ms` retry on transient `PermissionDenied`), sent via `x-goog-api-key` (never `?key=`), never returned in plaintext by MCP tools (`get_settings` returns masked hints only), and never written to logs or the SQLite usage database (`usage.db`).
 - Release binaries downloaded by `scripts/run-companion.sh` are verified against SHA-256 checksums before execution.

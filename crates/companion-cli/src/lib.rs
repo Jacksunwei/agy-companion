@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use companion_core::{Config, CoreError, JsonlUsageSink, UsageSink};
+use companion_core::{Config, CoreError, SqliteUsageSink, UsageSink};
 use companion_proxy::{ProxyError, ProxyState};
 use companion_ui_mcp::UiMcpError;
 use thiserror::Error;
@@ -189,7 +189,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
     precheck_existing_data_dir(&usage_dir)?;
     let runtime_data_dir = resolve_runtime_data_dir(&config)?;
     precheck_existing_data_dir(&runtime_data_dir)?;
-    let usage_sink: Arc<dyn UsageSink> = Arc::new(JsonlUsageSink::new(usage_dir)?);
+    let usage_sink: Arc<dyn UsageSink> = Arc::new(SqliteUsageSink::new(usage_dir)?);
 
     // Pre-register SIGTERM and SIGHUP before binding so host-restart signals are never missed.
     #[cfg(unix)]

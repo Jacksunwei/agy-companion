@@ -8,7 +8,8 @@ Provides:
 - run_cli (one-shot CLI execution with captured stdout/stderr/duration)
 - http_raw_request (unnormalized raw paths + 413 early socket close resilience)
 - http_stream_request (unbuffered read1() incremental SSE arrival measurement)
-- poll_usage_events (Guard A13 async JSONL polling)
+- poll_usage_events (Guard A13 async SQLite polling)
+- usage_storage_files / read_usage_raw_bytes / open_usage_db_readonly
 - find_key_recursive / extract_models_list / resolve_binary / find_free_port
 """
 
@@ -24,6 +25,7 @@ import os
 import signal
 import socket
 import socketserver
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -554,18 +556,13 @@ class IsolatedEnv:
 
     def usage_files(self, usage_dir: Path | None = None) -> list[Path]:
         target_dir = usage_dir if usage_dir is not None else self.usage_dir
-        if not target_dir.exists():
-            return []
-        return sorted(p for p in target_dir.glob("*.jsonl") if p.is_file())
+        return usage_files(target_dir)
 
     def read_usage_events(self, usage_dir: Path | None = None) -> list[dict[str, Any]]:
+        target_dir = usage_dir if usage_dir is not None else self.usage_dir
         events: list[dict[str, Any]] = []
-        for fpath in self.usage_files(usage_dir=usage_dir):
-            text = fpath.read_text(encoding="utf-8")
-            for line in text.splitlines():
-                stripped = line.strip()
-                if stripped:
-                    events.append(json.loads(stripped))
+        for db_path in usage_files(target_dir):
+            events.extend(_read_usage_events_from_db(db_path))
         return events
 
     def close(self) -> None:
@@ -578,6 +575,78 @@ class IsolatedEnv:
         self.close()
 
 
+USAGE_DB_FILENAME = "usage.db"
+USAGE_SQLITE_FILENAMES: tuple[str, ...] = (
+    "usage.db",
+    "usage.db-wal",
+    "usage.db-shm",
+    "usage.db-journal",
+)
+_USAGE_EVENT_COLUMNS: tuple[str, ...] = (
+    "timestamp_utc",
+    "request_id",
+    "provider",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "cached_tokens",
+    "reasoning_tokens",
+    "latency_ms",
+    "source",
+)
+
+
+def usage_files(usage_dir: Path) -> list[Path]:
+    """Return `[<usage_dir>/usage.db]` when present as a regular non-symlink file."""
+    if not usage_dir.exists():
+        return []
+    db_path = usage_dir / USAGE_DB_FILENAME
+    if db_path.is_file() and not db_path.is_symlink():
+        return [db_path]
+    return []
+
+
+def usage_storage_files(usage_dir: Path) -> list[Path]:
+    """Return all existing regular SQLite files (`usage.db`, `-wal`, `-shm`, `-journal`)."""
+    if not usage_dir.exists():
+        return []
+    found: list[Path] = []
+    for name in USAGE_SQLITE_FILENAMES:
+        candidate = usage_dir / name
+        if candidate.is_file() and not candidate.is_symlink():
+            found.append(candidate)
+    return found
+
+
+def read_usage_raw_bytes(usage_dir: Path) -> bytes:
+    """Concatenate raw bytes across `usage.db` and any existing SQLite sidecars."""
+    chunks: list[bytes] = []
+    for path in usage_storage_files(usage_dir):
+        try:
+            chunks.append(path.read_bytes())
+        except FileNotFoundError:
+            continue
+    return b"".join(chunks)
+
+
+def open_usage_db_readonly(db_path: Path, *, timeout: float = 2.0) -> sqlite3.Connection:
+    """Open a SQLite usage database strictly read-only via RFC 3986 file URI."""
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=timeout)
+
+
+def _read_usage_events_from_db(db_path: Path) -> list[dict[str, Any]]:
+    with contextlib.closing(open_usage_db_readonly(db_path)) as conn:
+        cur = conn.execute(
+            "SELECT timestamp_utc, request_id, provider, model, "
+            "input_tokens, output_tokens, cached_tokens, reasoning_tokens, "
+            "latency_ms, source "
+            "FROM usage_events ORDER BY id ASC"
+        )
+        rows = cur.fetchall()
+    return [dict(zip(_USAGE_EVENT_COLUMNS, row)) for row in rows]
+
+
 def poll_usage_events(
     usage_dir: Path,
     *,
@@ -585,30 +654,19 @@ def poll_usage_events(
     timeout: float = 2.0,
     interval: float = 0.05,
 ) -> tuple[list[Path], list[dict[str, Any]]]:
-    """Poll `<usage_dir>/*.jsonl` until at least `min_count` valid JSONL events exist (Guard A13)."""
+    """Poll `<usage_dir>/usage.db` until at least `min_count` valid usage rows exist (Guard A13)."""
     deadline = time.monotonic() + timeout
     last_files: list[Path] = []
     last_events: list[dict[str, Any]] = []
     while True:
-        files = sorted(p for p in usage_dir.glob("*.jsonl") if p.is_file()) if usage_dir.exists() else []
+        files = usage_files(usage_dir)
         events: list[dict[str, Any]] = []
         parse_ok = True
-        for fpath in files:
+        for db_path in files:
             try:
-                content = fpath.read_text(encoding="utf-8")
-            except OSError:
+                events.extend(_read_usage_events_from_db(db_path))
+            except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
                 parse_ok = False
-                break
-            for line in content.splitlines():
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    events.append(json.loads(stripped))
-                except json.JSONDecodeError:
-                    parse_ok = False
-                    break
-            if not parse_ok:
                 break
         last_files = files
         last_events = events

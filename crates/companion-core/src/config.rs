@@ -56,8 +56,8 @@ pub enum CoreError {
     },
     #[error("failed to serialize config: {reason}")]
     SerializeConfig { reason: String },
-    #[error("failed to serialize usage event: {reason}")]
-    SerializeUsage { reason: String },
+    #[error("usage database error at '{path}': {reason}")]
+    UsageDatabase { path: PathBuf, reason: String },
     #[error("corrupted integration markers in '{path}': {reason}")]
     CorruptedMarkers { path: PathBuf, reason: String },
     #[error("unsupported shell '{shell}': expected zsh, bash, or fish")]

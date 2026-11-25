@@ -2114,8 +2114,8 @@ class TestTier1RolloutR23UninstallCli(E2ETestCase):
         self.register_pidfile_cleanup(env=env)
         port = find_free_port()
         cfg = env.write_config(env.make_config_dict(listen_port=port, api_key="AIzaSyRolloutR23Keep123"))
-        usage_canary = env.usage_dir / "2026-11.jsonl"
-        usage_canary.write_text('{"ts":"2026-11-24T00:00:00Z"}\n', encoding="utf-8")
+        usage_canary = env.usage_dir / "usage.db"
+        usage_canary.write_bytes(b"SQLite format 3\x00")
         gemini_cfg = env.home_dir / ".gemini" / "config" / "config.json"
         gemini_cfg.parent.mkdir(parents=True, exist_ok=True)
         gemini_cfg.write_text('{"keep":"user"}\n', encoding="utf-8")
@@ -2152,7 +2152,7 @@ class TestTier1RolloutR23UninstallCli(E2ETestCase):
             self.fail(f"Proxy on port {port} still responded to /health after uninstall")
         # Preserved by default:
         self.assertTrue(cfg.is_file(), "config.json must be preserved without --purge")
-        self.assertTrue(usage_canary.is_file(), "usage JSONL must be preserved without --purge")
+        self.assertTrue(usage_canary.is_file(), "usage.db must be preserved without --purge")
         self.assertEqual(gemini_cfg.read_text(encoding="utf-8"), '{"keep":"user"}\n')
 
     def test_t1_r23_uninstall_purge_removes_config_and_usage_keeping_gemini_config(self) -> None:
@@ -2162,8 +2162,12 @@ class TestTier1RolloutR23UninstallCli(E2ETestCase):
         self.register_pidfile_cleanup(env=env)
         port = find_free_port()
         cfg = env.write_config(env.make_config_dict(listen_port=port, api_key="AIzaSyRolloutR23Purge12"))
-        usage_canary = env.usage_dir / "2026-11.jsonl"
-        usage_canary.write_text('{"ts":"2026-11-24T00:00:00Z"}\n', encoding="utf-8")
+        usage_canary = env.usage_dir / "usage.db"
+        usage_canary.write_bytes(b"SQLite format 3\x00")
+        usage_wal_canary = env.usage_dir / "usage.db-wal"
+        usage_wal_canary.write_bytes(b"wal-canary")
+        legacy_jsonl_canary = env.usage_dir / "2026-11.jsonl"
+        legacy_jsonl_canary.write_text('{"ts":"2026-11-24T00:00:00Z"}\n', encoding="utf-8")
         gemini_cfg = env.home_dir / ".gemini" / "config" / "config.json"
         gemini_cfg.parent.mkdir(parents=True, exist_ok=True)
         gemini_cfg.write_text('{"keep":"antigravity"}\n', encoding="utf-8")
@@ -2189,7 +2193,9 @@ class TestTier1RolloutR23UninstallCli(E2ETestCase):
         )
         self.assertEqual(un.returncode, 0, f"{un.stdout}\n{un.stderr}")
         self.assertFalse(cfg.exists(), "--purge must delete config.json")
-        self.assertFalse(usage_canary.exists(), "--purge must delete usage files")
+        self.assertFalse(usage_canary.exists(), "--purge must delete usage.db")
+        self.assertFalse(usage_wal_canary.exists(), "--purge must delete usage.db-wal")
+        self.assertFalse(legacy_jsonl_canary.exists(), "--purge must delete legacy JSONL usage files")
         self.assertFalse((plugins_dir / "agy-companion").exists())
         self.assertEqual(gemini_cfg.read_text(encoding="utf-8"), '{"keep":"antigravity"}\n')
 

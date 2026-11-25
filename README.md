@@ -13,7 +13,7 @@ flowchart LR
     Proxy["companion-proxy<br/>127.0.0.1:24141 (Axum 0.8)<br/>64 MiB limit · mtime hot-reload · idle shutdown"]
     Provider["companion-providers<br/>GeminiProvider (reqwest rustls)<br/>zero-compression · 900s timeout<br/>x-goog-api-key"]
     Gemini["Google Gemini API<br/>generativelanguage.googleapis.com"]
-    Usage["JsonlUsageSink (0600 YYYY-MM.jsonl)<br/>GET /api/stats · GET /health"]
+    Usage["SqliteUsageSink (0600 usage.db · WAL)<br/>GET /api/stats · GET /health"]
     Mcp["companion-ui-mcp (rmcp stdio)<br/>ui://companion/settings.html<br/>open_settings · get_settings · save_settings<br/>test_connection · set_launcher_integration"]
     Config["Config JSON & env.sh (0600)<br/>XDG / Windows paths"]
 
@@ -31,15 +31,15 @@ flowchart LR
 
 | Component | Path | Responsibility |
 | --- | --- | --- |
-| **Core Domain** | [`crates/companion-core/`](crates/companion-core/) | Versioned config (`schema_version = 1`), XDG + Windows path precedence, atomic `0600` persistence, `RedactedConfig` masking, `PROXY_PLACEHOLDER_API_KEY` quarantine, `GeminiUsageMetadata`, `UsageSink` / `JsonlUsageSink`, zero-`eval` `integration` (`env.sh` + shell RC hooks) |
+| **Core Domain** | [`crates/companion-core/`](crates/companion-core/) | Versioned config (`schema_version = 1`), XDG + Windows path precedence, atomic `0600` persistence, `RedactedConfig` masking, `PROXY_PLACEHOLDER_API_KEY` quarantine, `GeminiUsageMetadata`, `UsageSink` / `SqliteUsageSink` (`usage.db`, WAL mode), zero-`eval` `integration` (`env.sh` + shell RC hooks) |
 | **Provider Layer** | [`crates/companion-providers/`](crates/companion-providers/) | `ProviderAdapter` async trait + raw `reqwest 0.13` (`rustls`, zero compression) `GeminiProvider` pass-through & `health_check()` |
 | **Loopback Proxy** | [`crates/companion-proxy/`](crates/companion-proxy/) | Strict `127.0.0.1` Axum 0.8 proxy, `GET /health`, `GET /api/stats` (incl. CloudCode & catalog telemetry), `POST /v1beta/models/{*rest}` (64 MiB cap), CloudCode 8-entry 128-bit SipHash per-account LRU & Day-0 untouched catalog, SSE/JSON `usageMetadata` tee, config mtime hot-reload, active in-flight `IdleTracker` |
 | **MCP App Server** | [`crates/companion-ui-mcp/`](crates/companion-ui-mcp/) | `rmcp 3.11` stdio MCP server serving embedded `ui://companion/settings.html` + 5 tools (`open_settings`, redacted `get_settings`, serialized `save_settings`, `test_connection`, `set_launcher_integration`) |
 | **Unified CLI** | [`crates/companion-cli/`](crates/companion-cli/) | Single `agy-companion` binary (`install`, `uninstall`, `integration`, `hook-env`, `serve`, `launch`, `ui-mcp`, `doctor`, `models`, `--version`) with embedded 7-file plugin bundle and `rmcp` `INFO` log ceiling |
-| **Embedded UI** | [`ui/`](ui/) | Vite 8 + TypeScript + `@modelcontextprotocol/ext-apps 2` single-file bundle ([`ui/dist/index.html`](ui/dist/index.html), `283,627` bytes `< 512,000`, zero `innerHTML`) |
+| **Embedded UI** | [`ui/`](ui/) | Vite 8 + TypeScript + `@modelcontextprotocol/ext-apps 2` single-file bundle ([`ui/dist/index.html`](ui/dist/index.html), `300,466` bytes `< 512,000`, zero `innerHTML`) |
 | **Antigravity Plugin** | [`plugin/`](plugin/) | Plugin manifest, bundled SVG icon ([`assets/logo.svg`](plugin/assets/logo.svg)), MCP & proxy sidecar definitions, hardened launcher [`run-companion.sh`](plugin/scripts/run-companion.sh), companion skill |
 | **Distribution Shims** | [`packages/`](packages/) | npm (`agy-companion` / `agyc` + 5 `@agy-companion/<os>-<arch>` optionalDeps) and Python (`maturin` `bindings = "bin"`) |
-| **Opaque-Box E2E** | [`e2e/`](e2e/) | Pure Python 3 stdlib 4-tier E2E test suite (`328` E2E tests: `T1=139, T2=145, T3=31, T4=13` + `25` harness self-tests; see [`e2e/README.md`](e2e/README.md)) |
+| **Opaque-Box E2E** | [`e2e/`](e2e/) | Pure Python 3 stdlib 4-tier E2E test suite (`331` E2E tests: `T1=139, T2=148, T3=31, T4=13` + `26` harness self-tests; see [`e2e/README.md`](e2e/README.md)) |
 
 ---
 
@@ -193,7 +193,7 @@ agy-companion doctor --json   # machine-readable JSON output
 | --- | --- |
 | **Config file** | `--config <path>` → `AGY_COMPANION_CONFIG` → `$XDG_CONFIG_HOME/agy-companion/config.json` → Platform default |
 | **Data dir (`env.sh`, `proxy.pid`, `proxy.log`, `bin/`)** | `$XDG_DATA_HOME/agy-companion` → Platform default |
-| **Usage JSONL dir** | `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → Platform default (writes `YYYY-MM.jsonl`) |
+| **Usage data dir** | `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → Platform default (stores SQLite `usage.db` in WAL mode) |
 
 ### Platform Defaults
 
@@ -227,11 +227,11 @@ npm --prefix ui run build
 # 4. Inspect daemon & sidecar logs:
 ls -la ~/.local/share/agy-companion/proxy.log ~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/
 
-# 5. Full 7-gate local verification & Rust workspace tests (265 tests)
+# 5. Full 7-gate local verification & Rust workspace tests (276 tests)
 ./scripts/agent_check.sh
 cargo test --workspace
 
-# 6. Pure Python 3 stdlib opaque-box E2E suite (25 self-tests + 328 E2E tests: T1=139, T2=145, T3=31, T4=13)
+# 6. Pure Python 3 stdlib opaque-box E2E suite (26 self-tests + 331 E2E tests: T1=139, T2=148, T3=31, T4=13)
 python3 -B e2e/run_e2e.py --self-test -v
 cargo build -p companion-cli
 python3 -B e2e/run_e2e.py --tier all --binary target/debug/agy-companion --repo-root . -v
@@ -249,7 +249,7 @@ All 5 Rust crates, `crates/companion-cli/src/main.rs`, and CLI integration tests
 | **S2** | **Secret redaction, atomic writes & zero leaks** | `get_settings`/`open_settings` return `RedactedConfig` only (`AIza...abcd` / `****`, never plaintext); `PROXY_PLACEHOLDER_API_KEY` (`agy-companion-local`) is quarantined across all crates; `Config::validate()` enforces printable-ASCII `api_key` header safety; `config_write_lock` & `integration_write_lock` serialize concurrent mutations; `Config::save_secure`, `env.sh`, `proxy.pid`, and rotating `5 MiB` `proxy.log` enforce `0600`/`0700` Unix perms (and Windows bounded retry); `rmcp` tracing is capped at `INFO`; `agent_check.sh` scans for `AIza[0-9A-Za-z_-]{35}`. |
 | **S3** | **Upstream auth & SSRF defense** | Authenticates upstream via `x-goog-api-key` (strips `?key=`, preserves `?alt=sse`); remote `base_url` requires `https://` (`http://` restricted to literal `127.0.0.1` / `localhost`); rejects credentials, backslashes, `..` traversal, and HTTP redirects (`Policy::none()`); CloudCode uses conditional `.no_proxy()` (loopback only) and metadata-only fallback/403 retry (zero generation retries). |
 | **S4** | **Raw pass-through & zero compression** | `reqwest 0.13` enables only `rustls`, `stream`, `json`, `http2` (zero `gzip`/`brotli`/`deflate`/`zstd`); request bytes forward untouched (preserving implicit caching) and SSE/JSON streams tee `usageMetadata` without mutating or buffering payloads; CloudCode preserves upstream `Content-Encoding` on raw/Day-0 fallback. |
-| **S5** | **UI zero-`innerHTML` & strict CSP** | Safe DOM APIs only (`createElement`, `textContent`, `replaceChildren`); handlers registered before `app.connect()`; `snapshotEpoch` stale-refresh guard & `refreshBtn` write lockout; unified S5 sink & whitespace-aware external-tag scanning across `ui/src/` and `ui/dist/index.html` (`283,627` bytes `< 512,000`); `AGY_COMPANION_UI_HTML` checks `fs::metadata` (`is_file()` & `MAX_UI_HTML_BYTES = 10 MiB`) before `File::open()`. |
+| **S5** | **UI zero-`innerHTML` & strict CSP** | Safe DOM APIs only (`createElement`, `textContent`, `replaceChildren`); handlers registered before `app.connect()`; `snapshotEpoch` stale-refresh guard & `refreshBtn` write lockout; unified S5 sink & whitespace-aware external-tag scanning across `ui/src/` and `ui/dist/index.html` (`300,466` bytes `< 512,000`); `AGY_COMPANION_UI_HTML` checks `fs::metadata` (`is_file()` & `MAX_UI_HTML_BYTES = 10 MiB`) before `File::open()`. |
 | **S6** | **Path validation & fail-closed config loading** | XDG + Windows precedence with fail-closed `..`/NUL rejection; `MAX_CONFIG_FILE_BYTES` (`1 MiB`) cap; symlink/FIFO/non-regular rejection + post-open `fstat` `is_file()` & `(dev, ino)` checks across `Config::load_or_default`, `doctor`, `install`/`uninstall`, and proxy startup/hot-reload (`FileStamp::Rejected` retains previous active config). |
 | **S7** | **Minimal HTTP surface & upfront limits** | Only `GET` and `POST` allowed (`405` otherwise); outermost `enforce_content_length_limit` rejects malformed/conflicting `Content-Length` (`400`) and `> 64 MiB` / overflow (`413`) before reading body bytes alongside `DefaultBodyLimit::max(64 MiB)`; `X-Content-Type-Options: nosniff` + `Cache-Control: no-store` on `/health`, `/api/stats`, and JSON errors. |
 | **S8** | **Launcher integrity & packaging allow-list** | `run-companion.sh` scrubs inherited proxy env vars via `exec_clean`, honors `XDG_DATA_HOME`, checks version-matched cache before `$PATH`, uses physical `cd -P --`, HTTPS-only downloads, SHA-256 verification (`< "${checksums_file}"`), `tar -f -` stdin traversal checks, and `INT`/`TERM`/`HUP`/`EXIT` traps; `dev-install.sh` uses `cd -P --`; npm shim uses `execFileSync` with a hardcoded 5-target allow-list and public `publishConfig`; Python `find_binary()` rejects `..`/NUL; 4-way version parity (`0.1.0`). |
@@ -258,7 +258,7 @@ All 5 Rust crates, `crates/companion-cli/src/main.rs`, and CLI integration tests
 
 ## Roadmap
 
-- **Milestone 1 + Rollout PR 1–PR 3 (Complete — `v0.1.0`):** Loopback Gemini pass-through proxy with implicit cache preservation, CloudCode Pro/PayGo/Enterprise transparency (per-account SipHash LRU + Day-0 untouched catalog), Managed On-Demand Daemon, native Dock/Launcher auto-start (`env.sh` + shell RC hooks), one-command `install`/`uninstall` with embedded 7-file plugin bundle and Windows parity, embedded MCP App Settings UI (`aux_pane` + `global`), npm/PyPI distribution shims, `265` Rust tests, and `328` opaque-box E2E tests (+ `25` self-tests).
+- **Milestone 1 + Rollout PR 1–PR 3 (Complete — `v0.1.0`):** Loopback Gemini pass-through proxy with implicit cache preservation, CloudCode Pro/PayGo/Enterprise transparency (per-account SipHash LRU + Day-0 untouched catalog), Managed On-Demand Daemon, native Dock/Launcher auto-start (`env.sh` + shell RC hooks), one-command `install`/`uninstall` with embedded 7-file plugin bundle and Windows parity, embedded MCP App Settings UI (`aux_pane` + `global`), SQLite WAL usage storage (`usage.db`), npm/PyPI distribution shims, `276` Rust tests, and `331` opaque-box E2E tests (+ `26` self-tests).
 - **M2 & M3 (Planned):** Codex Pro and Claude provider adapters behind the `ProviderAdapter` trait ([`crates/companion-providers/`](crates/companion-providers/)).
 - **M4 (Planned):** Ollama Cloud and OpenAI-compatible 1-hop `Gemini ↔ OpenAI Chat Completions` adapter (local Ollama, OpenRouter, vLLM, LM Studio, OpenAI API).
 - **Deferred Day-1 Seams:**

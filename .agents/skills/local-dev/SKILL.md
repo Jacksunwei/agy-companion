@@ -98,7 +98,7 @@ The plugin `"agy-companion"` combined with server key `"hub"` in `plugin/mcp_con
 
 ## 6. Live E2E Testing with `agy` CLI & XDG Isolation
 
-Use isolated temporary `XDG_CONFIG_HOME` / `XDG_DATA_HOME` directories (absolute paths, no `..`) and a non-default port so personal config and usage logs remain untouched:
+Use isolated temporary `XDG_CONFIG_HOME` / `XDG_DATA_HOME` directories (absolute paths, no `..`) and a non-default port so personal config and usage database remain untouched:
 
 ```bash
 TMP_DEV="$(mktemp -d)"
@@ -113,6 +113,7 @@ PROXY_PID=$!
 GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:14141" agy -p "Reply with OK"
 curl -s http://127.0.0.1:14141/api/stats
 ls -la "${XDG_DATA_HOME}/agy-companion/usage/"
+sqlite3 "${XDG_DATA_HOME}/agy-companion/usage/usage.db" "SELECT timestamp_utc, model, input_tokens, output_tokens, cached_tokens FROM usage_events ORDER BY id DESC LIMIT 5;"
 
 kill "${PROXY_PID}"
 rm -rf "${TMP_DEV}"

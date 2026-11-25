@@ -93,11 +93,11 @@ Local proxy HTTP endpoints (`127.0.0.1:24141`):
   - **macOS & Linux:** `~/.config/agy-companion/config.json` *(intentional XDG default on macOS — no `~/Library/Application Support/` drift)*
   - **Windows:** `%APPDATA%\agy-companion\config.json` *(fallback: `%USERPROFILE%\.config\agy-companion\config.json`)*
   - Saved atomically (Unix `0600` / parent `0700`; Windows ACLs with bounded `3`-attempt retry). Symlinks, `..` traversal, and NUL bytes are rejected fail-closed.
-- **Data, usage & daemon files:** `$XDG_DATA_HOME/agy-companion/` *(platform default `~/.local/share/agy-companion/` on macOS/Linux; `%LOCALAPPDATA%\agy-companion\` on Windows)* stores `usage/YYYY-MM.jsonl` (`0600`, metadata only), `env.sh` (`0600`), `proxy.pid` (`0600`), rotating `5 MiB` `proxy.log` (`0600`), and `bin/agy-companion[.exe]`.
+- **Data, usage & daemon files:** `$XDG_DATA_HOME/agy-companion/` *(platform default `~/.local/share/agy-companion/` on macOS/Linux; `%LOCALAPPDATA%\agy-companion\` on Windows)* stores `usage/usage.db` (SQLite WAL, `0600`, metadata only), `env.sh` (`0600`), `proxy.pid` (`0600`), rotating `5 MiB` `proxy.log` (`0600`), and `bin/agy-companion[.exe]`.
 - **Sidecar logs (Antigravity App):** `~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/`.
 - **Diagnose issues:**
   1. Run `agy-companion doctor` (exits non-zero on config permission errors, unreachable proxy, or version/protocol skew) and `agy-companion integration status`.
   2. If config permissions fail on macOS/Linux, run `chmod 600 ~/.config/agy-companion/config.json`.
   3. On symlinked or read-only dotfiles (Nix/Stow/Home Manager), `integration` returns `manual_required` with a 1-line static snippet; CLI users can opt in explicitly via `agy-companion integration enable --follow-rc-symlink`.
   4. If a non-Gemini-3/4 tool call inside an agent subshell returns `400`, run `unset GOOGLE_GEMINI_BASE_URL` in that command to reach the Gemini API directly.
-  5. After changing `listen_port` or upgrading, quit Antigravity completely (`Cmd+Q` on macOS) and reopen, or re-run `npx -y agy-companion@latest install`. To remove cleanly, run `agy-companion uninstall` (add `--purge` to delete config and usage logs).
+  5. After changing `listen_port` or upgrading, quit Antigravity completely (`Cmd+Q` on macOS) and reopen, or re-run `npx -y agy-companion@latest install`. To remove cleanly, run `agy-companion uninstall` (add `--purge` to delete config and usage database).
