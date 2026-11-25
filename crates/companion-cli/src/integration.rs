@@ -96,7 +96,7 @@ fn format_human_integration_output(
 ) -> String {
     let mut lines = Vec::new();
 
-    if !status.supported {
+    if status.state() == IntegrationState::Unsupported {
         lines.push(
             "Dock / Launcher login-shell integration is not used on this platform.".to_string(),
         );
@@ -117,7 +117,7 @@ fn format_human_integration_output(
         "Next step: Quit Antigravity completely (closing the window is not enough) and reopen it."
     };
 
-    if status.manual_required {
+    if status.state() == IntegrationState::ManualRequired {
         match action {
             IntegrationActionKind::Enable => {
                 lines.push(
@@ -235,22 +235,21 @@ fn append_common_fields(lines: &mut Vec<String>, status: &IntegrationStatus) {
 
 #[cfg(test)]
 mod tests {
+    use companion_core::integration::IntegrationPaths;
+
     use super::*;
 
-    fn sample_status() -> IntegrationStatus {
-        IntegrationStatus {
-            supported: true,
-            enabled: true,
-            manual_required: false,
-            shell: Some(ShellKind::Zsh),
-            rc_path: Some(PathBuf::from("/tmp/home/.zlogin")),
+    fn sample_paths() -> IntegrationPaths {
+        IntegrationPaths {
+            shell: ShellKind::Zsh,
+            rc_path: PathBuf::from("/tmp/home/.zlogin"),
             env_script_path: Some(PathBuf::from("/tmp/data/env.sh")),
-            binary_path: Some(PathBuf::from("/tmp/bin/agy-companion")),
-            symlink_target: None,
-            manual_snippet: None,
-            hybrid_active: false,
-            message: None,
+            binary_path: PathBuf::from("/tmp/bin/agy-companion"),
         }
+    }
+
+    fn sample_status() -> IntegrationStatus {
+        IntegrationStatus::enabled(sample_paths(), None, false)
     }
 
     #[test]
@@ -268,29 +267,30 @@ mod tests {
         assert!(enable_text.contains("Quit Antigravity completely"));
         assert!(enable_text.contains("/tmp/home/.zlogin"));
 
-        let mut manual = enabled.clone();
-        manual.enabled = false;
-        manual.manual_required = true;
-        manual.symlink_target = Some(PathBuf::from("/nix/store/abc-zlogin"));
-        manual.manual_snippet = Some("[ -r env.sh ] && . env.sh".to_string());
+        let manual = IntegrationStatus::manual_required(
+            sample_paths(),
+            false,
+            Some(PathBuf::from("/nix/store/abc-zlogin")),
+            Some("[ -r env.sh ] && . env.sh".to_string()),
+            false,
+            "RC file is a symlink",
+        );
         let manual_text = format_human_integration_output(IntegrationActionKind::Enable, &manual);
         assert!(manual_text.contains("/nix/store/abc-zlogin"));
         assert!(manual_text.contains("[ -r env.sh ] && . env.sh"));
         assert!(manual_text.contains("--follow-rc-symlink"));
 
         let mut active = enabled.clone();
-        active.hybrid_active = true;
+        active.mark_hybrid_active();
         let status_active = format_human_integration_output(IntegrationActionKind::Status, &active);
         assert!(status_active.contains("Status: Active"));
 
-        let mut disabled = enabled.clone();
-        disabled.enabled = false;
+        let disabled = IntegrationStatus::disabled(sample_paths(), None, false);
         let disable_text =
             format_human_integration_output(IntegrationActionKind::Disable, &disabled);
         assert!(disable_text.contains("Dock / Launcher integration disabled."));
 
-        let mut unsupported = disabled;
-        unsupported.supported = false;
+        let unsupported = IntegrationStatus::unsupported(false, "Windows uses Start Menu shortcut");
         let unsup_text =
             format_human_integration_output(IntegrationActionKind::Status, &unsupported);
         assert!(unsup_text.contains("not used on this platform"));
@@ -300,5 +300,6 @@ mod tests {
             .unwrap();
         let parsed: IntegrationStatus = serde_json::from_slice(&json_buf).unwrap();
         assert_eq!(parsed, active);
+        assert_eq!(parsed.state, IntegrationState::Active);
     }
 }

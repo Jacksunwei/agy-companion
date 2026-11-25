@@ -227,7 +227,7 @@ class TestTier3RolloutCombinations(E2ETestCase):
         self.assertEqual(r0.status, 200)
         self.assertNotIn("companion/gemini-4-hydrogen-low", r0.json()["models"])
         self.assertIs(
-            http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()["last_catalog_included_proxy_models"],
+            http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()["cloudcode"]["last_catalog_included_proxy_models"],
             False,
         )
 
@@ -275,7 +275,7 @@ class TestTier3RolloutCombinations(E2ETestCase):
         self.assertEqual(r1.status, 200)
         self.assertIn("companion/gemini-4-hydrogen-low", r1.json()["models"])
         self.assertIs(
-            http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()["last_catalog_included_proxy_models"],
+            http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()["cloudcode"]["last_catalog_included_proxy_models"],
             True,
         )
 
@@ -321,8 +321,8 @@ class TestTier3RolloutCombinations(E2ETestCase):
         self.assertEqual(len(mock_gemini.requests), 0)
 
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertEqual(stats["cloudcode_mode"], "fixed")
-        self.assertIs(stats["last_catalog_included_proxy_models"], True)
+        self.assertEqual(stats["cloudcode"]["mode"], "fixed")
+        self.assertIs(stats["cloudcode"]["last_catalog_included_proxy_models"], True)
 
     def test_t3_r04_placeholder_quarantine_across_proxy_mcp_and_doctor(self) -> None:
         """R07+R08+R18: Placeholder key is quarantined consistently across proxy, Day-0 catalog, MCP, and doctor."""
@@ -378,7 +378,7 @@ class TestTier3RolloutCombinations(E2ETestCase):
         # 4. MCP get_settings reports unconfigured and save_settings rejects placeholder
         mcp = self.start_mcp(env, config_path=cfg, extra_env={"GEMINI_API_KEY": _PLACEHOLDER_KEY})
         sc = mcp.call_tool("get_settings", {}).get("structuredContent", {})
-        self.assertIs(sc["config"]["api_key_configured"], False)
+        self.assertIs(sc["config"]["providers"]["gemini"]["api_key_configured"], False)
         err = mcp.save_settings_smart(api_key=_PLACEHOLDER_KEY, raw=True)
         mcp.assert_clean_stdout()
         self.assertTrue(McpStdioClient.is_tool_error(err))
@@ -414,7 +414,10 @@ class TestTier3RolloutCombinations(E2ETestCase):
         # Save real key through MCP
         save_res = mcp.save_settings_smart(api_key="AIzaSyRolloutT3C05Save1", raw=False)
         mcp.assert_clean_stdout()
-        self.assertIs(save_res.get("structuredContent", {})["config"]["api_key_configured"], True)
+        self.assertIs(
+            save_res.get("structuredContent", {})["config"]["providers"]["gemini"]["api_key_configured"],
+            True,
+        )
         env.bump_mtime(cfg, delta=3.0)
 
         # After save: merged catalog + updated MCP snapshot stats & cloudcode
@@ -432,7 +435,7 @@ class TestTier3RolloutCombinations(E2ETestCase):
         snap = mcp.call_tool("get_settings", {}).get("structuredContent", {})
         mcp.assert_clean_stdout()
         self.assertTrue(snap["proxy"]["reachable"])
-        self.assertIs(snap["stats"]["last_catalog_included_proxy_models"], True)
+        self.assertIs(snap["stats"]["cloudcode"]["last_catalog_included_proxy_models"], True)
         self.assertEqual(snap["cloudcode"]["mode"], "fixed")
 
     def test_t3_r06_idle_shutdown_primary_hands_off_to_adopt_running_secondary(self) -> None:

@@ -65,10 +65,11 @@ async fn try_hook_env(opts: &HookEnvOptions) -> Result<Option<u16>, String> {
         resolve_cli_config_path(opts.config_override.as_deref()).map_err(|e| e.to_string())?;
     let mut config = load_config_checked(&config_path).map_err(|e| e.to_string())?;
     if let Some(port) = opts.port_override {
-        config.listen_port = port;
+        config.proxy.port =
+            std::num::NonZeroU16::new(port).ok_or_else(|| CliError::InvalidPort(0).to_string())?;
     }
     config.validate().map_err(|e| e.to_string())?;
-    let port = config.listen_port;
+    let port = config.proxy.port.get();
 
     if probe_running_companion_proxy_with_timeout(port, HOOK_ENV_PROBE_TIMEOUT)
         .await
@@ -277,7 +278,11 @@ mod tests {
         // Corrupt config containing a synthetic secret must never echo secret to stderr
         let secret = "super-secret-value-never-log";
         let bad_cfg = tmp.path().join("bad-config.json");
-        fs::write(&bad_cfg, format!(r#"{{"gemini":{{"api_key":"{secret}"}},"#)).unwrap();
+        fs::write(
+            &bad_cfg,
+            format!(r#"{{"providers":{{"gemini":{{"api_key":"{secret}"}}}},"#),
+        )
+        .unwrap();
         let mut out2 = Vec::new();
         let mut err2 = Vec::new();
         run_hook_env(

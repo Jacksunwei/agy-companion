@@ -5,10 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use companion_core::integration::{IntegrationOptions, IntegrationStatus};
+use companion_core::config::{
+    ApiKeyPatch as CoreApiKeyPatch, CloudCodeConfigPatch, ConfigPatch, GeminiConfigPatch,
+    ProvidersConfigPatch, ProxyConfigPatch,
+};
+use companion_core::integration::{IntegrationOptions, IntegrationState, IntegrationStatus};
+use companion_core::protocol::HealthResponse;
 use companion_core::{
-    Config, RedactedConfig, api_key_hint, is_placeholder_api_key, validate_listen_host,
-    validate_path, validate_upstream_url,
+    CloudCodeStatus, Config, GeminiConfig, HostPlatform, ModelPreset, ProxyHealthSummary,
+    RedactedConfig, StatsSnapshot, api_key_hint, curated_model_presets, validate_path,
 };
 use companion_providers::{GeminiProvider, ProviderAdapter};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -48,89 +53,19 @@ pub enum UiMcpError {
     Join(#[from] tokio::task::JoinError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProxyHealthPayload {
-    pub reachable: bool,
-    pub status: Option<String>,
-    pub version: Option<String>,
-    pub protocol_version: Option<u32>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProxyStatsPayload {
-    pub requests: u64,
-    pub prompt_tokens: u64,
-    pub cached_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub cache_hit_ratio: f64,
-    #[serde(default)]
-    pub last_catalog_refresh_at_ms: Option<u64>,
-    #[serde(default)]
-    pub last_catalog_included_proxy_models: Option<bool>,
-    #[serde(default)]
-    pub cloudcode_mode: Option<String>,
-    #[serde(default)]
-    pub cloudcode_resolved_upstream: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudCodeStatusPayload {
-    pub mode: String,
-    pub configured_upstream: String,
-    pub resolved_upstream: Option<String>,
-}
-
-fn default_host_platform() -> String {
-    std::env::consts::OS.to_string()
-}
-
-fn build_cloudcode_status(
-    cfg: &Config,
-    stats: Option<&ProxyStatsPayload>,
-) -> CloudCodeStatusPayload {
-    let is_auto = cfg.cloudcode_upstream_url.eq_ignore_ascii_case("auto");
-    let mode = stats
-        .and_then(|s| s.cloudcode_mode.as_deref())
-        .filter(|m| !m.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if is_auto {
-                "auto".to_string()
-            } else {
-                "fixed".to_string()
-            }
-        });
-    let resolved_upstream = stats
-        .and_then(|s| s.cloudcode_resolved_upstream.as_deref())
-        .filter(|u| !u.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            if mode == "fixed" {
-                Some(cfg.cloudcode_upstream_url.clone())
-            } else {
-                None
-            }
-        });
-    CloudCodeStatusPayload {
-        mode,
-        configured_upstream: cfg.cloudcode_upstream_url.clone(),
-        resolved_upstream,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SettingsSnapshot {
     pub config: RedactedConfig,
     pub binary_version: String,
-    pub proxy: ProxyHealthPayload,
+    pub proxy: ProxyHealthSummary,
     pub version_skew: bool,
-    pub stats: Option<ProxyStatsPayload>,
+    pub stats: Option<StatsSnapshot>,
     pub launcher_integration: IntegrationStatus,
-    pub cloudcode: CloudCodeStatusPayload,
-    #[serde(default = "default_host_platform")]
-    pub platform: String,
+    pub cloudcode: CloudCodeStatus,
+    #[serde(default = "curated_model_presets")]
+    pub supported_models: Vec<ModelPreset>,
+    #[serde(default)]
+    pub platform: HostPlatform,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -139,29 +74,112 @@ pub struct SetLauncherIntegrationArgs {
     pub enabled: bool,
 }
 
-#[derive(Clone, Default, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct SaveSettingsArgs {
-    pub api_key: Option<String>,
-    pub clear_api_key: Option<bool>,
-    pub default_model: Option<String>,
-    pub base_url: Option<String>,
-    pub cloudcode_upstream_url: Option<String>,
-    pub listen_port: Option<u16>,
-    pub listen_host: Option<String>,
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxySettingsPatch {
+    pub host: Option<String>,
+    pub port: Option<u16>,
 }
 
-impl fmt::Debug for SaveSettingsArgs {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CloudCodeSettingsPatch {
+    pub upstream: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyPatch {
+    Clear,
+    Set(String),
+}
+
+impl fmt::Debug for ApiKeyPatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SaveSettingsArgs")
-            .field("api_key", &api_key_hint(self.api_key.as_deref()))
-            .field("clear_api_key", &self.clear_api_key)
-            .field("default_model", &self.default_model)
-            .field("base_url", &self.base_url)
-            .field("cloudcode_upstream_url", &self.cloudcode_upstream_url)
-            .field("listen_port", &self.listen_port)
-            .field("listen_host", &self.listen_host)
-            .finish()
+        match self {
+            Self::Clear => f.write_str("ApiKeyPatch::Clear"),
+            Self::Set(raw) => f
+                .debug_tuple("ApiKeyPatch::Set")
+                .field(&api_key_hint(Some(raw)))
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct GeminiSettingsPatch {
+    pub api_key: Option<ApiKeyPatch>,
+    pub base_url: Option<String>,
+    pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProvidersSettingsPatch {
+    pub gemini: Option<GeminiSettingsPatch>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SaveSettingsArgs {
+    pub proxy: Option<ProxySettingsPatch>,
+    pub cloudcode: Option<CloudCodeSettingsPatch>,
+    pub providers: Option<ProvidersSettingsPatch>,
+}
+
+impl From<ApiKeyPatch> for CoreApiKeyPatch {
+    fn from(patch: ApiKeyPatch) -> Self {
+        match patch {
+            ApiKeyPatch::Clear => Self::Clear,
+            ApiKeyPatch::Set(raw) => Self::Set(raw),
+        }
+    }
+}
+
+impl From<ProxySettingsPatch> for ProxyConfigPatch {
+    fn from(patch: ProxySettingsPatch) -> Self {
+        Self {
+            host: patch.host,
+            port: patch.port,
+        }
+    }
+}
+
+impl From<CloudCodeSettingsPatch> for CloudCodeConfigPatch {
+    fn from(patch: CloudCodeSettingsPatch) -> Self {
+        Self {
+            upstream: patch.upstream,
+        }
+    }
+}
+
+impl From<GeminiSettingsPatch> for GeminiConfigPatch {
+    fn from(patch: GeminiSettingsPatch) -> Self {
+        Self {
+            api_key: patch.api_key.map(Into::into),
+            base_url: patch.base_url,
+            default_model: patch.default_model,
+            timeout_secs: None,
+        }
+    }
+}
+
+impl From<ProvidersSettingsPatch> for ProvidersConfigPatch {
+    fn from(patch: ProvidersSettingsPatch) -> Self {
+        Self {
+            gemini: patch.gemini.map(Into::into),
+        }
+    }
+}
+
+impl From<SaveSettingsArgs> for ConfigPatch {
+    fn from(args: SaveSettingsArgs) -> Self {
+        Self {
+            proxy: args.proxy.map(Into::into),
+            cloudcode: args.cloudcode.map(Into::into),
+            providers: args.providers.map(Into::into),
+        }
     }
 }
 
@@ -169,13 +187,6 @@ impl fmt::Debug for SaveSettingsArgs {
 pub struct TestConnectionPayload {
     pub ok: bool,
     pub message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawProxyHealth {
-    status: String,
-    version: String,
-    protocol_version: u32,
 }
 
 #[derive(Clone)]
@@ -324,35 +335,20 @@ impl CompanionUiServer {
         &self,
         listen_port: u16,
         binary_version: &str,
-    ) -> (ProxyHealthPayload, bool, Option<ProxyStatsPayload>) {
+    ) -> (ProxyHealthSummary, bool, Option<StatsSnapshot>) {
         let health_url = format!("http://127.0.0.1:{listen_port}/health");
-        match self.read_bounded_json::<RawProxyHealth>(&health_url).await {
+        match self.read_bounded_json::<HealthResponse>(&health_url).await {
             Ok(raw) => {
                 let version_skew = raw.version != binary_version;
                 let stats_url = format!("http://127.0.0.1:{listen_port}/api/stats");
                 let stats = self
-                    .read_bounded_json::<ProxyStatsPayload>(&stats_url)
+                    .read_bounded_json::<StatsSnapshot>(&stats_url)
                     .await
                     .ok();
-                let proxy = ProxyHealthPayload {
-                    reachable: true,
-                    status: Some(raw.status),
-                    version: Some(raw.version),
-                    protocol_version: Some(raw.protocol_version),
-                    error: None,
-                };
+                let proxy = ProxyHealthSummary::from_health(&raw);
                 (proxy, version_skew, stats)
             }
-            Err(err) => {
-                let proxy = ProxyHealthPayload {
-                    reachable: false,
-                    status: None,
-                    version: None,
-                    protocol_version: None,
-                    error: Some(err),
-                };
-                (proxy, false, None)
-            }
+            Err(err) => (ProxyHealthSummary::unreachable(err), false, None),
         }
     }
 
@@ -382,8 +378,13 @@ impl CompanionUiServer {
         integration_override: Option<IntegrationStatus>,
     ) -> SettingsSnapshot {
         let binary_version = env!("CARGO_PKG_VERSION").to_string();
-        let (proxy, version_skew, stats) = self.probe_proxy(cfg.listen_port, &binary_version).await;
-        let cloudcode = build_cloudcode_status(cfg, stats.as_ref());
+        let (proxy, version_skew, stats) = self
+            .probe_proxy(cfg.proxy.port.get(), &binary_version)
+            .await;
+        let cloudcode = CloudCodeStatus::from_config_and_stats(
+            &cfg.cloudcode.upstream,
+            stats.as_ref().map(|s| &s.cloudcode),
+        );
 
         let mut launcher_integration = match integration_override {
             Some(status) => status,
@@ -395,32 +396,14 @@ impl CompanionUiServer {
                 .await
                 {
                     Ok(Ok(status)) => status,
-                    Ok(Err(err)) => IntegrationStatus {
-                        supported: !cfg!(windows),
-                        enabled: false,
-                        manual_required: false,
-                        shell: None,
-                        rc_path: None,
-                        env_script_path: None,
-                        binary_path: None,
-                        symlink_target: None,
-                        manual_snippet: None,
-                        hybrid_active: companion_core::integration::detect_hybrid_active(),
-                        message: Some(err.to_string()),
-                    },
-                    Err(err) => IntegrationStatus {
-                        supported: !cfg!(windows),
-                        enabled: false,
-                        manual_required: false,
-                        shell: None,
-                        rc_path: None,
-                        env_script_path: None,
-                        binary_path: None,
-                        symlink_target: None,
-                        manual_snippet: None,
-                        hybrid_active: companion_core::integration::detect_hybrid_active(),
-                        message: Some(format!("launcher integration check failed: {err}")),
-                    },
+                    Ok(Err(err)) => IntegrationStatus::error_fallback(
+                        companion_core::integration::detect_hybrid_active(),
+                        err.to_string(),
+                    ),
+                    Err(err) => IntegrationStatus::error_fallback(
+                        companion_core::integration::detect_hybrid_active(),
+                        format!("launcher integration check failed: {err}"),
+                    ),
                 }
             }
         };
@@ -429,10 +412,10 @@ impl CompanionUiServer {
         // fetchAvailableModels refresh on our local proxy is authoritative proof of live Hybrid Mode.
         if stats
             .as_ref()
-            .and_then(|s| s.last_catalog_refresh_at_ms)
+            .and_then(|s| s.cloudcode.last_catalog_refresh_at_ms)
             .is_some()
         {
-            launcher_integration.hybrid_active = true;
+            launcher_integration.mark_hybrid_active();
         }
 
         SettingsSnapshot {
@@ -443,7 +426,8 @@ impl CompanionUiServer {
             stats,
             launcher_integration,
             cloudcode,
-            platform: default_host_platform(),
+            supported_models: curated_model_presets(),
+            platform: HostPlatform::current(),
         }
     }
 
@@ -641,36 +625,6 @@ async fn load_ui_html_override(path: PathBuf) -> Result<String, ErrorData> {
     .map_err(|err| ErrorData::internal_error(format!("UI HTML load task failed: {err}"), None))?
 }
 
-fn validate_api_key_input(raw: &str) -> Result<Option<String>, &'static str> {
-    if !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
-        return Err("api_key contains invalid header characters");
-    }
-
-    let trimmed = raw.trim_matches(' ');
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    if !trimmed.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
-        return Err("api_key contains invalid header characters");
-    }
-
-    if is_placeholder_api_key(trimmed) {
-        return Err(
-            "api_key cannot be set to the internal proxy placeholder ('agy-companion-local'); enter a real Gemini API key",
-        );
-    }
-
-    Ok(Some(trimmed.to_string()))
-}
-
-fn validate_trimmed_ascii_field(raw: &str, field_name: &str) -> Result<String, String> {
-    if !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
-        return Err(format!("{field_name} contains invalid characters"));
-    }
-    Ok(raw.trim_matches(' ').to_string())
-}
-
 fn tool_error(message: impl Into<String>) -> CallToolResult {
     let message = message.into();
     let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
@@ -707,19 +661,20 @@ fn format_snapshot_summary(snapshot: &SettingsSnapshot) -> String {
         "unreachable".to_string()
     };
 
-    let key_state = match snapshot.config.api_key_hint.as_deref() {
+    let gemini = &snapshot.config.providers.gemini;
+    let key_state = match gemini.api_key_hint.as_deref() {
         Some(hint) => format!("configured ({hint})"),
-        None if snapshot.config.api_key_configured => "configured".to_string(),
+        None if gemini.api_key_configured => "configured".to_string(),
         None => "not configured".to_string(),
     };
 
     format!(
         "Antigravity Companion v{} — proxy at {}:{} is {}, model {}, API key {}.",
         snapshot.binary_version,
-        snapshot.config.listen_host,
-        snapshot.config.listen_port,
+        snapshot.config.proxy.host,
+        snapshot.config.proxy.port,
         proxy_state,
-        snapshot.config.gemini_default_model,
+        gemini.default_model,
         key_state
     )
 }
@@ -779,65 +734,12 @@ impl CompanionUiServer {
         &self,
         Parameters(args): Parameters<SaveSettingsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let patch: ConfigPatch = args.into();
         let write_guard = self.config_write_lock.lock().await;
         let config_path = self.config_path.clone();
         let save_outcome = tokio::task::spawn_blocking(move || -> Result<Config, String> {
             let mut cfg = Config::load_or_default(&config_path).map_err(|err| err.to_string())?;
-
-            // Validate api_key strictly (ASCII-before-trim) before inspecting clear_api_key.
-            let validated_api_key = match args.api_key.as_deref() {
-                Some(raw) => validate_api_key_input(raw).map_err(str::to_string)?,
-                None => None,
-            };
-
-            if args.clear_api_key == Some(true) {
-                if validated_api_key.is_some() {
-                    return Err("cannot set both api_key and clear_api_key: true".to_string());
-                }
-                cfg.gemini.api_key = None;
-            } else if let Some(new_key) = validated_api_key {
-                cfg.gemini.api_key = Some(new_key);
-            } else if cfg
-                .gemini
-                .api_key
-                .as_deref()
-                .is_some_and(is_placeholder_api_key)
-            {
-                // Defensively scrub any pre-existing legacy placeholder saved on disk.
-                cfg.gemini.api_key = None;
-            }
-
-            if let Some(raw_model) = args.default_model.as_deref() {
-                let trimmed = validate_trimmed_ascii_field(raw_model, "default_model")?;
-                cfg.gemini.default_model = trimmed;
-            }
-
-            if let Some(raw_url) = args.base_url.as_deref() {
-                let trimmed = validate_trimmed_ascii_field(raw_url, "base_url")?;
-                validate_upstream_url(&trimmed).map_err(|err| err.to_string())?;
-                cfg.gemini.base_url = trimmed;
-            }
-
-            if let Some(raw_cc_url) = args.cloudcode_upstream_url.as_deref() {
-                let trimmed = validate_trimmed_ascii_field(raw_cc_url, "cloudcode_upstream_url")?;
-                companion_core::validate_cloudcode_upstream_url(&trimmed)
-                    .map_err(|err| err.to_string())?;
-                cfg.cloudcode_upstream_url = trimmed;
-            }
-
-            if let Some(raw_host) = args.listen_host.as_deref() {
-                validate_listen_host(raw_host).map_err(|err| err.to_string())?;
-                cfg.listen_host = raw_host.to_string();
-            }
-
-            if let Some(port) = args.listen_port {
-                if port == 0 {
-                    return Err("listen_port must be between 1 and 65535".to_string());
-                }
-                cfg.listen_port = port;
-            }
-
-            cfg.validate().map_err(|err| err.to_string())?;
+            cfg.apply_patch(patch).map_err(|err| err.to_string())?;
             cfg.save_secure(&config_path)
                 .map_err(|err| err.to_string())?;
             Ok(cfg)
@@ -878,6 +780,7 @@ impl CompanionUiServer {
         };
 
         let timeout_secs = cfg
+            .providers
             .gemini
             .timeout_secs
             .clamp(1, MAX_TEST_CONNECTION_TIMEOUT_SECS);
@@ -886,11 +789,11 @@ impl CompanionUiServer {
             .test_connection_timeout_override
             .unwrap_or(timeout_secs);
 
-        let provider = match GeminiProvider::new(
-            &cfg.gemini.base_url,
-            cfg.gemini.api_key.clone(),
+        let test_cfg = GeminiConfig {
             timeout_secs,
-        ) {
+            ..cfg.providers.gemini.clone()
+        };
+        let provider = match GeminiProvider::from_config(&test_cfg) {
             Ok(provider) => {
                 #[cfg(test)]
                 let provider = provider.with_env_fallback(self.env_api_key_fallback);
@@ -909,7 +812,7 @@ impl CompanionUiServer {
                 ok: true,
                 message: format!(
                     "Connected to Gemini upstream ({}) successfully.",
-                    cfg.gemini.base_url
+                    cfg.providers.gemini.base_url
                 ),
             },
             Err(err) => TestConnectionPayload {
@@ -963,24 +866,30 @@ impl CompanionUiServer {
         let snapshot = self
             .build_snapshot_with_integration(&cfg, Some(status))
             .await;
-        let prefix = if !snapshot.launcher_integration.supported {
-            "Dock / Launcher hook is not supported on this platform."
-        } else if snapshot.launcher_integration.manual_required {
-            if enabled {
-                if snapshot.launcher_integration.env_script_path.is_some() {
-                    "Dock / Launcher env.sh prepared; manual 1-line RC step required."
-                } else {
-                    "Dock / Launcher integration requires a manual shell config step."
-                }
-            } else if snapshot.launcher_integration.enabled {
-                "Dock / Launcher hook could not be removed automatically; remove the managed shell config lines manually."
-            } else {
-                "Dock / Launcher hook neutralized; remove the managed RC lines manually."
+        let prefix = match snapshot.launcher_integration.state() {
+            IntegrationState::Unsupported => {
+                "Dock / Launcher hook is not supported on this platform."
             }
-        } else if enabled {
-            "Dock / Launcher auto-start enabled."
-        } else {
-            "Dock / Launcher auto-start disabled."
+            IntegrationState::ManualRequired => {
+                if enabled {
+                    if snapshot.launcher_integration.env_script_path.is_some() {
+                        "Dock / Launcher env.sh prepared; manual 1-line RC step required."
+                    } else {
+                        "Dock / Launcher integration requires a manual shell config step."
+                    }
+                } else if snapshot.launcher_integration.enabled {
+                    "Dock / Launcher hook could not be removed automatically; remove the managed shell config lines manually."
+                } else {
+                    "Dock / Launcher hook neutralized; remove the managed RC lines manually."
+                }
+            }
+            IntegrationState::Active | IntegrationState::Enabled | IntegrationState::Disabled => {
+                if enabled {
+                    "Dock / Launcher auto-start enabled."
+                } else {
+                    "Dock / Launcher auto-start disabled."
+                }
+            }
         };
         snapshot_tool_result(
             format!("{prefix} {}", format_snapshot_summary(&snapshot)),
@@ -1044,6 +953,7 @@ mod tests {
     use super::*;
 
     use std::fs;
+    use std::num::NonZeroU16;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -1051,12 +961,24 @@ mod tests {
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::get;
-    use companion_core::Config;
+    use companion_core::{ApiKey, CloudCodeUpstream, Config, LoopbackHost};
     use rmcp::model::ErrorCode;
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
+
+    fn config_with_port(port: u16) -> Config {
+        let mut cfg = Config::default();
+        cfg.proxy.port = NonZeroU16::new(port).expect("non-zero port");
+        cfg
+    }
+
+    fn write_raw_secure(path: &Path, content: &str) {
+        fs::write(path, content).expect("write raw config");
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    }
 
     async fn free_closed_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1216,6 +1138,25 @@ mod tests {
                 tool_meta.0.get("ui").and_then(|v| v.get("visibility")),
                 Some(&json!(["app"]))
             );
+            if app_only == "save_settings" {
+                assert_eq!(
+                    tool.input_schema.get("additionalProperties"),
+                    Some(&json!(false)),
+                    "save_settings schema must deny unknown fields: {:?}",
+                    tool.input_schema
+                );
+                let props = tool
+                    .input_schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .expect("save_settings properties object");
+                assert!(props.contains_key("proxy"));
+                assert!(props.contains_key("cloudcode"));
+                assert!(props.contains_key("providers"));
+                assert!(!props.contains_key("listen_port"));
+                assert!(!props.contains_key("api_key"));
+                assert!(!props.contains_key("clear_api_key"));
+            }
             if app_only == "set_launcher_integration" {
                 assert_eq!(
                     tool.input_schema.get("additionalProperties"),
@@ -1336,11 +1277,8 @@ mod tests {
         let cfg_path = tmp.path().join("config.json");
         let secret = "AIzaSySecret1234567890";
 
-        let mut cfg = Config {
-            listen_port: free_closed_port().await,
-            ..Default::default()
-        };
-        cfg.gemini.api_key = Some(secret.to_string());
+        let mut cfg = config_with_port(free_closed_port().await);
+        cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(secret).expect("valid api key"));
         cfg.save_secure(&cfg_path).expect("save config");
 
         let server = CompanionUiServer::new(cfg_path, None).expect("server");
@@ -1364,8 +1302,13 @@ mod tests {
                     .expect("structured_content"),
             )
             .expect("parse SettingsSnapshot");
-            assert!(snapshot.config.api_key_configured);
-            assert_eq!(snapshot.config.api_key_hint.as_deref(), Some("AIza...7890"));
+            assert!(snapshot.config.providers.gemini.api_key_configured);
+            assert_eq!(
+                snapshot.config.providers.gemini.api_key_hint.as_deref(),
+                Some("AIza...7890")
+            );
+            assert_eq!(snapshot.supported_models, curated_model_presets());
+            assert_eq!(snapshot.platform, HostPlatform::current());
         }
     }
 
@@ -1379,7 +1322,12 @@ mod tests {
         // Reject remote http:// URL
         let bad = server
             .save_settings(Parameters(SaveSettingsArgs {
-                base_url: Some("http://example.com".to_string()),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        base_url: Some("http://example.com".to_string()),
+                        ..Default::default()
+                    }),
+                }),
                 ..Default::default()
             }))
             .await
@@ -1391,13 +1339,20 @@ mod tests {
         let secret = "AIzaSyValidSaveTestKey9876";
         let ok = server
             .save_settings(Parameters(SaveSettingsArgs {
-                api_key: Some(secret.to_string()),
-                default_model: Some("gemini-3.8-flash".to_string()),
-                base_url: Some("https://generativelanguage.googleapis.com".to_string()),
-                cloudcode_upstream_url: Some("https://cloudcode-pa.googleapis.com".to_string()),
-                listen_port: Some(closed_port),
-                listen_host: Some("127.0.0.1".to_string()),
-                clear_api_key: None,
+                proxy: Some(ProxySettingsPatch {
+                    host: Some("127.0.0.1".to_string()),
+                    port: Some(closed_port),
+                }),
+                cloudcode: Some(CloudCodeSettingsPatch {
+                    upstream: Some("https://cloudcode-pa.googleapis.com".to_string()),
+                }),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        api_key: Some(ApiKeyPatch::Set(secret.to_string())),
+                        base_url: Some("https://generativelanguage.googleapis.com".to_string()),
+                        default_model: Some("gemini-3.8-flash".to_string()),
+                    }),
+                }),
             }))
             .await
             .expect("save_settings ok");
@@ -1408,9 +1363,16 @@ mod tests {
         assert!(serialized.contains("AIza...9876"));
 
         let saved = Config::load_or_default(&cfg_path).expect("reload config");
-        assert_eq!(saved.gemini.api_key.as_deref(), Some(secret));
-        assert_eq!(saved.gemini.default_model, "gemini-3.8-flash");
-        assert_eq!(saved.listen_port, closed_port);
+        assert_eq!(
+            saved.providers.gemini.api_key.as_ref().map(ApiKey::expose),
+            Some(secret)
+        );
+        assert_eq!(saved.providers.gemini.default_model, "gemini-3.8-flash");
+        assert_eq!(saved.proxy.port.get(), closed_port);
+        assert_eq!(
+            saved.cloudcode.upstream,
+            CloudCodeUpstream::Fixed("https://cloudcode-pa.googleapis.com".to_string())
+        );
 
         #[cfg(unix)]
         {
@@ -1424,63 +1386,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_settings_preserves_existing_key_when_omitted_or_blank_and_clears_on_flag() {
+    async fn save_settings_preserves_existing_key_when_omitted_rejects_blank_set_and_clears_on_variant()
+     {
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
         let closed_port = free_closed_port().await;
         let initial_key = "AIzaSyKeepThisSecretKey4321";
 
-        let mut cfg = Config {
-            listen_port: closed_port,
-            ..Default::default()
-        };
-        cfg.gemini.api_key = Some(initial_key.to_string());
+        let mut cfg = config_with_port(closed_port);
+        cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(initial_key).expect("valid key"));
         cfg.save_secure(&cfg_path).expect("save initial");
 
         let server = CompanionUiServer::new(cfg_path.clone(), None).expect("server");
 
-        // Omitted, empty, and ASCII-spaces-only api_key all preserve existing key
-        for api_key_arg in [None, Some(String::new()), Some("   ".to_string())] {
-            let res = server
+        // Omitting providers, providers.gemini, or providers.gemini.api_key preserves existing key
+        for args in [
+            SaveSettingsArgs::default(),
+            SaveSettingsArgs {
+                providers: Some(ProvidersSettingsPatch { gemini: None }),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        api_key: None,
+                        default_model: Some("gemini-3.8-flash".to_string()),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            },
+        ] {
+            let res = server.save_settings(Parameters(args)).await.expect("save");
+            assert_eq!(res.is_error, Some(false));
+            let reloaded = Config::load_or_default(&cfg_path).expect("reload");
+            assert_eq!(
+                reloaded
+                    .providers
+                    .gemini
+                    .api_key
+                    .as_ref()
+                    .map(ApiKey::expose),
+                Some(initial_key)
+            );
+        }
+
+        // ApiKeyPatch::Set("") and ApiKeyPatch::Set("   ") are strictly rejected without altering initial_key
+        for blank in ["", "   "] {
+            let rejected = server
                 .save_settings(Parameters(SaveSettingsArgs {
-                    api_key: api_key_arg,
-                    default_model: Some("gemini-3.8-flash".to_string()),
+                    providers: Some(ProvidersSettingsPatch {
+                        gemini: Some(GeminiSettingsPatch {
+                            api_key: Some(ApiKeyPatch::Set(blank.to_string())),
+                            ..Default::default()
+                        }),
+                    }),
                     ..Default::default()
                 }))
                 .await
-                .expect("save");
-            assert_eq!(res.is_error, Some(false));
+                .expect("blank set");
+            assert_eq!(rejected.is_error, Some(true));
             let reloaded = Config::load_or_default(&cfg_path).expect("reload");
-            assert_eq!(reloaded.gemini.api_key.as_deref(), Some(initial_key));
+            assert_eq!(
+                reloaded
+                    .providers
+                    .gemini
+                    .api_key
+                    .as_ref()
+                    .map(ApiKey::expose),
+                Some(initial_key)
+            );
         }
 
-        // Conflicting clear_api_key: true + non-empty api_key must be rejected without echoing secret
-        let conflicting_secret = "AIzaSyConflictingKeyValue999";
-        let conflict = server
-            .save_settings(Parameters(SaveSettingsArgs {
-                api_key: Some(conflicting_secret.to_string()),
-                clear_api_key: Some(true),
-                ..Default::default()
-            }))
-            .await
-            .expect("conflict");
-        assert_eq!(conflict.is_error, Some(true));
-        let conflict_json = serde_json::to_string(&conflict).expect("serialize");
-        assert!(!conflict_json.contains(conflicting_secret));
-        let reloaded = Config::load_or_default(&cfg_path).expect("reload");
-        assert_eq!(reloaded.gemini.api_key.as_deref(), Some(initial_key));
-
-        // Explicit clear_api_key: true clears saved key
+        // Explicit ApiKeyPatch::Clear clears saved key
         let cleared = server
             .save_settings(Parameters(SaveSettingsArgs {
-                clear_api_key: Some(true),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        api_key: Some(ApiKeyPatch::Clear),
+                        ..Default::default()
+                    }),
+                }),
                 ..Default::default()
             }))
             .await
             .expect("clear");
         assert_eq!(cleared.is_error, Some(false));
         let reloaded = Config::load_or_default(&cfg_path).expect("reload");
-        assert_eq!(reloaded.gemini.api_key, None);
+        assert_eq!(reloaded.providers.gemini.api_key, None);
     }
 
     #[tokio::test]
@@ -1489,9 +1482,14 @@ mod tests {
         let cfg_path = tmp.path().join("config.json");
         let server = CompanionUiServer::new(cfg_path.clone(), None).expect("server");
 
-        // Verify SaveSettingsArgs Debug redacts api_key
+        // Verify SaveSettingsArgs Debug redacts api_key via ApiKeyPatch
         let debug_args = SaveSettingsArgs {
-            api_key: Some("AIzaSyDebugSecretShouldHide".to_string()),
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    api_key: Some(ApiKeyPatch::Set("AIzaSyDebugSecretShouldHide".to_string())),
+                    ..Default::default()
+                }),
+            }),
             ..Default::default()
         };
         let dbg = format!("{debug_args:?}");
@@ -1507,7 +1505,12 @@ mod tests {
         ] {
             let res = server
                 .save_settings(Parameters(SaveSettingsArgs {
-                    api_key: Some(bad_key.to_string()),
+                    providers: Some(ProvidersSettingsPatch {
+                        gemini: Some(GeminiSettingsPatch {
+                            api_key: Some(ApiKeyPatch::Set(bad_key.to_string())),
+                            ..Default::default()
+                        }),
+                    }),
                     ..Default::default()
                 }))
                 .await
@@ -1522,40 +1525,82 @@ mod tests {
             assert!(!serialized.contains("Embedded"));
         }
 
-        // Invalid host, port, model, remote http URL, credentialed URL
+        // Invalid host, port, model (incl. bare gemini-5), remote http URL, credentialed URL
         let invalid_cases = [
             SaveSettingsArgs {
-                listen_host: Some("0.0.0.0".to_string()),
+                proxy: Some(ProxySettingsPatch {
+                    host: Some("0.0.0.0".to_string()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             SaveSettingsArgs {
-                listen_port: Some(0),
+                proxy: Some(ProxySettingsPatch {
+                    port: Some(0),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             SaveSettingsArgs {
-                default_model: Some("../evil".to_string()),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        default_model: Some("../evil".to_string()),
+                        ..Default::default()
+                    }),
+                }),
                 ..Default::default()
             },
             SaveSettingsArgs {
-                default_model: Some("gemini-2.5-pro".to_string()),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        default_model: Some("gemini-2.5-pro".to_string()),
+                        ..Default::default()
+                    }),
+                }),
                 ..Default::default()
             },
             SaveSettingsArgs {
-                default_model: Some("gemini-2.5-flash".to_string()),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        default_model: Some("gemini-2.5-flash".to_string()),
+                        ..Default::default()
+                    }),
+                }),
                 ..Default::default()
             },
             SaveSettingsArgs {
-                base_url: Some("http://evil.com".to_string()),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        default_model: Some("gemini-5".to_string()),
+                        ..Default::default()
+                    }),
+                }),
                 ..Default::default()
             },
             SaveSettingsArgs {
-                base_url: Some("https://user:pass@generativelanguage.googleapis.com".to_string()),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        base_url: Some("http://evil.com".to_string()),
+                        ..Default::default()
+                    }),
+                }),
                 ..Default::default()
             },
             SaveSettingsArgs {
-                cloudcode_upstream_url: Some(
-                    "http://daily-cloudcode-pa.googleapis.com".to_string(),
-                ),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        base_url: Some(
+                            "https://user:pass@generativelanguage.googleapis.com".to_string(),
+                        ),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            },
+            SaveSettingsArgs {
+                cloudcode: Some(CloudCodeSettingsPatch {
+                    upstream: Some("http://daily-cloudcode-pa.googleapis.com".to_string()),
+                }),
                 ..Default::default()
             },
         ];
@@ -1592,21 +1637,21 @@ mod tests {
                 "/api/stats",
                 get(|| async {
                     axum::Json(json!({
-                        "requests": 7,
-                        "prompt_tokens": 1000,
-                        "cached_tokens": 600,
-                        "output_tokens": 250,
-                        "reasoning_tokens": 50,
-                        "cache_hit_ratio": 0.6
+                        "usage": {
+                            "requests": 7,
+                            "prompt_tokens": 1000,
+                            "cached_tokens": 600,
+                            "output_tokens": 250,
+                            "reasoning_tokens": 50,
+                            "cache_hit_ratio": 0.6
+                        },
+                        "cloudcode": {}
                     }))
                 }),
             );
         let (port_match, handle_match) = spawn_mock_http(matching_router).await;
 
-        let mut cfg = Config {
-            listen_port: port_match,
-            ..Default::default()
-        };
+        let mut cfg = config_with_port(port_match);
         cfg.save_secure(&cfg_path).expect("save");
 
         let server = CompanionUiServer::new(cfg_path.clone(), None).expect("server");
@@ -1624,8 +1669,8 @@ mod tests {
         assert_eq!(snap.proxy.error, None);
         assert!(!snap.version_skew);
         let stats = snap.stats.expect("stats");
-        assert_eq!(stats.requests, 7);
-        assert_eq!(stats.cached_tokens, 600);
+        assert_eq!(stats.usage.requests, 7);
+        assert_eq!(stats.usage.cached_tokens, 600);
         handle_match.abort();
 
         // Case 2: Reachable with mismatched version (skew = true)
@@ -1640,7 +1685,7 @@ mod tests {
             }),
         );
         let (port_skew, handle_skew) = spawn_mock_http(skew_router).await;
-        cfg.listen_port = port_skew;
+        cfg.proxy.port = NonZeroU16::new(port_skew).unwrap();
         cfg.save_secure(&cfg_path).expect("save skew");
 
         let res_skew = server.get_settings().await.expect("get_settings skew");
@@ -1659,7 +1704,7 @@ mod tests {
             get(|| async { "x".repeat(MAX_PROBE_BODY_BYTES + 1024) }),
         );
         let (port_huge, handle_huge) = spawn_mock_http(huge_router).await;
-        cfg.listen_port = port_huge;
+        cfg.proxy.port = NonZeroU16::new(port_huge).unwrap();
         cfg.save_secure(&cfg_path).expect("save huge");
         let res_huge = server.get_settings().await.expect("get_settings huge");
         let snap_huge: SettingsSnapshot =
@@ -1676,7 +1721,7 @@ mod tests {
         handle_huge.abort();
 
         // Case 4: Unreachable closed port
-        cfg.listen_port = free_closed_port().await;
+        cfg.proxy.port = NonZeroU16::new(free_closed_port().await).unwrap();
         cfg.save_secure(&cfg_path).expect("save closed");
         let res_down = server.get_settings().await.expect("get_settings down");
         let snap_down: SettingsSnapshot =
@@ -1706,22 +1751,21 @@ mod tests {
                     "/api/stats",
                     get(|| async {
                         axum::Json(json!({
-                            "requests": 2,
-                            "prompt_tokens": 100,
-                            "cached_tokens": 50,
-                            "output_tokens": 20,
-                            "reasoning_tokens": 5,
-                            "cache_hit_ratio": 0.5
+                            "usage": {
+                                "requests": 2,
+                                "prompt_tokens": 100,
+                                "cached_tokens": 50,
+                                "output_tokens": 20,
+                                "reasoning_tokens": 5,
+                                "cache_hit_ratio": 0.5
+                            }
                         }))
                     }),
                 );
             let (port, handle) = spawn_mock_http(router).await;
             let tmp = TempDir::new().expect("tempdir");
             let cfg_path = tmp.path().join("config.json");
-            let cfg = Config {
-                listen_port: port,
-                ..Default::default()
-            };
+            let cfg = config_with_port(port);
             cfg.save_secure(&cfg_path).expect("save");
 
             let server = CompanionUiServer::new(cfg_path, None).expect("server");
@@ -1729,7 +1773,7 @@ mod tests {
             let snap: SettingsSnapshot =
                 serde_json::from_value(res.structured_content.expect("structured")).expect("parse");
             assert!(snap.proxy.reachable);
-            assert_eq!(snap.stats.expect("stats").requests, 2);
+            assert_eq!(snap.stats.expect("stats").usage.requests, 2);
             handle.abort();
             return;
         }
@@ -1767,8 +1811,8 @@ mod tests {
         );
         let (ok_port, ok_handle) = spawn_mock_http(ok_router).await;
         let mut cfg = Config::default();
-        cfg.gemini.base_url = format!("http://127.0.0.1:{ok_port}");
-        cfg.gemini.api_key = Some(valid_secret.to_string());
+        cfg.providers.gemini.base_url = format!("http://127.0.0.1:{ok_port}");
+        cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(valid_secret).unwrap());
         cfg.save_secure(&cfg_path).expect("save ok");
 
         let server = CompanionUiServer::new(cfg_path.clone(), None)
@@ -1804,8 +1848,8 @@ mod tests {
             }),
         );
         let (bad_port, bad_handle) = spawn_mock_http(bad_router).await;
-        cfg.gemini.base_url = format!("http://127.0.0.1:{bad_port}");
-        cfg.gemini.api_key = Some(bad_secret.to_string());
+        cfg.providers.gemini.base_url = format!("http://127.0.0.1:{bad_port}");
+        cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(bad_secret).unwrap());
         cfg.save_secure(&cfg_path).expect("save bad");
 
         let res_bad = server.test_connection().await.expect("test bad");
@@ -1821,7 +1865,7 @@ mod tests {
         bad_handle.abort();
 
         // 3. Missing API key (deterministic with env fallback disabled)
-        cfg.gemini.api_key = None;
+        cfg.providers.gemini.api_key = None;
         cfg.save_secure(&cfg_path).expect("save missing");
         let res_missing = server.test_connection().await.expect("test missing");
         assert_eq!(res_missing.is_error, Some(false));
@@ -1839,8 +1883,8 @@ mod tests {
             }),
         );
         let (slow_port, slow_handle) = spawn_mock_http(slow_router).await;
-        cfg.gemini.base_url = format!("http://127.0.0.1:{slow_port}");
-        cfg.gemini.api_key = Some(valid_secret.to_string());
+        cfg.providers.gemini.base_url = format!("http://127.0.0.1:{slow_port}");
+        cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(valid_secret).unwrap());
         cfg.save_secure(&cfg_path).expect("save slow");
 
         let fast_timeout_server = CompanionUiServer::new(cfg_path, None)
@@ -2171,7 +2215,36 @@ mod tests {
         let res_not_found = recv_msg(&mut reader).await;
         assert_eq!(res_not_found["error"]["code"], json!(-32002));
 
-        // 6. tools/call save_settings first (sets closed_port so open_settings never probes ambient host port 4141)
+        // 6a. Verify save_settings rejects legacy flat / unknown fields at the JSON-RPC boundary
+        send_msg(
+            &mut write_half,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 50,
+                "method": "tools/call",
+                "params": {
+                    "name": "save_settings",
+                    "arguments": {
+                        "listen_port": closed_port
+                    }
+                }
+            }),
+        )
+        .await;
+        let bad_save_resp = recv_msg(&mut reader).await;
+        let save_rejected = bad_save_resp.get("error").is_some()
+            || bad_save_resp["result"]["isError"] == json!(true);
+        assert!(
+            save_rejected,
+            "save_settings with legacy flat listen_port must be rejected: {bad_save_resp:?}"
+        );
+        let save_err_blob = serde_json::to_string(&bad_save_resp).expect("serialize");
+        assert!(
+            save_err_blob.contains("unknown field") && save_err_blob.contains("listen_port"),
+            "expected unknown field error for listen_port, got: {save_err_blob}"
+        );
+
+        // 6. tools/call save_settings first (sets closed_port so open_settings never probes ambient host port)
         let wire_secret = "AIzaSyWireProtocolSecret123";
         send_msg(
             &mut write_half,
@@ -2182,10 +2255,14 @@ mod tests {
                 "params": {
                     "name": "save_settings",
                     "arguments": {
-                        "api_key": wire_secret,
-                        "base_url": format!("http://127.0.0.1:{upstream_port}"),
-                        "listen_port": closed_port,
-                        "default_model": "gemini-3.8-flash"
+                        "proxy": { "port": closed_port },
+                        "providers": {
+                            "gemini": {
+                                "api_key": { "set": wire_secret },
+                                "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                                "default_model": "gemini-3.8-flash"
+                            }
+                        }
                     }
                 }
             }),
@@ -2232,8 +2309,18 @@ mod tests {
         let get_resp = recv_msg(&mut reader).await;
         assert_eq!(get_resp["result"]["isError"], json!(false));
         assert_eq!(
-            get_resp["result"]["structuredContent"]["config"]["api_key_hint"],
+            get_resp["result"]["structuredContent"]["config"]["providers"]["gemini"]["api_key_hint"],
             json!("AIza...t123")
+        );
+        assert_eq!(
+            get_resp["result"]["structuredContent"]["supported_models"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            get_resp["result"]["structuredContent"]["platform"],
+            json!(HostPlatform::current().as_str())
         );
         assert!(
             !serde_json::to_string(&get_resp)
@@ -2294,7 +2381,10 @@ mod tests {
         let save_big = tokio::time::timeout(
             Duration::from_secs(2),
             server.save_settings(Parameters(SaveSettingsArgs {
-                listen_port: Some(closed_port),
+                proxy: Some(ProxySettingsPatch {
+                    port: Some(closed_port),
+                    ..Default::default()
+                }),
                 ..Default::default()
             })),
         )
@@ -2320,7 +2410,10 @@ mod tests {
         let save_fifo = tokio::time::timeout(
             Duration::from_secs(2),
             server.save_settings(Parameters(SaveSettingsArgs {
-                listen_port: Some(closed_port),
+                proxy: Some(ProxySettingsPatch {
+                    port: Some(closed_port),
+                    ..Default::default()
+                }),
                 ..Default::default()
             })),
         )
@@ -2338,10 +2431,7 @@ mod tests {
         for trial in 0..10u16 {
             let tmp = TempDir::new().expect("tempdir");
             let cfg_path = tmp.path().join("config.json");
-            let initial = Config {
-                listen_port: closed_port,
-                ..Default::default()
-            };
+            let initial = config_with_port(closed_port);
             initial.save_secure(&cfg_path).expect("seed config");
 
             let server = CompanionUiServer::new(cfg_path.clone(), None)
@@ -2362,7 +2452,12 @@ mod tests {
             let (r1, r2, r3) = tokio::join!(
                 tokio::spawn(async move {
                     s1.save_settings(Parameters(SaveSettingsArgs {
-                        api_key: Some(key_clone),
+                        providers: Some(ProvidersSettingsPatch {
+                            gemini: Some(GeminiSettingsPatch {
+                                api_key: Some(ApiKeyPatch::Set(key_clone)),
+                                ..Default::default()
+                            }),
+                        }),
                         ..Default::default()
                     }))
                     .await
@@ -2370,7 +2465,12 @@ mod tests {
                 }),
                 tokio::spawn(async move {
                     s2.save_settings(Parameters(SaveSettingsArgs {
-                        default_model: Some(model_clone),
+                        providers: Some(ProvidersSettingsPatch {
+                            gemini: Some(GeminiSettingsPatch {
+                                default_model: Some(model_clone),
+                                ..Default::default()
+                            }),
+                        }),
                         ..Default::default()
                     }))
                     .await
@@ -2378,7 +2478,10 @@ mod tests {
                 }),
                 tokio::spawn(async move {
                     s3.save_settings(Parameters(SaveSettingsArgs {
-                        listen_port: Some(new_port),
+                        proxy: Some(ProxySettingsPatch {
+                            port: Some(new_port),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     }))
                     .await
@@ -2392,32 +2495,35 @@ mod tests {
 
             let final_cfg = Config::load_or_default(&cfg_path).expect("load final config");
             assert_eq!(
-                final_cfg.gemini.api_key.as_deref(),
+                final_cfg
+                    .providers
+                    .gemini
+                    .api_key
+                    .as_ref()
+                    .map(ApiKey::expose),
                 Some(key_value.as_str()),
                 "trial {trial}: lost api_key update"
             );
             assert_eq!(
-                final_cfg.gemini.default_model, model_value,
+                final_cfg.providers.gemini.default_model, model_value,
                 "trial {trial}: lost default_model update"
             );
             assert_eq!(
-                final_cfg.listen_port, new_port,
-                "trial {trial}: lost listen_port update"
+                final_cfg.proxy.port.get(),
+                new_port,
+                "trial {trial}: lost proxy.port update"
             );
         }
 
-        // Part B: 10 trials of concurrent clear_api_key vs non-key model update -> zero key resurrection.
+        // Part B: 10 trials of concurrent ApiKeyPatch::Clear vs non-key model update -> zero key resurrection.
         for trial in 0..10u16 {
             let tmp = TempDir::new().expect("tempdir");
             let cfg_path = tmp.path().join("config.json");
-            let initial = Config {
-                listen_port: closed_port,
-                gemini: companion_core::GeminiConfig {
-                    api_key: Some(format!("AIzaSyMustStayCleared{trial:02}")),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut initial = config_with_port(closed_port);
+            initial.providers.gemini.api_key = Some(
+                ApiKey::parse_strict(&format!("AIzaSyMustStayCleared{trial:02}"))
+                    .expect("valid key"),
+            );
             initial.save_secure(&cfg_path).expect("seed config");
 
             let server = CompanionUiServer::new(cfg_path.clone(), None)
@@ -2433,7 +2539,12 @@ mod tests {
             let (r1, r2) = tokio::join!(
                 tokio::spawn(async move {
                     s1.save_settings(Parameters(SaveSettingsArgs {
-                        clear_api_key: Some(true),
+                        providers: Some(ProvidersSettingsPatch {
+                            gemini: Some(GeminiSettingsPatch {
+                                api_key: Some(ApiKeyPatch::Clear),
+                                ..Default::default()
+                            }),
+                        }),
                         ..Default::default()
                     }))
                     .await
@@ -2441,7 +2552,12 @@ mod tests {
                 }),
                 tokio::spawn(async move {
                     s2.save_settings(Parameters(SaveSettingsArgs {
-                        default_model: Some(model_clone),
+                        providers: Some(ProvidersSettingsPatch {
+                            gemini: Some(GeminiSettingsPatch {
+                                default_model: Some(model_clone),
+                                ..Default::default()
+                            }),
+                        }),
                         ..Default::default()
                     }))
                     .await
@@ -2454,12 +2570,12 @@ mod tests {
 
             let final_cfg = Config::load_or_default(&cfg_path).expect("load final config");
             assert_eq!(
-                final_cfg.gemini.api_key, None,
+                final_cfg.providers.gemini.api_key, None,
                 "trial {trial}: cleared API key was resurrected by concurrent non-key save"
             );
             assert_eq!(
-                final_cfg.gemini.default_model, model_value,
-                "trial {trial}: lost default_model update alongside clear_api_key"
+                final_cfg.providers.gemini.default_model, model_value,
+                "trial {trial}: lost default_model update alongside ApiKeyPatch::Clear"
             );
         }
     }
@@ -2490,21 +2606,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_stats_payload_deserializes_both_legacy_6_field_and_extended_10_field_json() {
-        let legacy: ProxyStatsPayload = serde_json::from_value(json!({
-            "requests": 3,
-            "prompt_tokens": 100,
-            "cached_tokens": 50,
-            "output_tokens": 20,
-            "reasoning_tokens": 5,
-            "cache_hit_ratio": 0.5
+    async fn stats_snapshot_deserializes_minimal_usage_only_and_full_structured_json() {
+        let minimal: StatsSnapshot = serde_json::from_value(json!({
+            "usage": {
+                "requests": 3,
+                "prompt_tokens": 100,
+                "cached_tokens": 50,
+                "output_tokens": 20,
+                "reasoning_tokens": 5,
+                "cache_hit_ratio": 0.5
+            }
         }))
-        .expect("legacy 6-field stats should deserialize");
-        assert_eq!(legacy.requests, 3);
-        assert_eq!(legacy.last_catalog_refresh_at_ms, None);
-        assert_eq!(legacy.last_catalog_included_proxy_models, None);
-        assert_eq!(legacy.cloudcode_mode, None);
-        assert_eq!(legacy.cloudcode_resolved_upstream, None);
+        .expect("minimal usage-only stats should deserialize");
+        assert_eq!(minimal.usage.requests, 3);
+        assert_eq!(minimal.cloudcode.last_catalog_refresh_at_ms, None);
+        assert_eq!(minimal.cloudcode.last_catalog_included_proxy_models, None);
+        assert_eq!(minimal.cloudcode.mode, "");
+        assert_eq!(minimal.cloudcode.resolved_upstream, None);
 
         let extended_router = Router::new()
             .route(
@@ -2521,26 +2639,27 @@ mod tests {
                 "/api/stats",
                 get(|| async {
                     axum::Json(json!({
-                        "requests": 9,
-                        "prompt_tokens": 2000,
-                        "cached_tokens": 1200,
-                        "output_tokens": 400,
-                        "reasoning_tokens": 80,
-                        "cache_hit_ratio": 0.6,
-                        "last_catalog_refresh_at_ms": 1735689600123u64,
-                        "last_catalog_included_proxy_models": true,
-                        "cloudcode_mode": "auto",
-                        "cloudcode_resolved_upstream": "https://daily-cloudcode-pa.googleapis.com"
+                        "usage": {
+                            "requests": 9,
+                            "prompt_tokens": 2000,
+                            "cached_tokens": 1200,
+                            "output_tokens": 400,
+                            "reasoning_tokens": 80,
+                            "cache_hit_ratio": 0.6
+                        },
+                        "cloudcode": {
+                            "mode": "auto",
+                            "resolved_upstream": "https://daily-cloudcode-pa.googleapis.com",
+                            "last_catalog_refresh_at_ms": 1735689600123u64,
+                            "last_catalog_included_proxy_models": true
+                        }
                     }))
                 }),
             );
         let (port, handle) = spawn_mock_http(extended_router).await;
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
-        let cfg = Config {
-            listen_port: port,
-            ..Default::default()
-        };
+        let cfg = config_with_port(port);
         cfg.save_secure(&cfg_path).expect("save");
 
         let server = CompanionUiServer::new(cfg_path, None).expect("server");
@@ -2549,12 +2668,18 @@ mod tests {
         let snap: SettingsSnapshot =
             serde_json::from_value(res.structured_content.expect("structured")).expect("parse");
         let stats = snap.stats.expect("extended stats");
-        assert_eq!(stats.requests, 9);
-        assert_eq!(stats.last_catalog_refresh_at_ms, Some(1735689600123));
-        assert_eq!(stats.last_catalog_included_proxy_models, Some(true));
-        assert_eq!(stats.cloudcode_mode.as_deref(), Some("auto"));
+        assert_eq!(stats.usage.requests, 9);
         assert_eq!(
-            stats.cloudcode_resolved_upstream.as_deref(),
+            stats.cloudcode.last_catalog_refresh_at_ms,
+            Some(1735689600123)
+        );
+        assert_eq!(
+            stats.cloudcode.last_catalog_included_proxy_models,
+            Some(true)
+        );
+        assert_eq!(stats.cloudcode.mode, "auto");
+        assert_eq!(
+            stats.cloudcode.resolved_upstream.as_deref(),
             Some("https://daily-cloudcode-pa.googleapis.com")
         );
         handle.abort();
@@ -2570,23 +2695,20 @@ mod tests {
             .expect("server")
             .with_env_api_key_fallback(false);
 
-        for args in [
-            SaveSettingsArgs {
-                api_key: Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string()),
-                ..Default::default()
-            },
-            SaveSettingsArgs {
-                api_key: Some(format!("  {}  ", companion_core::PROXY_PLACEHOLDER_API_KEY)),
-                ..Default::default()
-            },
-            SaveSettingsArgs {
-                api_key: Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string()),
-                clear_api_key: Some(true),
-                ..Default::default()
-            },
+        for raw in [
+            companion_core::PROXY_PLACEHOLDER_API_KEY.to_string(),
+            format!("  {}  ", companion_core::PROXY_PLACEHOLDER_API_KEY),
         ] {
             let res = server
-                .save_settings(Parameters(args))
+                .save_settings(Parameters(SaveSettingsArgs {
+                    providers: Some(ProvidersSettingsPatch {
+                        gemini: Some(GeminiSettingsPatch {
+                            api_key: Some(ApiKeyPatch::Set(raw)),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }))
                 .await
                 .expect("save_settings error result");
             assert_eq!(res.is_error, Some(true));
@@ -2601,25 +2723,37 @@ mod tests {
             "rejected placeholder saves must not create config.json"
         );
 
-        // Seed legacy config.json on disk containing the placeholder sentinel.
-        let mut legacy_cfg = Config {
-            listen_port: closed_port,
-            ..Default::default()
-        };
-        legacy_cfg.gemini.api_key = Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string());
-        legacy_cfg.save_secure(&cfg_path).expect("save legacy");
+        // Seed legacy config.json on disk containing the placeholder sentinel via raw JSON.
+        write_raw_secure(
+            &cfg_path,
+            &json!({
+                "schema_version": 1,
+                "proxy": { "host": "127.0.0.1", "port": closed_port },
+                "providers": {
+                    "gemini": {
+                        "api_key": companion_core::PROXY_PLACEHOLDER_API_KEY
+                    }
+                }
+            })
+            .to_string(),
+        );
 
         let get_res = server.get_settings().await.expect("get_settings");
         assert_eq!(get_res.is_error, Some(false));
         let get_snap: SettingsSnapshot =
             serde_json::from_value(get_res.structured_content.expect("structured")).expect("parse");
-        assert!(!get_snap.config.api_key_configured);
-        assert_eq!(get_snap.config.api_key_hint, None);
+        assert!(!get_snap.config.providers.gemini.api_key_configured);
+        assert_eq!(get_snap.config.providers.gemini.api_key_hint, None);
 
         // Saving an unrelated field must scrub the legacy placeholder on disk.
         let heal_res = server
             .save_settings(Parameters(SaveSettingsArgs {
-                default_model: Some("gemini-4-neon".to_string()),
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        default_model: Some("gemini-4-neon".to_string()),
+                        ..Default::default()
+                    }),
+                }),
                 ..Default::default()
             }))
             .await
@@ -2627,10 +2761,15 @@ mod tests {
         assert_eq!(heal_res.is_error, Some(false));
 
         let reloaded = Config::load_or_default(&cfg_path).expect("reload");
-        assert_eq!(reloaded.gemini.default_model, "gemini-4-neon");
+        assert_eq!(reloaded.providers.gemini.default_model, "gemini-4-neon");
         assert_eq!(
-            reloaded.gemini.api_key, None,
+            reloaded.providers.gemini.api_key, None,
             "legacy on-disk placeholder must be scrubbed on save"
+        );
+        let raw_disk = fs::read_to_string(&cfg_path).expect("read healed config");
+        assert!(
+            !raw_disk.contains(companion_core::PROXY_PLACEHOLDER_API_KEY),
+            "placeholder sentinel must be removed from disk file after save"
         );
     }
 
@@ -2655,8 +2794,8 @@ mod tests {
             let tmp = TempDir::new().expect("tempdir");
             let cfg_path = tmp.path().join("config.json");
             let mut cfg = Config::default();
-            cfg.gemini.base_url = format!("http://127.0.0.1:{port}");
-            cfg.gemini.api_key = None;
+            cfg.providers.gemini.base_url = format!("http://127.0.0.1:{port}");
+            cfg.providers.gemini.api_key = None;
             cfg.save_secure(&cfg_path).expect("save");
 
             let server = CompanionUiServer::new(cfg_path, None).expect("server");
@@ -2690,10 +2829,19 @@ mod tests {
         let (port, handle) = spawn_mock_http(router).await;
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
-        let mut cfg = Config::default();
-        cfg.gemini.base_url = format!("http://127.0.0.1:{port}");
-        cfg.gemini.api_key = Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string());
-        cfg.save_secure(&cfg_path).expect("save");
+        write_raw_secure(
+            &cfg_path,
+            &json!({
+                "schema_version": 1,
+                "providers": {
+                    "gemini": {
+                        "base_url": format!("http://127.0.0.1:{port}"),
+                        "api_key": companion_core::PROXY_PLACEHOLDER_API_KEY
+                    }
+                }
+            })
+            .to_string(),
+        );
 
         let server = CompanionUiServer::new(cfg_path, None)
             .expect("server")
@@ -2734,10 +2882,7 @@ mod tests {
     async fn set_launcher_integration_enables_disables_and_never_follows_rc_symlink() {
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
-        let cfg = Config {
-            listen_port: free_closed_port().await,
-            ..Default::default()
-        };
+        let cfg = config_with_port(free_closed_port().await);
         cfg.save_secure(&cfg_path).expect("save config");
 
         let rc_path = tmp.path().join(".zlogin");
@@ -2765,11 +2910,17 @@ mod tests {
         let snap: SettingsSnapshot =
             serde_json::from_value(enabled_res.structured_content.expect("sc")).expect("parse");
         if cfg!(windows) {
-            assert!(!snap.launcher_integration.supported);
+            assert_eq!(
+                snap.launcher_integration.state(),
+                IntegrationState::Unsupported
+            );
             return;
         }
         assert!(snap.launcher_integration.enabled);
-        assert!(!snap.launcher_integration.manual_required);
+        assert!(matches!(
+            snap.launcher_integration.state(),
+            IntegrationState::Enabled | IntegrationState::Active
+        ));
         assert!(rc_path.is_file());
         assert!(data_dir.join("env.sh").is_file());
 
@@ -2782,6 +2933,10 @@ mod tests {
         let snap_off: SettingsSnapshot =
             serde_json::from_value(disabled_res.structured_content.expect("sc")).expect("parse");
         assert!(!snap_off.launcher_integration.enabled);
+        assert_eq!(
+            snap_off.launcher_integration.state(),
+            IntegrationState::Disabled
+        );
         assert!(!rc_path.exists());
         assert!(!data_dir.join("env.sh").exists());
 
@@ -2810,7 +2965,10 @@ mod tests {
             let sym_snap: SettingsSnapshot =
                 serde_json::from_value(sym_res.structured_content.expect("sc")).expect("parse");
             assert!(!sym_snap.launcher_integration.enabled);
-            assert!(sym_snap.launcher_integration.manual_required);
+            assert_eq!(
+                sym_snap.launcher_integration.state(),
+                IntegrationState::ManualRequired
+            );
             assert!(sym_snap.launcher_integration.manual_snippet.is_some());
             assert_eq!(
                 sym_snap.launcher_integration.symlink_target.as_deref(),
@@ -2842,16 +3000,20 @@ mod tests {
                 "/api/stats",
                 get(|| async {
                     axum::Json(json!({
-                        "requests": 3,
-                        "prompt_tokens": 100,
-                        "cached_tokens": 50,
-                        "output_tokens": 25,
-                        "reasoning_tokens": 0,
-                        "cache_hit_ratio": 0.5,
-                        "last_catalog_refresh_at_ms": 1735689600123_u64,
-                        "last_catalog_included_proxy_models": true,
-                        "cloudcode_mode": "auto",
-                        "cloudcode_resolved_upstream": "https://daily-cloudcode-pa.googleapis.com"
+                        "usage": {
+                            "requests": 3,
+                            "prompt_tokens": 100,
+                            "cached_tokens": 50,
+                            "output_tokens": 25,
+                            "reasoning_tokens": 0,
+                            "cache_hit_ratio": 0.5
+                        },
+                        "cloudcode": {
+                            "mode": "auto",
+                            "resolved_upstream": "https://daily-cloudcode-pa.googleapis.com",
+                            "last_catalog_refresh_at_ms": 1735689600123_u64,
+                            "last_catalog_included_proxy_models": true
+                        }
                     }))
                 }),
             );
@@ -2859,21 +3021,27 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
-        let cfg = Config {
-            listen_port: port,
-            ..Default::default()
-        };
+        let cfg = config_with_port(port);
         cfg.save_secure(&cfg_path).expect("save config");
+
+        let rc_path = tmp.path().join(".zlogin");
+        let data_dir = tmp.path().join("data");
+        let fake_bin = tmp.path().join("agy-companion");
+        fs::write(&fake_bin, "#!/bin/sh\n").expect("write bin");
+        let opts = IntegrationOptions {
+            shell: Some(companion_core::ShellKind::Zsh),
+            rc_file: Some(rc_path),
+            binary_path: Some(fake_bin),
+            data_dir: Some(data_dir),
+            follow_rc_symlink: false,
+        };
+        if !cfg!(windows) {
+            companion_core::integration::enable(&opts).expect("enable integration");
+        }
 
         let server = CompanionUiServer::new(cfg_path, None)
             .expect("server")
-            .with_integration_options(IntegrationOptions {
-                shell: Some(companion_core::ShellKind::Zsh),
-                rc_file: Some(tmp.path().join(".zlogin")),
-                binary_path: Some(tmp.path().join("agy-companion")),
-                data_dir: Some(tmp.path().join("data")),
-                follow_rc_symlink: false,
-            });
+            .with_integration_options(opts);
         let res = server.get_settings().await.expect("get_settings");
         assert_eq!(res.is_error, Some(false));
         let snap: SettingsSnapshot =
@@ -2881,14 +3049,19 @@ mod tests {
 
         assert_eq!(
             snap.cloudcode,
-            CloudCodeStatusPayload {
+            CloudCodeStatus {
                 mode: "auto".to_string(),
                 configured_upstream: "auto".to_string(),
                 resolved_upstream: Some("https://daily-cloudcode-pa.googleapis.com".to_string()),
             }
         );
+        assert_ne!(snap.cloudcode.resolved_upstream.as_deref(), Some("auto"));
         assert!(snap.launcher_integration.hybrid_active);
-        assert_eq!(snap.platform, std::env::consts::OS);
+        if !cfg!(windows) {
+            assert_eq!(snap.launcher_integration.state(), IntegrationState::Active);
+        }
+        assert_eq!(snap.supported_models, curated_model_presets());
+        assert_eq!(snap.platform, HostPlatform::current());
         handle.abort();
     }
 
@@ -2896,10 +3069,7 @@ mod tests {
     async fn concurrent_set_launcher_integration_calls_are_serialized_without_corruption() {
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
-        let cfg = Config {
-            listen_port: free_closed_port().await,
-            ..Default::default()
-        };
+        let cfg = config_with_port(free_closed_port().await);
         cfg.save_secure(&cfg_path).expect("save config");
 
         let rc_path = tmp.path().join(".zlogin");
@@ -2952,10 +3122,7 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
-        let cfg = Config {
-            listen_port: free_closed_port().await,
-            ..Default::default()
-        };
+        let cfg = config_with_port(free_closed_port().await);
         cfg.save_secure(&cfg_path).expect("save config");
 
         let data_dir = tmp.path().join("data");
@@ -2999,7 +3166,10 @@ mod tests {
         let dis_snap: SettingsSnapshot =
             serde_json::from_value(dis_res.structured_content.expect("sc")).expect("parse");
         assert!(!dis_snap.launcher_integration.enabled);
-        assert!(dis_snap.launcher_integration.manual_required);
+        assert_eq!(
+            dis_snap.launcher_integration.state(),
+            IntegrationState::ManualRequired
+        );
         assert!(dis_snap.launcher_integration.manual_snippet.is_none());
         let dis_text = dis_res
             .content
@@ -3070,7 +3240,10 @@ mod tests {
             fish_dis_snap.launcher_integration.enabled,
             "Fish symlink disable leaves hook active because Fish has no env.sh"
         );
-        assert!(fish_dis_snap.launcher_integration.manual_required);
+        assert_eq!(
+            fish_dis_snap.launcher_integration.state(),
+            IntegrationState::ManualRequired
+        );
         let fish_dis_text = fish_dis_res
             .content
             .first()
@@ -3085,5 +3258,202 @@ mod tests {
             fish_dis_text.contains("could not be removed automatically"),
             "Fish symlink disable summary should explain automatic removal could not occur: {fish_dis_text}"
         );
+    }
+
+    #[test]
+    fn save_settings_args_denies_unknown_fields_at_every_nesting_level_and_api_key_patch_variants()
+    {
+        // Valid payloads
+        assert_eq!(
+            serde_json::from_value::<SaveSettingsArgs>(json!({})).expect("empty patch"),
+            SaveSettingsArgs::default()
+        );
+        let clear_patch: SaveSettingsArgs = serde_json::from_value(json!({
+            "providers": { "gemini": { "api_key": "clear" } }
+        }))
+        .expect("clear patch");
+        assert_eq!(
+            clear_patch
+                .providers
+                .as_ref()
+                .and_then(|p| p.gemini.as_ref())
+                .and_then(|g| g.api_key.as_ref()),
+            Some(&ApiKeyPatch::Clear)
+        );
+        let set_patch: SaveSettingsArgs = serde_json::from_value(json!({
+            "providers": { "gemini": { "api_key": { "set": "AIzaSyValidPatchKey123" } } }
+        }))
+        .expect("set patch");
+        assert_eq!(
+            set_patch
+                .providers
+                .as_ref()
+                .and_then(|p| p.gemini.as_ref())
+                .and_then(|g| g.api_key.as_ref()),
+            Some(&ApiKeyPatch::Set("AIzaSyValidPatchKey123".to_string()))
+        );
+
+        // Unknown fields at every nesting level, legacy flat keys, and malformed api_key variants
+        let rejected_payloads = [
+            json!({ "unknown_top": 1 }),
+            json!({ "listen_port": 24141 }),
+            json!({ "api_key": "AIzaSyFlatKey123456" }),
+            json!({ "clear_api_key": true }),
+            json!({ "proxy": { "port": 24141, "extra": true } }),
+            json!({ "cloudcode": { "upstream": "auto", "extra": 1 } }),
+            json!({ "providers": { "openai": {} } }),
+            json!({ "providers": { "gemini": { "timeout_secs": 900 } } }),
+            json!({ "providers": { "gemini": { "unknown": "x" } } }),
+            json!({ "providers": { "gemini": { "api_key": { "set": "k", "extra": 1 } } } }),
+            json!({ "providers": { "gemini": { "api_key": { "clear": true } } } }),
+            json!({ "providers": { "gemini": { "api_key": "other" } } }),
+            json!({ "providers": { "gemini": { "api_key": {} } } }),
+        ];
+
+        for payload in rejected_payloads {
+            assert!(
+                serde_json::from_value::<SaveSettingsArgs>(payload.clone()).is_err(),
+                "expected rejection for payload: {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_snapshot_json_exposes_nested_config_structured_stats_supported_models_and_platform()
+     {
+        let router = Router::new()
+            .route(
+                "/health",
+                get(|| async {
+                    axum::Json(json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "protocol_version": 1
+                    }))
+                }),
+            )
+            .route(
+                "/api/stats",
+                get(|| async {
+                    // Simulate stale stats claiming mode="fixed" with resolved_upstream=null
+                    // while config is CloudCodeUpstream::Auto -> resolved_upstream MUST NEVER be "auto".
+                    axum::Json(json!({
+                        "usage": {
+                            "requests": 1,
+                            "prompt_tokens": 10,
+                            "cached_tokens": 5,
+                            "output_tokens": 2,
+                            "reasoning_tokens": 0,
+                            "cache_hit_ratio": 0.5
+                        },
+                        "cloudcode": {
+                            "mode": "fixed",
+                            "resolved_upstream": null,
+                            "last_catalog_refresh_at_ms": null,
+                            "last_catalog_included_proxy_models": null
+                        }
+                    }))
+                }),
+            );
+        let (port, handle) = spawn_mock_http(router).await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let cfg = config_with_port(port);
+        cfg.save_secure(&cfg_path).expect("save config");
+
+        let server = CompanionUiServer::new(cfg_path, None)
+            .expect("server")
+            .with_integration_options(IntegrationOptions {
+                shell: Some(companion_core::ShellKind::Zsh),
+                rc_file: Some(tmp.path().join(".zlogin")),
+                binary_path: Some(tmp.path().join("agy-companion")),
+                data_dir: Some(tmp.path().join("data")),
+                follow_rc_symlink: false,
+            });
+        let res = server.get_settings().await.expect("get_settings");
+        assert_eq!(res.is_error, Some(false));
+        let sc = res.structured_content.expect("structured_content");
+
+        // Top-level keys
+        let obj = sc.as_object().expect("snapshot object");
+        for key in [
+            "config",
+            "binary_version",
+            "proxy",
+            "version_skew",
+            "stats",
+            "launcher_integration",
+            "cloudcode",
+            "supported_models",
+            "platform",
+        ] {
+            assert!(obj.contains_key(key), "missing snapshot key {key}");
+        }
+
+        // supported_models has 5 curated presets & platform is lowercase
+        let models = obj["supported_models"].as_array().expect("models array");
+        assert_eq!(models.len(), 5);
+        assert_eq!(obj["platform"], json!(HostPlatform::current().as_str()));
+
+        // launcher_integration exposes canonical `state` without removed `supported`/`manual_required`
+        let li = obj["launcher_integration"]
+            .as_object()
+            .expect("launcher_integration object");
+        assert!(li.contains_key("state"));
+        assert!(!li.contains_key("supported"));
+        assert!(!li.contains_key("manual_required"));
+
+        // cloudcode.resolved_upstream must NEVER be "auto"
+        assert_eq!(obj["cloudcode"]["configured_upstream"], json!("auto"));
+        assert!(obj["cloudcode"]["resolved_upstream"].is_null());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn save_settings_accepts_gemini_5_and_3_9_models_and_trims_proxy_host() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cfg_path = tmp.path().join("config.json");
+        let closed_port = free_closed_port().await;
+        let server = CompanionUiServer::new(cfg_path.clone(), None).expect("server");
+
+        for model in ["gemini-5-pro", "gemini-3.9-pro"] {
+            let ok = server
+                .save_settings(Parameters(SaveSettingsArgs {
+                    proxy: Some(ProxySettingsPatch {
+                        host: Some(" localhost ".to_string()),
+                        port: Some(closed_port),
+                    }),
+                    providers: Some(ProvidersSettingsPatch {
+                        gemini: Some(GeminiSettingsPatch {
+                            default_model: Some(model.to_string()),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .expect("save model");
+            assert_eq!(ok.is_error, Some(false), "model={model} must succeed");
+            let saved = Config::load_or_default(&cfg_path).expect("reload");
+            assert_eq!(saved.providers.gemini.default_model, model);
+            assert_eq!(saved.proxy.host, LoopbackHost::Localhost);
+            assert_eq!(saved.proxy.port.get(), closed_port);
+        }
+
+        let bare = server
+            .save_settings(Parameters(SaveSettingsArgs {
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        default_model: Some("gemini-5".to_string()),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("bare gemini-5");
+        assert_eq!(bare.is_error, Some(true), "bare gemini-5 must be rejected");
     }
 }

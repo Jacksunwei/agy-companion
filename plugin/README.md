@@ -6,7 +6,7 @@ Bring your own models (BYOM) and track token usage and implicit cache hit rates 
 
 - **One-Command Install, Upgrade & Clean Uninstall:** Install the embedded 7-file plugin, stable native binary, Dock/Launcher integration, and background loopback proxy in a single command (`npx -y agy-companion@latest install`), upgrade by re-running the same command, and remove cleanly with `npx -y agy-companion@latest uninstall [--purge]`.
 - **Native Dock / Spotlight / Launcher Auto-Start:** On macOS and Linux, an owned `0600` zero-`eval` `env.sh` + 1-line login-shell hook (`~/.zlogin`, `~/.profile` / existing Bash login profile, or `fish/conf.d/agy-companion.fish`) ensures the Managed On-Demand Daemon is warm before Antigravity's `language_server` boots — while isolating MCP servers (`JETSKI_MCP_ENV_RESTORE_*`) and integrated terminals (`${VAR+x}` 3-state scrub). On Windows, `install` writes direct-`.exe` plugin manifests (zero `bash` dependency) and creates a reversible Start Menu shortcut (`Antigravity (Companion).lnk`).
-- **Google AI Pro, PayGo & Enterprise CloudCode Transparency:** `cloudcode_upstream_url` defaults to `"auto"`, using an 8-entry per-account 128-bit SipHash-1-3 LRU preserved across config hot-reloads to keep Personal Google AI Pro (`daily-cloudcode-pa.googleapis.com`), PayGo, and Enterprise (`cloudcode-pa.googleapis.com` with metadata-only `403` `x-goog-user-project` stripping) working seamlessly. On Day-0 (before an API key is saved), the native Google model picker is returned completely untouched.
+- **Google AI Pro, PayGo & Enterprise CloudCode Transparency:** `cloudcode.upstream` defaults to `"auto"`, using an 8-entry per-account 128-bit SipHash-1-3 LRU preserved across config hot-reloads to keep Personal Google AI Pro (`daily-cloudcode-pa.googleapis.com`), PayGo, and Enterprise (`cloudcode-pa.googleapis.com` with metadata-only `403` `x-goog-user-project` stripping) working seamlessly. On Day-0 (before an API key is saved), the native Google model picker is returned completely untouched.
 - **Loopback-Only Rust Proxy Sidecar (`agy-companion serve`):** Listens exclusively on `127.0.0.1` (default port `24141`, with fresh-install `24141..=24150` fallback), forwards `/v1beta/models/*:generateContent` and `:streamGenerateContent` byte-for-byte to preserve Gemini implicit context caching, authenticates upstream via `x-goog-api-key` (never `?key=`), and supports `--adopt-running` (`500ms` takeover) and `--idle-shutdown-secs`.
 - **Embedded MCP App Settings UI (`agy-companion ui-mcp`):** Native Antigravity panel (`ui://companion/settings.html`) accessible from the side panel (`aux_pane`) and left sidebar **Plugins** view (`global`). Includes a live Proxy Status Bar, CloudCode active-upstream badge, **Dock / Launcher Auto-Start** toggle (`set_launcher_integration`), write-only Gemini Settings form with post-save auto-verify and 5-minute model-refresh countdown, copyable `customModelsConfig` snippet, and live Usage & Cache Telemetry — with zero external network fetches and redacted API key handling.
 - **Usage & Cache Observability:** Tees `usageMetadata` from unary JSON and SSE responses into `GET /api/stats` and a WAL-mode SQLite database (`usage.db`, Unix mode `0600`) containing only token counts and latency metadata (zero prompt/response bodies or secrets).
@@ -41,7 +41,7 @@ Open the Settings panel in Antigravity App via the side panel `+` menu (**Antigr
 
 In the panel:
 1. Paste your Gemini API key (stored atomically — Unix mode `0600` / parent dir `0700`, Windows user-profile ACLs with bounded `3`-attempt rename retry — never returned in plaintext), or export `GEMINI_API_KEY` in your shell environment.
-2. Adjust the default model (Gemini 3 & 4 only; default: `gemini-4-hydrogen`), upstream base URL (default: `https://generativelanguage.googleapis.com`), or loopback port (default: `24141`) if needed.
+2. Adjust the default model (Gemini 3.8+ & 4+ only; default: `gemini-4-hydrogen`), upstream base URL (default: `https://generativelanguage.googleapis.com`), or loopback port (default: `24141`) if needed.
 3. Click **Save Settings**. The UI automatically verifies the key via `test_connection` and displays a live 5-minute model-refresh countdown (or quit with `Cmd+Q` and reopen Antigravity to load `(Proxy)` models immediately).
 4. Use the **Dock / Launcher Auto-Start** card to toggle login-shell integration on macOS/Linux (or run `agy-companion launch` directly at any time to launch Antigravity App in Hybrid Mode).
 
@@ -148,20 +148,20 @@ When developing from a local checkout:
    ```bash
    agy-companion integration status
    ```
-   If your shell RC file is symlinked or read-only (Nix, Home Manager, Stow), `integration` reports `manual_required` and prints a single static line to add (or opt in explicitly with `agy-companion integration enable --follow-rc-symlink`).
+   If your shell RC file is symlinked or read-only (Nix, Home Manager, Stow), `integration` reports `state: "manual_required"` and prints a single static line to add (or opt in explicitly with `agy-companion integration enable --follow-rc-symlink`).
 3. **Fix config file permissions (macOS/Linux):**
    ```bash
    chmod 600 ~/.config/agy-companion/config.json
    ```
    *(Substitute `$XDG_CONFIG_HOME/agy-companion/config.json` or `$AGY_COMPANION_CONFIG` if overridden. On Windows, Unix mode checks are skipped and user-profile ACLs apply.)*
-4. **Non-Gemini-3/4 `400` in an agent subshell:** Run `unset GOOGLE_GEMINI_BASE_URL` in that command to reach the Gemini API directly without passing through the Gemini-3/4-only proxy.
+4. **Non-Gemini-3.8+/4+ `400` in an agent subshell:** Run `unset GOOGLE_GEMINI_BASE_URL` in that command to reach the Gemini API directly without passing through the Gemini-3.8+/4+-only proxy.
 5. **Probe the proxy directly:**
    ```bash
    curl -s http://127.0.0.1:24141/health
    curl -s http://127.0.0.1:24141/api/stats
    ```
 6. **Inspect logs:** Check `~/.local/share/agy-companion/proxy.log` (Managed On-Demand Daemon) and `~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/` (Antigravity sidecar).
-7. **Port changes & version skew:** Changes to `api_key`, `base_url`, and `default_model` hot-reload automatically via config mtime. Changing `listen_port` or upgrading requires restarting the proxy sidecar (or quitting Antigravity with `Cmd+Q` and reopening).
+7. **Port changes & version skew:** Changes to `api_key`, `base_url`, and `default_model` hot-reload automatically via config mtime. Changing `proxy.port` or upgrading requires restarting the proxy sidecar (or quitting Antigravity with `Cmd+Q` and reopening).
 8. **Reload the MCP App UI:** In Antigravity App, restart the `agy-companion_hub` server under **Settings > MCP Servers > Restart**.
 
 ## Security & Privacy

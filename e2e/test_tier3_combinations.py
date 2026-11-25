@@ -111,12 +111,13 @@ class TestTier3Combinations(E2ETestCase):
         self.assertEqual(events[0]["reasoning_tokens"], 50)
 
         stats = poll_stats(proxy.port, min_requests=1)
-        self.assertEqual(stats["requests"], 1)
-        self.assertEqual(stats["prompt_tokens"], 1000)
-        self.assertEqual(stats["cached_tokens"], 750)
-        self.assertEqual(stats["output_tokens"], 200)
-        self.assertEqual(stats["reasoning_tokens"], 50)
-        self.assertAlmostEqual(stats["cache_hit_ratio"], 0.75, places=6)
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 1)
+        self.assertEqual(usage["prompt_tokens"], 1000)
+        self.assertEqual(usage["cached_tokens"], 750)
+        self.assertEqual(usage["output_tokens"], 200)
+        self.assertEqual(usage["reasoning_tokens"], 50)
+        self.assertAlmostEqual(usage["cache_hit_ratio"], 0.75, places=6)
 
         mcp = self.start_mcp(env, config_path=cfg)
         get_res = mcp.call_tool("get_settings", {})
@@ -477,12 +478,13 @@ class TestTier3Combinations(E2ETestCase):
         sum_out = sum(e["output_tokens"] for e in events)
         sum_reason = sum(e["reasoning_tokens"] for e in events)
 
-        self.assertEqual(stats["requests"], 3)
-        self.assertEqual(stats["prompt_tokens"], sum_in)
-        self.assertEqual(stats["cached_tokens"], sum_cached)
-        self.assertEqual(stats["output_tokens"], sum_out)
-        self.assertEqual(stats["reasoning_tokens"], sum_reason)
-        self.assertAlmostEqual(stats["cache_hit_ratio"], sum_cached / sum_in, places=6)
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 3)
+        self.assertEqual(usage["prompt_tokens"], sum_in)
+        self.assertEqual(usage["cached_tokens"], sum_cached)
+        self.assertEqual(usage["output_tokens"], sum_out)
+        self.assertEqual(usage["reasoning_tokens"], sum_reason)
+        self.assertAlmostEqual(usage["cache_hit_ratio"], sum_cached / sum_in, places=6)
 
     def test_t3_14_doctor_and_get_settings_both_detect_proxy_version_skew(self) -> None:
         """F6+F8+F9: Both doctor and ui-mcp get_settings detect stale proxy version '0.0.1-stale'."""
@@ -645,11 +647,12 @@ class TestTier3Combinations(E2ETestCase):
         self.assertIn("xdg", resp.text)
 
         stats = poll_stats(proxy.port, min_requests=1, timeout=3.0)
-        self.assertEqual(stats.get("requests"), 1)
-        self.assertEqual(stats.get("prompt_tokens"), 500)
-        self.assertEqual(stats.get("cached_tokens"), 300)
-        self.assertEqual(stats.get("output_tokens"), 25)
-        self.assertEqual(stats.get("reasoning_tokens"), 8)
+        usage = stats["usage"]
+        self.assertEqual(usage.get("requests"), 1)
+        self.assertEqual(usage.get("prompt_tokens"), 500)
+        self.assertEqual(usage.get("cached_tokens"), 300)
+        self.assertEqual(usage.get("output_tokens"), 25)
+        self.assertEqual(usage.get("reasoning_tokens"), 8)
 
         files, events = poll_usage_events(expected_usage_dir, min_count=1, timeout=3.0)
         self.assertGreaterEqual(len(files), 1, f"Expected SQLite usage.db under {expected_usage_dir}")

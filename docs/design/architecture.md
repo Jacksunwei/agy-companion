@@ -60,9 +60,10 @@ agy-companion/
 ├── Cargo.toml                        # Cargo workspace root (single version source of truth)
 ├── Cargo.lock
 ├── crates/
-│   ├── companion-core/               # Pure Rust domain (zero network/fs I/O):
-│   │                                 #   routing config (schema_version = 1), usage metadata parser,
-│   │                                 #   UsageEvent / UsageSink trait, secret redaction helpers
+│   ├── companion-core/               # Core Rust domain & safe filesystem primitives:
+│   │                                 #   nested v1 config, fs_safe TOCTOU/atomic guards, protocol wire DTOs,
+│   │                                 #   validation, Gemini 3.8+/4+ models catalog, redaction,
+│   │                                 #   usage/{mod,sqlite} (optional `sqlite` feature), and login-shell integration
 │   ├── companion-providers/          # Upstream provider adapters (raw reqwest + rustls, direct 1-hop Gemini <-> Provider):
 │   │                                 #   M1: gemini (byte-for-byte streaming pass-through + usage tee)
 │   │                                 #   M4: openai_compat (Ollama Cloud, local Ollama, OpenRouter, vLLM)
@@ -151,8 +152,8 @@ Path resolution lives in pure, deterministic helpers in `companion-core` and app
 
 | Artifact | Precedence (Highest → Lowest) | Validation & XDG Rules |
 | --- | --- | --- |
-| **Config file** | 1. `--config <path>` CLI flag<br>2. `AGY_COMPANION_CONFIG` env var<br>3. `$XDG_CONFIG_HOME/agy-companion/config.json`<br>4. Platform default (table below) | Explicit overrides (`--config`, `AGY_COMPANION_CONFIG`) and `XDG_CONFIG_HOME` values are validated via `validate_path` and platform-aware traversal/NUL checks (any `..` traversal or NUL byte fails closed with `InvalidPath`, even on relative traversal payloads). Per the XDG Base Directory Specification, unset, empty/whitespace, or benign relative `XDG_CONFIG_HOME` values (without `..` or NUL) are ignored and fall back to the platform default. Higher-precedence valid overrides short-circuit lower tiers. |
-| **Usage data directory** | 1. `config.usage_dir`<br>2. `$XDG_DATA_HOME/agy-companion/usage`<br>3. Platform default (table below) | `config.usage_dir` and `XDG_DATA_HOME` values reject `..` traversal and NUL bytes fail-closed with `InvalidPath` (even on relative traversal payloads). Unset, empty/whitespace, or benign relative `XDG_DATA_HOME` values are ignored and fall back to the platform default. Stores a WAL-mode SQLite database (`usage.db`, `PRAGMA user_version = 1`) inside the resolved directory. |
+| **Config file** | 1. `--config <path>` CLI flag<br>2. `AGY_COMPANION_CONFIG` env var<br>3. `$XDG_CONFIG_HOME/agy-companion/config.json`<br>4. Platform default (table below) | Explicit overrides (`--config`, `AGY_COMPANION_CONFIG`) and `XDG_CONFIG_HOME` values are validated via `fs_safe::validate_path` and platform-aware traversal/NUL checks (any `..` traversal or NUL byte fails closed with `CoreError::Fs(FsError::...)`, even on relative traversal payloads). Per the XDG Base Directory Specification, unset, empty/whitespace, or benign relative `XDG_CONFIG_HOME` values (without `..` or NUL) are ignored and fall back to the platform default. Higher-precedence valid overrides short-circuit lower tiers. |
+| **Usage data directory** | 1. `config.usage_dir`<br>2. `$XDG_DATA_HOME/agy-companion/usage`<br>3. Platform default (table below) | `config.usage_dir` and `XDG_DATA_HOME` values reject `..` traversal and NUL bytes fail-closed with `CoreError::Fs(FsError::...)` (even on relative traversal payloads). Unset, empty/whitespace, or benign relative `XDG_DATA_HOME` values are ignored and fall back to the platform default. Stores a WAL-mode SQLite database (`usage.db`, `PRAGMA user_version = 1`) inside the resolved directory. |
 
 **Platform Defaults:**
 
@@ -193,12 +194,12 @@ All Milestone 1 components enforce the following boundaries:
 
 1. **Loopback-Only Binding:** `companion-proxy` MUST bind exclusively to `127.0.0.1` (never `0.0.0.0`).
 2. **Secret Redaction & Storage:**
-   - Because `agy` CLI ignores MCP `_meta.ui.visibility: ["app"]`, `get_settings` MUST NEVER return plaintext API keys — only redacted hints (`configured: true, hint: "AIza...9x2Q"`).
+   - Because `agy` CLI ignores MCP `_meta.ui.visibility: ["app"]`, `get_settings` MUST NEVER return plaintext API keys — only nested redacted hints (`providers.gemini.api_key_configured: true, providers.gemini.api_key_hint: "AIza...9x2Q"`).
    - Store secrets outside any workspace via atomic temp-file + rename persistence (`Config::save_secure`): Unix enforces mode `0600` files / `0700` parent directories; Windows stores under user-profile ACLs (`%APPDATA%`) with a bounded retry (`3` attempts, `25ms` → `50ms` backoff) on transient `ErrorKind::PermissionDenied` during rename. Never log API keys or send them in URL query parameters (always use `x-goog-api-key` header).
 3. **Frontend XSS & CSP Discipline (`ui/`):**
    - Rely on MCP App default strict CSP (`default-src 'none'`); no external CDN scripts or `connectDomains` (all backend calls go through MCP `app.callServerTool`).
    - Zero `innerHTML`, `outerHTML`, `document.write`, or `dangerouslySetInnerHTML` — build DOM strictly with `textContent`, `document.createElement`, and `replaceChildren`.
-   - Persist edits eagerly via `save_settings` (Antigravity does not send `ui/resource-teardown`).
+   - Persist edits eagerly via strict nested `save_settings` patches (`#[serde(deny_unknown_fields)]`; Antigravity does not send `ui/resource-teardown`).
 4. **Upstream URL & Path Validation:**
    - Upstream remote base URLs must use `https://` (allow `http://127.0.0.1` / `http://localhost` only for local providers or tests).
    - Validate all explicit config/data paths (`--config`, `AGY_COMPANION_CONFIG`, `config.usage_dir`, `--data-dir`) and `XDG_CONFIG_HOME` / `XDG_DATA_HOME` values against traversal (`..`) and NUL bytes (fail-closed, including relative traversal payloads), while ignoring unset, empty/whitespace, or benign relative XDG env vars per the XDG Base Directory Specification; verify SHA-256 checksums before executing any binary downloaded by `plugin/scripts/run-companion.sh`.

@@ -11,11 +11,12 @@ pub mod models;
 
 use std::fs;
 use std::io::ErrorKind;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use companion_core::{Config, CoreError, SqliteUsageSink, UsageSink};
+use companion_core::{Config, CoreError, FsError, SqliteUsageSink, UsageSink};
 use companion_proxy::{ProxyError, ProxyState};
 use companion_ui_mcp::UiMcpError;
 use thiserror::Error;
@@ -49,6 +50,12 @@ pub enum CliError {
     Install(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<FsError> for CliError {
+    fn from(err: FsError) -> Self {
+        Self::Core(CoreError::Fs(err))
+    }
 }
 
 pub(crate) fn normalized_metadata_path(path: &Path) -> PathBuf {
@@ -181,7 +188,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
     let config_path = resolve_cli_config_path(options.config_override.as_deref())?;
     let mut config = load_config_checked(&config_path)?;
     if let Some(port) = options.port_override {
-        config.listen_port = port;
+        config.proxy.port = NonZeroU16::new(port).ok_or(CliError::InvalidPort(0))?;
     }
     config.validate()?;
 
@@ -251,7 +258,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
                 if options.adopt_running && source.kind() == ErrorKind::AddrInUse =>
             {
                 if let Some(health) =
-                    launch::probe_running_companion_proxy(config.listen_port).await
+                    launch::probe_running_companion_proxy(config.proxy.port.get()).await
                 {
                     takeover_retry_used = false;
                     if !logged_adopt {
@@ -358,7 +365,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use companion_core::CoreError;
+    use companion_core::{CoreError, FsError};
     use tempfile::TempDir;
 
     use crate::{
@@ -369,21 +376,27 @@ mod tests {
     fn cli_rejects_path_traversal_in_config_and_data_dir() {
         let cfg_err = resolve_cli_config_path(Some(Path::new("../escape.json")))
             .expect_err("traversal in --config must fail");
-        assert!(matches!(cfg_err, CoreError::InvalidPath { .. }));
+        assert!(matches!(
+            cfg_err,
+            CoreError::Fs(FsError::ParentDirTraversal)
+        ));
 
         let data_err = validate_ui_mcp_paths(
             Some(Path::new("/tmp/valid-config.json")),
             Some(Path::new("../escape")),
         )
         .expect_err("traversal in --data-dir must fail");
-        assert!(matches!(data_err, CoreError::InvalidPath { .. }));
+        assert!(matches!(
+            data_err,
+            CoreError::Fs(FsError::ParentDirTraversal)
+        ));
 
         let empty_data_err = validate_ui_mcp_paths(
             Some(Path::new("/tmp/valid-config.json")),
             Some(Path::new("")),
         )
         .expect_err("empty --data-dir must fail");
-        assert!(matches!(empty_data_err, CoreError::InvalidPath { .. }));
+        assert!(matches!(empty_data_err, CoreError::Fs(FsError::EmptyPath)));
     }
 
     #[test]

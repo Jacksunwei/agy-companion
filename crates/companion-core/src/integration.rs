@@ -1,6 +1,6 @@
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{ErrorKind, Read};
+use std::fs;
+use std::io::ErrorKind;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -9,19 +9,23 @@ use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
 use crate::config::{
-    CoreError, PROXY_PLACEHOLDER_API_KEY, TargetPlatform, XDG_CONFIG_HOME_ENV_VAR,
-    default_data_dir, read_optional_env, resolve_xdg_base, validate_path,
-    write_file_atomic_with_mode,
+    CoreError, TargetPlatform, XDG_CONFIG_HOME_ENV_VAR, default_data_dir, read_optional_env,
+    resolve_xdg_base,
 };
+use crate::fs_safe::{
+    self, AtomicWriteOptions, DirChainStatus, FsError, ParentDirPolicy, SymlinkPolicy,
+    TargetFilePolicy,
+};
+use crate::validation::PROXY_PLACEHOLDER_API_KEY;
 
 pub const HOOK_BEGIN_MARKER: &str =
     "# >>> agy-companion (Antigravity Dock/Launcher integration) >>>";
 pub const HOOK_END_MARKER: &str = "# <<< agy-companion <<<";
-pub const MAX_RC_FILE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_RC_FILE_BYTES: u64 = 1024 * 1024;
 pub const ENV_SCRIPT_FILENAME: &str = "env.sh";
-pub const FISH_DROPIN_FILENAME: &str = "agy-companion.fish";
+pub(crate) const FISH_DROPIN_FILENAME: &str = "agy-companion.fish";
 pub const DEFAULT_RESTORE_PREFIX: &str = "AGY_COMPANION_ORIG_";
-pub const PORTABLE_ENV_SCRIPT_EXPR: &str =
+pub(crate) const PORTABLE_ENV_SCRIPT_EXPR: &str =
     "${XDG_DATA_HOME:-$HOME/.local/share}/agy-companion/env.sh";
 
 const ZDOTDIR_ENV_VAR: &str = "ZDOTDIR";
@@ -81,33 +85,138 @@ pub struct IntegrationOptions {
     pub follow_rc_symlink: bool,
 }
 
+/// Core shell and path metadata shared by `disabled`, `enabled`, and `manual_required` statuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationPaths {
+    pub shell: ShellKind,
+    pub rc_path: PathBuf,
+    pub env_script_path: Option<PathBuf>,
+    pub binary_path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrationStatus {
-    pub supported: bool,
+    pub state: IntegrationState,
     pub enabled: bool,
-    pub manual_required: bool,
+    pub hybrid_active: bool,
     pub shell: Option<ShellKind>,
     pub rc_path: Option<PathBuf>,
     pub env_script_path: Option<PathBuf>,
     pub binary_path: Option<PathBuf>,
     pub symlink_target: Option<PathBuf>,
     pub manual_snippet: Option<String>,
-    pub hybrid_active: bool,
     pub message: Option<String>,
 }
 
 impl IntegrationStatus {
-    pub fn state(&self) -> IntegrationState {
-        if !self.supported {
-            IntegrationState::Unsupported
-        } else if self.manual_required {
-            IntegrationState::ManualRequired
-        } else if self.enabled && self.hybrid_active {
-            IntegrationState::Active
-        } else if self.enabled {
-            IntegrationState::Enabled
-        } else {
-            IntegrationState::Disabled
+    pub const fn state(&self) -> IntegrationState {
+        self.state
+    }
+
+    /// Marks Hybrid Mode as active (e.g., when live CloudCode catalog traffic is observed).
+    /// Promotes `Enabled` -> `Active` while leaving `Disabled`, `ManualRequired`, and `Unsupported` intact.
+    pub fn mark_hybrid_active(&mut self) {
+        self.hybrid_active = true;
+        if self.state == IntegrationState::Enabled {
+            self.state = IntegrationState::Active;
+        }
+    }
+
+    pub fn unsupported(hybrid_active: bool, message: impl Into<String>) -> Self {
+        Self {
+            state: IntegrationState::Unsupported,
+            enabled: false,
+            hybrid_active,
+            shell: None,
+            rc_path: None,
+            env_script_path: None,
+            binary_path: None,
+            symlink_target: None,
+            manual_snippet: None,
+            message: Some(message.into()),
+        }
+    }
+
+    pub fn error_fallback(hybrid_active: bool, message: impl Into<String>) -> Self {
+        Self {
+            state: if is_platform_supported() {
+                IntegrationState::Disabled
+            } else {
+                IntegrationState::Unsupported
+            },
+            enabled: false,
+            hybrid_active,
+            shell: None,
+            rc_path: None,
+            env_script_path: None,
+            binary_path: None,
+            symlink_target: None,
+            manual_snippet: None,
+            message: Some(message.into()),
+        }
+    }
+
+    pub fn disabled(
+        paths: IntegrationPaths,
+        symlink_target: Option<PathBuf>,
+        hybrid_active: bool,
+    ) -> Self {
+        Self {
+            state: IntegrationState::Disabled,
+            enabled: false,
+            hybrid_active,
+            shell: Some(paths.shell),
+            rc_path: Some(paths.rc_path),
+            env_script_path: paths.env_script_path,
+            binary_path: Some(paths.binary_path),
+            symlink_target,
+            manual_snippet: None,
+            message: None,
+        }
+    }
+
+    pub fn enabled(
+        paths: IntegrationPaths,
+        symlink_target: Option<PathBuf>,
+        hybrid_active: bool,
+    ) -> Self {
+        Self {
+            state: if hybrid_active {
+                IntegrationState::Active
+            } else {
+                IntegrationState::Enabled
+            },
+            enabled: true,
+            hybrid_active,
+            shell: Some(paths.shell),
+            rc_path: Some(paths.rc_path),
+            env_script_path: paths.env_script_path,
+            binary_path: Some(paths.binary_path),
+            symlink_target,
+            manual_snippet: None,
+            message: None,
+        }
+    }
+
+    pub fn manual_required(
+        paths: IntegrationPaths,
+        enabled: bool,
+        symlink_target: Option<PathBuf>,
+        manual_snippet: Option<String>,
+        hybrid_active: bool,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: IntegrationState::ManualRequired,
+            enabled,
+            hybrid_active,
+            shell: Some(paths.shell),
+            rc_path: Some(paths.rc_path),
+            env_script_path: paths.env_script_path,
+            binary_path: Some(paths.binary_path),
+            symlink_target,
+            manual_snippet,
+            message: Some(message.into()),
         }
     }
 }
@@ -156,7 +265,7 @@ pub fn detect_shell(shell_env: Option<&str>) -> ShellKind {
     }
 }
 
-pub fn is_loopback_hybrid_url(raw: &str) -> bool {
+pub(crate) fn is_loopback_hybrid_url(raw: &str) -> bool {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return false;
@@ -193,7 +302,7 @@ pub fn detect_hybrid_active() -> bool {
 }
 
 fn validate_shell_safe_path(path: &Path) -> Result<&str, CoreError> {
-    validate_path(path)?;
+    fs_safe::validate_path(path)?;
     let raw = path.to_str().ok_or_else(|| CoreError::InvalidPath {
         reason: "path must be valid UTF-8".to_string(),
     })?;
@@ -254,7 +363,7 @@ where
 
     let resolved_data = match data_dir {
         Some(dir) => {
-            validate_path(dir)?;
+            fs_safe::validate_path(dir)?;
             Some(dir.to_path_buf())
         }
         None => default_data_dir().ok(),
@@ -292,7 +401,7 @@ fn resolve_optional_absolute_dir(candidate: Option<&Path>) -> Result<Option<Path
     if let Some(raw) = dir.to_str() {
         return resolve_xdg_base(Some(raw), TargetPlatform::current());
     }
-    validate_path(dir)?;
+    fs_safe::validate_path(dir)?;
     if dir.is_absolute() {
         Ok(Some(dir.to_path_buf()))
     } else {
@@ -300,13 +409,13 @@ fn resolve_optional_absolute_dir(candidate: Option<&Path>) -> Result<Option<Path
     }
 }
 
-pub fn resolve_rc_path(
+pub(crate) fn resolve_rc_path(
     shell: ShellKind,
     home: &Path,
     zdotdir: Option<&Path>,
     xdg_config_home: Option<&Path>,
 ) -> Result<PathBuf, CoreError> {
-    validate_path(home)?;
+    fs_safe::validate_path(home)?;
     match shell {
         ShellKind::Zsh => {
             let base =
@@ -316,7 +425,7 @@ pub fn resolve_rc_path(
         ShellKind::Bash => {
             for candidate in [".bash_profile", ".bash_login", ".profile"] {
                 let path = home.join(candidate);
-                let check_path: PathBuf = path.components().collect();
+                let check_path = fs_safe::normalize_path(&path);
                 if fs::symlink_metadata(&check_path).is_ok() {
                     return Ok(path);
                 }
@@ -331,7 +440,7 @@ pub fn resolve_rc_path(
     }
 }
 
-pub fn render_env_sh(binary_path: &Path) -> Result<String, CoreError> {
+pub(crate) fn render_env_sh(binary_path: &Path) -> Result<String, CoreError> {
     let bin_str = validate_shell_safe_path(binary_path)?;
     let quoted_bin = posix_single_quote(bin_str);
     let placeholder = PROXY_PLACEHOLDER_API_KEY;
@@ -542,7 +651,7 @@ fi
     ))
 }
 
-pub fn render_fish_dropin(binary_path: &Path) -> Result<String, CoreError> {
+pub(crate) fn render_fish_dropin(binary_path: &Path) -> Result<String, CoreError> {
     let bin_str = validate_shell_safe_path(binary_path)?;
     let quoted_bin = fish_single_quote(bin_str);
     let placeholder = PROXY_PLACEHOLDER_API_KEY;
@@ -762,20 +871,34 @@ pub fn render_rc_snippet(shell: ShellKind, target_path: &Path) -> Result<String,
     }
 }
 
-pub fn write_env_script(env_script_path: &Path, binary_path: &Path) -> Result<(), CoreError> {
+fn rc_write_options(file_mode: u32) -> AtomicWriteOptions {
+    AtomicWriteOptions {
+        file_mode,
+        dir_mode: DEFAULT_RC_DIR_MODE,
+        parent_policy: ParentDirPolicy::AllowSymlink,
+        target_policy: TargetFilePolicy::RejectSymlinkAndNonRegular,
+    }
+}
+
+pub(crate) fn write_env_script(
+    env_script_path: &Path,
+    binary_path: &Path,
+) -> Result<(), CoreError> {
     validate_shell_safe_path(env_script_path)?;
-    let home = dirs::home_dir();
+    let home = fs_safe::default_home_dir();
     validate_env_script_parent_dir(env_script_path, home.as_deref())?;
     let content = render_env_sh(binary_path)?;
-    write_file_atomic_with_mode(
+    fs_safe::write_atomic(
         env_script_path,
         content.as_bytes(),
-        0o600,
-        0o700,
-        true,
-        false,
-        true,
-    )
+        AtomicWriteOptions {
+            file_mode: 0o600,
+            dir_mode: 0o700,
+            parent_policy: ParentDirPolicy::RejectSymlinkAndTighten,
+            target_policy: TargetFilePolicy::RejectSymlinkAndNonRegular,
+        },
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -925,101 +1048,21 @@ struct LoadedRegularFile {
 }
 
 fn read_regular_file_checked(path: &Path) -> Result<Option<LoadedRegularFile>, CoreError> {
-    validate_path(path)?;
-    let check_path: PathBuf = path.components().collect();
-    let lstat_meta = match fs::symlink_metadata(&check_path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(CoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+    let Some((content, meta)) =
+        fs_safe::read_regular_file_utf8_bounded(path, MAX_RC_FILE_BYTES, SymlinkPolicy::Reject)?
+    else {
+        return Ok(None);
     };
-
-    if lstat_meta.file_type().is_symlink() {
-        return Err(CoreError::InvalidPath {
-            reason: format!("symbolic links are not allowed for '{}'", path.display()),
-        });
-    }
-    if !lstat_meta.file_type().is_file() {
-        return Err(CoreError::InvalidPath {
-            reason: format!("path '{}' must be a regular file", path.display()),
-        });
-    }
-    if lstat_meta.len() > MAX_RC_FILE_BYTES {
-        return Err(CoreError::InvalidPath {
-            reason: format!(
-                "file '{}' exceeds maximum allowed size of {MAX_RC_FILE_BYTES} bytes",
-                path.display()
-            ),
-        });
-    }
-
-    let file = File::open(&check_path).map_err(|source| CoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let fstat_meta = file.metadata().map_err(|source| CoreError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !fstat_meta.file_type().is_file() {
-        return Err(CoreError::InvalidPath {
-            reason: format!("path '{}' must be a regular file", path.display()),
-        });
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if lstat_meta.dev() != fstat_meta.dev() || lstat_meta.ino() != fstat_meta.ino() {
-            return Err(CoreError::InvalidPath {
-                reason: format!(
-                    "path '{}' changed during open (TOCTOU symlink/file swap detected)",
-                    path.display()
-                ),
-            });
-        }
-    }
-    if fstat_meta.len() > MAX_RC_FILE_BYTES {
-        return Err(CoreError::InvalidPath {
-            reason: format!(
-                "file '{}' exceeds maximum allowed size of {MAX_RC_FILE_BYTES} bytes",
-                path.display()
-            ),
-        });
-    }
-
-    let mut bytes = Vec::new();
-    file.take(MAX_RC_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|source| CoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() as u64 > MAX_RC_FILE_BYTES {
-        return Err(CoreError::InvalidPath {
-            reason: format!(
-                "file '{}' exceeds maximum allowed size of {MAX_RC_FILE_BYTES} bytes",
-                path.display()
-            ),
-        });
-    }
-
-    let content = String::from_utf8(bytes).map_err(|_| CoreError::InvalidPath {
-        reason: format!("file '{}' is not valid UTF-8", path.display()),
-    })?;
 
     #[cfg(unix)]
     let unix_mode = {
         use std::os::unix::fs::PermissionsExt;
-        fstat_meta.permissions().mode() & 0o777
+        meta.permissions().mode() & 0o777
     };
     #[cfg(not(unix))]
     let unix_mode = DEFAULT_RC_FILE_MODE;
 
-    let readonly = fstat_meta.permissions().readonly();
+    let readonly = meta.permissions().readonly();
     Ok(Some(LoadedRegularFile {
         content,
         unix_mode,
@@ -1052,19 +1095,6 @@ enum RcInspection {
 }
 
 #[derive(Debug)]
-enum DirChainInspection {
-    SafeDir,
-    Missing,
-    Symlink {
-        symlink_dir: PathBuf,
-        link_target: Option<PathBuf>,
-    },
-    NotDirectory {
-        path: PathBuf,
-    },
-}
-
-#[derive(Debug)]
 enum DirTargetState {
     Ready,
     Missing,
@@ -1077,45 +1107,11 @@ fn default_fish_dir_chain(
 ) -> Result<(PathBuf, &'static [&'static str]), CoreError> {
     if let Some(xdg) = resolve_optional_absolute_dir(xdg_config_home)? {
         let default_dot_config = home.join(".config");
-        let norm_xdg: PathBuf = xdg.components().collect();
-        let norm_default: PathBuf = default_dot_config.components().collect();
-        if norm_xdg != norm_default {
+        if fs_safe::normalize_path(&xdg) != fs_safe::normalize_path(&default_dot_config) {
             return Ok((xdg, &["fish", "conf.d"]));
         }
     }
     Ok((home.to_path_buf(), &[".config", "fish", "conf.d"]))
-}
-
-fn inspect_dir_chain(root: &Path, rel_dirs: &[&str]) -> Result<DirChainInspection, CoreError> {
-    let mut current = root.to_path_buf();
-    for segment in rel_dirs {
-        current.push(segment);
-        let check_path: PathBuf = current.components().collect();
-        match fs::symlink_metadata(&check_path) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    let link_target = fs::read_link(&check_path).ok();
-                    return Ok(DirChainInspection::Symlink {
-                        symlink_dir: current,
-                        link_target,
-                    });
-                }
-                if !meta.file_type().is_dir() {
-                    return Ok(DirChainInspection::NotDirectory { path: current });
-                }
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                return Ok(DirChainInspection::Missing);
-            }
-            Err(source) => {
-                return Err(CoreError::Io {
-                    path: current,
-                    source,
-                });
-            }
-        }
-    }
-    Ok(DirChainInspection::SafeDir)
 }
 
 fn validate_env_script_parent_dir(env_path: &Path, home: Option<&Path>) -> Result<(), CoreError> {
@@ -1128,63 +1124,24 @@ fn validate_env_script_parent_dir(env_path: &Path, home: Option<&Path>) -> Resul
                 env_path.display()
             ),
         })?;
-    let norm_data_dir: PathBuf = data_dir.components().collect();
+    let norm_data_dir = fs_safe::normalize_path(data_dir);
     if let Some(home_dir) = home {
-        let default_data_dir: PathBuf = home_dir
-            .join(".local")
-            .join("share")
-            .join("agy-companion")
-            .components()
-            .collect();
+        let default_data_dir =
+            fs_safe::normalize_path(&home_dir.join(".local").join("share").join("agy-companion"));
         if norm_data_dir == default_data_dir {
-            match inspect_dir_chain(home_dir, &[".local", "share", "agy-companion"])? {
-                DirChainInspection::SafeDir | DirChainInspection::Missing => return Ok(()),
-                DirChainInspection::Symlink { symlink_dir, .. } => {
-                    return Err(CoreError::InvalidPath {
-                        reason: format!(
-                            "symbolic links are not allowed for env script data directory '{}'",
-                            symlink_dir.display()
-                        ),
-                    });
+            match fs_safe::inspect_dir_chain(home_dir, &[".local", "share", "agy-companion"])? {
+                DirChainStatus::SafeDir | DirChainStatus::Missing => return Ok(()),
+                DirChainStatus::Symlink { path, .. } => {
+                    return Err(FsError::SymlinkRejected { path }.into());
                 }
-                DirChainInspection::NotDirectory { path } => {
-                    return Err(CoreError::InvalidPath {
-                        reason: format!(
-                            "intermediate directory '{}' for '{}' is not a directory",
-                            path.display(),
-                            env_path.display()
-                        ),
-                    });
+                DirChainStatus::NotDirectory { path } => {
+                    return Err(FsError::NotDirectory { path }.into());
                 }
             }
         }
     }
-    match fs::symlink_metadata(&norm_data_dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(CoreError::InvalidPath {
-                    reason: format!(
-                        "symbolic links are not allowed for env script data directory '{}'",
-                        data_dir.display()
-                    ),
-                });
-            }
-            if !meta.file_type().is_dir() {
-                return Err(CoreError::InvalidPath {
-                    reason: format!(
-                        "env script parent directory '{}' must be a directory",
-                        data_dir.display()
-                    ),
-                });
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(CoreError::Io {
-            path: data_dir.to_path_buf(),
-            source,
-        }),
-    }
+    let _ = fs_safe::inspect_existing_dir(data_dir)?;
+    Ok(())
 }
 
 fn validate_env_script_dir_chain(ctx: &ResolvedContext) -> Result<(), CoreError> {
@@ -1192,24 +1149,8 @@ fn validate_env_script_dir_chain(ctx: &ResolvedContext) -> Result<(), CoreError>
         return Ok(());
     };
     validate_env_script_parent_dir(env_path, Some(&ctx.home))?;
-    let check_path: PathBuf = env_path.components().collect();
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::InvalidPath {
-            reason: format!(
-                "symbolic links are not allowed for env script '{}'",
-                env_path.display()
-            ),
-        }),
-        Ok(meta) if !meta.file_type().is_file() => Err(CoreError::InvalidPath {
-            reason: format!("env script '{}' must be a regular file", env_path.display()),
-        }),
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(CoreError::Io {
-            path: env_path.to_path_buf(),
-            source,
-        }),
-    }
+    let _ = fs_safe::inspect_regular_file_if_exists(env_path, None)?;
+    Ok(())
 }
 
 fn inspect_symlinked_dir_chain_target(
@@ -1219,7 +1160,7 @@ fn inspect_symlinked_dir_chain_target(
     let mut current = root.to_path_buf();
     for segment in rel_dirs {
         current.push(segment);
-        let check_path: PathBuf = current.components().collect();
+        let check_path = fs_safe::normalize_path(&current);
         match fs::metadata(&check_path) {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => return Ok(DirTargetState::NotDirectory { path: current }),
@@ -1236,8 +1177,8 @@ fn inspect_symlinked_dir_chain_target(
 }
 
 fn inspect_rc_file(path: &Path) -> Result<RcInspection, CoreError> {
-    validate_path(path)?;
-    let check_path: PathBuf = path.components().collect();
+    fs_safe::validate_path(path)?;
+    let check_path = fs_safe::normalize_path(path);
     let lstat_meta = match fs::symlink_metadata(&check_path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(RcInspection::Missing),
@@ -1304,27 +1245,15 @@ fn inspect_rc_file(path: &Path) -> Result<RcInspection, CoreError> {
 }
 
 fn is_regular_file_existing(path: &Path) -> bool {
-    let check_path: PathBuf = path.components().collect();
+    let check_path = fs_safe::normalize_path(path);
     fs::symlink_metadata(&check_path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
 fn build_unsupported_status(hybrid_active: bool) -> IntegrationStatus {
-    IntegrationStatus {
-        supported: false,
-        enabled: false,
-        manual_required: false,
-        shell: None,
-        rc_path: None,
-        env_script_path: None,
-        binary_path: None,
-        symlink_target: None,
-        manual_snippet: None,
+    IntegrationStatus::unsupported(
         hybrid_active,
-        message: Some(
-            "Login-shell RC integration is only used on macOS and Linux. Use `agy-companion launch` or the Windows Start Menu shortcut instead."
-                .to_string(),
-        ),
-    }
+        "Login-shell RC integration is only used on macOS and Linux. Use `agy-companion launch` or the Windows Start Menu shortcut instead.",
+    )
 }
 
 struct ResolvedContext {
@@ -1336,6 +1265,17 @@ struct ResolvedContext {
     home: PathBuf,
     zdotdir: Option<PathBuf>,
     xdg_config_home: Option<PathBuf>,
+}
+
+impl ResolvedContext {
+    fn into_paths(self) -> IntegrationPaths {
+        IntegrationPaths {
+            shell: self.shell,
+            rc_path: self.rc_path,
+            env_script_path: self.env_script_path,
+            binary_path: self.binary_path,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1351,16 +1291,16 @@ fn resolve_context(
     let home_dir = home
         .map(Path::to_path_buf)
         .ok_or(CoreError::HomeDirUnavailable)?;
-    validate_path(&home_dir)?;
+    fs_safe::validate_path(&home_dir)?;
 
     let (data_dir, use_portable_env_expr) = match opts.data_dir.as_deref() {
         Some(custom) => {
-            validate_path(custom)?;
+            fs_safe::validate_path(custom)?;
             (custom.to_path_buf(), false)
         }
         None => match default_data_override {
             Some(dir) => {
-                validate_path(dir)?;
+                fs_safe::validate_path(dir)?;
                 (dir.to_path_buf(), true)
             }
             None => (default_data_dir()?, true),
@@ -1456,27 +1396,13 @@ fn remove_env_script_if_unused(ctx: &ResolvedContext) -> Result<(), CoreError> {
     if env_script_still_referenced_elsewhere(ctx, &ctx.rc_path)? {
         return Ok(());
     }
-    let check_path: PathBuf = env_path.components().collect();
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::InvalidPath {
-            reason: format!(
-                "symbolic links are not allowed for env script '{}'",
-                env_path.display()
-            ),
-        }),
-        Ok(meta) if !meta.file_type().is_file() => Err(CoreError::InvalidPath {
-            reason: format!("env script '{}' must be a regular file", env_path.display()),
-        }),
-        Ok(_) => fs::remove_file(&check_path).map_err(|source| CoreError::Io {
+    if fs_safe::inspect_regular_file_if_exists(env_path, None)?.is_some() {
+        fs::remove_file(fs_safe::normalize_path(env_path)).map_err(|source| FsError::Io {
             path: env_path.to_path_buf(),
             source,
-        }),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(CoreError::Io {
-            path: env_path.to_path_buf(),
-            source,
-        }),
+        })?;
     }
+    Ok(())
 }
 
 struct ProcessEnvInputs {
@@ -1487,7 +1413,7 @@ struct ProcessEnvInputs {
 }
 
 fn read_process_env_inputs() -> Result<ProcessEnvInputs, CoreError> {
-    let home = dirs::home_dir();
+    let home = fs_safe::default_home_dir();
     let zdotdir = read_optional_env(ZDOTDIR_ENV_VAR)?.map(PathBuf::from);
     let xdg_config_home = read_optional_env(XDG_CONFIG_HOME_ENV_VAR)?.map(PathBuf::from);
     let shell_env = std::env::var(SHELL_ENV_VAR).ok();
@@ -1578,19 +1504,13 @@ fn status_with_env(
     if ctx.shell == ShellKind::Fish && opts.rc_file.is_none() {
         let (fish_root, fish_rel_dirs) =
             default_fish_dir_chain(&ctx.home, ctx.xdg_config_home.as_deref())?;
-        match inspect_dir_chain(&fish_root, fish_rel_dirs)? {
-            DirChainInspection::SafeDir | DirChainInspection::Missing => {}
-            DirChainInspection::NotDirectory { path } => {
-                return Err(CoreError::InvalidPath {
-                    reason: format!(
-                        "intermediate directory '{}' for '{}' is not a directory",
-                        path.display(),
-                        ctx.rc_path.display()
-                    ),
-                });
+        match fs_safe::inspect_dir_chain(&fish_root, fish_rel_dirs)? {
+            DirChainStatus::SafeDir | DirChainStatus::Missing => {}
+            DirChainStatus::NotDirectory { path } => {
+                return Err(FsError::NotDirectory { path }.into());
             }
-            DirChainInspection::Symlink {
-                symlink_dir,
+            DirChainStatus::Symlink {
+                path: symlink_dir,
                 link_target,
             } => {
                 let has_markers =
@@ -1610,43 +1530,33 @@ fn status_with_env(
                         ),
                         DirTargetState::Missing | DirTargetState::NotDirectory { .. } => false,
                     };
-                let enabled = has_markers;
-                let manual_required = !has_markers;
                 let symlink_target = link_target.or_else(|| fs::canonicalize(&symlink_dir).ok());
-                return Ok(IntegrationStatus {
-                    supported: true,
-                    enabled,
-                    manual_required,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target,
-                    manual_snippet: manual_required.then_some(snippet),
-                    hybrid_active,
-                    message: manual_required.then(|| {
-                        "Fish configuration directory is a symlink (likely managed by Nix, Stow, or Chezmoi); add the snippet manually."
-                            .to_string()
-                    }),
-                });
+                return if has_markers {
+                    Ok(IntegrationStatus::enabled(
+                        ctx.into_paths(),
+                        symlink_target,
+                        hybrid_active,
+                    ))
+                } else {
+                    Ok(IntegrationStatus::manual_required(
+                        ctx.into_paths(),
+                        false,
+                        symlink_target,
+                        Some(snippet),
+                        hybrid_active,
+                        "Fish configuration directory is a symlink (likely managed by Nix, Stow, or Chezmoi); add the snippet manually.",
+                    ))
+                };
             }
         }
     }
 
     match inspect_rc_file(&ctx.rc_path)? {
-        RcInspection::Missing => Ok(IntegrationStatus {
-            supported: true,
-            enabled: false,
-            manual_required: false,
-            shell: Some(ctx.shell),
-            rc_path: Some(ctx.rc_path),
-            env_script_path: ctx.env_script_path,
-            binary_path: Some(ctx.binary_path),
-            symlink_target: None,
-            manual_snippet: None,
+        RcInspection::Missing => Ok(IntegrationStatus::disabled(
+            ctx.into_paths(),
+            None,
             hybrid_active,
-            message: None,
-        }),
+        )),
         RcInspection::Regular { file, markers } => {
             let has_markers = matches!(markers, MarkerState::Valid { .. });
             let enabled = match ctx.shell {
@@ -1654,22 +1564,28 @@ fn status_with_env(
                 ShellKind::Fish => has_markers,
             };
             let manual_required = file.readonly && !has_markers && env_exists;
-            Ok(IntegrationStatus {
-                supported: true,
-                enabled,
-                manual_required,
-                shell: Some(ctx.shell),
-                rc_path: Some(ctx.rc_path),
-                env_script_path: ctx.env_script_path,
-                binary_path: Some(ctx.binary_path),
-                symlink_target: None,
-                manual_snippet: manual_required.then_some(snippet),
-                hybrid_active,
-                message: manual_required.then(|| {
-                    "RC file is read-only; add the snippet manually to finish enabling auto-start."
-                        .to_string()
-                }),
-            })
+            if manual_required {
+                Ok(IntegrationStatus::manual_required(
+                    ctx.into_paths(),
+                    false,
+                    None,
+                    Some(snippet),
+                    hybrid_active,
+                    "RC file is read-only; add the snippet manually to finish enabling auto-start.",
+                ))
+            } else if enabled {
+                Ok(IntegrationStatus::enabled(
+                    ctx.into_paths(),
+                    None,
+                    hybrid_active,
+                ))
+            } else {
+                Ok(IntegrationStatus::disabled(
+                    ctx.into_paths(),
+                    None,
+                    hybrid_active,
+                ))
+            }
         }
         RcInspection::Symlink {
             link_target,
@@ -1693,22 +1609,28 @@ fn status_with_env(
                 ShellKind::Fish => !has_markers,
             };
             let symlink_target = link_target.or(canonical_target);
-            Ok(IntegrationStatus {
-                supported: true,
-                enabled,
-                manual_required,
-                shell: Some(ctx.shell),
-                rc_path: Some(ctx.rc_path),
-                env_script_path: ctx.env_script_path,
-                binary_path: Some(ctx.binary_path),
-                symlink_target,
-                manual_snippet: manual_required.then_some(snippet),
-                hybrid_active,
-                message: manual_required.then(|| {
-                    "RC file is a symlink (likely managed by Nix, Stow, or Chezmoi); add the snippet manually."
-                        .to_string()
-                }),
-            })
+            if manual_required {
+                Ok(IntegrationStatus::manual_required(
+                    ctx.into_paths(),
+                    false,
+                    symlink_target,
+                    Some(snippet),
+                    hybrid_active,
+                    "RC file is a symlink (likely managed by Nix, Stow, or Chezmoi); add the snippet manually.",
+                ))
+            } else if enabled {
+                Ok(IntegrationStatus::enabled(
+                    ctx.into_paths(),
+                    symlink_target,
+                    hybrid_active,
+                ))
+            } else {
+                Ok(IntegrationStatus::disabled(
+                    ctx.into_paths(),
+                    symlink_target,
+                    hybrid_active,
+                ))
+            }
         }
     }
 }
@@ -1754,19 +1676,13 @@ fn enable_with_env(
     if ctx.shell == ShellKind::Fish && opts.rc_file.is_none() {
         let (fish_root, fish_rel_dirs) =
             default_fish_dir_chain(&ctx.home, ctx.xdg_config_home.as_deref())?;
-        match inspect_dir_chain(&fish_root, fish_rel_dirs)? {
-            DirChainInspection::SafeDir | DirChainInspection::Missing => {}
-            DirChainInspection::NotDirectory { path } => {
-                return Err(CoreError::InvalidPath {
-                    reason: format!(
-                        "intermediate directory '{}' for '{}' is not a directory",
-                        path.display(),
-                        ctx.rc_path.display()
-                    ),
-                });
+        match fs_safe::inspect_dir_chain(&fish_root, fish_rel_dirs)? {
+            DirChainStatus::SafeDir | DirChainStatus::Missing => {}
+            DirChainStatus::NotDirectory { path } => {
+                return Err(FsError::NotDirectory { path }.into());
             }
-            DirChainInspection::Symlink {
-                symlink_dir,
+            DirChainStatus::Symlink {
+                path: symlink_dir,
                 link_target,
             } => {
                 let target_display = link_target.or_else(|| fs::canonicalize(&symlink_dir).ok());
@@ -1797,42 +1713,34 @@ fn enable_with_env(
                         let fish_needs_update = existing_content
                             .as_deref()
                             .is_some_and(|content| !content.contains(&snippet));
-                        return Ok(IntegrationStatus {
-                            supported: true,
-                            enabled: true,
-                            manual_required: fish_needs_update,
-                            shell: Some(ctx.shell),
-                            rc_path: Some(ctx.rc_path),
-                            env_script_path: ctx.env_script_path,
-                            binary_path: Some(ctx.binary_path),
-                            symlink_target: target_display,
-                            manual_snippet: fish_needs_update.then_some(snippet),
-                            hybrid_active,
-                            message: fish_needs_update.then(|| {
-                                "Fish configuration directory is a symlink; existing hook could not be updated automatically."
-                                    .to_string()
-                            }),
-                        });
+                        return if fish_needs_update {
+                            Ok(IntegrationStatus::manual_required(
+                                ctx.into_paths(),
+                                true,
+                                target_display,
+                                Some(snippet),
+                                hybrid_active,
+                                "Fish configuration directory is a symlink; existing hook could not be updated automatically.",
+                            ))
+                        } else {
+                            Ok(IntegrationStatus::enabled(
+                                ctx.into_paths(),
+                                target_display,
+                                hybrid_active,
+                            ))
+                        };
                     }
-                    return Ok(IntegrationStatus {
-                        supported: true,
-                        enabled: false,
-                        manual_required: true,
-                        shell: Some(ctx.shell),
-                        rc_path: Some(ctx.rc_path),
-                        env_script_path: ctx.env_script_path,
-                        binary_path: Some(ctx.binary_path),
-                        symlink_target: target_display,
-                        manual_snippet: Some(snippet),
+                    return Ok(IntegrationStatus::manual_required(
+                        ctx.into_paths(),
+                        false,
+                        target_display,
+                        Some(snippet),
                         hybrid_active,
-                        message: Some(
-                            "Fish configuration directory is a symlink; left untouched. Add the snippet manually or re-run with --follow-rc-symlink."
-                                .to_string(),
-                        ),
-                    });
+                        "Fish configuration directory is a symlink; left untouched. Add the snippet manually or re-run with --follow-rc-symlink.",
+                    ));
                 }
 
-                let sym_check: PathBuf = symlink_dir.components().collect();
+                let sym_check = fs_safe::normalize_path(&symlink_dir);
                 match fs::metadata(&sym_check) {
                     Ok(meta) if meta.is_dir() => {}
                     Ok(_) => {
@@ -1861,13 +1769,7 @@ fn enable_with_env(
                 if let DirTargetState::NotDirectory { path } =
                     inspect_symlinked_dir_chain_target(&fish_root, fish_rel_dirs)?
                 {
-                    return Err(CoreError::InvalidPath {
-                        reason: format!(
-                            "intermediate directory '{}' for '{}' is not a directory",
-                            path.display(),
-                            ctx.rc_path.display()
-                        ),
-                    });
+                    return Err(FsError::NotDirectory { path }.into());
                 }
                 followed_dir_symlink_target = fs::canonicalize(&sym_check).ok().or(target_display);
             }
@@ -1898,39 +1800,31 @@ fn enable_with_env(
                         && file
                             .as_ref()
                             .is_some_and(|loaded| !loaded.content.contains(&snippet));
-                    return Ok(IntegrationStatus {
-                        supported: true,
-                        enabled: true,
-                        manual_required: fish_needs_update,
-                        shell: Some(ctx.shell),
-                        rc_path: Some(ctx.rc_path),
-                        env_script_path: ctx.env_script_path,
-                        binary_path: Some(ctx.binary_path),
-                        symlink_target: target_display,
-                        manual_snippet: fish_needs_update.then_some(snippet),
-                        hybrid_active,
-                        message: fish_needs_update.then(|| {
-                            "Fish drop-in symlink already contains a hook but could not be updated automatically."
-                                .to_string()
-                        }),
-                    });
+                    return if fish_needs_update {
+                        Ok(IntegrationStatus::manual_required(
+                            ctx.into_paths(),
+                            true,
+                            target_display,
+                            Some(snippet),
+                            hybrid_active,
+                            "Fish drop-in symlink already contains a hook but could not be updated automatically.",
+                        ))
+                    } else {
+                        Ok(IntegrationStatus::enabled(
+                            ctx.into_paths(),
+                            target_display,
+                            hybrid_active,
+                        ))
+                    };
                 }
-                return Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: false,
-                    manual_required: true,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: target_display,
-                    manual_snippet: Some(snippet),
+                return Ok(IntegrationStatus::manual_required(
+                    ctx.into_paths(),
+                    false,
+                    target_display,
+                    Some(snippet),
                     hybrid_active,
-                    message: Some(
-                        "RC file is a symlink; left untouched. Add the snippet manually or re-run with --follow-rc-symlink."
-                            .to_string(),
-                    ),
-                });
+                    "RC file is a symlink; left untouched. Add the snippet manually or re-run with --follow-rc-symlink.",
+                ));
             }
 
             let (canonical, loaded, markers) = match target {
@@ -1956,72 +1850,42 @@ fn enable_with_env(
                     });
                 }
             };
-            validate_path(&canonical)?;
+            fs_safe::validate_path(&canonical)?;
             if loaded.readonly {
                 ensure_env_script(&ctx)?;
-                return Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: matches!(markers, MarkerState::Valid { .. }),
-                    manual_required: true,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: Some(canonical),
-                    manual_snippet: Some(snippet),
+                return Ok(IntegrationStatus::manual_required(
+                    ctx.into_paths(),
+                    matches!(markers, MarkerState::Valid { .. }),
+                    Some(canonical),
+                    Some(snippet),
                     hybrid_active,
-                    message: Some(
-                        "Canonical RC symlink target is read-only; left untouched. Add the snippet manually."
-                            .to_string(),
-                    ),
-                });
+                    "Canonical RC symlink target is read-only; left untouched. Add the snippet manually.",
+                ));
             }
 
             let updated = upsert_marker_block(&canonical, &loaded.content, &snippet)?;
             ensure_env_script(&ctx)?;
-            match write_file_atomic_with_mode(
+            match fs_safe::write_atomic(
                 &canonical,
                 updated.as_bytes(),
-                loaded.unix_mode,
-                DEFAULT_RC_DIR_MODE,
-                false,
-                true,
-                true,
+                rc_write_options(loaded.unix_mode),
             ) {
-                Ok(()) => Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: true,
-                    manual_required: false,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: Some(canonical),
-                    manual_snippet: None,
+                Ok(()) => Ok(IntegrationStatus::enabled(
+                    ctx.into_paths(),
+                    Some(canonical),
                     hybrid_active,
-                    message: None,
-                }),
-                Err(CoreError::Io { source, .. })
-                    if source.kind() == ErrorKind::PermissionDenied =>
-                {
-                    Ok(IntegrationStatus {
-                        supported: true,
-                        enabled: matches!(markers, MarkerState::Valid { .. }),
-                        manual_required: true,
-                        shell: Some(ctx.shell),
-                        rc_path: Some(ctx.rc_path),
-                        env_script_path: ctx.env_script_path,
-                        binary_path: Some(ctx.binary_path),
-                        symlink_target: Some(canonical),
-                        manual_snippet: Some(snippet),
+                )),
+                Err(FsError::Io { source, .. }) if source.kind() == ErrorKind::PermissionDenied => {
+                    Ok(IntegrationStatus::manual_required(
+                        ctx.into_paths(),
+                        matches!(markers, MarkerState::Valid { .. }),
+                        Some(canonical),
+                        Some(snippet),
                         hybrid_active,
-                        message: Some(
-                            "Canonical RC symlink target is not writable; left untouched. Add the snippet manually."
-                                .to_string(),
-                        ),
-                    })
+                        "Canonical RC symlink target is not writable; left untouched. Add the snippet manually.",
+                    ))
                 }
-                Err(err) => Err(err),
+                Err(err) => Err(err.into()),
             }
         }
         RcInspection::Regular { file, markers } => {
@@ -2030,117 +1894,73 @@ fn enable_with_env(
                 let already_present = matches!(markers, MarkerState::Valid { .. });
                 let manual_required = !already_present
                     || (ctx.shell == ShellKind::Fish && !file.content.contains(&snippet));
-                return Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: already_present,
-                    manual_required,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: followed_dir_symlink_target,
-                    manual_snippet: manual_required.then_some(snippet),
-                    hybrid_active,
-                    message: manual_required.then(|| {
-                        "RC file is read-only; left untouched. Add the snippet manually."
-                            .to_string()
-                    }),
-                });
+                return if manual_required {
+                    Ok(IntegrationStatus::manual_required(
+                        ctx.into_paths(),
+                        already_present,
+                        followed_dir_symlink_target,
+                        Some(snippet),
+                        hybrid_active,
+                        "RC file is read-only; left untouched. Add the snippet manually.",
+                    ))
+                } else {
+                    Ok(IntegrationStatus::enabled(
+                        ctx.into_paths(),
+                        followed_dir_symlink_target,
+                        hybrid_active,
+                    ))
+                };
             }
 
             let updated = upsert_marker_block(&ctx.rc_path, &file.content, &snippet)?;
             ensure_env_script(&ctx)?;
-            match write_file_atomic_with_mode(
+            match fs_safe::write_atomic(
                 &ctx.rc_path,
                 updated.as_bytes(),
-                file.unix_mode,
-                DEFAULT_RC_DIR_MODE,
-                false,
-                true,
-                true,
+                rc_write_options(file.unix_mode),
             ) {
-                Ok(()) => Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: true,
-                    manual_required: false,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: followed_dir_symlink_target,
-                    manual_snippet: None,
+                Ok(()) => Ok(IntegrationStatus::enabled(
+                    ctx.into_paths(),
+                    followed_dir_symlink_target,
                     hybrid_active,
-                    message: None,
-                }),
-                Err(CoreError::Io { source, .. })
-                    if source.kind() == ErrorKind::PermissionDenied =>
-                {
-                    Ok(IntegrationStatus {
-                        supported: true,
-                        enabled: matches!(markers, MarkerState::Valid { .. }),
-                        manual_required: true,
-                        shell: Some(ctx.shell),
-                        rc_path: Some(ctx.rc_path),
-                        env_script_path: ctx.env_script_path,
-                        binary_path: Some(ctx.binary_path),
-                        symlink_target: followed_dir_symlink_target,
-                        manual_snippet: Some(snippet),
+                )),
+                Err(FsError::Io { source, .. }) if source.kind() == ErrorKind::PermissionDenied => {
+                    Ok(IntegrationStatus::manual_required(
+                        ctx.into_paths(),
+                        matches!(markers, MarkerState::Valid { .. }),
+                        followed_dir_symlink_target,
+                        Some(snippet),
                         hybrid_active,
-                        message: Some(
-                            "RC file directory is not writable; left untouched. Add the snippet manually."
-                                .to_string(),
-                        ),
-                    })
+                        "RC file directory is not writable; left untouched. Add the snippet manually.",
+                    ))
                 }
-                Err(err) => Err(err),
+                Err(err) => Err(err.into()),
             }
         }
         RcInspection::Missing => {
             let updated = upsert_marker_block(&ctx.rc_path, "", &snippet)?;
             ensure_env_script(&ctx)?;
-            match write_file_atomic_with_mode(
+            match fs_safe::write_atomic(
                 &ctx.rc_path,
                 updated.as_bytes(),
-                DEFAULT_RC_FILE_MODE,
-                DEFAULT_RC_DIR_MODE,
-                false,
-                true,
-                true,
+                rc_write_options(DEFAULT_RC_FILE_MODE),
             ) {
-                Ok(()) => Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: true,
-                    manual_required: false,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: followed_dir_symlink_target,
-                    manual_snippet: None,
+                Ok(()) => Ok(IntegrationStatus::enabled(
+                    ctx.into_paths(),
+                    followed_dir_symlink_target,
                     hybrid_active,
-                    message: None,
-                }),
-                Err(CoreError::Io { source, .. })
-                    if source.kind() == ErrorKind::PermissionDenied =>
-                {
-                    Ok(IntegrationStatus {
-                        supported: true,
-                        enabled: false,
-                        manual_required: true,
-                        shell: Some(ctx.shell),
-                        rc_path: Some(ctx.rc_path),
-                        env_script_path: ctx.env_script_path,
-                        binary_path: Some(ctx.binary_path),
-                        symlink_target: followed_dir_symlink_target,
-                        manual_snippet: Some(snippet),
+                )),
+                Err(FsError::Io { source, .. }) if source.kind() == ErrorKind::PermissionDenied => {
+                    Ok(IntegrationStatus::manual_required(
+                        ctx.into_paths(),
+                        false,
+                        followed_dir_symlink_target,
+                        Some(snippet),
                         hybrid_active,
-                        message: Some(
-                            "RC file parent directory is not writable; add the snippet manually."
-                                .to_string(),
-                        ),
-                    })
+                        "RC file parent directory is not writable; add the snippet manually.",
+                    ))
                 }
-                Err(err) => Err(err),
+                Err(err) => Err(err.into()),
             }
         }
     }
@@ -2175,37 +1995,23 @@ fn disable_with_env(
     if ctx.shell == ShellKind::Fish && opts.rc_file.is_none() {
         let (fish_root, fish_rel_dirs) =
             default_fish_dir_chain(&ctx.home, ctx.xdg_config_home.as_deref())?;
-        match inspect_dir_chain(&fish_root, fish_rel_dirs)? {
-            DirChainInspection::SafeDir | DirChainInspection::Missing => {}
-            DirChainInspection::NotDirectory { path } => {
-                return Err(CoreError::InvalidPath {
-                    reason: format!(
-                        "intermediate directory '{}' for '{}' is not a directory",
-                        path.display(),
-                        ctx.rc_path.display()
-                    ),
-                });
+        match fs_safe::inspect_dir_chain(&fish_root, fish_rel_dirs)? {
+            DirChainStatus::SafeDir | DirChainStatus::Missing => {}
+            DirChainStatus::NotDirectory { path } => {
+                return Err(FsError::NotDirectory { path }.into());
             }
-            DirChainInspection::Symlink {
-                symlink_dir,
+            DirChainStatus::Symlink {
+                path: symlink_dir,
                 link_target,
             } => {
                 let target_display = link_target.or_else(|| fs::canonicalize(&symlink_dir).ok());
                 match inspect_symlinked_dir_chain_target(&fish_root, fish_rel_dirs)? {
                     DirTargetState::Missing | DirTargetState::NotDirectory { .. } => {
-                        return Ok(IntegrationStatus {
-                            supported: true,
-                            enabled: false,
-                            manual_required: false,
-                            shell: Some(ctx.shell),
-                            rc_path: Some(ctx.rc_path),
-                            env_script_path: ctx.env_script_path,
-                            binary_path: Some(ctx.binary_path),
-                            symlink_target: target_display,
-                            manual_snippet: None,
+                        return Ok(IntegrationStatus::disabled(
+                            ctx.into_paths(),
+                            target_display,
                             hybrid_active,
-                            message: None,
-                        });
+                        ));
                     }
                     DirTargetState::Ready => {
                         if !opts.follow_rc_symlink {
@@ -2223,38 +2029,22 @@ fn disable_with_env(
                                 }
                             );
                             if !has_valid_markers {
-                                return Ok(IntegrationStatus {
-                                    supported: true,
-                                    enabled: false,
-                                    manual_required: false,
-                                    shell: Some(ctx.shell),
-                                    rc_path: Some(ctx.rc_path),
-                                    env_script_path: ctx.env_script_path,
-                                    binary_path: Some(ctx.binary_path),
-                                    symlink_target: target_display,
-                                    manual_snippet: None,
+                                return Ok(IntegrationStatus::disabled(
+                                    ctx.into_paths(),
+                                    target_display,
                                     hybrid_active,
-                                    message: None,
-                                });
+                                ));
                             }
-                            return Ok(IntegrationStatus {
-                                supported: true,
-                                enabled: true,
-                                manual_required: true,
-                                shell: Some(ctx.shell),
-                                rc_path: Some(ctx.rc_path),
-                                env_script_path: ctx.env_script_path,
-                                binary_path: Some(ctx.binary_path),
-                                symlink_target: target_display,
-                                manual_snippet: None,
+                            return Ok(IntegrationStatus::manual_required(
+                                ctx.into_paths(),
+                                true,
+                                target_display,
+                                None,
                                 hybrid_active,
-                                message: Some(
-                                    "Fish configuration directory is a symlink and was left untouched. Remove the hook manually or re-run with --follow-rc-symlink."
-                                        .to_string(),
-                                ),
-                            });
+                                "Fish configuration directory is a symlink and was left untouched. Remove the hook manually or re-run with --follow-rc-symlink.",
+                            ));
                         }
-                        let sym_check: PathBuf = symlink_dir.components().collect();
+                        let sym_check = fs_safe::normalize_path(&symlink_dir);
                         followed_dir_symlink_target =
                             fs::canonicalize(&sym_check).ok().or(target_display);
                     }
@@ -2266,19 +2056,11 @@ fn disable_with_env(
     match inspect_rc_file(&ctx.rc_path)? {
         RcInspection::Missing => {
             remove_env_script_if_unused(&ctx)?;
-            Ok(IntegrationStatus {
-                supported: true,
-                enabled: false,
-                manual_required: false,
-                shell: Some(ctx.shell),
-                rc_path: Some(ctx.rc_path),
-                env_script_path: ctx.env_script_path,
-                binary_path: Some(ctx.binary_path),
-                symlink_target: followed_dir_symlink_target,
-                manual_snippet: None,
+            Ok(IntegrationStatus::disabled(
+                ctx.into_paths(),
+                followed_dir_symlink_target,
                 hybrid_active,
-                message: None,
-            })
+            ))
         }
         RcInspection::Symlink {
             link_target,
@@ -2286,19 +2068,11 @@ fn disable_with_env(
         } => match target {
             SymlinkTargetKind::Dangling | SymlinkTargetKind::NonRegular => {
                 remove_env_script_if_unused(&ctx)?;
-                Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: false,
-                    manual_required: false,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: link_target,
-                    manual_snippet: None,
+                Ok(IntegrationStatus::disabled(
+                    ctx.into_paths(),
+                    link_target,
                     hybrid_active,
-                    message: None,
-                })
+                ))
             }
             SymlinkTargetKind::Regular {
                 canonical,
@@ -2308,127 +2082,80 @@ fn disable_with_env(
                 let target_display = link_target.or_else(|| Some(canonical.clone()));
                 if !matches!(markers, MarkerState::Valid { .. }) {
                     remove_env_script_if_unused(&ctx)?;
-                    return Ok(IntegrationStatus {
-                        supported: true,
-                        enabled: false,
-                        manual_required: false,
-                        shell: Some(ctx.shell),
-                        rc_path: Some(ctx.rc_path),
-                        env_script_path: ctx.env_script_path,
-                        binary_path: Some(ctx.binary_path),
-                        symlink_target: target_display,
-                        manual_snippet: None,
+                    return Ok(IntegrationStatus::disabled(
+                        ctx.into_paths(),
+                        target_display,
                         hybrid_active,
-                        message: None,
-                    });
+                    ));
                 }
 
                 if !opts.follow_rc_symlink {
                     remove_env_script_if_unused(&ctx)?;
                     let still_enabled = ctx.shell == ShellKind::Fish;
-                    return Ok(IntegrationStatus {
-                        supported: true,
-                        enabled: still_enabled,
-                        manual_required: true,
-                        shell: Some(ctx.shell),
-                        rc_path: Some(ctx.rc_path),
-                        env_script_path: ctx.env_script_path,
-                        binary_path: Some(ctx.binary_path),
-                        symlink_target: target_display,
-                        manual_snippet: None,
+                    let msg = if ctx.shell == ShellKind::Fish {
+                        "Fish drop-in is a symlink and was left untouched. Remove the hook manually or re-run with --follow-rc-symlink."
+                    } else {
+                        "Removed env.sh (neutralizing the hook), but left the symlinked RC file untouched. Remove the managed lines manually or re-run with --follow-rc-symlink."
+                    };
+                    return Ok(IntegrationStatus::manual_required(
+                        ctx.into_paths(),
+                        still_enabled,
+                        target_display,
+                        None,
                         hybrid_active,
-                        message: Some(if ctx.shell == ShellKind::Fish {
-                            "Fish drop-in is a symlink and was left untouched. Remove the hook manually or re-run with --follow-rc-symlink."
-                                .to_string()
-                        } else {
-                            "Removed env.sh (neutralizing the hook), but left the symlinked RC file untouched. Remove the managed lines manually or re-run with --follow-rc-symlink."
-                                .to_string()
-                        }),
-                    });
+                        msg,
+                    ));
                 }
 
-                validate_path(&canonical)?;
+                fs_safe::validate_path(&canonical)?;
                 if loaded.readonly {
                     remove_env_script_if_unused(&ctx)?;
-                    return Ok(IntegrationStatus {
-                        supported: true,
-                        enabled: ctx.shell == ShellKind::Fish,
-                        manual_required: true,
-                        shell: Some(ctx.shell),
-                        rc_path: Some(ctx.rc_path),
-                        env_script_path: ctx.env_script_path,
-                        binary_path: Some(ctx.binary_path),
-                        symlink_target: Some(canonical),
-                        manual_snippet: None,
+                    let still_enabled = ctx.shell == ShellKind::Fish;
+                    return Ok(IntegrationStatus::manual_required(
+                        ctx.into_paths(),
+                        still_enabled,
+                        Some(canonical),
+                        None,
                         hybrid_active,
-                        message: Some(
-                            "Canonical RC symlink target is read-only; left untouched.".to_string(),
-                        ),
-                    });
+                        "Canonical RC symlink target is read-only; left untouched.",
+                    ));
                 }
 
                 let (stripped, _) = strip_marker_block(&canonical, &loaded.content)?;
-                write_file_atomic_with_mode(
+                fs_safe::write_atomic(
                     &canonical,
                     stripped.as_bytes(),
-                    loaded.unix_mode,
-                    DEFAULT_RC_DIR_MODE,
-                    false,
-                    true,
-                    true,
+                    rc_write_options(loaded.unix_mode),
                 )?;
                 remove_env_script_if_unused(&ctx)?;
-                Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: false,
-                    manual_required: false,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: Some(canonical),
-                    manual_snippet: None,
+                Ok(IntegrationStatus::disabled(
+                    ctx.into_paths(),
+                    Some(canonical),
                     hybrid_active,
-                    message: None,
-                })
+                ))
             }
         },
         RcInspection::Regular { file, markers } => {
             if !matches!(markers, MarkerState::Valid { .. }) {
                 remove_env_script_if_unused(&ctx)?;
-                return Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: false,
-                    manual_required: false,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: followed_dir_symlink_target,
-                    manual_snippet: None,
+                return Ok(IntegrationStatus::disabled(
+                    ctx.into_paths(),
+                    followed_dir_symlink_target,
                     hybrid_active,
-                    message: None,
-                });
+                ));
             }
 
             if file.readonly {
                 remove_env_script_if_unused(&ctx)?;
-                return Ok(IntegrationStatus {
-                    supported: true,
-                    enabled: ctx.shell == ShellKind::Fish,
-                    manual_required: true,
-                    shell: Some(ctx.shell),
-                    rc_path: Some(ctx.rc_path),
-                    env_script_path: ctx.env_script_path,
-                    binary_path: Some(ctx.binary_path),
-                    symlink_target: followed_dir_symlink_target,
-                    manual_snippet: None,
+                let still_enabled = ctx.shell == ShellKind::Fish;
+                return Ok(IntegrationStatus::manual_required(
+                    ctx.into_paths(),
+                    still_enabled,
+                    followed_dir_symlink_target,
+                    None,
                     hybrid_active,
-                    message: Some(
-                        "RC file is read-only; left untouched. Remove the managed lines manually."
-                            .to_string(),
-                    ),
-                });
+                    "RC file is read-only; left untouched. Remove the managed lines manually.",
+                ));
             }
 
             let (stripped, _) = strip_marker_block(&ctx.rc_path, &file.content)?;
@@ -2438,22 +2165,15 @@ fn disable_with_env(
                     Err(err) if err.kind() == ErrorKind::NotFound => {}
                     Err(err) if err.kind() == ErrorKind::PermissionDenied => {
                         remove_env_script_if_unused(&ctx)?;
-                        return Ok(IntegrationStatus {
-                            supported: true,
-                            enabled: ctx.shell == ShellKind::Fish,
-                            manual_required: true,
-                            shell: Some(ctx.shell),
-                            rc_path: Some(ctx.rc_path),
-                            env_script_path: ctx.env_script_path,
-                            binary_path: Some(ctx.binary_path),
-                            symlink_target: followed_dir_symlink_target,
-                            manual_snippet: None,
+                        let still_enabled = ctx.shell == ShellKind::Fish;
+                        return Ok(IntegrationStatus::manual_required(
+                            ctx.into_paths(),
+                            still_enabled,
+                            followed_dir_symlink_target,
+                            None,
                             hybrid_active,
-                            message: Some(
-                                "RC file could not be removed due to permissions; remove it manually."
-                                    .to_string(),
-                            ),
-                        });
+                            "RC file could not be removed due to permissions; remove it manually.",
+                        ));
                     }
                     Err(source) => {
                         return Err(CoreError::Io {
@@ -2463,55 +2183,36 @@ fn disable_with_env(
                     }
                 }
             } else {
-                match write_file_atomic_with_mode(
+                match fs_safe::write_atomic(
                     &ctx.rc_path,
                     stripped.as_bytes(),
-                    file.unix_mode,
-                    DEFAULT_RC_DIR_MODE,
-                    false,
-                    true,
-                    true,
+                    rc_write_options(file.unix_mode),
                 ) {
                     Ok(()) => {}
-                    Err(CoreError::Io { source, .. })
+                    Err(FsError::Io { source, .. })
                         if source.kind() == ErrorKind::PermissionDenied =>
                     {
                         remove_env_script_if_unused(&ctx)?;
-                        return Ok(IntegrationStatus {
-                            supported: true,
-                            enabled: ctx.shell == ShellKind::Fish,
-                            manual_required: true,
-                            shell: Some(ctx.shell),
-                            rc_path: Some(ctx.rc_path),
-                            env_script_path: ctx.env_script_path,
-                            binary_path: Some(ctx.binary_path),
-                            symlink_target: followed_dir_symlink_target,
-                            manual_snippet: None,
+                        let still_enabled = ctx.shell == ShellKind::Fish;
+                        return Ok(IntegrationStatus::manual_required(
+                            ctx.into_paths(),
+                            still_enabled,
+                            followed_dir_symlink_target,
+                            None,
                             hybrid_active,
-                            message: Some(
-                                "RC file directory is not writable; remove the managed lines manually."
-                                    .to_string(),
-                            ),
-                        });
+                            "RC file directory is not writable; remove the managed lines manually.",
+                        ));
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => return Err(err.into()),
                 }
             }
 
             remove_env_script_if_unused(&ctx)?;
-            Ok(IntegrationStatus {
-                supported: true,
-                enabled: false,
-                manual_required: false,
-                shell: Some(ctx.shell),
-                rc_path: Some(ctx.rc_path),
-                env_script_path: ctx.env_script_path,
-                binary_path: Some(ctx.binary_path),
-                symlink_target: followed_dir_symlink_target,
-                manual_snippet: None,
+            Ok(IntegrationStatus::disabled(
+                ctx.into_paths(),
+                followed_dir_symlink_target,
                 hybrid_active,
-                message: None,
-            })
+            ))
         }
     }
 }
@@ -2522,7 +2223,7 @@ fn collect_known_rc_paths(
     xdg_config_home: Option<&Path>,
     include_fish: bool,
 ) -> Result<Vec<PathBuf>, CoreError> {
-    validate_path(home)?;
+    fs_safe::validate_path(home)?;
     let mut paths = Vec::new();
     let mut push_unique = |candidate: PathBuf| {
         if !paths.contains(&candidate) {
@@ -2574,19 +2275,17 @@ pub fn strip_all_known_rc_files(
         fish_dropin_path.push(seg);
     }
     fish_dropin_path.push(FISH_DROPIN_FILENAME);
-    let norm_fish_dropin: PathBuf = fish_dropin_path.components().collect();
+    let norm_fish_dropin = fs_safe::normalize_path(&fish_dropin_path);
     let mut report = StripReport::default();
 
     for path in candidates {
-        if path.components().collect::<PathBuf>() == norm_fish_dropin {
-            match inspect_dir_chain(&fish_root, fish_rel_dirs) {
-                Ok(DirChainInspection::SafeDir) => {}
-                Ok(DirChainInspection::Missing)
-                | Ok(DirChainInspection::NotDirectory { .. })
-                | Err(_) => {
+        if fs_safe::normalize_path(&path) == norm_fish_dropin {
+            match fs_safe::inspect_dir_chain(&fish_root, fish_rel_dirs) {
+                Ok(DirChainStatus::SafeDir) => {}
+                Ok(DirChainStatus::Missing) | Ok(DirChainStatus::NotDirectory { .. }) | Err(_) => {
                     continue;
                 }
-                Ok(DirChainInspection::Symlink { .. }) => {
+                Ok(DirChainStatus::Symlink { .. }) => {
                     match inspect_symlinked_dir_chain_target(&fish_root, fish_rel_dirs) {
                         Ok(DirTargetState::Ready) => match inspect_rc_file(&path) {
                             Ok(RcInspection::Regular {
@@ -2605,7 +2304,7 @@ pub fn strip_all_known_rc_files(
                             }
                             Ok(_) => {}
                             Err(_) => {
-                                let check_path: PathBuf = path.components().collect();
+                                let check_path = fs_safe::normalize_path(&path);
                                 if fs::symlink_metadata(&check_path).is_ok() {
                                     report.skipped_manual_files.push(path);
                                 }
@@ -2625,7 +2324,7 @@ pub fn strip_all_known_rc_files(
             Err(_) => {
                 // Do not let an unrelated corrupt, oversized, non-UTF-8, FIFO, or
                 // unreadable RC file abort cleaning the remaining known RC files.
-                let check_path: PathBuf = path.components().collect();
+                let check_path = fs_safe::normalize_path(&path);
                 if fs::symlink_metadata(&check_path).is_ok() {
                     report.skipped_manual_files.push(path);
                 }
@@ -2676,22 +2375,18 @@ pub fn strip_all_known_rc_files(
                         Err(source) => return Err(CoreError::Io { path, source }),
                     }
                 } else {
-                    match write_file_atomic_with_mode(
+                    match fs_safe::write_atomic(
                         &path,
                         stripped.as_bytes(),
-                        file.unix_mode,
-                        DEFAULT_RC_DIR_MODE,
-                        false,
-                        true,
-                        true,
+                        rc_write_options(file.unix_mode),
                     ) {
                         Ok(()) => report.modified_files.push(path),
-                        Err(CoreError::Io { source, .. })
+                        Err(FsError::Io { source, .. })
                             if source.kind() == ErrorKind::PermissionDenied =>
                         {
                             report.skipped_manual_files.push(path);
                         }
-                        Err(err) => return Err(err),
+                        Err(err) => return Err(err.into()),
                     }
                 }
             }
@@ -2785,7 +2480,7 @@ mod tests {
                 Some(Path::new("/tmp/../escape")),
                 None
             ),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::ParentDirTraversal))
         ));
         assert!(matches!(
             resolve_rc_path(
@@ -2794,7 +2489,7 @@ mod tests {
                 Some(Path::new("/tmp/bad\0zdot")),
                 None
             ),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::ContainsNul))
         ));
     }
 
@@ -2859,11 +2554,11 @@ mod tests {
         );
         assert!(matches!(
             resolve_rc_path(ShellKind::Fish, &home, None, Some(Path::new("/tmp/../bad"))),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::ParentDirTraversal))
         ));
         assert!(matches!(
             resolve_rc_path(ShellKind::Fish, &home, None, Some(Path::new("/tmp/a\0b"))),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::ContainsNul))
         ));
     }
 
@@ -2877,7 +2572,7 @@ mod tests {
         assert!(rendered.contains("AGY_COMPANION_ALLOW_REMOTE_SSH"));
         assert!(rendered.contains("0*|??????*"));
 
-        for bad in ["/tmp/a\nb", "/tmp/a\rb", "/tmp/../escape", "/tmp/a\0b"] {
+        for bad in ["/tmp/a\nb", "/tmp/a\rb"] {
             assert!(
                 matches!(
                     render_env_sh(Path::new(bad)),
@@ -2886,6 +2581,14 @@ mod tests {
                 "expected InvalidPath for {bad:?}"
             );
         }
+        assert!(matches!(
+            render_env_sh(Path::new("/tmp/../escape")),
+            Err(CoreError::Fs(FsError::ParentDirTraversal))
+        ));
+        assert!(matches!(
+            render_env_sh(Path::new("/tmp/a\0b")),
+            Err(CoreError::Fs(FsError::ContainsNul))
+        ));
     }
 
     #[test]
@@ -2933,7 +2636,7 @@ mod tests {
         symlink(&real_target, &sym_env).unwrap();
         assert!(matches!(
             write_env_script(&sym_env, &bin),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
         ));
         assert_eq!(fs::read_to_string(&real_target).unwrap(), "keep");
 
@@ -2942,7 +2645,7 @@ mod tests {
         symlink(&data_dir, &sym_parent).unwrap();
         assert!(matches!(
             write_env_script(&sym_parent.join("env.sh"), &bin),
-            Err(CoreError::InvalidPath { .. })
+            Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
         ));
 
         // FIFO target rejected without hanging (< 1s)
@@ -2959,7 +2662,10 @@ mod tests {
         let res = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("write_env_script must reject FIFO without blocking");
-        assert!(matches!(res, Err(CoreError::InvalidPath { .. })));
+        assert!(matches!(
+            res,
+            Err(CoreError::Fs(FsError::NotRegularFile { .. }))
+        ));
     }
 
     #[test]
@@ -2984,7 +2690,7 @@ mod tests {
         )
         .unwrap();
         assert!(st1.enabled);
-        assert!(!st1.manual_required);
+        assert_eq!(st1.state, IntegrationState::Enabled);
         let zlogin = home.join(".zlogin");
         assert!(zlogin.is_file());
         assert!(data.join("env.sh").is_file());
@@ -3308,7 +3014,7 @@ mod tests {
         )
         .unwrap();
         assert!(!st.enabled);
-        assert!(st.manual_required);
+        assert_eq!(st.state, IntegrationState::ManualRequired);
         assert_eq!(
             st.symlink_target.as_deref(),
             Some(dotfiles_target.as_path())
@@ -3339,7 +3045,7 @@ mod tests {
             0o600
         );
 
-        // Subsequent status() preserves manual_required == true
+        // Subsequent status() preserves ManualRequired state
         let polled = status_with_env(
             &opts,
             Some(&home),
@@ -3351,10 +3057,10 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(polled.manual_required);
+        assert_eq!(polled.state, IntegrationState::ManualRequired);
         assert!(polled.manual_snippet.is_some());
 
-        // Dangling symlink also non-mutating manual_required
+        // Dangling symlink also non-mutating ManualRequired
         fs::remove_file(&dotfiles_target).unwrap();
         let dangling_st = enable_with_env(
             &opts,
@@ -3367,7 +3073,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(dangling_st.manual_required);
+        assert_eq!(dangling_st.state, IntegrationState::ManualRequired);
         assert!(!dangling_st.enabled);
         assert!(
             fs::symlink_metadata(&zlogin)
@@ -3406,7 +3112,7 @@ mod tests {
         )
         .unwrap();
         assert!(st.enabled);
-        assert!(!st.manual_required);
+        assert_eq!(st.state, IntegrationState::Enabled);
         assert!(
             fs::symlink_metadata(&zlogin)
                 .unwrap()
@@ -3488,7 +3194,7 @@ mod tests {
         )
         .unwrap();
         assert!(!st.enabled);
-        assert!(st.manual_required);
+        assert_eq!(st.state, IntegrationState::ManualRequired);
         assert!(st.manual_snippet.is_some());
         assert_eq!(fs::read_to_string(&zlogin).unwrap(), "# readonly\n");
         assert_eq!(
@@ -3604,7 +3310,10 @@ mod tests {
         let res = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("FIFO RC must fail fast");
-        assert!(matches!(res, Err(CoreError::InvalidPath { .. })));
+        assert!(matches!(
+            res,
+            Err(CoreError::Fs(FsError::NotRegularFile { .. }))
+        ));
         fs::remove_file(&fifo_rc).unwrap();
 
         // > 1 MiB RC file fails closed
@@ -3621,7 +3330,10 @@ mod tests {
             true,
         )
         .unwrap_err();
-        assert!(matches!(err, CoreError::InvalidPath { .. }));
+        assert!(matches!(
+            err,
+            CoreError::Fs(FsError::SizeLimitExceeded { .. })
+        ));
     }
 
     #[test]
@@ -3701,24 +3413,25 @@ mod tests {
     fn windows_unsupported_status_and_json_roundtrip() {
         let opts = IntegrationOptions::default();
         let st = status_with_env(&opts, None, None, None, None, None, false, false).unwrap();
-        assert!(!st.supported);
+        assert_eq!(st.state, IntegrationState::Unsupported);
         assert!(!st.enabled);
-        assert!(!st.manual_required);
         assert_eq!(st.state(), IntegrationState::Unsupported);
 
         let val = serde_json::to_value(&st).unwrap();
         let obj = val.as_object().unwrap();
+        assert!(!obj.contains_key("supported"));
+        assert!(!obj.contains_key("manual_required"));
+        assert_eq!(obj["state"], "unsupported");
         for key in [
-            "supported",
+            "state",
             "enabled",
-            "manual_required",
+            "hybrid_active",
             "shell",
             "rc_path",
             "env_script_path",
             "binary_path",
             "symlink_target",
             "manual_snippet",
-            "hybrid_active",
             "message",
         ] {
             assert!(obj.contains_key(key), "missing IntegrationStatus key {key}");
@@ -3987,37 +3700,55 @@ mod tests {
 
     #[test]
     fn integration_status_state_derivation() {
-        let base = IntegrationStatus {
-            supported: true,
-            enabled: false,
-            manual_required: false,
-            shell: Some(ShellKind::Zsh),
-            rc_path: None,
-            env_script_path: None,
-            binary_path: None,
-            symlink_target: None,
-            manual_snippet: None,
-            hybrid_active: false,
-            message: None,
+        let paths = || IntegrationPaths {
+            shell: ShellKind::Zsh,
+            rc_path: PathBuf::from("/tmp/.zlogin"),
+            env_script_path: Some(PathBuf::from("/tmp/env.sh")),
+            binary_path: PathBuf::from("/tmp/agy-companion"),
         };
-        assert_eq!(base.state(), IntegrationState::Disabled);
 
-        let mut active = base.clone();
-        active.enabled = true;
-        active.hybrid_active = true;
+        let mut disabled = IntegrationStatus::disabled(paths(), None, false);
+        assert_eq!(disabled.state(), IntegrationState::Disabled);
+        assert!(!disabled.enabled);
+        disabled.mark_hybrid_active();
+        assert!(disabled.hybrid_active);
+        assert_eq!(disabled.state(), IntegrationState::Disabled);
+
+        let active = IntegrationStatus::enabled(paths(), None, true);
         assert_eq!(active.state(), IntegrationState::Active);
+        assert!(active.enabled);
+        assert!(active.hybrid_active);
 
-        let mut pending = base.clone();
-        pending.enabled = true;
+        let mut pending = IntegrationStatus::enabled(paths(), None, false);
         assert_eq!(pending.state(), IntegrationState::Enabled);
+        assert!(pending.enabled);
+        assert!(!pending.hybrid_active);
+        pending.mark_hybrid_active();
+        assert!(pending.hybrid_active);
+        assert_eq!(pending.state(), IntegrationState::Active);
 
-        let mut manual = base.clone();
-        manual.manual_required = true;
+        let mut manual =
+            IntegrationStatus::manual_required(paths(), false, None, None, false, "manual");
+        assert_eq!(manual.state(), IntegrationState::ManualRequired);
+        manual.mark_hybrid_active();
+        assert!(manual.hybrid_active);
         assert_eq!(manual.state(), IntegrationState::ManualRequired);
 
-        let mut unsupported = base;
-        unsupported.supported = false;
+        let mut unsupported = IntegrationStatus::unsupported(false, "windows");
         assert_eq!(unsupported.state(), IntegrationState::Unsupported);
+        assert!(!unsupported.enabled);
+        unsupported.mark_hybrid_active();
+        assert!(unsupported.hybrid_active);
+        assert_eq!(unsupported.state(), IntegrationState::Unsupported);
+
+        let fallback = IntegrationStatus::error_fallback(false, "probe failed");
+        let expected_fallback_state = if is_platform_supported() {
+            IntegrationState::Disabled
+        } else {
+            IntegrationState::Unsupported
+        };
+        assert_eq!(fallback.state(), expected_fallback_state);
+        assert!(!fallback.enabled);
 
         assert!(is_valid_restore_prefix("AGY_COMPANION_ORIG_"));
         assert!(is_valid_restore_prefix("_A1"));
@@ -4065,10 +3796,10 @@ mod tests {
         )
         .unwrap();
         assert!(!st_before.enabled);
-        assert!(!st_before.manual_required);
+        assert_eq!(st_before.state, IntegrationState::Disabled);
         assert_eq!(st_before.symlink_target.as_deref(), Some(fifo.as_path()));
 
-        // default enable writes 0600 env.sh and returns manual_required without opening FIFO
+        // default enable writes 0600 env.sh and returns ManualRequired without opening FIFO
         let st_en = enable_with_env(
             &opts_default,
             Some(&home),
@@ -4081,7 +3812,7 @@ mod tests {
         )
         .unwrap();
         assert!(!st_en.enabled);
-        assert!(st_en.manual_required);
+        assert_eq!(st_en.state, IntegrationState::ManualRequired);
         assert!(st_en.manual_snippet.is_some());
         assert_eq!(st_en.symlink_target.as_deref(), Some(fifo.as_path()));
         assert_eq!(
@@ -4093,7 +3824,7 @@ mod tests {
             0o600
         );
 
-        // status after enable returns manual_required: true without crashing
+        // status after enable returns ManualRequired without crashing
         let st_after = status_with_env(
             &opts_default,
             Some(&home),
@@ -4106,11 +3837,11 @@ mod tests {
         )
         .unwrap();
         assert!(!st_after.enabled);
-        assert!(st_after.manual_required);
+        assert_eq!(st_after.state, IntegrationState::ManualRequired);
         assert!(st_after.manual_snippet.is_some());
         assert_eq!(st_after.symlink_target.as_deref(), Some(fifo.as_path()));
 
-        // Fish symlink-to-FIFO status returns manual_required: true without crashing
+        // Fish symlink-to-FIFO status returns ManualRequired without crashing
         let fish_dropin = xdg.join("fish/conf.d/agy-companion.fish");
         fs::create_dir_all(fish_dropin.parent().unwrap()).unwrap();
         symlink(&fifo, &fish_dropin).unwrap();
@@ -4127,7 +3858,7 @@ mod tests {
         )
         .unwrap();
         assert!(!fish_st.enabled);
-        assert!(fish_st.manual_required);
+        assert_eq!(fish_st.state, IntegrationState::ManualRequired);
         assert_eq!(fish_st.symlink_target.as_deref(), Some(fifo.as_path()));
 
         // disable neutralizes env.sh cleanly without opening or mutating symlink target
@@ -4255,7 +3986,7 @@ mod tests {
                 true,
             )
             .unwrap_err();
-            assert!(matches!(err, CoreError::InvalidPath { .. }));
+            assert!(matches!(err, CoreError::Fs(FsError::NotRegularFile { .. })));
             assert!(!data.join("env.sh").exists());
         }
 
@@ -4636,9 +4367,10 @@ mod tests {
             )
             .unwrap();
             assert!(!st.enabled, "{label}: status must not report enabled");
-            assert!(
-                st.manual_required,
-                "{label}: status must report manual_required for symlinked Fish dir"
+            assert_eq!(
+                st.state,
+                IntegrationState::ManualRequired,
+                "{label}: status must report ManualRequired for symlinked Fish dir"
             );
             assert!(
                 st.symlink_target.is_some(),
@@ -4661,9 +4393,10 @@ mod tests {
             )
             .unwrap();
             assert!(!en.enabled, "{label}: enable must not report enabled");
-            assert!(
-                en.manual_required,
-                "{label}: enable must report manual_required without --follow-rc-symlink"
+            assert_eq!(
+                en.state,
+                IntegrationState::ManualRequired,
+                "{label}: enable must report ManualRequired without --follow-rc-symlink"
             );
             assert!(
                 en.symlink_target.is_some(),
@@ -4699,7 +4432,7 @@ mod tests {
                 st_existing.enabled,
                 "{label}: status should reflect existing valid markers read-only"
             );
-            assert!(!st_existing.manual_required);
+            assert_eq!(st_existing.state, IntegrationState::Enabled);
 
             let en_stale = enable_with_env(
                 &opts,
@@ -4713,8 +4446,9 @@ mod tests {
             )
             .unwrap();
             assert!(en_stale.enabled);
-            assert!(
-                en_stale.manual_required,
+            assert_eq!(
+                en_stale.state,
+                IntegrationState::ManualRequired,
                 "{label}: stale fish hook behind symlinked dir must require manual update"
             );
             assert_eq!(
@@ -4735,9 +4469,10 @@ mod tests {
             )
             .unwrap();
             assert!(dis.enabled, "{label}: fish hook still active until removed");
-            assert!(
-                dis.manual_required,
-                "{label}: disable must report manual_required without --follow-rc-symlink"
+            assert_eq!(
+                dis.state,
+                IntegrationState::ManualRequired,
+                "{label}: disable must report ManualRequired without --follow-rc-symlink"
             );
             assert_eq!(
                 fs::read_to_string(victim_dropin).unwrap(),
@@ -4759,7 +4494,7 @@ mod tests {
             )
             .unwrap();
             assert!(en_follow.enabled, "{label}: follow enable must succeed");
-            assert!(!en_follow.manual_required);
+            assert_eq!(en_follow.state, IntegrationState::Enabled);
             let updated = fs::read_to_string(victim_dropin).unwrap();
             assert!(updated.contains("# stow user note"));
             assert!(updated.contains(HOOK_BEGIN_MARKER));
@@ -4777,7 +4512,7 @@ mod tests {
             )
             .unwrap();
             assert!(!dis_follow.enabled, "{label}: follow disable must succeed");
-            assert!(!dis_follow.manual_required);
+            assert_eq!(dis_follow.state, IntegrationState::Disabled);
             assert_eq!(
                 fs::read_to_string(victim_dropin).unwrap(),
                 "# stow user note\n"
@@ -4874,7 +4609,7 @@ mod tests {
             );
         }
 
-        // Case (f): Non-directory intermediate regular file fails closed with CoreError::InvalidPath.
+        // Case (f): Non-directory intermediate regular file fails closed with CoreError::Fs(FsError::NotDirectory).
         {
             let tmp = TempDir::new().unwrap();
             let home = tmp.path().join("home");
@@ -4894,7 +4629,7 @@ mod tests {
                     false,
                     true
                 ),
-                Err(CoreError::InvalidPath { .. })
+                Err(CoreError::Fs(FsError::NotDirectory { .. }))
             ));
             assert!(matches!(
                 enable_with_env(
@@ -4907,7 +4642,7 @@ mod tests {
                     false,
                     true
                 ),
-                Err(CoreError::InvalidPath { .. })
+                Err(CoreError::Fs(FsError::NotDirectory { .. }))
             ));
             assert!(matches!(
                 disable_with_env(
@@ -4920,12 +4655,12 @@ mod tests {
                     false,
                     true
                 ),
-                Err(CoreError::InvalidPath { .. })
+                Err(CoreError::Fs(FsError::NotDirectory { .. }))
             ));
         }
 
         // Case (g): Dangling Fish directory symlink ($HOME/.config/fish -> /nonexistent):
-        // manual_required when follow=false, InvalidPath when follow=true, no false-positive strip.
+        // ManualRequired when follow=false, InvalidPath when follow=true, no false-positive strip.
         {
             let tmp = TempDir::new().unwrap();
             let home = tmp.path().join("home");
@@ -4948,7 +4683,7 @@ mod tests {
             )
             .unwrap();
             assert!(!st.enabled);
-            assert!(st.manual_required);
+            assert_eq!(st.state, IntegrationState::ManualRequired);
             assert!(st.manual_snippet.is_some());
 
             let en = enable_with_env(
@@ -4963,7 +4698,7 @@ mod tests {
             )
             .unwrap();
             assert!(!en.enabled);
-            assert!(en.manual_required);
+            assert_eq!(en.state, IntegrationState::ManualRequired);
             assert!(!missing_target.exists());
 
             let dis = disable_with_env(
@@ -4978,7 +4713,7 @@ mod tests {
             )
             .unwrap();
             assert!(!dis.enabled);
-            assert!(!dis.manual_required);
+            assert_eq!(dis.state, IntegrationState::Disabled);
 
             let follow_opts = make_opts(ShellKind::Fish, None, data, bin, true);
             assert!(matches!(
@@ -5019,7 +4754,7 @@ mod tests {
             )
             .unwrap();
             assert!(en.enabled);
-            assert!(!en.manual_required);
+            assert_eq!(en.state, IntegrationState::Enabled);
             assert!(
                 home.join(".config/fish/conf.d/agy-companion.fish")
                     .is_file()
@@ -5197,9 +4932,9 @@ mod tests {
                         false,
                         true,
                     ),
-                    Err(CoreError::InvalidPath { .. })
+                    Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
                 ),
-                "{label} ({shell}): enable must fail closed with InvalidPath"
+                "{label} ({shell}): enable must fail closed with SymlinkRejected"
             );
             assert!(
                 !victim_env.exists(),
@@ -5237,9 +4972,9 @@ mod tests {
                         false,
                         true,
                     ),
-                    Err(CoreError::InvalidPath { .. })
+                    Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
                 ),
-                "{label} ({shell}): status must fail closed with InvalidPath"
+                "{label} ({shell}): status must fail closed with SymlinkRejected"
             );
             assert!(
                 matches!(
@@ -5253,9 +4988,9 @@ mod tests {
                         false,
                         true,
                     ),
-                    Err(CoreError::InvalidPath { .. })
+                    Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
                 ),
-                "{label} ({shell}): enable with existing files must fail closed with InvalidPath"
+                "{label} ({shell}): enable with existing files must fail closed with SymlinkRejected"
             );
             assert!(
                 matches!(
@@ -5269,9 +5004,9 @@ mod tests {
                         false,
                         true,
                     ),
-                    Err(CoreError::InvalidPath { .. })
+                    Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
                 ),
-                "{label} ({shell}): disable must fail closed with InvalidPath"
+                "{label} ({shell}): disable must fail closed with SymlinkRejected"
             );
             assert_eq!(
                 fs::read_to_string(victim_env).unwrap(),
@@ -5457,9 +5192,9 @@ mod tests {
                             false,
                             true,
                         ),
-                        Err(CoreError::InvalidPath { .. })
+                        Err(CoreError::Fs(FsError::NotDirectory { .. }))
                     ),
-                    "non_dir={non_dir_kind} ({shell}): enable must fail with InvalidPath"
+                    "non_dir={non_dir_kind} ({shell}): enable must fail with NotDirectory"
                 );
                 assert!(
                     matches!(
@@ -5473,9 +5208,9 @@ mod tests {
                             false,
                             true,
                         ),
-                        Err(CoreError::InvalidPath { .. })
+                        Err(CoreError::Fs(FsError::NotDirectory { .. }))
                     ),
-                    "non_dir={non_dir_kind} ({shell}): status must fail with InvalidPath"
+                    "non_dir={non_dir_kind} ({shell}): status must fail with NotDirectory"
                 );
                 assert!(
                     matches!(
@@ -5489,9 +5224,9 @@ mod tests {
                             false,
                             true,
                         ),
-                        Err(CoreError::InvalidPath { .. })
+                        Err(CoreError::Fs(FsError::NotDirectory { .. }))
                     ),
-                    "non_dir={non_dir_kind} ({shell}): disable must fail with InvalidPath"
+                    "non_dir={non_dir_kind} ({shell}): disable must fail with NotDirectory"
                 );
             }
 
@@ -5532,7 +5267,7 @@ mod tests {
                         false,
                         true,
                     ),
-                    Err(CoreError::InvalidPath { .. })
+                    Err(CoreError::Fs(FsError::SymlinkRejected { .. }))
                 ));
                 assert!(
                     !victim_local.join("share/agy-companion/env.sh").exists(),
@@ -5766,16 +5501,31 @@ mod tests {
                     .unwrap_or_else(|_| panic!("{kind} ({shell}): timed out (FIFO hang)"));
 
                 assert!(
-                    matches!(st_res, Err(CoreError::InvalidPath { .. })),
-                    "{kind} ({shell}): status must fail closed with InvalidPath, got: {st_res:?}"
+                    matches!(
+                        st_res,
+                        Err(CoreError::Fs(
+                            FsError::SymlinkRejected { .. } | FsError::NotRegularFile { .. }
+                        ))
+                    ),
+                    "{kind} ({shell}): status must fail closed with FsError, got: {st_res:?}"
                 );
                 assert!(
-                    matches!(en_res, Err(CoreError::InvalidPath { .. })),
-                    "{kind} ({shell}): enable must fail closed with InvalidPath, got: {en_res:?}"
+                    matches!(
+                        en_res,
+                        Err(CoreError::Fs(
+                            FsError::SymlinkRejected { .. } | FsError::NotRegularFile { .. }
+                        ))
+                    ),
+                    "{kind} ({shell}): enable must fail closed with FsError, got: {en_res:?}"
                 );
                 assert!(
-                    matches!(dis_res, Err(CoreError::InvalidPath { .. })),
-                    "{kind} ({shell}): disable must fail closed with InvalidPath, got: {dis_res:?}"
+                    matches!(
+                        dis_res,
+                        Err(CoreError::Fs(
+                            FsError::SymlinkRejected { .. } | FsError::NotRegularFile { .. }
+                        ))
+                    ),
+                    "{kind} ({shell}): disable must fail closed with FsError, got: {dis_res:?}"
                 );
                 assert!(
                     rc_path.is_file(),

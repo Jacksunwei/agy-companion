@@ -59,7 +59,7 @@ When Antigravity App starts from macOS Dock/Spotlight or a Linux desktop launche
 
 Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionProject` field, so treating any `"project"` key as PayGo/Business misrouted personal accounts to `prod`. PR 1 deletes `request_hints_business_project` and enforces a strict precedence order in `crates/companion-proxy/src/cloudcode.rs`:
 
-1. **Explicit fixed `cloudcode_upstream_url`** (any value other than `"auto"`): honors the configured upstream directly.
+1. **Explicit fixed `cloudcode.upstream`** (any value other than `"auto"`): honors the configured upstream directly.
 2. **Enterprise entitlement hint:** `fetchAvailableModels` request body containing `entitlement.userTier` routes to `https://cloudcode-pa.googleapis.com` (`prod`) with `strip_user_project = true`.
 3. **`User-Agent` `auth_method=` hint:** `auth_method=gcp` or `auth_method=adc` routes to `prod`; `auth_method=consumer` routes to `https://daily-cloudcode-pa.googleapis.com` (`daily`).
 4. **`loadCodeAssist` tier inspection:** inspects both `paidTier.usesGcpTos` and `currentTier.usesGcpTos` plus `gcp-*` tier prefixes, with `prod` -> `daily` fallback on non-2xx/transport failure.
@@ -68,7 +68,7 @@ Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionPr
 **Per-Account LRU & Hot-Reload Preservation (zero new crates):**
 - An 8-entry bounded LRU keyed by 128-bit SipHash-1-3 (`std::collections::hash_map::RandomState` x2; raw Bearer tokens are never stored on the heap) stores `AccountRoute { use_prod, strip_user_project }`.
 - On hourly OAuth token refresh (cache miss on `forward_raw`), routing checks `User-Agent` `auth_method=` and falls back to `last_resolved_prod`, preventing PayGo/Enterprise sessions from bouncing back to `daily`.
-- `HotReloadProvider` preserves the `Arc<CloudCodeClient>` (and routing cache) across config hot-reloads whenever `cloudcode_upstream_url` and `timeout_secs` are unchanged.
+- `HotReloadProvider` preserves the `Arc<CloudCodeClient>` (and routing cache) across config hot-reloads whenever `cloudcode.upstream` and `timeout_secs` are unchanged.
 
 **Hard Idempotency Invariant:**
 - `daily` <-> `prod` fallback and the 1-time Enterprise `403` retry without `x-goog-user-project` run **ONLY** on read-only metadata RPCs (`fetchAvailableModels`, `loadCodeAssist`) — **NEVER** on generation or streaming RPCs (`streamGenerateContent`, etc.).
@@ -83,8 +83,8 @@ Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionPr
 
 - `PROXY_PLACEHOLDER_API_KEY` (`"agy-companion-local"`) lives in `companion-core` (`is_placeholder_api_key`) and is quarantined across `companion-providers`, `companion-proxy`, `companion-ui-mcp`, and `doctor` so it never leaks upstream or false-passes diagnostics.
 - On Day-0 (`!has_configured_api_key`), `POST /v1internal:fetchAvailableModels` returns upstream JSON and headers untouched (hiding `(Proxy)` models until a real API key is saved).
-- `GET /api/stats` exposes 4 additive `#[serde(default)]` fields (`last_catalog_refresh_at_ms`, `last_catalog_included_proxy_models`, `cloudcode_mode`, `cloudcode_resolved_upstream`).
-- Unsupported non-Gemini-3/4 `400` responses include the actionable hint `unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly`.
+- `GET /api/stats` exposes structured `StatsSnapshot` JSON (`{ "usage": { ... }, "cloudcode": { "mode", "resolved_upstream", "last_catalog_refresh_at_ms", "last_catalog_included_proxy_models" } }`).
+- Unsupported non-Gemini-3.8+/4+ `400` responses include the actionable hint `unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly`.
 - Managed On-Demand Daemon primitives: `--idle-shutdown-secs` guarded by active in-flight requests and open SSE streams (passive `/health` and `/api/stats` probes do not reset idle time), `64 KiB`-capped `/health` probe (`250ms` timeout in `hook-env`), `500ms` `--adopt-running` polling, atomic `0600` structured `proxy.pid`, and `0600` rotating `5 MiB` `proxy.log`.
 
 | Criterion | OS User Service (`launchd` / `systemd --user`) | Managed On-Demand Daemon + `SidecarManager` (Chosen) |
@@ -107,7 +107,7 @@ Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionPr
   - Zsh: `${ZDOTDIR:-$HOME}/.zlogin` (runs after `.zshrc`, survives `.zshrc` `ANTIGRAVITY_RESOLVING_ENVIRONMENT` early returns, leaves Stow/Nix `.zshrc` untouched, and is deleted cleanly on disable/uninstall when empty).
   - Bash: first existing of `~/.bash_profile`, `~/.bash_login`, `~/.profile`, falling back to `~/.profile`.
   - Fish: `${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/agy-companion.fish` (zero `| source`).
-  - Symlinked or read-only RC files (Nix, Home Manager, Stow, Chezmoi) are never silently mutated; status reports `manual_required` with a 1-line static snippet (CLI opts in explicitly via `--follow-rc-symlink`).
+  - Symlinked or read-only RC files (Nix, Home Manager, Stow, Chezmoi) are never silently mutated; status reports `state: "manual_required"` with a 1-line static snippet (CLI opts in explicitly via `--follow-rc-symlink`).
   - Marker parser matches `# >>> agy-companion` and `# <<< agy-companion` prefixes and fails closed with exact 1-based line numbers on unbalanced or corrupted markers.
 - **CLI & MCP App UI:** Adds `hook-env --ensure-running --print-port`, `integration enable|disable|status [--shell] [--rc-file] [--binary] [--follow-rc-symlink] [--json]`, updated `launch` (`JETSKI_MCP_ENV_RESTORE_*` + `--idle-shutdown-secs 1800`), app-only `set_launcher_integration({ enabled: bool })` (`#[serde(deny_unknown_fields)]`, async mutex serialized, `follow_rc_symlink: false`), and an updated single-file UI (`< 512,000` bytes, strictly S5 zero-`innerHTML`) with a **Dock / Launcher Auto-Start** card, CloudCode active-upstream badge, post-save auto-verification + live 5-minute model-refresh countdown banner, collapsed Advanced/CLI `<details>`, and platform-aware launch command snippet.
 
@@ -158,6 +158,6 @@ Standalone web bootstrap scripts are intentionally omitted in v1 to avoid duplic
 
 ## 5. Verification & Residual Caveats
 
-- **Verification gates:** `./scripts/agent_check.sh` (7/7 gates: governance, hygiene/secret scan, zero AI attribution, Bash 3.2 & modern bash checks, 4-way version parity & packaging shims + `26/26` E2E self-tests, Rust `fmt`/`clippy -D warnings`/`test` + S5 UI scanning, plugin manifest/SVG/`agy plugin validate --strict ./plugin`) plus the full 4-tier isolated-`$HOME` opaque-box E2E suite (`331` tests across Tiers 1–4, run via `python3 -B`).
-- **Residual non-login `run_command` subshells:** Non-login agent tool subshells inherit `GOOGLE_GEMINI_BASE_URL`; keeping `/v1beta/models/*` strictly Gemini-3/4-only with the explicit `400` `unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly` hint avoids widening S7 or silently billing the companion key for unrelated scripts.
+- **Verification gates:** `./scripts/agent_check.sh` (7/7 gates: governance, hygiene/secret scan, zero AI attribution, Bash 3.2 & modern bash checks, 4-way version parity & packaging shims + `26/26` E2E self-tests, Rust `fmt`/`clippy -D warnings`/`test` + S5 UI scanning, plugin manifest/SVG/`agy plugin validate --strict ./plugin`) plus the full 4-tier isolated-`$HOME` opaque-box E2E suite (`333` tests across Tiers 1–4, run via `python3 -B`).
+- **Residual non-login `run_command` subshells:** Non-login agent tool subshells inherit `GOOGLE_GEMINI_BASE_URL`; keeping `/v1beta/models/*` strictly Gemini-3.8+/4+-only with the explicit `400` `unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly` hint avoids widening S7 or silently billing the companion key for unrelated scripts.
 - **Windows host smoke test:** Cross-platform Rust unit tests validate Windows `.exe` discovery, direct-`.exe` manifests, and PowerShell shortcut quoting on macOS/Linux; end-to-end Start Menu execution should be smoke-tested on a native Windows host when cutting the first release.

@@ -18,7 +18,7 @@ pub struct Cli {
 pub enum Commands {
     /// Run the loopback Gemini pass-through HTTP proxy.
     Serve {
-        /// Loopback listen port (1-65535; overrides config.listen_port).
+        /// Loopback listen port (1-65535; overrides config.proxy.port).
         #[arg(long, value_parser = parse_nonzero_port)]
         port: Option<u16>,
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).
@@ -47,7 +47,7 @@ pub enum Commands {
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Proxy port to probe (1-65535; overrides config.listen_port).
+        /// Proxy port to probe (1-65535; overrides config.proxy.port).
         #[arg(long, value_parser = parse_nonzero_port)]
         port: Option<u16>,
         /// Emit machine-readable JSON report to stdout.
@@ -59,7 +59,7 @@ pub enum Commands {
         /// Emit pure JSON only (suitable for scripting or piping).
         #[arg(long)]
         json: bool,
-        /// Proxy port to embed in model URLs (1-65535; overrides config.listen_port).
+        /// Proxy port to embed in model URLs (1-65535; overrides config.proxy.port).
         #[arg(long, value_parser = parse_nonzero_port)]
         port: Option<u16>,
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).
@@ -68,7 +68,7 @@ pub enum Commands {
     },
     /// Launch Antigravity App in Hybrid Mode (original Google AI Pro models + proxy models).
     Launch {
-        /// Proxy port (1-65535; overrides config.listen_port).
+        /// Proxy port (1-65535; overrides config.proxy.port).
         #[arg(long, value_parser = parse_nonzero_port)]
         port: Option<u16>,
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).
@@ -90,7 +90,7 @@ pub enum Commands {
         /// Print ONLY the validated loopback port (`<port>\n`) when healthy.
         #[arg(long = "print-port")]
         print_port: bool,
-        /// Proxy port (1-65535; overrides config.listen_port).
+        /// Proxy port (1-65535; overrides config.proxy.port).
         #[arg(long, value_parser = parse_nonzero_port)]
         port: Option<u16>,
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).

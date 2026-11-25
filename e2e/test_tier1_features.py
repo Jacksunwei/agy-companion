@@ -1,7 +1,7 @@
-"""Tier 1: Core Feature Coverage (82 isolated happy-path opaque-box E2E tests).
+"""Tier 1: Core Feature Coverage (90 isolated happy-path opaque-box E2E tests).
 
-Covers all 12 core features (6–7 tests per feature F1–F12 = 74 tests) plus 8
-additive feature tests for F14, F15 & F16 (XDG paths).
+Covers all core features F1–F12 plus additive feature tests for F14–F16 (XDG paths),
+CloudCode hybrid routing, placeholder quarantine, and Gemini 3.8+/4+/5+ model validation.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from harness import (
     run_cli,
     usage_storage_files,
 )
+from mcp_client import McpStdioClient
 from mock_gemini import JsonAction, SseStreamAction, build_sse_events
 
 
@@ -89,36 +90,22 @@ class TestTier1F1Config(E2ETestCase):
         sc = res.get("structuredContent", {})
         self.assertIsInstance(sc, dict)
 
-        found_sv, sv = find_key_recursive(sc, "schema_version")
-        self.assertTrue(found_sv, f"Missing schema_version in {sc!r}")
-        self.assertEqual(sv, 1)
+        cfg = sc.get("config")
+        self.assertIsInstance(cfg, dict, f"Missing config object in {sc!r}")
+        assert isinstance(cfg, dict)
+        self.assertEqual(cfg.get("schema_version"), 1)
+        self.assertEqual(cfg.get("proxy", {}).get("host"), "127.0.0.1")
+        self.assertEqual(cfg.get("proxy", {}).get("port"), 24141)
+        self.assertEqual(cfg.get("cloudcode", {}).get("upstream"), "auto")
 
-        found_host, host = find_key_recursive(sc, "listen_host")
-        self.assertTrue(found_host, f"Missing listen_host in {sc!r}")
-        self.assertEqual(host, "127.0.0.1")
-
-        found_port, port = find_key_recursive(sc, "listen_port")
-        self.assertTrue(found_port, f"Missing listen_port in {sc!r}")
-        self.assertEqual(port, 24141)
-
-        found_url, base_url = _find_any_key(sc, ("gemini_base_url", "base_url"))
-        self.assertTrue(found_url, f"Missing gemini_base_url in {sc!r}")
+        gem = cfg.get("providers", {}).get("gemini", {})
         self.assertTrue(
-            str(base_url).startswith("https://generativelanguage.googleapis.com"),
-            f"Unexpected default base_url: {base_url!r}",
+            str(gem.get("base_url", "")).startswith("https://generativelanguage.googleapis.com"),
+            f"Unexpected default base_url: {gem!r}",
         )
-
-        found_timeout, timeout_secs = _find_any_key(sc, ("gemini_timeout_secs", "timeout_secs"))
-        self.assertTrue(found_timeout, f"Missing timeout_secs in {sc!r}")
-        self.assertEqual(timeout_secs, 900)
-
-        found_cfg, configured = find_key_recursive(sc, "api_key_configured")
-        self.assertTrue(found_cfg, f"Missing api_key_configured in {sc!r}")
-        self.assertIs(configured, False)
-
-        found_hint, hint = find_key_recursive(sc, "api_key_hint")
-        if found_hint:
-            self.assertIsNone(hint)
+        self.assertEqual(gem.get("timeout_secs"), 900)
+        self.assertIs(gem.get("api_key_configured"), False)
+        self.assertIsNone(gem.get("api_key_hint"))
 
     def test_t1_f1_save_creates_config_with_mode_0600(self) -> None:
         """save_settings creates missing parent dirs and persists schema_version=1 at 0600."""
@@ -137,8 +124,14 @@ class TestTier1F1Config(E2ETestCase):
 
         saved = json.loads(nested_cfg.read_text(encoding="utf-8"))
         self.assertEqual(saved.get("schema_version"), 1)
-        self.assertEqual(saved.get("gemini", {}).get("default_model"), "gemini-4-hydrogen")
-        self.assertEqual(saved.get("gemini", {}).get("api_key"), "AIzaSyModeCheck12345678")
+        self.assertEqual(
+            saved.get("providers", {}).get("gemini", {}).get("default_model"),
+            "gemini-4-hydrogen",
+        )
+        self.assertEqual(
+            saved.get("providers", {}).get("gemini", {}).get("api_key"),
+            "AIzaSyModeCheck12345678",
+        )
 
     def test_t1_f1_atomic_save_leaves_no_temp_files(self) -> None:
         """Sequential atomic save_settings writes leave only config.json at 0600."""
@@ -153,7 +146,10 @@ class TestTier1F1Config(E2ETestCase):
         entries = sorted(p.name for p in cfg_dir.iterdir())
         self.assertEqual(entries, ["config.json"], f"Unexpected temp files left behind: {entries}")
         parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
-        self.assertEqual(parsed.get("gemini", {}).get("default_model"), "gemini-4-hydrogen")
+        self.assertEqual(
+            parsed.get("providers", {}).get("gemini", {}).get("default_model"),
+            "gemini-4-hydrogen",
+        )
         self.assertEqual(stat.S_IMODE(os.stat(cfg_path).st_mode), 0o600)
 
     def test_t1_f1_env_var_config_path_override(self) -> None:
@@ -727,7 +723,7 @@ class TestTier1F5Proxy(E2ETestCase):
         self.assertEqual(resp.status, 200)
         self.assertIn("mock unary response", resp.text)
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertEqual(stats["requests"], 1)
+        self.assertEqual(stats["usage"]["requests"], 1)
 
     def test_t1_f5_proxies_stream_generate_content_with_sse_tee(self) -> None:
         """POST :streamGenerateContent?alt=sse passes SSE bytes untouched and tees usage."""
@@ -755,11 +751,12 @@ class TestTier1F5Proxy(E2ETestCase):
         _, events = poll_usage_events(env.usage_dir, min_count=1)
         self.assertEqual(len(events), 1)
         stats = poll_stats(proxy.port, min_requests=1)
-        self.assertEqual(stats["requests"], 1)
-        self.assertEqual(stats["prompt_tokens"], 400)
-        self.assertEqual(stats["cached_tokens"], 200)
-        self.assertEqual(stats["output_tokens"], 80)
-        self.assertEqual(stats["reasoning_tokens"], 20)
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 1)
+        self.assertEqual(usage["prompt_tokens"], 400)
+        self.assertEqual(usage["cached_tokens"], 200)
+        self.assertEqual(usage["output_tokens"], 80)
+        self.assertEqual(usage["reasoning_tokens"], 20)
 
     def test_t1_f5_routes_arbitrary_model_name_in_wildcard(self) -> None:
         """Wildcard route forwards arbitrary model identifiers verbatim."""
@@ -780,6 +777,138 @@ class TestTier1F5Proxy(E2ETestCase):
         req = mock.last_request()
         assert req is not None
         self.assertEqual(req.path, path)
+
+    def test_t1_f5_gemini_5_and_3_9_supported_while_bare_major_rejected(self) -> None:
+        """Gemini 5+ and 3.9+ models work end-to-end (MCP, proxy, CloudCode template) while bare/malformed majors are rejected."""
+        env = self.make_env()
+        mock_gemini = self.start_mock_gemini()
+        mock_ccpa = self.start_mock_gemini()
+        cfg = env.write_config(
+            env.make_config_dict(
+                base_url=mock_gemini.base_url,
+                cloudcode_upstream_url=mock_ccpa.base_url,
+                api_key="AIzaSyBug4ModelTest12",
+            )
+        )
+
+        # 1. MCP save_settings accepts gemini-5-pro and gemini-3.9-pro, rejects bare/malformed models.
+        mcp = self.start_mcp(env, config_path=cfg)
+        res_g5 = mcp.save_settings_smart(default_model="gemini-5-pro")
+        mcp.assert_clean_stdout()
+        self.assertFalse(McpStdioClient.is_tool_error(res_g5), res_g5)
+        self.assertEqual(
+            json.loads(cfg.read_text(encoding="utf-8"))["providers"]["gemini"]["default_model"],
+            "gemini-5-pro",
+        )
+
+        res_g39 = mcp.save_settings_smart(default_model="gemini-3.9-pro")
+        mcp.assert_clean_stdout()
+        self.assertFalse(McpStdioClient.is_tool_error(res_g39), res_g39)
+        self.assertEqual(
+            json.loads(cfg.read_text(encoding="utf-8"))["providers"]["gemini"]["default_model"],
+            "gemini-3.9-pro",
+        )
+
+        for bad_model in ("gemini-5", "gemini-5-", "gemini-5.", "gemini-5pro", "gemini-4", "gemini-3.7-pro"):
+            with self.subTest(mcp_bad_model=bad_model):
+                bad_resp = mcp.save_settings_smart(default_model=bad_model, raw=True)
+                mcp.assert_clean_stdout()
+                self.assertTrue(
+                    McpStdioClient.is_tool_error(bad_resp),
+                    f"Expected MCP rejection for {bad_model!r}, got: {bad_resp!r}",
+                )
+                self.assertEqual(
+                    json.loads(cfg.read_text(encoding="utf-8"))["providers"]["gemini"]["default_model"],
+                    "gemini-3.9-pro",
+                )
+
+        # 2. Live proxy forwards gemini-5-pro & gemini-3.9-pro, inherits CloudCode template from gemini-5-pro-high,
+        # and rejects bare/malformed majors with 400 + 0 upstream hits.
+        proxy = self.start_proxy(env, config_path=cfg)
+        for valid_model in ("gemini-5-pro", "gemini-3.9-pro"):
+            path = f"/v1beta/models/{valid_model}:generateContent"
+            resp = http_raw_request(
+                "127.0.0.1",
+                proxy.port,
+                "POST",
+                path,
+                body=b'{"contents":[]}',
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(resp.status, 200, f"Expected 200 for {valid_model}: {resp.text}")
+            req = mock_gemini.last_request()
+            assert req is not None
+            self.assertEqual(req.path, path)
+
+        mock_gemini.enqueue(
+            JsonAction(
+                status=200,
+                payload={
+                    "models": [
+                        {"name": "models/gemini-5-pro"},
+                        {"name": "models/gemini-3.9-pro"},
+                    ]
+                },
+            )
+        )
+        mock_ccpa.enqueue(
+            JsonAction(
+                status=200,
+                payload={
+                    "models": {
+                        "gemini-5-pro-high": {
+                            "model": "MODEL_PLACEHOLDER_M427",
+                            "displayName": "Gemini 5 Pro (High)",
+                            "thinkingLevel": 3,
+                            "modelExperimentIds": ["exp-g5-bug4"],
+                        }
+                    },
+                    "defaultAgentModelId": "gemini-5-pro-high",
+                },
+            )
+        )
+        fetch_resp = http_raw_request(
+            "127.0.0.1",
+            proxy.port,
+            "POST",
+            "/v1internal:fetchAvailableModels",
+            headers={
+                "Authorization": "Bearer bug4-pro-token",
+                "Content-Type": "application/json",
+            },
+            body=b'{"project":"personal"}',
+        )
+        self.assertEqual(fetch_resp.status, 200, fetch_resp.text)
+        merged = json.loads(fetch_resp.text)
+        self.assertIn("companion/gemini-5-pro-high", merged.get("models", {}))
+        self.assertIn("companion/gemini-3.9-pro-high", merged.get("models", {}))
+        self.assertEqual(
+            merged["models"]["companion/gemini-3.9-pro-high"].get("modelExperimentIds"),
+            ["exp-g5-bug4"],
+        )
+
+        req_count_before = len(mock_gemini.requests)
+        for bad_model in ("gemini-5", "gemini-5-", "gemini-5.", "gemini-5pro"):
+            with self.subTest(proxy_bad_model=bad_model):
+                bad_resp = http_raw_request(
+                    "127.0.0.1",
+                    proxy.port,
+                    "POST",
+                    f"/v1beta/models/{bad_model}:generateContent",
+                    body=b'{"contents":[]}',
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(bad_resp.status, 400, f"Expected 400 for {bad_model}: {bad_resp.text}")
+                self.assertIn("Gemini 3.8+ and Gemini 4+", bad_resp.text)
+                self.assertIn("unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly", bad_resp.text)
+                self.assertEqual((bad_resp.header("x-content-type-options") or "").lower(), "nosniff")
+                self.assertIn("no-store", (bad_resp.header("cache-control") or "").lower())
+        self.assertEqual(
+            len(mock_gemini.requests),
+            req_count_before,
+            "Rejected models must never hit upstream Gemini",
+        )
+        proxy.stop()
 
     def test_t1_f5_config_mtime_hot_reload_applies_new_key(self) -> None:
         """Modifying config file mtime hot-reloads api_key without restarting serve."""
@@ -865,12 +994,14 @@ class TestTier1F6HealthAndStats(E2ETestCase):
         resp = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats")
         self.assertEqual(resp.status, 200)
         stats = resp.json()
-        self.assertEqual(stats["requests"], 0)
-        self.assertEqual(stats["prompt_tokens"], 0)
-        self.assertEqual(stats["cached_tokens"], 0)
-        self.assertEqual(stats["output_tokens"], 0)
-        self.assertEqual(stats["reasoning_tokens"], 0)
-        self.assertEqual(stats["cache_hit_ratio"], 0.0)
+        self.assertEqual(set(stats.keys()), {"usage", "cloudcode"})
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 0)
+        self.assertEqual(usage["prompt_tokens"], 0)
+        self.assertEqual(usage["cached_tokens"], 0)
+        self.assertEqual(usage["output_tokens"], 0)
+        self.assertEqual(usage["reasoning_tokens"], 0)
+        self.assertEqual(usage["cache_hit_ratio"], 0.0)
 
     def test_t1_f6_stats_sets_security_headers(self) -> None:
         """GET /api/stats sets X-Content-Type-Options: nosniff and Cache-Control: no-store (S7)."""
@@ -905,12 +1036,13 @@ class TestTier1F6HealthAndStats(E2ETestCase):
         )
         self.assertEqual(resp.status, 200)
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertEqual(stats["requests"], 1)
-        self.assertEqual(stats["prompt_tokens"], 1000)
-        self.assertEqual(stats["cached_tokens"], 800)
-        self.assertEqual(stats["output_tokens"], 150)
-        self.assertEqual(stats["reasoning_tokens"], 40)
-        self.assertAlmostEqual(stats["cache_hit_ratio"], 0.8, places=6)
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 1)
+        self.assertEqual(usage["prompt_tokens"], 1000)
+        self.assertEqual(usage["cached_tokens"], 800)
+        self.assertEqual(usage["output_tokens"], 150)
+        self.assertEqual(usage["reasoning_tokens"], 40)
+        self.assertAlmostEqual(usage["cache_hit_ratio"], 0.8, places=6)
 
     def test_t1_f6_stats_accumulates_across_multiple_requests(self) -> None:
         """GET /api/stats sums counters accurately across sequential requests."""
@@ -957,12 +1089,13 @@ class TestTier1F6HealthAndStats(E2ETestCase):
             )
             self.assertEqual(r.status, 200)
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
-        self.assertEqual(stats["requests"], 2)
-        self.assertEqual(stats["prompt_tokens"], 2000)
-        self.assertEqual(stats["cached_tokens"], 1500)
-        self.assertEqual(stats["output_tokens"], 300)
-        self.assertEqual(stats["reasoning_tokens"], 50)
-        self.assertAlmostEqual(stats["cache_hit_ratio"], 0.75, places=6)
+        usage = stats["usage"]
+        self.assertEqual(usage["requests"], 2)
+        self.assertEqual(usage["prompt_tokens"], 2000)
+        self.assertEqual(usage["cached_tokens"], 1500)
+        self.assertEqual(usage["output_tokens"], 300)
+        self.assertEqual(usage["reasoning_tokens"], 50)
+        self.assertAlmostEqual(usage["cache_hit_ratio"], 0.75, places=6)
 
 
 class TestTier1F7UiBundle(E2ETestCase):
@@ -1089,8 +1222,8 @@ class TestTier1F7UiBundle(E2ETestCase):
         )
         self.assertRegex(
             src,
-            r"refs\.endpointTag\.textContent\s*=\s*`\$\{snapshot\.config\.listen_host\}:\$\{snapshot\.config\.listen_port\}`",
-            "endpointTag should render snapshot.config.listen_host dynamically instead of hardcoded 127.0.0.1",
+            r"refs\.endpointTag\.textContent\s*=\s*`\$\{snapshot\.config\.proxy\.host\}:\$\{snapshot\.config\.proxy\.port\}`",
+            "endpointTag should render snapshot.config.proxy.host dynamically instead of hardcoded 127.0.0.1",
         )
         self.assertRegex(
             src,
@@ -1785,12 +1918,11 @@ class TestTier1F16XdgPaths(E2ETestCase):
         get_res = mcp.call_tool("get_settings", {})
         mcp.assert_clean_stdout()
         sc = get_res.get("structuredContent", {})
-        found_p, listen_port = find_key_recursive(sc, "listen_port")
-        found_m, model = _find_any_key(sc, ("gemini_default_model", "default_model"))
-        found_h, hint = find_key_recursive(sc, "api_key_hint")
-        self.assertTrue(found_p and listen_port == port, f"Bad listen_port in {sc!r}")
-        self.assertTrue(found_m and model == "gemini-3.8-flash", f"Bad model in {sc!r}")
-        self.assertTrue(found_h and hint == "AIza...st12", f"Bad hint in {sc!r}")
+        cfg_sc = sc.get("config", {})
+        self.assertEqual(cfg_sc.get("proxy", {}).get("port"), port, f"Bad proxy.port in {sc!r}")
+        gem_sc = cfg_sc.get("providers", {}).get("gemini", {})
+        self.assertEqual(gem_sc.get("default_model"), "gemini-3.8-flash", f"Bad model in {sc!r}")
+        self.assertEqual(gem_sc.get("api_key_hint"), "AIza...st12", f"Bad hint in {sc!r}")
 
     def test_t1_f16_xdg_data_home_honored_when_usage_dir_omitted(self) -> None:
         """XDG_DATA_HOME/agy-companion/usage receives SQLite usage.db when config.usage_dir is omitted."""
@@ -2103,8 +2235,8 @@ class TestTier1F16XdgPaths(E2ETestCase):
             base_url=mock_gemini.base_url,
             api_key="AIzaSyCloudCodeHybrid12",
             default_model="gemini-4-hydrogen",
+            cloudcode_upstream_url=mock_ccpa.base_url,
         )
-        cfg_dict["cloudcode_upstream_url"] = mock_ccpa.base_url
         cfg = env.write_config(cfg_dict)
         proxy = self.start_proxy(env, config_path=cfg)
 
@@ -2172,7 +2304,7 @@ class TestTier1F16XdgPaths(E2ETestCase):
         slots_before = {
             k: v["model"] for k, v in merged["models"].items() if k.startswith("companion/")
         }
-        cfg_dict["gemini"]["default_model"] = "gemini-4-neon"
+        cfg_dict["providers"]["gemini"]["default_model"] = "gemini-4-neon"
         env.write_config(cfg_dict, path=cfg)
         env.bump_mtime(cfg)
         fetch_resp2 = http_raw_request(
@@ -2301,8 +2433,10 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 mock_ccpa = self.start_mock_gemini()
                 mock_ccpa.enqueue(JsonAction(status=200, payload=upstream_catalog))
 
-                cfg_dict = env.make_config_dict(api_key=api_key)
-                cfg_dict["cloudcode_upstream_url"] = mock_ccpa.base_url
+                cfg_dict = env.make_config_dict(
+                    api_key=api_key,
+                    cloudcode_upstream_url=mock_ccpa.base_url,
+                )
                 cfg = env.write_config(cfg_dict)
                 proxy = self.start_proxy(env, config_path=cfg)
 
@@ -2328,27 +2462,35 @@ class TestTier1F16XdgPaths(E2ETestCase):
                 stats_resp = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats")
                 self.assertEqual(stats_resp.status, 200, stats_resp.text)
                 stats = json.loads(stats_resp.text)
-                expected_keys = {
+                self.assertEqual(set(stats.keys()), {"usage", "cloudcode"})
+                expected_usage_keys = {
                     "requests",
                     "prompt_tokens",
                     "cached_tokens",
                     "output_tokens",
                     "reasoning_tokens",
                     "cache_hit_ratio",
+                }
+                expected_cc_keys = {
+                    "mode",
+                    "resolved_upstream",
                     "last_catalog_refresh_at_ms",
                     "last_catalog_included_proxy_models",
-                    "cloudcode_mode",
-                    "cloudcode_resolved_upstream",
                 }
                 self.assertTrue(
-                    expected_keys.issubset(stats.keys()),
-                    f"Missing /api/stats fields: {expected_keys - set(stats.keys())}",
+                    expected_usage_keys.issubset(stats["usage"].keys()),
+                    f"Missing /api/stats.usage fields: {expected_usage_keys - set(stats['usage'].keys())}",
                 )
-                self.assertIsInstance(stats["last_catalog_refresh_at_ms"], int)
-                self.assertGreater(stats["last_catalog_refresh_at_ms"], 0)
-                self.assertIs(stats["last_catalog_included_proxy_models"], False)
-                self.assertEqual(stats["cloudcode_mode"], "fixed")
-                self.assertEqual(stats["cloudcode_resolved_upstream"], mock_ccpa.base_url)
+                self.assertTrue(
+                    expected_cc_keys.issubset(stats["cloudcode"].keys()),
+                    f"Missing /api/stats.cloudcode fields: {expected_cc_keys - set(stats['cloudcode'].keys())}",
+                )
+                cc = stats["cloudcode"]
+                self.assertIsInstance(cc["last_catalog_refresh_at_ms"], int)
+                self.assertGreater(cc["last_catalog_refresh_at_ms"], 0)
+                self.assertIs(cc["last_catalog_included_proxy_models"], False)
+                self.assertEqual(cc["mode"], "fixed")
+                self.assertEqual(cc["resolved_upstream"], mock_ccpa.base_url)
                 proxy.stop()
 
     def test_t1_pr1_placeholder_sentinel_quarantine_in_doctor_and_ui_mcp(self) -> None:
@@ -2384,12 +2526,15 @@ class TestTier1F16XdgPaths(E2ETestCase):
 
         # 2. ui-mcp save_settings rejects "agy-companion-local".
         mcp = self.start_mcp(env, config_path=cfg)
-        save_res = mcp.call_tool("save_settings", {"api_key": "agy-companion-local"})
+        save_res = mcp.call_tool(
+            "save_settings",
+            {"providers": {"gemini": {"api_key": {"set": "agy-companion-local"}}}},
+        )
         mcp.assert_clean_stdout()
         self.assertIs(save_res.get("isError"), True, save_res)
         self.assertIn("placeholder", _text_blocks(save_res).lower())
         saved_cfg = json.loads(cfg.read_text(encoding="utf-8"))
-        self.assertIsNone(saved_cfg["gemini"]["api_key"])
+        self.assertIsNone(saved_cfg["providers"]["gemini"]["api_key"])
 
     def test_t1_pr1_unsupported_model_400_includes_unset_base_url_hint(self) -> None:
         """Non-Gemini-3/4 400 error explains both model support and unsetting GOOGLE_GEMINI_BASE_URL."""

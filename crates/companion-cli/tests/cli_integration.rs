@@ -3,18 +3,25 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::num::NonZeroU16;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::routing::get;
-use companion_core::Config;
+use companion_core::{ApiKey, Config};
 use companion_proxy::{HealthResponse, PROTOCOL_VERSION};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 const BIN: &str = env!("CARGO_BIN_EXE_agy-companion");
+
+fn config_with_port(port: u16) -> Config {
+    let mut cfg = Config::default();
+    cfg.proxy.port = NonZeroU16::new(port).expect("non-zero port");
+    cfg
+}
 
 struct ChildGuard {
     child: Option<Child>,
@@ -220,10 +227,10 @@ where
     for attempt in 1..=SERVE_START_MAX_ATTEMPTS {
         let port = pick_port(attempt);
         let mut cfg = Config::load_or_default(cfg_path).expect("load temp config");
-        if cfg.listen_port != port {
-            cfg.listen_port = port;
+        if cfg.proxy.port.get() != port {
+            cfg.proxy.port = NonZeroU16::new(port).expect("non-zero port");
             cfg.save_secure(cfg_path)
-                .expect("update temp config listen_port");
+                .expect("update temp config proxy.port");
         }
         let pid_path = companion_cli::daemon::resolve_runtime_data_dir(&cfg)
             .expect("resolve runtime data dir")
@@ -388,11 +395,11 @@ fn binary_version_prints_agy_companion_version() {
 fn serve_rejects_non_loopback_config_and_port_zero() {
     let temp = TempDir::new().expect("tempdir");
 
-    // (a) listen_host: 0.0.0.0
+    // (a) proxy.host: 0.0.0.0
     let bad_host = temp.path().join("bad_host.json");
     fs::write(
         &bad_host,
-        r#"{"schema_version":1,"listen_host":"0.0.0.0","listen_port":4141,"gemini":{"base_url":"https://generativelanguage.googleapis.com","api_key":"AIzaSyServeBadHostSecret111","default_model":"gemini-4-hydrogen","timeout_secs":900}}"#,
+        r#"{"schema_version":1,"proxy":{"host":"0.0.0.0","port":4141},"providers":{"gemini":{"base_url":"https://generativelanguage.googleapis.com","api_key":"AIzaSyServeBadHostSecret111","default_model":"gemini-4-hydrogen","timeout_secs":900}}}"#,
     )
     .expect("write bad_host");
     let out = Command::new(BIN)
@@ -421,7 +428,7 @@ fn serve_rejects_non_loopback_config_and_port_zero() {
     let bad_url = temp.path().join("bad_url.json");
     fs::write(
         &bad_url,
-        r#"{"schema_version":1,"listen_host":"127.0.0.1","listen_port":4141,"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyServeBadUrlSecret222","default_model":"gemini-4-hydrogen","timeout_secs":900}}"#,
+        r#"{"schema_version":1,"proxy":{"host":"127.0.0.1","port":4141},"providers":{"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyServeBadUrlSecret222","default_model":"gemini-4-hydrogen","timeout_secs":900}}}"#,
     )
     .expect("write bad_url");
     let out = Command::new(BIN)
@@ -443,7 +450,7 @@ async fn serve_binds_loopback_serves_health_and_exits_cleanly_on_sigterm() {
     let usage_dir = temp.path().join("usage");
 
     let mut cfg = Config::default();
-    cfg.gemini.api_key = Some("AIzaSyServeLiveSecret8888".to_string());
+    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyServeLiveSecret8888").unwrap());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
 
@@ -516,7 +523,8 @@ async fn doctor_passes_against_healthy_server_under_hostile_proxy_and_never_leak
     let temp = TempDir::new().expect("tempdir");
     let cfg_path = temp.path().join("config.json");
     let mut cfg = Config::default();
-    cfg.gemini.api_key = Some("AIzaSyCfgSecretMustNotLeak1".to_string());
+    cfg.providers.gemini.api_key =
+        Some(ApiKey::parse_strict("AIzaSyCfgSecretMustNotLeak1").unwrap());
     cfg.save_secure(&cfg_path).expect("save_secure");
 
     for extra_args in [&["--json"][..], &[][..]] {
@@ -640,7 +648,7 @@ fn ui_mcp_stdio_initialize_emits_strict_json_rpc_only_on_stdout() {
     fs::create_dir(&data_dir).expect("mkdir data_dir");
 
     let mut cfg = Config::default();
-    cfg.gemini.api_key = Some("AIzaSyUiMcpCfgSecret5555".to_string());
+    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyUiMcpCfgSecret5555").unwrap());
     cfg.save_secure(&cfg_path).expect("save_secure");
 
     let mut child = Command::new(BIN)
@@ -770,8 +778,8 @@ fn models_json_flag_emits_valid_custom_models_config_for_custom_port() {
     let temp = TempDir::new().expect("tempdir");
     let cfg_path = temp.path().join("config.json");
     let mut cfg = Config::default();
-    cfg.gemini.default_model = "gemini-3.8-flash".to_string();
-    cfg.gemini.api_key = Some("AIzaSyModelsSecret4444".to_string());
+    cfg.providers.gemini.default_model = "gemini-3.8-flash".to_string();
+    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyModelsSecret4444").unwrap());
     cfg.save_secure(&cfg_path).expect("save_secure");
 
     let output = Command::new(BIN)
@@ -840,11 +848,8 @@ fn models_json_flag_emits_valid_custom_models_config_for_custom_port() {
 fn config_env_precedence_and_eager_path_traversal_rejection() {
     let temp = TempDir::new().expect("tempdir");
     let env_cfg = temp.path().join("env_config.json");
-    let mut cfg = Config {
-        listen_port: 5353,
-        ..Config::default()
-    };
-    cfg.gemini.default_model = "gemini-3.9-pro".to_string();
+    let mut cfg = config_with_port(5353);
+    cfg.providers.gemini.default_model = "gemini-3.9-pro".to_string();
     cfg.save_secure(&env_cfg).expect("save env_cfg");
 
     // AGY_COMPANION_CONFIG is honored when --config is omitted
@@ -863,10 +868,7 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
 
     // Explicit --config overrides even an invalid AGY_COMPANION_CONFIG
     let cli_cfg = temp.path().join("cli_config.json");
-    let cfg2 = Config {
-        listen_port: 5454,
-        ..Config::default()
-    };
+    let cfg2 = config_with_port(5454);
     cfg2.save_secure(&cli_cfg).expect("save cli_cfg");
     let out = Command::new(BIN)
         .args(["models", "--json", "--config"])
@@ -970,8 +972,12 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
             "params": {
                 "name": "save_settings",
                 "arguments": {
-                    "api_key": canary,
-                    "listen_port": closed_port
+                    "proxy": { "port": closed_port },
+                    "providers": {
+                        "gemini": {
+                            "api_key": { "set": canary }
+                        }
+                    }
                 }
             }
         });
@@ -1021,11 +1027,11 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
                     "save_settings should succeed under RUST_LOG={rust_log}: {parsed}"
                 );
                 assert_eq!(
-                    parsed["result"]["structuredContent"]["config"]["api_key_configured"],
+                    parsed["result"]["structuredContent"]["config"]["providers"]["gemini"]["api_key_configured"],
                     true
                 );
                 assert_eq!(
-                    parsed["result"]["structuredContent"]["config"]["api_key_hint"],
+                    parsed["result"]["structuredContent"]["config"]["providers"]["gemini"]["api_key_hint"],
                     "AIza...9999"
                 );
                 saw_save_result = true;
@@ -1038,7 +1044,10 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
 
         // Verify persisted config on disk has 0600 permissions and saved API key.
         let saved = Config::load_or_default(&cfg_path).expect("load saved config");
-        assert_eq!(saved.gemini.api_key.as_deref(), Some(canary));
+        assert_eq!(
+            saved.providers.gemini.api_key.as_ref().map(ApiKey::expose),
+            Some(canary)
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1308,7 +1317,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
             "method": "tools/call",
             "params": {
                 "name": "save_settings",
-                "arguments": { "listen_port": closed_port }
+                "arguments": { "proxy": { "port": closed_port } }
             }
         })],
         Duration::from_secs(15),
@@ -1468,7 +1477,7 @@ async fn serve_writes_0600_proxy_pid_and_proxy_log_in_isolated_dir_and_cleans_pi
     let usage_dir = temp.path().join("usage");
 
     let mut cfg = Config::default();
-    cfg.gemini.api_key = Some("AIzaSyPidLogSecret12345".to_string());
+    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyPidLogSecret12345").unwrap());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
 
@@ -1596,8 +1605,8 @@ async fn serve_idle_shutdown_waits_for_in_flight_stream_then_exits_zero() {
     let usage_dir = temp.path().join("usage");
 
     let mut cfg = Config::default();
-    cfg.gemini.base_url = format!("http://127.0.0.1:{upstream_port}");
-    cfg.gemini.api_key = Some("AIzaSyIdleStreamKey1234".to_string());
+    cfg.providers.gemini.base_url = format!("http://127.0.0.1:{upstream_port}");
+    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyIdleStreamKey1234").unwrap());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
 
@@ -1935,11 +1944,8 @@ async fn hook_env_cold_starts_detached_daemon_and_fails_open_when_plugin_missing
     let port = free_loopback_port();
     let cfg_path = temp.path().join("config.json");
     let usage_dir = temp.path().join("runtime").join("usage");
-    let cfg = Config {
-        listen_port: port,
-        usage_dir: Some(usage_dir),
-        ..Default::default()
-    };
+    let mut cfg = config_with_port(port);
+    cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save config");
 
     let pid_path = temp.path().join("runtime").join("proxy.pid");
@@ -2054,11 +2060,13 @@ fn integration_cli_lifecycle_handles_shells_symlinks_and_corrupted_markers() {
     assert_eq!(en.status.code(), Some(0));
     let en_json: Value = serde_json::from_slice(&en.stdout).expect("json");
     if cfg!(windows) {
-        assert_eq!(en_json["supported"], false);
+        assert_eq!(en_json["state"], "unsupported");
         return;
     }
+    assert_eq!(en_json["state"], "enabled");
     assert_eq!(en_json["enabled"], true);
-    assert_eq!(en_json["manual_required"], false);
+    assert!(en_json.get("supported").is_none());
+    assert!(en_json.get("manual_required").is_none());
     assert!(home.join(".zlogin").is_file());
     let env_sh = home.join("xdg-data/agy-companion/env.sh");
     assert!(env_sh.is_file());
@@ -2069,6 +2077,7 @@ fn integration_cli_lifecycle_handles_shells_symlinks_and_corrupted_markers() {
         .expect("status zsh");
     assert_eq!(st.status.code(), Some(0));
     let st_json: Value = serde_json::from_slice(&st.stdout).expect("json");
+    assert_eq!(st_json["state"], "enabled");
     assert_eq!(st_json["enabled"], true);
 
     let dis = isolated_cli_command(&home)
@@ -2077,6 +2086,7 @@ fn integration_cli_lifecycle_handles_shells_symlinks_and_corrupted_markers() {
         .expect("disable zsh");
     assert_eq!(dis.status.code(), Some(0));
     let dis_json: Value = serde_json::from_slice(&dis.stdout).expect("json");
+    assert_eq!(dis_json["state"], "disabled");
     assert_eq!(dis_json["enabled"], false);
     assert!(!home.join(".zlogin").exists());
     assert!(!env_sh.exists());
@@ -2121,7 +2131,7 @@ fn integration_cli_lifecycle_handles_shells_symlinks_and_corrupted_markers() {
             .expect("enable symlink");
         assert_eq!(manual.status.code(), Some(0));
         let m_json: Value = serde_json::from_slice(&manual.stdout).expect("json");
-        assert_eq!(m_json["manual_required"], true);
+        assert_eq!(m_json["state"], "manual_required");
         assert_eq!(m_json["enabled"], false);
         assert_eq!(fs::read_to_string(&target).unwrap(), "# stow\n");
 
@@ -2138,6 +2148,7 @@ fn integration_cli_lifecycle_handles_shells_symlinks_and_corrupted_markers() {
             .expect("enable follow");
         assert_eq!(follow.status.code(), Some(0));
         let f_json: Value = serde_json::from_slice(&follow.stdout).expect("json");
+        assert_eq!(f_json["state"], "enabled");
         assert_eq!(f_json["enabled"], true);
         assert!(
             fs::read_to_string(&target)
@@ -2211,11 +2222,8 @@ async fn launch_subcommand_spawns_detached_daemon_and_sets_restore_env_preservin
     let port = free_loopback_port();
     let cfg_path = temp.path().join("config.json");
     let usage_dir = temp.path().join("runtime").join("usage");
-    let cfg = Config {
-        listen_port: port,
-        usage_dir: Some(usage_dir),
-        ..Default::default()
-    };
+    let mut cfg = config_with_port(port);
+    cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save config");
     let pid_path = temp.path().join("runtime").join("proxy.pid");
     let _pid_guard = DetachedPidFileGuard::new(pid_path.clone());
@@ -2287,10 +2295,7 @@ fn install_and_uninstall_full_isolated_lifecycle_respects_symlink_guard_dry_run_
     fs::write(usage_dir.join("usage.db"), b"SQLite format 3\0").expect("write usage db");
     fs::write(usage_dir.join("usage.db-wal"), b"wal-canary").expect("write usage wal");
     fs::write(usage_dir.join("2026-11.jsonl"), "{}\n").expect("write legacy usage jsonl");
-    let cfg = Config {
-        listen_port: free_loopback_port(),
-        ..Default::default()
-    };
+    let cfg = config_with_port(free_loopback_port());
     cfg.save_secure(&cfg_path).expect("save config");
 
     // Protect user's ~/.gemini/config/config.json — must NEVER be modified even with --purge.
@@ -2520,10 +2525,7 @@ async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall
 
     let port = free_loopback_port();
     let cfg_path = xdg_config.join("agy-companion").join("config.json");
-    let cfg = Config {
-        listen_port: port,
-        ..Default::default()
-    };
+    let cfg = config_with_port(port);
     cfg.save_secure(&cfg_path).expect("save config");
 
     let data_dir = xdg_data.join("agy-companion");
@@ -2756,11 +2758,8 @@ fn uninstall_refuses_to_traverse_symlinked_runtime_data_dir_and_usage_dir() {
         symlink(&victim_dir, &sym_custom_usage).expect("symlink custom usage");
 
         let cfg_path = xdg_config.join("agy-companion").join("config.json");
-        let cfg = Config {
-            listen_port: free_loopback_port(),
-            usage_dir: Some(sym_custom_usage.clone()),
-            ..Default::default()
-        };
+        let mut cfg = config_with_port(free_loopback_port());
+        cfg.usage_dir = Some(sym_custom_usage.clone());
         cfg.save_secure(&cfg_path).expect("save config");
 
         for dry_run in [true, false] {
@@ -2868,11 +2867,8 @@ fn uninstall_refuses_to_traverse_symlinked_runtime_data_dir_and_usage_dir() {
         symlink(&victim_parent, &sym_parent).expect("symlink parent");
 
         let cfg_path = xdg_config.join("agy-companion").join("config.json");
-        let cfg = Config {
-            listen_port: free_loopback_port(),
-            usage_dir: Some(sym_parent.join("usage")),
-            ..Default::default()
-        };
+        let mut cfg = config_with_port(free_loopback_port());
+        cfg.usage_dir = Some(sym_parent.join("usage"));
         cfg.save_secure(&cfg_path).expect("save config");
 
         for dry_run in [true, false] {
@@ -3393,12 +3389,9 @@ fn install_and_uninstall_refuse_symlinked_default_xdg_home_ancestors() {
 
         let victim_cfg = temp.path().join("victim_cfg");
         let victim_cfg_file = victim_cfg.join("agy-companion").join("config.json");
-        Config {
-            listen_port: free_loopback_port(),
-            ..Default::default()
-        }
-        .save_secure(&victim_cfg_file)
-        .expect("save victim config");
+        config_with_port(free_loopback_port())
+            .save_secure(&victim_cfg_file)
+            .expect("save victim config");
 
         symlink(&victim_cfg, home.join(".config")).expect("symlink .config");
 
@@ -3490,12 +3483,9 @@ fn install_refuses_to_traverse_symlinked_config_dir_and_starts_no_proxy() {
     let port = free_loopback_port();
     let victim_cfg_dir = temp.path().join("victim_cfg_dir");
     let victim_cfg_file = victim_cfg_dir.join("config.json");
-    Config {
-        listen_port: port,
-        ..Default::default()
-    }
-    .save_secure(&victim_cfg_file)
-    .expect("save victim config");
+    config_with_port(port)
+        .save_secure(&victim_cfg_file)
+        .expect("save victim config");
     let before = fs::read_to_string(&victim_cfg_file).expect("read before");
 
     symlink(&victim_cfg_dir, xdg_config.join("agy-companion")).expect("symlink config dir");
@@ -3657,12 +3647,9 @@ fn uninstall_and_install_refuse_symlinked_fish_intermediate_dirs() {
 
         // Pre-write isolated config with an ephemeral free port so we never collide with 4141.
         let cfg_path = home.join(".config/agy-companion/config.json");
-        Config {
-            listen_port: free_loopback_port(),
-            ..Default::default()
-        }
-        .save_secure(&cfg_path)
-        .expect("save isolated config");
+        config_with_port(free_loopback_port())
+            .save_secure(&cfg_path)
+            .expect("save isolated config");
 
         let inst = isolated_cli_command(&home)
             .env("SHELL", "/usr/local/bin/fish")
@@ -3687,8 +3674,8 @@ fn uninstall_and_install_refuse_symlinked_fish_intermediate_dirs() {
         let inst_json: Value = serde_json::from_slice(&inst.stdout).expect("parse install JSON");
         assert_eq!(inst_json["ok"], true);
         assert_eq!(
-            inst_json["launcher_integration"]["manual_required"], true,
-            "{stow_kind}: Stow-symlinked fish dir must set manual_required=true: {inst_json}"
+            inst_json["launcher_integration"]["state"], "manual_required",
+            "{stow_kind}: Stow-symlinked fish dir must set state=manual_required: {inst_json}"
         );
         assert_eq!(
             inst_json["launcher_integration"]["enabled"], false,
@@ -4173,10 +4160,7 @@ fn ui_mcp_degrades_gracefully_and_preserves_rc_on_unsafe_leaf_env_sh() {
         fs::create_dir_all(&data_dir).expect("mkdir data_dir");
 
         let cfg_path = xdg_config.join("agy-companion").join("config.json");
-        let cfg = Config {
-            listen_port: free_loopback_port(),
-            ..Default::default()
-        };
+        let cfg = config_with_port(free_loopback_port());
         cfg.save_secure(&cfg_path).expect("save config");
 
         let env_path = data_dir.join(companion_core::integration::ENV_SCRIPT_FILENAME);
@@ -4303,11 +4287,15 @@ fn ui_mcp_degrades_gracefully_and_preserves_rc_on_unsafe_leaf_env_sh() {
                 "{kind}: {name} must degrade cleanly with isError=false, got: {resp}"
             );
             let li = &resp["result"]["structuredContent"]["launcher_integration"];
+            assert_eq!(
+                li["state"], "disabled",
+                "{kind}: {name} state must be disabled"
+            );
             assert_eq!(li["enabled"], false, "{kind}: {name} enabled must be false");
             let msg = li["message"].as_str().unwrap_or("");
             assert!(
-                !msg.is_empty() && msg.contains("env script"),
-                "{kind}: {name} must surface informative env script error message, got: {li}"
+                !msg.is_empty() && msg.contains("env.sh"),
+                "{kind}: {name} must surface informative env.sh error message, got: {li}"
             );
         }
 
@@ -4354,10 +4342,7 @@ fn install_step1_unsafe_leaf_env_sh_fails_before_creating_dirs_unless_fish_or_no
         fs::create_dir_all(&data_dir).expect("mkdir data_dir");
 
         let cfg_path = xdg_config.join("agy-companion").join("config.json");
-        let cfg = Config {
-            listen_port: free_loopback_port(),
-            ..Default::default()
-        };
+        let cfg = config_with_port(free_loopback_port());
         cfg.save_secure(&cfg_path).expect("save config");
 
         let env_path = data_dir.join(companion_core::integration::ENV_SCRIPT_FILENAME);
@@ -4438,10 +4423,7 @@ fn install_step1_unsafe_leaf_env_sh_fails_before_creating_dirs_unless_fish_or_no
         fs::create_dir_all(&data_dir).expect("mkdir data_dir");
 
         let cfg_path = xdg_config.join("agy-companion").join("config.json");
-        let cfg = Config {
-            listen_port: free_loopback_port(),
-            ..Default::default()
-        };
+        let cfg = config_with_port(free_loopback_port());
         cfg.save_secure(&cfg_path).expect("save config");
 
         let env_path = data_dir.join(companion_core::integration::ENV_SCRIPT_FILENAME);

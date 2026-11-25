@@ -5,18 +5,18 @@ pub mod routes;
 pub mod sse;
 pub mod stats;
 
-use std::fs;
 use std::future::Future;
-use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
+use companion_core::fs_safe::{inspect_file_stamp, read_verified_bytes_for_stamp};
 use companion_core::{
-    Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_GEMINI_MODEL, DEFAULT_TIMEOUT_SECS,
-    MAX_CONFIG_FILE_BYTES, UsageSink, validate_path,
+    CloudCodeUpstream, Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_GEMINI_MODEL,
+    DEFAULT_TIMEOUT_SECS, FileStamp, FsError, MAX_CONFIG_FILE_BYTES, RejectedReason, UsageSink,
+    validate_path,
 };
 use companion_providers::{GeminiProvider, ProviderAdapter, ProviderError};
 use thiserror::Error;
@@ -26,11 +26,10 @@ pub use cloudcode::{
     CloudCodeClient, CloudCodeError, MAX_CLOUDCODE_CATALOG_BYTES, is_cloudcode_path,
     merge_available_models, validate_cloudcode_path,
 };
-pub use routes::{DEFAULT_MAX_JSON_TEE_BYTES, HealthResponse, MAX_PROXY_BODY_BYTES, build_router};
+pub use companion_core::protocol::{HealthResponse, PROTOCOL_VERSION, StatsSnapshot};
+pub use routes::{DEFAULT_MAX_JSON_TEE_BYTES, MAX_PROXY_BODY_BYTES, build_router};
 pub use sse::{DEFAULT_MAX_SSE_EVENT_BYTES, SseUsageTracker};
-pub use stats::{ProxyStats, StatsSnapshot};
-
-pub const PROTOCOL_VERSION: u32 = 1;
+pub use stats::ProxyStats;
 
 const RACY_CLEAN_WINDOW: Duration = Duration::from_secs(1);
 
@@ -52,39 +51,20 @@ pub enum ProxyError {
     Serve(#[source] std::io::Error),
 }
 
+impl From<FsError> for ProxyError {
+    fn from(err: FsError) -> Self {
+        Self::Core(CoreError::Fs(err))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ActiveProvider {
     pub(crate) provider: Arc<dyn ProviderAdapter>,
     pub(crate) cloudcode: Arc<CloudCodeClient>,
-    pub(crate) cloudcode_upstream_url: String,
+    pub(crate) cloudcode_upstream: CloudCodeUpstream,
     pub(crate) cloudcode_timeout_secs: u64,
     pub(crate) has_configured_api_key: bool,
     pub(crate) default_model: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RejectedReason {
-    Symlink,
-    NotRegularFile,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FileStamp {
-    Missing,
-    Rejected(RejectedReason),
-    Unreadable(ErrorKind),
-    Present {
-        modified: Option<SystemTime>,
-        len: u64,
-        #[cfg(unix)]
-        dev: u64,
-        #[cfg(unix)]
-        ino: u64,
-        #[cfg(unix)]
-        ctime: i64,
-        #[cfg(unix)]
-        ctime_nsec: i64,
-    },
 }
 
 struct HotReloadInner {
@@ -197,7 +177,7 @@ impl ProxyState {
                 source: ProviderSource::Static(ActiveProvider {
                     provider,
                     cloudcode,
-                    cloudcode_upstream_url: DEFAULT_CLOUDCODE_UPSTREAM_URL.to_string(),
+                    cloudcode_upstream: CloudCodeUpstream::Auto,
                     cloudcode_timeout_secs: DEFAULT_TIMEOUT_SECS,
                     has_configured_api_key,
                     default_model: DEFAULT_GEMINI_MODEL.to_string(),
@@ -229,19 +209,16 @@ impl ProxyState {
         let source = match config_path {
             Some(path) => {
                 validate_path(&path)?;
-                let stamp = read_file_stamp(&path);
+                let stamp = inspect_file_stamp(&path);
                 if let FileStamp::Rejected(reason) = stamp {
-                    let msg = match reason {
-                        RejectedReason::Symlink => {
-                            "symbolic links are not allowed for config files"
-                        }
-                        RejectedReason::NotRegularFile => "config path must be a regular file",
-                    };
-                    return Err(ProxyError::Core(CoreError::InvalidPath {
-                        reason: msg.to_string(),
-                    }));
+                    return Err(match reason {
+                        RejectedReason::Symlink => FsError::SymlinkRejected { path }.into(),
+                        RejectedReason::NotRegularFile => FsError::NotRegularFile { path }.into(),
+                    });
                 }
-                let raw_bytes = read_bounded_bytes(&path, &stamp);
+                let raw_bytes = read_verified_bytes_for_stamp(&path, &stamp, MAX_CONFIG_FILE_BYTES)
+                    .ok()
+                    .flatten();
                 ProviderSource::HotReload(Box::new(HotReloadProvider {
                     path,
                     env_fallback,
@@ -301,139 +278,34 @@ fn build_active_provider(
     env_fallback: bool,
     previous_active: Option<&ActiveProvider>,
 ) -> Result<ActiveProvider, ProxyError> {
-    let provider = GeminiProvider::from_config(&config.gemini)?.with_env_fallback(env_fallback);
+    let provider =
+        GeminiProvider::from_config(&config.providers.gemini)?.with_env_fallback(env_fallback);
     let cloudcode = match previous_active {
         Some(prev)
-            if prev.cloudcode_upstream_url == config.cloudcode_upstream_url
-                && prev.cloudcode_timeout_secs == config.gemini.timeout_secs =>
+            if prev.cloudcode_upstream == config.cloudcode.upstream
+                && prev.cloudcode_timeout_secs == config.providers.gemini.timeout_secs =>
         {
             Arc::clone(&prev.cloudcode)
         }
         _ => Arc::new(CloudCodeClient::new(
-            &config.cloudcode_upstream_url,
-            config.gemini.timeout_secs,
+            config.cloudcode.upstream.as_str(),
+            config.providers.gemini.timeout_secs,
         )?),
     };
     let has_configured_api_key = provider.api_key_hint().is_some();
     Ok(ActiveProvider {
         provider: Arc::new(provider),
         cloudcode,
-        cloudcode_upstream_url: config.cloudcode_upstream_url.clone(),
-        cloudcode_timeout_secs: config.gemini.timeout_secs,
+        cloudcode_upstream: config.cloudcode.upstream.clone(),
+        cloudcode_timeout_secs: config.providers.gemini.timeout_secs,
         has_configured_api_key,
-        default_model: config.gemini.default_model.clone(),
+        default_model: config.providers.gemini.default_model.clone(),
     })
-}
-
-fn read_file_stamp(path: &Path) -> FileStamp {
-    // Strip trailing separators/dot components so POSIX lstat(2) inspects the entry itself
-    // without dereferencing symlinks or opening FIFOs/devices.
-    let check_path: PathBuf = path.components().collect();
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            let file_type = meta.file_type();
-            if file_type.is_symlink() {
-                return FileStamp::Rejected(RejectedReason::Symlink);
-            }
-            if !file_type.is_file() {
-                return FileStamp::Rejected(RejectedReason::NotRegularFile);
-            }
-            let modified = meta.modified().ok();
-            let len = meta.len();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                FileStamp::Present {
-                    modified,
-                    len,
-                    dev: meta.dev(),
-                    ino: meta.ino(),
-                    ctime: meta.ctime(),
-                    ctime_nsec: meta.ctime_nsec(),
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                FileStamp::Present { modified, len }
-            }
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => FileStamp::Missing,
-        Err(err) => FileStamp::Unreadable(err.kind()),
-    }
-}
-
-enum BoundedReadError {
-    NotFound,
-    Oversized,
-    Rejected(RejectedReason),
-    ChangedConcurrently,
-    Io(ErrorKind),
-}
-
-fn read_verified_config_bytes(path: &Path, stamp: &FileStamp) -> Result<Vec<u8>, BoundedReadError> {
-    let FileStamp::Present {
-        len,
-        #[cfg(unix)]
-        dev,
-        #[cfg(unix)]
-        ino,
-        ..
-    } = stamp
-    else {
-        return Err(match stamp {
-            FileStamp::Missing => BoundedReadError::NotFound,
-            FileStamp::Rejected(reason) => BoundedReadError::Rejected(*reason),
-            FileStamp::Unreadable(kind) => BoundedReadError::Io(*kind),
-            FileStamp::Present { .. } => unreachable!(),
-        });
-    };
-
-    if *len > MAX_CONFIG_FILE_BYTES {
-        return Err(BoundedReadError::Oversized);
-    }
-
-    let file = fs::File::open(path).map_err(|err| {
-        if err.kind() == ErrorKind::NotFound {
-            BoundedReadError::NotFound
-        } else {
-            BoundedReadError::Io(err.kind())
-        }
-    })?;
-
-    let open_meta = file
-        .metadata()
-        .map_err(|err| BoundedReadError::Io(err.kind()))?;
-    if !open_meta.file_type().is_file() {
-        return Err(BoundedReadError::Rejected(RejectedReason::NotRegularFile));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if open_meta.dev() != *dev || open_meta.ino() != *ino {
-            return Err(BoundedReadError::ChangedConcurrently);
-        }
-    }
-
-    let mut bytes = Vec::new();
-    file.take(MAX_CONFIG_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|err| BoundedReadError::Io(err.kind()))?;
-
-    if (bytes.len() as u64) > MAX_CONFIG_FILE_BYTES {
-        return Err(BoundedReadError::Oversized);
-    }
-
-    Ok(bytes)
-}
-
-fn read_bounded_bytes(path: &Path, stamp: &FileStamp) -> Option<Vec<u8>> {
-    read_verified_config_bytes(path, stamp).ok()
 }
 
 impl HotReloadProvider {
     fn active_provider(&self) -> ActiveProvider {
-        let current_stamp = read_file_stamp(&self.path);
+        let current_stamp = inspect_file_stamp(&self.path);
 
         {
             let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
@@ -447,7 +319,10 @@ impl HotReloadProvider {
                 {
                     return guard.active.clone();
                 }
-                if let Some(bytes) = read_bounded_bytes(&self.path, &current_stamp)
+                if let Some(bytes) =
+                    read_verified_bytes_for_stamp(&self.path, &current_stamp, MAX_CONFIG_FILE_BYTES)
+                        .ok()
+                        .flatten()
                     && guard.raw_bytes.as_deref() == Some(bytes.as_slice())
                 {
                     return guard.active.clone();
@@ -461,7 +336,10 @@ impl HotReloadProvider {
                 {
                     return guard.active.clone();
                 }
-                if let Some(bytes) = read_bounded_bytes(&self.path, &current_stamp)
+                if let Some(bytes) =
+                    read_verified_bytes_for_stamp(&self.path, &current_stamp, MAX_CONFIG_FILE_BYTES)
+                        .ok()
+                        .flatten()
                     && guard.last_failed_bytes.as_deref() == Some(bytes.as_slice())
                 {
                     return guard.active.clone();
@@ -470,7 +348,7 @@ impl HotReloadProvider {
         }
 
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let current_stamp = read_file_stamp(&self.path);
+        let current_stamp = inspect_file_stamp(&self.path);
         match current_stamp {
             FileStamp::Missing => {
                 self.apply_missing_config(&mut guard);
@@ -501,13 +379,17 @@ impl HotReloadProvider {
                 guard.active.clone()
             }
             FileStamp::Present { .. } => {
-                let bytes = match read_verified_config_bytes(&self.path, &current_stamp) {
-                    Ok(bytes) => bytes,
-                    Err(BoundedReadError::NotFound) => {
+                let bytes = match read_verified_bytes_for_stamp(
+                    &self.path,
+                    &current_stamp,
+                    MAX_CONFIG_FILE_BYTES,
+                ) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
                         self.apply_missing_config(&mut guard);
                         return guard.active.clone();
                     }
-                    Err(BoundedReadError::Oversized) => {
+                    Err(FsError::SizeLimitExceeded { .. }) => {
                         if guard.last_failed_stamp.as_ref() != Some(&current_stamp) {
                             tracing::warn!(
                                 max_bytes = MAX_CONFIG_FILE_BYTES,
@@ -519,11 +401,11 @@ impl HotReloadProvider {
                         guard.checked_at = Instant::now();
                         return guard.active.clone();
                     }
-                    Err(BoundedReadError::Rejected(reason)) => {
-                        let rejected_stamp = FileStamp::Rejected(reason);
+                    Err(FsError::SymlinkRejected { .. }) => {
+                        let rejected_stamp = FileStamp::Rejected(RejectedReason::Symlink);
                         if guard.last_failed_stamp.as_ref() != Some(&rejected_stamp) {
                             tracing::warn!(
-                                reason = ?reason,
+                                reason = ?RejectedReason::Symlink,
                                 "ignoring rejected config path during hot-reload; retaining previous configuration"
                             );
                         }
@@ -532,14 +414,31 @@ impl HotReloadProvider {
                         guard.checked_at = Instant::now();
                         return guard.active.clone();
                     }
-                    Err(BoundedReadError::ChangedConcurrently) => {
+                    Err(FsError::NotRegularFile { .. }) => {
+                        let rejected_stamp = FileStamp::Rejected(RejectedReason::NotRegularFile);
+                        if guard.last_failed_stamp.as_ref() != Some(&rejected_stamp) {
+                            tracing::warn!(
+                                reason = ?RejectedReason::NotRegularFile,
+                                "ignoring rejected config path during hot-reload; retaining previous configuration"
+                            );
+                        }
+                        guard.last_failed_stamp = Some(rejected_stamp);
+                        guard.last_failed_bytes = None;
+                        guard.checked_at = Instant::now();
+                        return guard.active.clone();
+                    }
+                    Err(FsError::ConcurrentModification { .. }) => {
                         tracing::warn!(
                             "config file changed concurrently during hot-reload read; retaining previous configuration"
                         );
                         guard.checked_at = Instant::now();
                         return guard.active.clone();
                     }
-                    Err(BoundedReadError::Io(kind)) => {
+                    Err(err) => {
+                        let kind = match &err {
+                            FsError::Io { source, .. } => source.kind(),
+                            _ => std::io::ErrorKind::InvalidInput,
+                        };
                         if guard.last_failed_stamp.as_ref() != Some(&current_stamp) {
                             tracing::warn!(
                                 error_kind = ?kind,
@@ -568,12 +467,12 @@ impl HotReloadProvider {
                     return guard.active.clone();
                 }
 
-                let parsed: Config = match serde_json::from_slice(&bytes) {
+                let parsed = match Config::from_json_bytes(&bytes, &self.path) {
                     Ok(cfg) => cfg,
-                    Err(err) => {
+                    Err(CoreError::ParseConfig { line, column, .. }) => {
                         tracing::warn!(
-                            line = err.line(),
-                            column = err.column(),
+                            line,
+                            column,
                             "failed to parse config JSON during hot-reload; retaining previous configuration"
                         );
                         guard.last_failed_stamp = Some(current_stamp);
@@ -581,17 +480,16 @@ impl HotReloadProvider {
                         guard.checked_at = Instant::now();
                         return guard.active.clone();
                     }
+                    Err(_) => {
+                        tracing::warn!(
+                            "config validation failed during hot-reload; retaining previous configuration"
+                        );
+                        guard.last_failed_stamp = Some(current_stamp);
+                        guard.last_failed_bytes = Some(bytes);
+                        guard.checked_at = Instant::now();
+                        return guard.active.clone();
+                    }
                 };
-
-                if parsed.validate().is_err() {
-                    tracing::warn!(
-                        "config validation failed during hot-reload; retaining previous configuration"
-                    );
-                    guard.last_failed_stamp = Some(current_stamp);
-                    guard.last_failed_bytes = Some(bytes);
-                    guard.checked_at = Instant::now();
-                    return guard.active.clone();
-                }
 
                 let new_active = match build_active_provider(
                     &parsed,
@@ -643,7 +541,10 @@ impl HotReloadProvider {
 
 pub fn loopback_socket_addr(config: &Config) -> Result<SocketAddr, ProxyError> {
     config.validate()?;
-    Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, config.listen_port)))
+    Ok(SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        config.proxy.port.get(),
+    )))
 }
 
 pub async fn bind_loopback_listener(config: &Config) -> Result<TcpListener, ProxyError> {
@@ -724,13 +625,16 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::num::NonZeroU16;
+    use std::path::Path;
     use std::sync::Mutex;
 
     use axum::Router;
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::post;
-    use companion_core::{NoopUsageSink, SqliteUsageSink, USAGE_DB_FILENAME};
+    use companion_core::{ApiKey, LoopbackHost, NoopUsageSink, SqliteUsageSink, USAGE_DB_FILENAME};
     use http::{HeaderMap, StatusCode, header};
     use tempfile::TempDir;
     use tokio::sync::oneshot;
@@ -786,43 +690,24 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_non_loopback_hosts_ports_and_listeners() {
-        let cfg_any = Config {
-            listen_host: "0.0.0.0".to_string(),
-            ..Config::default()
-        };
+        let path = Path::new("config.json");
         assert!(matches!(
-            loopback_socket_addr(&cfg_any),
-            Err(ProxyError::Core(CoreError::InvalidListenHost { .. }))
+            Config::from_json_str(r#"{"schema_version":1,"proxy":{"host":"0.0.0.0"}}"#, path),
+            Err(CoreError::InvalidListenHost { .. })
         ));
         assert!(matches!(
-            serve_with_shutdown(cfg_any, None, Arc::new(NoopUsageSink), async {}).await,
-            Err(ProxyError::Core(CoreError::InvalidListenHost { .. }))
+            Config::from_json_str(r#"{"schema_version":1,"proxy":{"host":"::"}}"#, path),
+            Err(CoreError::InvalidListenHost { .. })
         ));
-
-        let cfg_v6 = Config {
-            listen_host: "::".to_string(),
-            ..Config::default()
-        };
         assert!(matches!(
-            loopback_socket_addr(&cfg_v6),
-            Err(ProxyError::Core(CoreError::InvalidListenHost { .. }))
-        ));
-
-        let cfg_port0 = Config {
-            listen_port: 0,
-            ..Config::default()
-        };
-        assert!(matches!(
-            loopback_socket_addr(&cfg_port0),
-            Err(ProxyError::Core(CoreError::InvalidListenPort))
+            Config::from_json_str(r#"{"schema_version":1,"proxy":{"port":0}}"#, path),
+            Err(CoreError::InvalidListenPort)
         ));
 
         // "localhost" must still bind strictly to 127.0.0.1:<port>.
-        let cfg_localhost = Config {
-            listen_host: "localhost".to_string(),
-            listen_port: 4141,
-            ..Config::default()
-        };
+        let mut cfg_localhost = Config::default();
+        cfg_localhost.proxy.host = LoopbackHost::Localhost;
+        cfg_localhost.proxy.port = NonZeroU16::new(4141).unwrap();
         assert_eq!(
             loopback_socket_addr(&cfg_localhost).unwrap(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 4141))
@@ -856,8 +741,9 @@ mod tests {
         let sink_reader = Arc::clone(&sink);
 
         let mut cfg = Config::default();
-        cfg.gemini.base_url = format!("http://{upstream_addr}");
-        cfg.gemini.api_key = Some("AIzaLiveLoopbackKey12345".to_string());
+        cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaLiveLoopbackKey12345").unwrap());
 
         let state = ProxyState::from_config_with_env_fallback(cfg, None, sink, false).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -926,11 +812,11 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(snap.requests, 1);
-        assert_eq!(snap.prompt_tokens, 40);
-        assert_eq!(snap.cached_tokens, 20);
-        assert_eq!(snap.output_tokens, 10);
-        assert!((snap.cache_hit_ratio - 0.5).abs() < 1e-12);
+        assert_eq!(snap.usage.requests, 1);
+        assert_eq!(snap.usage.prompt_tokens, 40);
+        assert_eq!(snap.usage.cached_tokens, 20);
+        assert_eq!(snap.usage.output_tokens, 10);
+        assert!((snap.usage.cache_hit_ratio - 0.5).abs() < 1e-12);
 
         // 4. SqliteUsageSink persisted 1 event with zero secrets and 0600 permissions.
         let db_path = usage_dir.join(USAGE_DB_FILENAME);
@@ -993,8 +879,9 @@ mod tests {
         let config_path = tmp.path().join("config.json");
 
         let mut cfg = Config::default();
-        cfg.gemini.base_url = format!("http://{upstream1_addr}");
-        cfg.gemini.api_key = Some("AIzaInitialKey11111111".to_string());
+        cfg.providers.gemini.base_url = format!("http://{upstream1_addr}");
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaInitialKey11111111").unwrap());
         cfg.save_secure(&config_path).unwrap();
 
         // env_fallback = false keeps revocation deterministic even when host exports GEMINI_API_KEY.
@@ -1032,7 +919,8 @@ mod tests {
         );
 
         // 2. Immediate same-millisecond key rotation via Config::save_secure.
-        cfg.gemini.api_key = Some("AIzaRotatedKey22222222".to_string());
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaRotatedKey22222222").unwrap());
         cfg.save_secure(&config_path).unwrap();
         let r2 = client.post(&url).body("{}").send().await.unwrap();
         assert_eq!(r2.status(), StatusCode::OK);
@@ -1043,7 +931,7 @@ mod tests {
         );
 
         // 3. Base URL switch to upstream 2.
-        cfg.gemini.base_url = format!("http://{upstream2_addr}");
+        cfg.providers.gemini.base_url = format!("http://{upstream2_addr}");
         cfg.save_secure(&config_path).unwrap();
         let r3 = client.post(&url).body("{}").send().await.unwrap();
         assert_eq!(r3.status(), StatusCode::OK);
@@ -1054,13 +942,14 @@ mod tests {
         );
 
         // 4. Revoke API key (clear_api_key -> None) -> 401 Unauthorized immediately.
-        cfg.gemini.api_key = None;
+        cfg.providers.gemini.api_key = None;
         cfg.save_secure(&config_path).unwrap();
         let r4 = client.post(&url).body("{}").send().await.unwrap();
         assert_eq!(r4.status(), StatusCode::UNAUTHORIZED);
 
         // 5. Re-add key, confirm 200, then delete config file -> immediately revokes key -> 401.
-        cfg.gemini.api_key = Some("AIzaReaddedKey33333333".to_string());
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaReaddedKey33333333").unwrap());
         cfg.save_secure(&config_path).unwrap();
         let r5 = client.post(&url).body("{}").send().await.unwrap();
         assert_eq!(r5.status(), StatusCode::OK);
@@ -1085,8 +974,9 @@ mod tests {
         let config_path = tmp.path().join("config.json");
 
         let mut cfg = Config::default();
-        cfg.gemini.base_url = format!("http://{upstream_addr}");
-        cfg.gemini.api_key = Some("AIzaValidBeforeCorrupt1".to_string());
+        cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaValidBeforeCorrupt1").unwrap());
         cfg.save_secure(&config_path).unwrap();
 
         let state = ProxyState::from_config_with_env_fallback(
@@ -1128,13 +1018,17 @@ mod tests {
         // 2. Write schema-invalid config (0.0.0.0) -> proxy still retains last valid provider.
         let bad_json = serde_json::json!({
             "schema_version": 1,
-            "listen_host": "0.0.0.0",
-            "listen_port": 4141,
-            "gemini": {
-                "base_url": format!("http://{upstream_addr}"),
-                "api_key": "AIzaINVALIDHOSTSECRET",
-                "default_model": "gemini-4-hydrogen",
-                "timeout_secs": 900
+            "proxy": {
+                "host": "0.0.0.0",
+                "port": 4141
+            },
+            "providers": {
+                "gemini": {
+                    "base_url": format!("http://{upstream_addr}"),
+                    "api_key": "AIzaINVALIDHOSTSECRET",
+                    "default_model": "gemini-4-hydrogen",
+                    "timeout_secs": 900
+                }
             }
         });
         fs::write(&config_path, bad_json.to_string()).unwrap();
@@ -1147,7 +1041,8 @@ mod tests {
         );
 
         // 3. Write valid updated config -> proxy immediately recovers and adopts new key.
-        cfg.gemini.api_key = Some("AIzaRecoveredKey9999999".to_string());
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaRecoveredKey9999999").unwrap());
         cfg.save_secure(&config_path).unwrap();
         let r3 = client.post(&url).body("{}").send().await.unwrap();
         assert_eq!(r3.status(), StatusCode::OK);
@@ -1177,13 +1072,15 @@ mod tests {
         let evil_path = tmp.path().join("evil.json");
 
         let mut good_cfg = Config::default();
-        good_cfg.gemini.base_url = format!("http://{upstream1_addr}");
-        good_cfg.gemini.api_key = Some("AIzaGoodOriginalKey1111".to_string());
+        good_cfg.providers.gemini.base_url = format!("http://{upstream1_addr}");
+        good_cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaGoodOriginalKey1111").unwrap());
         good_cfg.save_secure(&config_path).unwrap();
 
         let mut evil_cfg = Config::default();
-        evil_cfg.gemini.base_url = format!("http://{upstream2_addr}");
-        evil_cfg.gemini.api_key = Some("AIzaEvilHijackKey22222".to_string());
+        evil_cfg.providers.gemini.base_url = format!("http://{upstream2_addr}");
+        evil_cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaEvilHijackKey22222").unwrap());
         evil_cfg.save_secure(&evil_path).unwrap();
 
         // Startup must also reject an initial symlink or FIFO config_path cleanly.
@@ -1196,7 +1093,9 @@ mod tests {
                 Arc::new(NoopUsageSink),
                 false,
             ),
-            Err(ProxyError::Core(CoreError::InvalidPath { .. }))
+            Err(ProxyError::Core(CoreError::Fs(
+                FsError::SymlinkRejected { .. }
+            )))
         ));
 
         let state = ProxyState::from_config_with_env_fallback(
@@ -1276,7 +1175,8 @@ mod tests {
 
         // (d) Clean recovery when replaced back with regular file via save_secure.
         fs::remove_file(&config_path).unwrap();
-        good_cfg.gemini.api_key = Some("AIzaRecoveredAfterSwap33".to_string());
+        good_cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaRecoveredAfterSwap33").unwrap());
         good_cfg.save_secure(&config_path).unwrap();
         let r4 = client.post(&url).body("{}").send().await.unwrap();
         assert_eq!(r4.status(), StatusCode::OK);
@@ -1298,11 +1198,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.json");
 
-        let mut cfg = Config {
-            cloudcode_upstream_url: DEFAULT_CLOUDCODE_UPSTREAM_URL.to_string(),
-            ..Default::default()
-        };
-        cfg.gemini.timeout_secs = 900;
+        let mut cfg = Config::default();
+        cfg.cloudcode.upstream = CloudCodeUpstream::Auto;
+        cfg.providers.gemini.timeout_secs = 900;
         cfg.save_secure(&config_path).unwrap();
 
         let state = ProxyState::from_config_with_env_fallback(
@@ -1316,9 +1214,10 @@ mod tests {
         let initial_cloudcode = Arc::clone(&state.active_provider().cloudcode);
         assert_eq!(initial_cloudcode.mode_label(), "auto");
 
-        // Saving a new API key without changing cloudcode_upstream_url or timeout_secs
+        // Saving a new API key without changing cloudcode.upstream or timeout_secs
         // must preserve the exact same Arc<CloudCodeClient> (and its routing LRU cache).
-        cfg.gemini.api_key = Some("AIzaSyReloadPreservesLru1".to_string());
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaSyReloadPreservesLru1").unwrap());
         cfg.save_secure(&config_path).unwrap();
         let after_key_save = state.active_provider();
         assert!(after_key_save.has_configured_api_key);
@@ -1328,7 +1227,7 @@ mod tests {
         );
 
         // Changing timeout_secs must rebuild CloudCodeClient.
-        cfg.gemini.timeout_secs = 600;
+        cfg.providers.gemini.timeout_secs = 600;
         cfg.save_secure(&config_path).unwrap();
         let after_timeout_change = state.active_provider();
         assert!(
@@ -1336,9 +1235,10 @@ mod tests {
             "CloudCodeClient Arc must rebuild when timeout_secs changes"
         );
 
-        // Changing cloudcode_upstream_url must also rebuild CloudCodeClient.
+        // Changing cloudcode.upstream must also rebuild CloudCodeClient.
         let prev = Arc::clone(&after_timeout_change.cloudcode);
-        cfg.cloudcode_upstream_url = "https://cloudcode-pa.googleapis.com".to_string();
+        cfg.cloudcode.upstream =
+            CloudCodeUpstream::Fixed("https://cloudcode-pa.googleapis.com".to_string());
         cfg.save_secure(&config_path).unwrap();
         let after_url_change = state.active_provider();
         assert!(
@@ -1403,9 +1303,10 @@ mod tests {
         });
 
         let mut cfg = Config::default();
-        cfg.gemini.base_url = format!("http://{upstream_addr}");
-        cfg.gemini.api_key = Some("AIzaSyActivityTestKey123".to_string());
-        cfg.cloudcode_upstream_url = format!("http://{upstream_addr}");
+        cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
+        cfg.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaSyActivityTestKey123").unwrap());
+        cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{upstream_addr}"));
 
         let state =
             ProxyState::from_config_with_env_fallback(cfg, None, Arc::new(NoopUsageSink), false)

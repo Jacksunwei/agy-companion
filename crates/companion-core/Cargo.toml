@@ -5,10 +5,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 chrono.workspace = true
 dirs.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

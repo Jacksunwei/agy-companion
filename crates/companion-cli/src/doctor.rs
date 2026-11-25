@@ -4,10 +4,12 @@ use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use companion_core::{Config, DEFAULT_LISTEN_PORT, is_placeholder_api_key};
-use companion_proxy::HealthResponse;
+use companion_core::protocol::sanitize_health_token;
+use companion_core::{
+    Config, DEFAULT_LISTEN_PORT, HealthResponse, PROTOCOL_VERSION, ProxyHealthSummary,
+    is_placeholder_api_key, sanitize_base_url,
+};
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 use crate::{CliError, MAX_CONFIG_FILE_BYTES, resolve_cli_config_path};
 
@@ -115,15 +117,6 @@ pub struct DoctorCheck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProxyProbeSummary {
-    pub reachable: bool,
-    pub status: Option<String>,
-    pub version: Option<String>,
-    pub protocol_version: Option<u32>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSummary {
     pub gemini_api_key_set: bool,
     pub google_gemini_base_url_set: bool,
@@ -137,7 +130,7 @@ pub struct DoctorReport {
     pub expected_protocol_version: u32,
     pub config_path: String,
     pub target_port: u16,
-    pub proxy: ProxyProbeSummary,
+    pub proxy: ProxyHealthSummary,
     pub version_skew: bool,
     pub protocol_skew: bool,
     pub env: EnvSummary,
@@ -160,7 +153,7 @@ impl Default for DoctorOptions {
             config_override: None,
             port_override: None,
             binary_version: env!("CARGO_PKG_VERSION").to_string(),
-            expected_protocol_version: companion_proxy::PROTOCOL_VERSION,
+            expected_protocol_version: PROTOCOL_VERSION,
             health_timeout: Duration::from_secs(DEFAULT_HEALTH_TIMEOUT_SECS),
             health_connect_timeout: Duration::from_secs(DEFAULT_HEALTH_CONNECT_TIMEOUT_SECS),
         }
@@ -176,49 +169,6 @@ pub struct HealthEvaluation {
     pub version_message: String,
 }
 
-fn sanitize_token(raw: &str) -> String {
-    let cleaned: String = raw.chars().filter(|ch| !ch.is_control()).take(64).collect();
-    if cleaned.is_empty() {
-        "<empty>".to_string()
-    } else {
-        cleaned
-    }
-}
-
-fn sanitize_base_url(raw: &str, target_port: u16) -> Option<(String, bool)> {
-    let trimmed = raw.trim();
-    if trimmed.chars().any(char::is_control) {
-        return None;
-    }
-
-    let parsed = Url::parse(trimmed).ok()?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return None;
-    }
-    let host = parsed.host_str()?;
-
-    let port_suffix = match parsed.port() {
-        Some(port) => format!(":{port}"),
-        None => String::new(),
-    };
-    let clean_path: String = parsed.path().chars().filter(|c| !c.is_control()).collect();
-    let display_path = if clean_path == "/" {
-        String::new()
-    } else {
-        clean_path.clone()
-    };
-    let sanitized = format!("{scheme}://{host}{port_suffix}{display_path}");
-
-    let normalized_path = clean_path.trim_end_matches('/');
-    let matches_proxy = scheme == "http"
-        && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
-        && parsed.port_or_known_default() == Some(target_port)
-        && (normalized_path.is_empty() || normalized_path == "/v1beta");
-
-    Some((sanitized, matches_proxy))
-}
-
 pub fn evaluate_health_response(
     health: &HealthResponse,
     expected_version: &str,
@@ -228,8 +178,8 @@ pub fn evaluate_health_response(
     let version_skew = health.version != expected_version;
     let protocol_skew = health.protocol_version != expected_protocol;
 
-    let safe_status = sanitize_token(&health.status);
-    let safe_version = sanitize_token(&health.version);
+    let safe_status = sanitize_health_token(&health.status);
+    let safe_version = sanitize_health_token(&health.version);
 
     let health_message = if status_ok {
         format!(
@@ -491,7 +441,7 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
 
     let target_port = options
         .port_override
-        .or_else(|| loaded_config.as_ref().map(|c| c.listen_port))
+        .or_else(|| loaded_config.as_ref().map(|c| c.proxy.port.get()))
         .unwrap_or(DEFAULT_LISTEN_PORT);
 
     let (proxy_summary, version_skew, protocol_skew) = match probe_proxy_health(
@@ -527,17 +477,7 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                 critical: true,
                 message: eval.version_message,
             });
-            let summary = ProxyProbeSummary {
-                reachable: true,
-                status: Some(sanitize_token(&health.status)),
-                version: Some(sanitize_token(&health.version)),
-                protocol_version: Some(health.protocol_version),
-                error: if eval.status_ok {
-                    None
-                } else {
-                    Some("proxy reported non-ok health status".to_string())
-                },
-            };
+            let summary = ProxyHealthSummary::from_health(&health);
             (summary, eval.version_skew, eval.protocol_skew)
         }
         Err(err_msg) => {
@@ -554,20 +494,14 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                 message: "skipped because proxy /health did not return a valid response"
                     .to_string(),
             });
-            let summary = ProxyProbeSummary {
-                reachable: false,
-                status: None,
-                version: None,
-                protocol_version: None,
-                error: Some(err_msg),
-            };
+            let summary = ProxyHealthSummary::unreachable(err_msg);
             (summary, false, false)
         }
     };
 
     let config_has_api_key = loaded_config
         .as_ref()
-        .map(|cfg| cfg.redacted().api_key_configured)
+        .map(|cfg| cfg.redacted().providers.gemini.api_key_configured)
         .unwrap_or(false);
 
     let gemini_api_key_set = matches!(
@@ -734,8 +668,7 @@ mod tests {
     use axum::http::{HeaderValue, StatusCode, header};
     use axum::response::IntoResponse;
     use axum::routing::get;
-    use companion_core::Config;
-    use companion_proxy::{HealthResponse, PROTOCOL_VERSION};
+    use companion_core::{ApiKey, Config, HealthResponse, PROTOCOL_VERSION};
     use tempfile::TempDir;
     use tokio::net::TcpListener;
 
@@ -1213,7 +1146,7 @@ mod tests {
         let ssrf = temp.path().join("ssrf.json");
         fs::write(
             &ssrf,
-            r#"{"schema_version":1,"listen_host":"0.0.0.0","listen_port":4141,"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyDoctorSsrfSecret888","default_model":"gemini-4-hydrogen","timeout_secs":900}}"#,
+            r#"{"schema_version":1,"proxy":{"host":"0.0.0.0","port":4141},"providers":{"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyDoctorSsrfSecret888","default_model":"gemini-4-hydrogen","timeout_secs":900}}}"#,
         )
         .expect("write ssrf");
         #[cfg(unix)]
@@ -1484,13 +1417,17 @@ mod tests {
                 .join(format!("{}.json", label.replace(' ', "_")));
             let raw = serde_json::json!({
                 "schema_version": 1,
-                "listen_host": "127.0.0.1",
-                "listen_port": port,
-                "gemini": {
-                    "base_url": "https://generativelanguage.googleapis.com",
-                    "api_key": bad_key,
-                    "default_model": "gemini-4-hydrogen",
-                    "timeout_secs": 900
+                "proxy": {
+                    "host": "127.0.0.1",
+                    "port": port
+                },
+                "providers": {
+                    "gemini": {
+                        "base_url": "https://generativelanguage.googleapis.com",
+                        "api_key": bad_key,
+                        "default_model": "gemini-4-hydrogen",
+                        "timeout_secs": 900
+                    }
                 }
             });
             fs::write(&cfg_path, raw.to_string()).expect("write config");
@@ -1572,9 +1509,25 @@ mod tests {
 
         // 2. Placeholder in BOTH env and legacy config.json -> still WARN, not PASS.
         let cfg_legacy = temp.path().join("legacy_placeholder.json");
-        let mut legacy = Config::default();
-        legacy.gemini.api_key = Some(companion_core::PROXY_PLACEHOLDER_API_KEY.to_string());
-        legacy.save_secure(&cfg_legacy).expect("save legacy");
+        fs::write(
+            &cfg_legacy,
+            serde_json::json!({
+                "schema_version": 1,
+                "providers": {
+                    "gemini": {
+                        "api_key": companion_core::PROXY_PLACEHOLDER_API_KEY
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write legacy placeholder");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&cfg_legacy, fs::Permissions::from_mode(0o600))
+                .expect("chmod legacy");
+        }
         let rep_legacy = run_doctor(
             DoctorOptions {
                 config_override: Some(cfg_legacy),
@@ -1597,7 +1550,8 @@ mod tests {
         // 3. Placeholder in env with a REAL saved key in config.json -> PASS, gemini_api_key_set == false, no leak.
         let cfg_real = temp.path().join("real_key.json");
         let mut real = Config::default();
-        real.gemini.api_key = Some("AIzaSyRealSavedKey1234".to_string());
+        real.providers.gemini.api_key =
+            Some(ApiKey::parse_strict("AIzaSyRealSavedKey1234").expect("valid key"));
         real.save_secure(&cfg_real).expect("save real");
         let rep_real = run_doctor(
             DoctorOptions {
