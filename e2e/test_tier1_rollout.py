@@ -171,6 +171,31 @@ def _wait_for_health(port: int, timeout: float = 5.0) -> dict[str, Any] | None:
     return None
 
 
+def _iter_rust_module_files(module_base: Path, *, include_tests: bool = False) -> list[Path]:
+    single_file = module_base.with_suffix(".rs")
+    if single_file.is_file():
+        return [single_file]
+    if module_base.is_dir():
+        files: list[Path] = []
+        for candidate in sorted(module_base.rglob("*.rs")):
+            if not candidate.is_file():
+                continue
+            if not include_tests:
+                rel_parts = candidate.relative_to(module_base).parts
+                if candidate.name == "tests.rs" or "tests" in rel_parts:
+                    continue
+            files.append(candidate)
+        return files
+    return []
+
+
+def _read_rust_module_source(module_base: Path, *, include_tests: bool = False) -> str:
+    files = _iter_rust_module_files(module_base, include_tests=include_tests)
+    if not files:
+        raise AssertionError(f"Missing expected Rust module: {module_base}")
+    return "\n".join(path.read_text(encoding="utf-8") for path in files)
+
+
 def _strip_rust_comments_and_tests(source: str) -> str:
     comment_re = re.compile(
         r'(r#*"[\s\S]*?"#*|"(?:\\.|[^"\\])*")|//[^\n]*|/\*[\s\S]*?\*/'
@@ -2249,8 +2274,8 @@ class TestTier1RolloutR24WindowsParity(E2ETestCase):
 
     def test_t1_r24_windows_launch_discovery_and_direct_exe_manifests_contract(self) -> None:
         """R24: Windows parity provides Antigravity.exe discovery, direct .exe manifests, and Start Menu .lnk."""
-        launch_rs = (self.repo_root / "crates" / "companion-cli" / "src" / "launch.rs").read_text(encoding="utf-8")
-        install_rs = (self.repo_root / "crates" / "companion-cli" / "src" / "install.rs").read_text(encoding="utf-8")
+        launch_rs = _read_rust_module_source(self.repo_root / "crates" / "companion-cli" / "src" / "launch")
+        install_rs = _read_rust_module_source(self.repo_root / "crates" / "companion-cli" / "src" / "install")
         self.assertIn("cfg(windows)", launch_rs)
         self.assertIn("Antigravity.exe", launch_rs)
         self.assertIn("cfg(windows)", install_rs)
@@ -2282,13 +2307,23 @@ class TestTier1RolloutR24WindowsParity(E2ETestCase):
 
     def test_t1_r24_windows_zero_setx_and_zero_hkcu_environment_mutations(self) -> None:
         """R24: Windows implementation never executes setx or mutates HKCU Environment registry keys."""
-        targets = (
-            self.repo_root / "crates" / "companion-cli" / "src" / "install.rs",
-            self.repo_root / "crates" / "companion-cli" / "src" / "launch.rs",
-            self.repo_root / "crates" / "companion-core" / "src" / "integration.rs",
+        required_modules = (
+            self.repo_root / "crates" / "companion-cli" / "src" / "install",
+            self.repo_root / "crates" / "companion-cli" / "src" / "launch",
+            self.repo_root / "crates" / "companion-core" / "src" / "integration",
         )
-        for path in targets:
-            with self.subTest(file=path.name):
+        optional_modules = (
+            self.repo_root / "crates" / "companion-cli" / "src" / "process",
+        )
+        paths: list[Path] = []
+        for module_base in required_modules:
+            module_files = _iter_rust_module_files(module_base, include_tests=False)
+            self.assertTrue(module_files, f"Missing expected Rust module: {module_base}")
+            paths.extend(module_files)
+        for module_base in optional_modules:
+            paths.extend(_iter_rust_module_files(module_base, include_tests=False))
+        for path in paths:
+            with self.subTest(file=str(path.relative_to(self.repo_root))):
                 self.assertTrue(path.is_file(), f"Missing expected source file: {path}")
                 code = _strip_rust_comments_and_tests(path.read_text(encoding="utf-8"))
                 self.assertIsNone(re.search(r"\bsetx\b", code, re.IGNORECASE), f"setx found in {path}")

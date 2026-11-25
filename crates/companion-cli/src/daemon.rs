@@ -89,11 +89,7 @@ impl ProxyPidGuard {
 
 impl Drop for ProxyPidGuard {
     fn drop(&mut self) {
-        if let Ok(Some(info)) = read_proxy_pid(&self.path)
-            && info.pid == self.expected_pid
-        {
-            let _ = fs::remove_file(&self.path);
-        }
+        crate::process::remove_pid_file_if_matches(&self.path, self.expected_pid);
     }
 }
 
@@ -1057,12 +1053,30 @@ mod tests {
     #[tokio::test]
     async fn wait_for_daemon_healthy_succeeds_via_final_probe_when_child_exits_after_winner_binds()
     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
         use axum::routing::get;
 
         let probe = LoopbackProxyClient::with_default_timeouts().expect("probe client");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
         let router = axum::Router::new().route(
             "/health",
-            get(|| async { axum::Json(HealthResponse::ok("0.1.0")) }),
+            get(move || {
+                let hits = Arc::clone(&hits_clone);
+                async move {
+                    let count = hits.fetch_add(1, Ordering::SeqCst);
+                    if count == 0 {
+                        // Poll #1 fails so wait_for_daemon_healthy enters the child.try_wait()
+                        // early-exit branch and MUST issue the post-exit final bind-race probe.
+                        (StatusCode::SERVICE_UNAVAILABLE, "starting").into_response()
+                    } else {
+                        (StatusCode::OK, axum::Json(HealthResponse::ok("0.1.0"))).into_response()
+                    }
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1072,17 +1086,32 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut child = spawn_fast_exiting_child();
-        // Wait briefly so child exits before wait_for_daemon_healthy polls try_wait.
+        let mut child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .arg("--exact")
+            .arg("__nonexistent_daemon_test_case__")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fast-exiting child");
+        // Drain piped stdout to EOF so the child has definitely exited before poll #1 runs,
+        // without calling wait()/try_wait() prematurely.
+        if let Some(mut stdout) = child.stdout.take() {
+            let mut sink = Vec::new();
+            let _ = stdout.read_to_end(&mut sink);
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        let started = Instant::now();
         let outcome = wait_for_daemon_healthy(
             &probe,
             &mut child,
             WaitHealthyOptions {
                 port,
                 total_timeout: Duration::from_secs(2),
-                poll_interval: Duration::from_millis(25),
+                // Deliberately longer than total_timeout so a second probe can ONLY happen via
+                // the post-exit final bind-race probe inside the child.try_wait() branch.
+                poll_interval: Duration::from_secs(5),
                 probe_timeout: Duration::from_millis(250),
                 expected_version: None,
             },
@@ -1093,6 +1122,16 @@ mod tests {
         assert_eq!(
             outcome,
             WaitHealthyOutcome::Ready(HealthResponse::ok("0.1.0"))
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "expected poll #1 (503) followed by post-exit final bind-race probe #2 (200)"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "post-exit final probe must complete immediately without sleeping poll_interval: {:?}",
+            started.elapsed()
         );
     }
 

@@ -41,6 +41,30 @@ _S5_EXTERNAL_TAGS_RE = re.compile(
 )
 
 
+def _read_rust_module_source(module_base: Path, *, include_tests: bool = False) -> str:
+    single_file = module_base.with_suffix(".rs")
+    if single_file.is_file():
+        files = [single_file]
+    elif module_base.is_dir():
+        files = [
+            candidate
+            for candidate in sorted(module_base.rglob("*.rs"))
+            if candidate.is_file()
+            and (
+                include_tests
+                or (
+                    candidate.name != "tests.rs"
+                    and "tests" not in candidate.relative_to(module_base).parts
+                )
+            )
+        ]
+    else:
+        files = []
+    if not files:
+        raise AssertionError(f"Missing expected Rust module: {module_base}")
+    return "\n".join(path.read_text(encoding="utf-8") for path in files)
+
+
 def _sample_catalog() -> dict[str, Any]:
     return {
         "models": {
@@ -724,7 +748,7 @@ class TestTier3RolloutCombinations(E2ETestCase):
 
         readme = (self.repo_root / "README.md").read_text(encoding="utf-8")
         design = (self.repo_root / "docs" / "design" / "dock-launcher-and-install.md").read_text(encoding="utf-8")
-        install_rs = (self.repo_root / "crates" / "companion-cli" / "src" / "install.rs").read_text(encoding="utf-8")
+        install_rs = _read_rust_module_source(self.repo_root / "crates" / "companion-cli" / "src" / "install")
 
         self.assertIn("npx -y agy-companion@latest install", readme)
         self.assertIn("npx -y agy-companion@latest install", design)

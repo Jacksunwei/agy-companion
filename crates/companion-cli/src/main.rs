@@ -22,25 +22,17 @@ fn rmcp_ceiling_allows(target: &str, level: &tracing::Level) -> bool {
     !(is_rmcp && *level > tracing::Level::INFO)
 }
 
-fn init_stderr_tracing(default_level: &str) {
+fn init_tracing<W>(default_level: &str, writer: W)
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     // Hard ceiling: rmcp DEBUG/TRACE logs raw JSON-RPC request payloads (including save_settings
     // plaintext api_key) before companion-ui-mcp deserializes into redacted argument structs.
     let rmcp_ceiling = filter_fn(|meta| rmcp_ceiling_allows(meta.target(), meta.level()));
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_filter(env_filter.and(rmcp_ceiling));
-    let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
-}
-
-fn init_serve_tracing(default_level: &str, log_target: ServeLogTarget) {
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    let rmcp_ceiling = filter_fn(|meta| rmcp_ceiling_allows(meta.target(), meta.level()));
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(log_target)
+        .with_writer(writer)
         .with_ansi(false)
         .with_filter(env_filter.and(rmcp_ceiling));
     let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
@@ -58,7 +50,7 @@ async fn main() -> ExitCode {
             idle_shutdown_secs,
         } => {
             let log_target = ServeLogTarget::default();
-            init_serve_tracing("info", log_target.clone());
+            init_tracing("info", log_target.clone());
             if let Err(err) = run_serve_configured(ServeOptions {
                 port_override: port,
                 config_override: config,
@@ -74,7 +66,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::UiMcp { data_dir, config } => {
-            init_stderr_tracing("warn");
+            init_tracing("warn", std::io::stderr);
             if let Err(err) = run_ui_mcp(data_dir, config).await {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
@@ -82,7 +74,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Doctor { config, port, json } => {
-            init_stderr_tracing("warn");
+            init_tracing("warn", std::io::stderr);
             let mut stdout = std::io::stdout().lock();
             match execute_doctor(config, port, json, &mut stdout).await {
                 Ok(true) => ExitCode::SUCCESS,
@@ -94,7 +86,7 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Models { json, port, config } => {
-            init_stderr_tracing("warn");
+            init_tracing("warn", std::io::stderr);
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_models(json, port, config, &mut stdout) {
                 eprintln!("error: {err}");
@@ -108,7 +100,7 @@ async fn main() -> ExitCode {
             app,
             print_env,
         } => {
-            init_stderr_tracing("warn");
+            init_tracing("warn", std::io::stderr);
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_launch(port, config, app, print_env, &mut stdout).await {
                 eprintln!("error: {err}");
@@ -123,7 +115,7 @@ async fn main() -> ExitCode {
             config,
             plugins_dir,
         } => {
-            init_stderr_tracing("warn");
+            init_tracing("warn", std::io::stderr);
             let mut stdout = std::io::stdout().lock();
             let mut stderr = std::io::stderr().lock();
             run_hook_env(
@@ -141,7 +133,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Commands::Integration { action } => {
-            init_stderr_tracing("warn");
+            init_tracing("warn", std::io::stderr);
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_integration(action, &mut stdout) {
                 eprintln!("error: {err}");
@@ -157,7 +149,7 @@ async fn main() -> ExitCode {
             force,
             json,
         } => {
-            init_stderr_tracing("warn");
+            init_tracing("warn", std::io::stderr);
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_install(
                 InstallOptions {
@@ -184,7 +176,7 @@ async fn main() -> ExitCode {
             dry_run,
             json,
         } => {
-            init_stderr_tracing("warn");
+            init_tracing("warn", std::io::stderr);
             let mut stdout = std::io::stdout().lock();
             if let Err(err) = run_uninstall(
                 UninstallOptions {
