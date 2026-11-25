@@ -2303,3 +2303,150 @@ async fn cloudcode_transport_errors_strip_upstream_url_and_query() {
         }
     }
 }
+
+#[test]
+fn merge_available_models_empty_proxy_models_injects_zero_models_even_with_valid_default_model() {
+    let upstream = serde_json::to_vec(&json!({
+        "models": {
+            "gemini-4-carbon-high": {
+                "model": "MODEL_PLACEHOLDER_M427",
+                "displayName": "Gemini 4 Carbon (High)",
+                "thinkingLevel": 3
+            }
+        },
+        "defaultAgentModelId": "gemini-4-carbon-high"
+    }))
+    .unwrap();
+
+    let merged = merge_available_models(&upstream, &[], "gemini-4-hydrogen").unwrap();
+    let parsed: Value = serde_json::from_slice(&merged).unwrap();
+    let models = parsed["models"].as_object().unwrap();
+    assert!(
+        !models.keys().any(|k| k.starts_with("companion/")),
+        "empty enabled_models must inject 0 companion/ models: {models:?}"
+    );
+    assert!(parsed.get("groupedModels").is_none());
+    assert!(parsed.get("agentModelSorts").is_none());
+}
+
+#[test]
+fn merge_available_models_does_not_force_default_model_when_omitted_from_enabled_models() {
+    let upstream = serde_json::to_vec(&json!({
+        "models": {
+            "gemini-4-carbon-high": {
+                "model": "MODEL_PLACEHOLDER_M427",
+                "displayName": "Gemini 4 Carbon (High)",
+                "thinkingLevel": 3
+            }
+        },
+        "defaultAgentModelId": "gemini-4-carbon-high"
+    }))
+    .unwrap();
+
+    let merged = merge_available_models(
+        &upstream,
+        &["gemini-4-carbon".to_string()],
+        "gemini-4-hydrogen",
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_slice(&merged).unwrap();
+    let injected: Vec<&String> = parsed["models"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| k.starts_with("companion/"))
+        .collect();
+    assert_eq!(
+        injected.len(),
+        3,
+        "only Carbon's 3 variants should exist: {injected:?}"
+    );
+    for suffix in ["low", "medium", "high"] {
+        assert!(
+            parsed["models"]
+                .as_object()
+                .unwrap()
+                .contains_key(&format!("companion/gemini-4-carbon-{suffix}"))
+        );
+    }
+    assert!(
+        !injected.iter().any(|k| k.contains("gemini-4-hydrogen")),
+        "default_model omitted from enabled_models must not be injected: {injected:?}"
+    );
+}
+
+#[test]
+fn merge_available_models_default_three_enabled_models_use_11_of_32_slots_in_capability_order() {
+    let upstream = serde_json::to_vec(&json!({
+        "models": {
+            "gemini-4-carbon-high": {
+                "model": "MODEL_PLACEHOLDER_M427",
+                "displayName": "Gemini 4 Carbon (High)",
+                "thinkingLevel": 3
+            }
+        },
+        "defaultAgentModelId": "gemini-4-carbon-high",
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "modelIds": ["gemini-4-carbon-high"] }]
+        }]
+    }))
+    .unwrap();
+
+    let enabled = companion_core::default_enabled_gemini_models();
+    let merged = merge_available_models(&upstream, &enabled, "gemini-4-hydrogen").unwrap();
+    let parsed: Value = serde_json::from_slice(&merged).unwrap();
+    let models = parsed["models"].as_object().unwrap();
+
+    let mut assigned_slots: Vec<String> = models
+        .iter()
+        .filter(|(k, _)| k.starts_with("companion/"))
+        .map(|(_, v)| v["model"].as_str().unwrap().to_string())
+        .collect();
+    assigned_slots.sort();
+
+    assert_eq!(assigned_slots.len(), 11, "default 3 models use 11/32 slots");
+    assert_eq!(
+        assigned_slots,
+        vec![
+            "MODEL_PLACEHOLDER_M334",
+            "MODEL_PLACEHOLDER_M335",
+            "MODEL_PLACEHOLDER_M336",
+            "MODEL_PLACEHOLDER_M337",
+            "MODEL_PLACEHOLDER_M341",
+            "MODEL_PLACEHOLDER_M342",
+            "MODEL_PLACEHOLDER_M343",
+            "MODEL_PLACEHOLDER_M344",
+            "MODEL_PLACEHOLDER_M345",
+            "MODEL_PLACEHOLDER_M346",
+            "MODEL_PLACEHOLDER_M347",
+        ]
+    );
+    assert!(
+        !models
+            .keys()
+            .any(|k| k.contains("argon") || k.contains("3.8-flash")),
+        "disabled curated models must not be injected"
+    );
+
+    let sort_ids: Vec<&str> = parsed["agentModelSorts"][0]["groups"][0]["modelIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|id| id.starts_with("companion/"))
+        .collect();
+    let first_carbon = sort_ids
+        .iter()
+        .position(|id| id.contains("carbon"))
+        .unwrap();
+    let first_neon = sort_ids.iter().position(|id| id.contains("neon")).unwrap();
+    let first_hydrogen = sort_ids
+        .iter()
+        .position(|id| id.contains("hydrogen"))
+        .unwrap();
+    assert!(
+        first_carbon < first_neon && first_neon < first_hydrogen,
+        "expected Carbon -> Neon -> Hydrogen order, got {sort_ids:?}"
+    );
+}

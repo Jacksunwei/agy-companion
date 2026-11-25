@@ -3,7 +3,8 @@
   "args": [
     "../../scripts/run-companion.sh",
     "serve",
-    "--adopt-running"
+    "--adopt-running",
+    "--auto-enable-launcher"
   ],
   "restart_policy": "on-failure",
   "display_name": "Antigravity Companion Proxy",

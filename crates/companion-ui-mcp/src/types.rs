@@ -161,6 +161,7 @@ impl From<GeminiSettingsPatch> for GeminiConfigPatch {
             api_key: patch.api_key.map(Into::into),
             base_url: patch.base_url,
             default_model: patch.default_model,
+            enabled_models: None,
             timeout_secs: None,
         }
     }
@@ -180,6 +181,7 @@ impl From<SaveSettingsArgs> for ConfigPatch {
             proxy: args.proxy.map(Into::into),
             cloudcode: args.cloudcode.map(Into::into),
             providers: args.providers.map(Into::into),
+            launcher_auto_start: None,
         }
     }
 }

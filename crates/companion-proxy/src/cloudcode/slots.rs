@@ -129,35 +129,35 @@ pub(super) fn available_placeholder_slots(used_enums: &HashSet<String>) -> usize
     (PLACEHOLDER_ENUM_COUNT as usize).saturating_sub(used_in_range)
 }
 
-/// Reserve placeholder slots for `default_model` first under slot pressure, fill
-/// remaining slots in capability order (skipping oversized 4-variant models so
-/// smaller 3-variant models can still fit), then sort selected models by
-/// `model_capability_sort_key` for consistent picker display order.
+/// Reserve placeholder slots for `default_model` first under slot pressure (only if
+/// `default_model` is present in `proxy_models`), fill remaining slots in capability
+/// order (skipping oversized 4-variant models so smaller 3-variant models can still fit),
+/// then sort selected models by `model_capability_sort_key` for consistent picker display order.
 pub(super) fn select_models_for_available_slots(
     proxy_models: &[String],
     default_model: &str,
     available_slots: usize,
 ) -> Vec<String> {
     let mut seen_models: HashSet<String> = HashSet::new();
-    let default_norm = normalize_model_id(default_model);
-    let valid_default = if !default_norm.is_empty()
-        && is_supported_gemini_model(&default_norm)
-        && seen_models.insert(default_norm.clone())
-    {
-        Some(default_norm)
-    } else {
-        None
-    };
-
-    let mut other_models: Vec<String> = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
     for raw in proxy_models {
         let norm = normalize_model_id(raw);
         if !norm.is_empty() && is_supported_gemini_model(&norm) && seen_models.insert(norm.clone())
         {
-            other_models.push(norm);
+            candidates.push(norm);
         }
     }
-    other_models.sort_by(|a, b| model_capability_sort_key(a).cmp(&model_capability_sort_key(b)));
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let default_norm = normalize_model_id(default_model);
+    let valid_default = candidates
+        .iter()
+        .position(|m| m == &default_norm)
+        .map(|pos| candidates.remove(pos));
+
+    candidates.sort_by(|a, b| model_capability_sort_key(a).cmp(&model_capability_sort_key(b)));
 
     let mut remaining_slots = available_slots;
     let mut selected_models: Vec<String> = Vec::new();
@@ -170,7 +170,7 @@ pub(super) fn select_models_for_available_slots(
         }
     }
 
-    for raw_id in other_models {
+    for raw_id in candidates {
         if remaining_slots == 0 {
             break;
         }

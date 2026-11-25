@@ -1500,3 +1500,136 @@ fn cli_integration_refuses_symlink_dir_and_fifo_leaf_env_sh_without_mutating_rc(
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn install_step1_unsafe_integration_lock_fails_before_mutating_filesystem() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for kind in ["symlink", "fifo", "directory"] {
+        for no_launcher_hook in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let home = temp.path().join("home");
+            let xdg_config = temp.path().join("xdg_config");
+            let xdg_data = temp.path().join("xdg_data");
+            let plugins_dir = temp.path().join("plugins");
+            let data_dir = xdg_data.join("agy-companion");
+            fs::create_dir_all(&home).expect("mkdir home");
+            fs::create_dir_all(&plugins_dir).expect("mkdir plugins");
+            fs::create_dir_all(&data_dir).expect("mkdir data_dir");
+
+            let cfg_path = xdg_config.join("agy-companion").join("config.json");
+            let lock_path = data_dir.join(companion_core::integration::INTEGRATION_LOCK_FILENAME);
+            let victim_lock = temp.path().join("victim_integration.lock");
+            let sentinel = "VICTIM_LOCK_UNTOUCHED\n";
+            match kind {
+                "symlink" => {
+                    fs::write(&victim_lock, sentinel).expect("write victim");
+                    fs::set_permissions(&victim_lock, fs::Permissions::from_mode(0o644))
+                        .expect("chmod 0644 victim");
+                    symlink(&victim_lock, &lock_path).expect("symlink integration.lock");
+                }
+                "fifo" => {
+                    assert!(
+                        Command::new("mkfifo")
+                            .arg(&lock_path)
+                            .status()
+                            .expect("mkfifo")
+                            .success()
+                    );
+                }
+                "directory" => {
+                    fs::create_dir_all(&lock_path).expect("mkdir integration.lock");
+                }
+                _ => unreachable!(),
+            }
+
+            let mut args = vec![
+                "install",
+                "--no-start-proxy",
+                "--plugins-dir",
+                plugins_dir.to_str().expect("utf8 plugins"),
+                "--config",
+                cfg_path.to_str().expect("utf8 cfg"),
+                "--json",
+            ];
+            if no_launcher_hook {
+                args.push("--no-launcher-hook");
+            }
+
+            let out = isolated_cli_command(&home)
+                .env("XDG_CONFIG_HOME", &xdg_config)
+                .env("XDG_DATA_HOME", &xdg_data)
+                .env("SHELL", "/bin/zsh")
+                .env("ZDOTDIR", &home)
+                .args(&args)
+                .output()
+                .expect("run install");
+
+            assert_ne!(
+                out.status.code(),
+                Some(0),
+                "{kind} (no_launcher_hook={no_launcher_hook}): install must fail closed in Step 1; stdout={}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(companion_core::integration::INTEGRATION_LOCK_FILENAME),
+                "{kind} (no_launcher_hook={no_launcher_hook}): stderr must mention integration.lock, got stderr={stderr}"
+            );
+            let expected_err = if kind == "symlink" {
+                "symbolic links are not allowed for"
+            } else {
+                "must be a regular file"
+            };
+            assert!(
+                stderr.contains(expected_err),
+                "{kind} (no_launcher_hook={no_launcher_hook}): expected '{expected_err}', got stderr={stderr}"
+            );
+
+            if kind == "symlink" {
+                assert_eq!(
+                    fs::read_to_string(&victim_lock).expect("read victim"),
+                    sentinel,
+                    "{kind} (no_launcher_hook={no_launcher_hook}): victim file must remain untouched"
+                );
+                assert_eq!(
+                    fs::metadata(&victim_lock)
+                        .expect("stat victim")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o644,
+                    "{kind} (no_launcher_hook={no_launcher_hook}): victim mode must remain 0o644"
+                );
+            }
+
+            assert!(
+                fs::symlink_metadata(plugins_dir.join("agy-companion")).is_err(),
+                "{kind} (no_launcher_hook={no_launcher_hook}): Step 1 failure must NOT create plugin dir"
+            );
+            assert!(
+                !data_dir.join("bin").exists(),
+                "{kind} (no_launcher_hook={no_launcher_hook}): Step 1 failure must NOT create data_dir/bin"
+            );
+            assert!(
+                fs::symlink_metadata(home.join(".local/bin/agy-companion")).is_err(),
+                "{kind} (no_launcher_hook={no_launcher_hook}): Step 1 failure must NOT create ~/.local/bin/agy-companion"
+            );
+            assert!(
+                !cfg_path.exists(),
+                "{kind} (no_launcher_hook={no_launcher_hook}): Step 1 failure must NOT create config.json"
+            );
+            assert!(
+                !data_dir
+                    .join(companion_core::integration::ENV_SCRIPT_FILENAME)
+                    .exists(),
+                "{kind} (no_launcher_hook={no_launcher_hook}): Step 1 failure must NOT create env.sh"
+            );
+            assert!(
+                !home.join(".zlogin").exists(),
+                "{kind} (no_launcher_hook={no_launcher_hook}): Step 1 failure must NOT create .zlogin"
+            );
+        }
+    }
+}

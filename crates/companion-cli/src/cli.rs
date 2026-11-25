@@ -28,6 +28,9 @@ pub enum Commands {
         /// instead of failing with address-in-use (intended for sidecar startup).
         #[arg(long = "adopt-running")]
         adopt_running: bool,
+        /// Auto-enable the login-shell launcher hook once on first run (intended for plugin sidecar startup).
+        #[arg(long = "auto-enable-launcher")]
+        auto_enable_launcher: bool,
         /// Automatically exit cleanly after this many seconds with zero in-flight requests
         /// (0 or omitted disables idle shutdown).
         #[arg(long = "idle-shutdown-secs")]
@@ -179,6 +182,9 @@ pub enum IntegrationCommands {
         /// Follow a symlinked RC file and edit its regular-file target.
         #[arg(long = "follow-rc-symlink")]
         follow_rc_symlink: bool,
+        /// Path to config.json (overrides AGY_COMPANION_CONFIG).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Emit machine-readable JSON status to stdout.
         #[arg(long)]
         json: bool,
@@ -194,6 +200,9 @@ pub enum IntegrationCommands {
         /// Follow a symlinked RC file and edit its regular-file target.
         #[arg(long = "follow-rc-symlink")]
         follow_rc_symlink: bool,
+        /// Path to config.json (overrides AGY_COMPANION_CONFIG).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Emit machine-readable JSON status to stdout.
         #[arg(long)]
         json: bool,
@@ -206,6 +215,9 @@ pub enum IntegrationCommands {
         /// Override shell RC file path.
         #[arg(long = "rc-file")]
         rc_file: Option<PathBuf>,
+        /// Path to config.json (overrides AGY_COMPANION_CONFIG).
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Emit machine-readable JSON status to stdout.
         #[arg(long)]
         json: bool,
@@ -247,6 +259,7 @@ mod tests {
                 port: Some(4242),
                 config: Some(PathBuf::from("/tmp/c.json")),
                 adopt_running: false,
+                auto_enable_launcher: false,
                 idle_shutdown_secs: None,
             }
         );
@@ -259,18 +272,25 @@ mod tests {
                 port: None,
                 config: None,
                 adopt_running: false,
+                auto_enable_launcher: false,
                 idle_shutdown_secs: None,
             }
         );
 
-        let serve_adopt = Cli::try_parse_from(["agy-companion", "serve", "--adopt-running"])
-            .expect("serve --adopt-running should parse");
+        let serve_adopt = Cli::try_parse_from([
+            "agy-companion",
+            "serve",
+            "--adopt-running",
+            "--auto-enable-launcher",
+        ])
+        .expect("serve --adopt-running --auto-enable-launcher should parse");
         assert_eq!(
             serve_adopt.command,
             Commands::Serve {
                 port: None,
                 config: None,
                 adopt_running: true,
+                auto_enable_launcher: true,
                 idle_shutdown_secs: None,
             }
         );
@@ -284,6 +304,7 @@ mod tests {
                 port: None,
                 config: None,
                 adopt_running: false,
+                auto_enable_launcher: false,
                 idle_shutdown_secs: Some(1800),
             }
         );
@@ -297,6 +318,7 @@ mod tests {
                 port: None,
                 config: None,
                 adopt_running: false,
+                auto_enable_launcher: false,
                 idle_shutdown_secs: Some(0),
             }
         );
@@ -387,6 +409,7 @@ mod tests {
                 port: Some(5151),
                 config: Some(PathBuf::from("/tmp/c.json")),
                 adopt_running: false,
+                auto_enable_launcher: false,
                 idle_shutdown_secs: None,
             }
         );
@@ -495,6 +518,8 @@ mod tests {
             "--binary",
             "/tmp/bin/agy-companion",
             "--follow-rc-symlink",
+            "--config",
+            "/tmp/c.json",
             "--json",
         ])
         .expect("integration enable should parse");
@@ -506,6 +531,7 @@ mod tests {
                     rc_file: Some(PathBuf::from("/tmp/.zlogin")),
                     binary: Some(PathBuf::from("/tmp/bin/agy-companion")),
                     follow_rc_symlink: true,
+                    config: Some(PathBuf::from("/tmp/c.json")),
                     json: true,
                 },
             }
@@ -518,6 +544,7 @@ mod tests {
             "--shell",
             "bash",
             "--follow-rc-symlink",
+            "--config=/tmp/d.json",
             "--json",
         ])
         .expect("integration disable should parse");
@@ -528,6 +555,7 @@ mod tests {
                     shell: Some(CliShell::Bash),
                     rc_file: None,
                     follow_rc_symlink: true,
+                    config: Some(PathBuf::from("/tmp/d.json")),
                     json: true,
                 },
             }
@@ -541,6 +569,8 @@ mod tests {
             "fish",
             "--rc-file",
             "/tmp/fish.fish",
+            "--config",
+            "/tmp/s.json",
             "--json",
         ])
         .expect("integration status should parse");
@@ -550,6 +580,7 @@ mod tests {
                 action: IntegrationCommands::Status {
                     shell: Some(CliShell::Fish),
                     rc_file: Some(PathBuf::from("/tmp/fish.fish")),
+                    config: Some(PathBuf::from("/tmp/s.json")),
                     json: true,
                 },
             }

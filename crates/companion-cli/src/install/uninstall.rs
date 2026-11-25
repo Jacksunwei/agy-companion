@@ -340,6 +340,12 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
                 }
             }
         }
+        if data_dir_safety == ExistingDirSafety::SafeDir {
+            let lock_path = data_dir.join(companion_core::integration::INTEGRATION_LOCK_FILENAME);
+            if remove_regular_file_if_present(&lock_path, opts.dry_run, &mut warnings)? {
+                purged_paths.push(lock_path);
+            }
+        }
         let sidecar_data_dir = home
             .join(".gemini")
             .join("antigravity")

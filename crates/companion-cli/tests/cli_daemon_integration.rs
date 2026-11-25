@@ -12,7 +12,10 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-use common::{DetachedPidFileGuard, config_with_port, free_loopback_port, isolated_cli_command};
+use common::{
+    DetachedPidFileGuard, config_with_port, free_loopback_port, isolated_cli_command,
+    spawn_serve_and_wait_healthy,
+};
 
 #[tokio::test]
 async fn hook_env_cold_starts_detached_daemon_and_fails_open_when_plugin_missing_or_port_occupied()
@@ -494,4 +497,250 @@ async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall
         !log_path.exists(),
         "proxy.log must NOT resurrect in purged data dir"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_integration_enable_disable_persist_launcher_auto_start_and_validate_config_flag() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_data = temp.path().join("xdg_data");
+    fs::create_dir_all(&home).expect("mkdir home");
+    let cfg_path = temp.path().join("custom/config.json");
+
+    // 1. Invalid --config traversal fails closed on enable, disable, and status without mutating RC.
+    for subcmd in ["enable", "disable", "status"] {
+        let out = isolated_cli_command(&home)
+            .env("XDG_DATA_HOME", &xdg_data)
+            .env("ZDOTDIR", &home)
+            .env("SHELL", "/bin/zsh")
+            .args([
+                "integration",
+                subcmd,
+                "--config",
+                "/tmp/../escape.json",
+                "--json",
+            ])
+            .output()
+            .expect("run invalid --config");
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "integration {subcmd} must reject traversal --config"
+        );
+    }
+    assert!(!home.join(".zlogin").exists());
+
+    // 2. Symlinked --config fails closed before mutating RC.
+    let target_cfg = temp.path().join("target_cfg.json");
+    let sym_cfg = temp.path().join("sym_cfg.json");
+    fs::write(&target_cfg, "{}").expect("write target");
+    symlink(&target_cfg, &sym_cfg).expect("symlink cfg");
+    let sym_out = isolated_cli_command(&home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .env("SHELL", "/bin/zsh")
+        .args([
+            "integration",
+            "enable",
+            "--config",
+            sym_cfg.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run symlink --config");
+    assert_ne!(sym_out.status.code(), Some(0));
+    assert!(!home.join(".zlogin").exists());
+
+    // 3. `integration enable --config` persists launcher_auto_start = true.
+    let en_out = isolated_cli_command(&home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .env("SHELL", "/bin/zsh")
+        .args([
+            "integration",
+            "enable",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run integration enable");
+    assert_eq!(
+        en_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&en_out.stderr)
+    );
+    assert!(home.join(".zlogin").is_file());
+    assert_eq!(
+        companion_core::Config::load_or_default(&cfg_path)
+            .unwrap()
+            .launcher_auto_start,
+        Some(true)
+    );
+
+    // 4. `integration disable --config` persists launcher_auto_start = false.
+    let dis_out = isolated_cli_command(&home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .env("SHELL", "/bin/zsh")
+        .args([
+            "integration",
+            "disable",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run integration disable");
+    assert_eq!(
+        dis_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&dis_out.stderr)
+    );
+    assert_eq!(
+        companion_core::Config::load_or_default(&cfg_path)
+            .unwrap()
+            .launcher_auto_start,
+        Some(false)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_serve_auto_enable_launcher_runs_once_and_standalone_serve_never_mutates_rc() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_data = temp.path().join("xdg_data");
+    fs::create_dir_all(&home).expect("mkdir home");
+    let cfg_path = temp.path().join("config.json");
+    let mut cfg = config_with_port(free_loopback_port());
+    cfg.usage_dir = Some(xdg_data.join("agy-companion").join("usage"));
+    cfg.save_secure(&cfg_path).expect("save config");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("build client");
+
+    // 1. Standalone `serve` (WITHOUT --auto-enable-launcher) NEVER mutates RC or launcher_auto_start.
+    {
+        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+            let mut cmd = isolated_cli_command(&home);
+            cmd.env("XDG_DATA_HOME", &xdg_data)
+                .env("ZDOTDIR", &home)
+                .env("SHELL", "/bin/zsh")
+                .args([
+                    "serve",
+                    "--port",
+                    &port.to_string(),
+                    "--config",
+                    cfg_path.to_str().unwrap(),
+                ]);
+            cmd
+        })
+        .await;
+        assert!(
+            !home.join(".zlogin").exists(),
+            "standalone serve must NEVER create .zlogin"
+        );
+        assert_eq!(
+            companion_core::Config::load_or_default(&cfg_path)
+                .unwrap()
+                .launcher_auto_start,
+            None,
+            "standalone serve must leave launcher_auto_start as None"
+        );
+    }
+
+    // 2. `serve --auto-enable-launcher` on None creates .zlogin + env.sh and persists Some(true).
+    {
+        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+            let mut cmd = isolated_cli_command(&home);
+            cmd.env("XDG_DATA_HOME", &xdg_data)
+                .env("ZDOTDIR", &home)
+                .env("SHELL", "/bin/zsh")
+                .args([
+                    "serve",
+                    "--port",
+                    &port.to_string(),
+                    "--config",
+                    cfg_path.to_str().unwrap(),
+                    "--auto-enable-launcher",
+                ]);
+            cmd
+        })
+        .await;
+        assert!(
+            home.join(".zlogin").is_file(),
+            "serve --auto-enable-launcher must create .zlogin on first run"
+        );
+        assert!(
+            xdg_data.join("agy-companion/env.sh").is_file(),
+            "serve --auto-enable-launcher must create env.sh on first run"
+        );
+        assert_eq!(
+            companion_core::Config::load_or_default(&cfg_path)
+                .unwrap()
+                .launcher_auto_start,
+            Some(true)
+        );
+    }
+
+    // 3. After `integration disable` sets Some(false), `serve --auto-enable-launcher` does NOT re-enable!
+    let dis_out = isolated_cli_command(&home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("ZDOTDIR", &home)
+        .env("SHELL", "/bin/zsh")
+        .args([
+            "integration",
+            "disable",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("run integration disable");
+    assert_eq!(dis_out.status.code(), Some(0));
+    assert!(!home.join(".zlogin").exists());
+    assert_eq!(
+        companion_core::Config::load_or_default(&cfg_path)
+            .unwrap()
+            .launcher_auto_start,
+        Some(false)
+    );
+
+    {
+        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+            let mut cmd = isolated_cli_command(&home);
+            cmd.env("XDG_DATA_HOME", &xdg_data)
+                .env("ZDOTDIR", &home)
+                .env("SHELL", "/bin/zsh")
+                .args([
+                    "serve",
+                    "--port",
+                    &port.to_string(),
+                    "--config",
+                    cfg_path.to_str().unwrap(),
+                    "--auto-enable-launcher",
+                ]);
+            cmd
+        })
+        .await;
+        assert!(
+            !home.join(".zlogin").exists(),
+            "serve --auto-enable-launcher must NOT re-enable after explicit opt-out"
+        );
+        assert_eq!(
+            companion_core::Config::load_or_default(&cfg_path)
+                .unwrap()
+                .launcher_auto_start,
+            Some(false)
+        );
+    }
 }

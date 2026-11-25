@@ -788,6 +788,7 @@ class TestTier1F5Proxy(E2ETestCase):
                 base_url=mock_gemini.base_url,
                 cloudcode_upstream_url=mock_ccpa.base_url,
                 api_key="AIzaSyBug4ModelTest12",
+                enabled_models=["gemini-5-pro", "gemini-3.9-pro"],
             )
         )
 
@@ -840,17 +841,6 @@ class TestTier1F5Proxy(E2ETestCase):
             assert req is not None
             self.assertEqual(req.path, path)
 
-        mock_gemini.enqueue(
-            JsonAction(
-                status=200,
-                payload={
-                    "models": [
-                        {"name": "models/gemini-5-pro"},
-                        {"name": "models/gemini-3.9-pro"},
-                    ]
-                },
-            )
-        )
         mock_ccpa.enqueue(
             JsonAction(
                 status=200,
