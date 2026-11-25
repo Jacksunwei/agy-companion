@@ -1,0 +1,38 @@
+name: Feature Request
+description: Suggest a new capability or UX improvement for agy-companion
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Looking to add a new model provider (Ollama, OpenAI-compatible, Claude, Codex)? Please use the **Provider Adapter Proposal** template instead.
+
+  - type: dropdown
+    id: target_surface
+    attributes:
+      label: Target Surface
+      options:
+        - MCP App UI (Monitor / Usage / Settings)
+        - Local Proxy (routing / caching / telemetry)
+        - CLI (doctor / models / usage / upgrade)
+        - Install / Uninstall / Dock & Launcher Integration
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Use Case
+      description: What workflow is missing or painful today?
+      placeholder: "When I try to ..., I currently have to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Behavior
+      description: Describe the behavior, CLI flag, or UI flow you'd like to see, plus any alternatives considered.
+    validations:
+      required: true

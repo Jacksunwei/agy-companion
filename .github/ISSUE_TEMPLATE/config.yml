@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Ideas (GitHub Discussions)
+    url: https://github.com/Jacksunwei/agy-companion/discussions
+    about: Ask usage questions, share custom setups, or brainstorm new ideas before opening an issue.
+  - name: Report a Security Vulnerability
+    url: https://github.com/Jacksunwei/agy-companion/security/advisories/new
+    about: Privately disclose security vulnerabilities — never post exploits or API keys in public issues.
