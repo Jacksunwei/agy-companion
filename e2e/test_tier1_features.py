@@ -1198,31 +1198,38 @@ class TestTier1F7UiBundle(E2ETestCase):
         self.assertIsNone(re.search(r'<link[^>]+href=["\']\./assets/', html, re.IGNORECASE))
 
     def test_t1_f7_ui_src_guards_stale_refresh_and_disables_refresh_during_writes(self) -> None:
-        """ui/src/main.ts tracks monotonic snapshotEpoch, guards stale get_settings, and disables refresh during writes."""
-        main_ts = self.repo_root / "ui" / "src" / "main.ts"
+        """ui/src tracks monotonic snapshotEpoch, guards stale get_settings during writes, and renders dynamic proxy endpoint."""
+        src_dir = self.repo_root / "ui" / "src"
+        main_ts = src_dir / "main.ts"
+        footer_ts = src_dir / "footer.ts"
         self.assertTrue(main_ts.is_file(), f"Missing {main_ts}")
+        self.assertTrue(footer_ts.is_file(), f"Missing {footer_ts}")
+        all_ts = "\n".join(
+            _strip_ts_comments(p.read_text(encoding="utf-8"))
+            for p in sorted(src_dir.glob("*.ts"))
+        )
         src = _strip_ts_comments(main_ts.read_text(encoding="utf-8"))
+        footer_src = _strip_ts_comments(footer_ts.read_text(encoding="utf-8"))
         self.assertIn("snapshotEpoch", src, "Expected monotonic snapshotEpoch in ui/src/main.ts")
         self.assertRegex(
             src,
-            r"refs\.refreshBtn\.disabled\s*=\s*!canCall\s*\|\|\s*state\.refreshing\s*\|\|\s*anyWrite",
-            "refreshBtn must be disabled while save_settings or clear_api_key is in flight",
+            r"isWriteInFlight\s*\(\)",
+            "refreshSettings must check write lockout while mutations are in flight",
         )
         self.assertRegex(
             src,
             r"state\.snapshotEpoch\s*!==\s*epoch",
             "refreshSettings must drop stale get_settings responses when snapshotEpoch advanced",
         )
+        self.assertIn("config.proxy.host", footer_src, "footer should render config.proxy.host dynamically")
+        self.assertIn("config.proxy.port", footer_src, "footer should render config.proxy.port dynamically")
         self.assertRegex(
-            src,
-            r"refs\.endpointTag\.textContent\s*=\s*`\$\{snapshot\.config\.proxy\.host\}:\$\{snapshot\.config\.proxy\.port\}`",
-            "endpointTag should render snapshot.config.proxy.host dynamically instead of hardcoded 127.0.0.1",
+            footer_src,
+            r"`\$\{host\}:\$\{port\}`",
+            "footer should format endpoint dynamically from host and port",
         )
-        self.assertRegex(
-            src,
-            r"if\s*\(\s*outcome\.data\.proxy\.reachable\s*\)\s*\{\s*state\.portChangedSinceSave\s*=\s*false;",
-            "refreshSettings should reset portChangedSinceSave once proxy is reachable again",
-        )
+        self.assertNotIn("refreshBtn", all_ts, "UX v2 removes manual refreshBtn")
+        self.assertNotIn("portChangedSinceSave", all_ts, "UX v2 removes editable portChangedSinceSave")
 
 
 class TestTier1F8McpServer(E2ETestCase):

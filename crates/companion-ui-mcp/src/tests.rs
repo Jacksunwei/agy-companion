@@ -336,6 +336,23 @@ async fn ui_resource_serves_mcp_app_mime_and_non_empty_html() {
                 !text.contains("AGY Companion"),
                 "embedded UI HTML must not contain stale AGY Companion display strings"
             );
+            let text_lower = text.to_lowercase();
+            let forbidden_ui_copy = [
+                "cloudcode",
+                "jetski",
+                "-cloudcode-pa.googleapis.com",
+                "restart required",
+                "agy companion",
+                "coming soon",
+                "refreshbtn",
+                "auto \u{2192} workspace",
+            ];
+            for token in forbidden_ui_copy {
+                assert!(
+                    !text_lower.contains(token),
+                    "forbidden UX v2 token `{token}` found in embedded UI HTML"
+                );
+            }
             assert_eq!(
                 meta.as_ref()
                     .and_then(|m| m.0.get("ui"))
@@ -346,7 +363,7 @@ async fn ui_resource_serves_mcp_app_mime_and_non_empty_html() {
         other => panic!("expected text resource contents, got {other:?}"),
     }
 
-    // Verify ui/src has zero forbidden DOM/JS sinks
+    // Verify ui/src has zero forbidden DOM/JS sinks and zero forbidden UX v2 tokens
     let ui_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/src");
     let forbidden = [
         "innerHTML",
@@ -365,6 +382,16 @@ async fn ui_resource_serves_mcp_app_mime_and_non_empty_html() {
         "prompt(",
         "fetch(",
     ];
+    let forbidden_ci = [
+        "cloudcode",
+        "jetski",
+        "-cloudcode-pa.googleapis.com",
+        "restart required",
+        "agy companion",
+        "coming soon",
+        "refreshbtn",
+        "auto \u{2192} workspace",
+    ];
     for entry in fs::read_dir(&ui_src).expect("read ui/src") {
         let path = entry.expect("entry").path();
         if path.is_file() {
@@ -373,6 +400,14 @@ async fn ui_resource_serves_mcp_app_mime_and_non_empty_html() {
                 assert!(
                     !content.contains(token),
                     "forbidden token `{token}` found in {}",
+                    path.display()
+                );
+            }
+            let content_lower = content.to_lowercase();
+            for token in forbidden_ci {
+                assert!(
+                    !content_lower.contains(token),
+                    "forbidden UX v2 token `{token}` found in {}",
                     path.display()
                 );
             }

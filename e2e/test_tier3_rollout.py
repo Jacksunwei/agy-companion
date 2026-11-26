@@ -745,7 +745,13 @@ class TestTier3RolloutCombinations(E2ETestCase):
         self.assertLess(len(html.encode("utf-8")), 512_000)
         self.assertIsNone(_S5_FORBIDDEN_SINKS_RE.search(html))
         self.assertIsNone(_S5_EXTERNAL_TAGS_RE.search(html))
-        for tool_name in ("get_settings", "save_settings", "test_connection", "set_launcher_integration"):
+        for tool_name in (
+            "get_settings",
+            "save_settings",
+            "test_connection",
+            "set_launcher_integration",
+            "get_usage",
+        ):
             self.assertIn(tool_name, html, f"UI bundle missing tool call reference: {tool_name}")
 
     def test_t3_r14_windows_parity_and_docs_align_with_npx_npm_uvx_only_policy(self) -> None:
