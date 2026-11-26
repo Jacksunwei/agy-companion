@@ -1910,26 +1910,52 @@ class TestTier1RolloutR19UiRolloutBundle(E2ETestCase):
         mcp_html = contents[0]["text"]
         self.assertEqual(mcp_html, raw.decode("utf-8"))
 
-        main_ts = (self.repo_root / "ui" / "src" / "main.ts").read_text(encoding="utf-8")
+        all_ts = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in sorted((self.repo_root / "ui" / "src").glob("*.ts"))
+        )
         self.assertIn("Antigravity Companion", raw.decode("utf-8"))
         self.assertNotIn("AGY Companion", raw.decode("utf-8"))
-        for marker in ("snapshotEpoch", "refreshBtn", "endpointTag", "portChangedSinceSave"):
-            self.assertIn(marker, main_ts, f"Missing preserved UI invariant: {marker}")
+        for marker in (
+            "snapshotEpoch",
+            "account_plan",
+            "proxy_rss_bytes",
+            "enabled_models",
+            "get_usage",
+        ):
+            self.assertIn(marker, all_ts, f"Missing preserved UX v2 UI invariant: {marker}")
 
     def test_t1_r19_ui_includes_launcher_cloudcode_countdown_and_details_contracts(self) -> None:
-        """R19: ui/src/main.ts and bundle include Dock integration, CloudCode, countdown, and collapsed details."""
-        main_ts = (self.repo_root / "ui" / "src" / "main.ts").read_text(encoding="utf-8")
+        """R19: ui/src/*.ts and bundle include UX v2 launcher, semantic plan, usage, and details contracts with zero forbidden codenames."""
+        all_ts = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in sorted((self.repo_root / "ui" / "src").glob("*.ts"))
+        )
         bundle_text = (self.repo_root / "ui" / "dist" / "index.html").read_text(encoding="utf-8")
         for token in (
             "set_launcher_integration",
             "launcher_integration",
-            "cloudcode",
-            "last_catalog_refresh_at_ms",
+            "account_plan",
+            "enabled_models",
+            "get_usage",
             "test_connection",
+            "proxy_rss_bytes",
         ):
-            self.assertIn(token, main_ts, f"Missing {token} in ui/src/main.ts")
+            self.assertIn(token, all_ts, f"Missing {token} in ui/src/*.ts")
             self.assertIn(token, bundle_text, f"Missing {token} in ui/dist/index.html")
-        self.assertIn("details", main_ts.lower())
+        self.assertIn("details", all_ts.lower())
+        for forbidden in (
+            "cloudcode",
+            "jetski",
+            "-cloudcode-pa.googleapis.com",
+            "restart required",
+            "agy companion",
+            "coming soon",
+            "refreshbtn",
+            "auto \u2192 workspace",
+        ):
+            self.assertNotIn(forbidden, all_ts.lower(), f"Forbidden token {forbidden!r} in ui/src/*.ts")
+            self.assertNotIn(forbidden, bundle_text.lower(), f"Forbidden token {forbidden!r} in ui/dist/index.html")
 
 
 class TestTier1RolloutR20RunCompanionHardening(E2ETestCase):

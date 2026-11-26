@@ -1496,7 +1496,11 @@ class TestTier2RolloutR19UiRolloutBundleBoundaries(E2ETestCase):
             pos = main_ts.find(handler)
             self.assertGreater(pos, 0, f"Missing {handler}")
             self.assertLess(pos, connect_pos, f"{handler} must be registered before app.connect()")
-        self.assertRegex(main_ts, r"(?i)(windows|linux|win32|platform|userAgent|navigator)")
+        all_ts = "\n".join(
+            _strip_ts_comments(p.read_text(encoding="utf-8"))
+            for p in sorted((self.repo_root / "ui" / "src").glob("*.ts"))
+        )
+        self.assertRegex(all_ts, r"(?i)(windows|linux|win32|platform|userAgent|navigator)")
 
 
 class TestTier2RolloutR20RunCompanionHardeningBoundaries(E2ETestCase):
