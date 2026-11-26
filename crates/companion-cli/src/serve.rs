@@ -61,6 +61,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         config.proxy.port = NonZeroU16::new(port).ok_or(CliError::InvalidPort(0))?;
     }
     config.validate()?;
+    crate::precheck_existing_auth_dir(&config_path)?;
 
     let usage_dir = config.effective_usage_dir()?;
     precheck_existing_data_dir(&usage_dir)?;

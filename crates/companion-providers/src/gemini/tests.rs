@@ -40,10 +40,9 @@ async fn spawn_mock_server(router: Router) -> MockServer {
     }
 }
 
-fn config_for(base_url: &str, api_key: Option<&str>, timeout_secs: u64) -> GeminiConfig {
+fn config_for(base_url: &str, timeout_secs: u64) -> GeminiConfig {
     GeminiConfig {
         base_url: base_url.to_string(),
-        api_key: api_key.and_then(|k| ApiKey::parse_from_disk(k).expect("valid test api_key")),
         timeout_secs,
         ..GeminiConfig::default()
     }
@@ -454,13 +453,15 @@ async fn normalizes_base_url_with_and_without_v1beta_and_trailing_slashes() {
         .expect_err("must reject Duration::ZERO");
     assert!(matches!(err, ProviderError::InvalidConfig(_)));
     let err = GeminiProvider::from_config_with_timeout(
-        &config_for("http://127.0.0.1:4141", None, 30),
+        &config_for("http://127.0.0.1:4141", 30),
+        None,
         Duration::ZERO,
     )
     .expect_err("must reject from_config_with_timeout Duration::ZERO");
     assert!(matches!(err, ProviderError::InvalidConfig(_)));
     let sub_sec = GeminiProvider::from_config_with_timeout(
-        &config_for("http://127.0.0.1:4141", None, 30),
+        &config_for("http://127.0.0.1:4141", 30),
+        None,
         Duration::from_millis(150),
     )
     .expect("construct sub-second timeout provider");
@@ -996,12 +997,15 @@ async fn rejects_non_ascii_and_control_api_keys_without_leaking_secret() {
 // 10. Custom Debug redaction on GeminiProvider, ForwardRequest, ForwardResponse
 #[test]
 fn debug_redacts_api_keys_on_gemini_provider_and_forward_request() {
-    let provider = GeminiProvider::from_config(&GeminiConfig {
-        base_url: "https://generativelanguage.googleapis.com/v1beta/".to_string(),
-        api_key: Some(ApiKey::parse_strict("AIzaSyTopSecretConfigured9999").unwrap()),
-        timeout_secs: 900,
-        ..GeminiConfig::default()
-    })
+    let key = ApiKey::parse_strict("AIzaSyTopSecretConfigured9999").unwrap();
+    let provider = GeminiProvider::from_config(
+        &GeminiConfig {
+            base_url: "https://generativelanguage.googleapis.com/v1beta/".to_string(),
+            timeout_secs: 900,
+            ..GeminiConfig::default()
+        },
+        Some(&key),
+    )
     .expect("construct provider from_config")
     .with_env_fallback(true);
     assert_eq!(provider.api_key_hint().as_deref(), Some("AIza...9999"));
@@ -1495,8 +1499,8 @@ async fn rejects_unicode_whitespace_in_api_keys_without_silent_fallback_or_echo(
         assert_sanitized_invalid_config(err, "api_key_override", bad);
 
         // Source 3: with_env_api_key env fallback (forward_gemini + health_check)
-        let cfg_no_key = config_for(&server.base_url, None, DEFAULT_TIMEOUT_SECS);
-        let env_provider = GeminiProvider::with_env_api_key(&cfg_no_key, Some(bad))
+        let cfg_no_key = config_for(&server.base_url, DEFAULT_TIMEOUT_SECS);
+        let env_provider = GeminiProvider::with_env_api_key(&cfg_no_key, None, Some(bad))
             .expect("construct provider with deferred env key");
 
         let err = env_provider
@@ -1579,9 +1583,10 @@ async fn rejects_unicode_whitespace_in_api_keys_without_silent_fallback_or_echo(
     assert_eq!(seen_key.lock().await.as_deref(), Some("AIzaSyValid1234"));
 
     // ASCII-padded env key trims cleanly
-    let cfg_blank = config_for(&server.base_url, Some("   "), DEFAULT_TIMEOUT_SECS);
-    let p_trimmed_env = GeminiProvider::with_env_api_key(&cfg_blank, Some("  AIzaSyValid1234  "))
-        .expect("construct provider with ASCII-padded env key");
+    let cfg_blank = config_for(&server.base_url, DEFAULT_TIMEOUT_SECS);
+    let p_trimmed_env =
+        GeminiProvider::with_env_api_key(&cfg_blank, None, Some("  AIzaSyValid1234  "))
+            .expect("construct provider with ASCII-padded env key");
     p_trimmed_env
         .forward_gemini(ForwardRequest {
             path_and_query: "/v1beta/models/gemini-4-hydrogen:generateContent".to_string(),

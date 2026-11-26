@@ -76,6 +76,14 @@ class TestHarnessGuardrails(E2ETestCase):
         self.assertIsInstance(port, int)
         self.assertGreater(port, 0)
         self.assertNotIn(port, RESERVED_PORT_RANGE)
+        self.assertNotIn("api_key", cfg["providers"]["gemini"])
+        self.assertFalse(iso.auth_dir.exists())
+        auth_file = iso.write_gemini_auth("test-self-auth-key-01")
+        self.assertEqual(auth_file, iso.gemini_auth_path)
+        self.assertTrue(auth_file.is_file())
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(os.lstat(iso.auth_dir).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.lstat(auth_file).st_mode), 0o600)
 
         hostile_vars = {
             "GEMINI_API_KEY": "hostile-test-key",

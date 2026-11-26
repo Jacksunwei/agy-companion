@@ -1,14 +1,14 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use companion_core::config::{
-    ApiKeyPatch as CoreApiKeyPatch, CloudCodeConfigPatch, ConfigPatch, GeminiConfigPatch,
-    ProvidersConfigPatch, ProxyConfigPatch,
+    CloudCodeConfigPatch, ConfigPatch, GeminiConfigPatch, ProvidersConfigPatch, ProxyConfigPatch,
 };
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::{
-    CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CloudCodeStatsSnapshot,
+    AuthStore, CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CloudCodeStatsSnapshot,
     CloudCodeStatus, CloudCodeUpstream, DEFAULT_CLOUDCODE_UPSTREAM_URL, HostPlatform, ModelPreset,
     ProxyHealthSummary, RedactedConfig, StatsSnapshot, UsageRange, api_key_hint,
     curated_model_presets,
@@ -35,7 +35,7 @@ pub enum UiHtmlSource {
     Fixed(Option<PathBuf>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct UiServerOptions {
     pub ui_html_source: UiHtmlSource,
     pub env_api_key_fallback: bool,
@@ -44,6 +44,31 @@ pub struct UiServerOptions {
     pub hybrid_active_override: Option<bool>,
     pub probe_timeout: Duration,
     pub auto_enable_launcher: bool,
+    pub auth_store_override: Option<Arc<dyn AuthStore>>,
+}
+
+impl fmt::Debug for UiServerOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UiServerOptions")
+            .field("ui_html_source", &self.ui_html_source)
+            .field("env_api_key_fallback", &self.env_api_key_fallback)
+            .field(
+                "test_connection_timeout_override",
+                &self.test_connection_timeout_override,
+            )
+            .field(
+                "integration_options_override",
+                &self.integration_options_override,
+            )
+            .field("hybrid_active_override", &self.hybrid_active_override)
+            .field("probe_timeout", &self.probe_timeout)
+            .field("auto_enable_launcher", &self.auto_enable_launcher)
+            .field(
+                "auth_store_override",
+                &self.auth_store_override.as_ref().map(|_| "<AuthStore>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for UiServerOptions {
@@ -56,6 +81,7 @@ impl Default for UiServerOptions {
             hybrid_active_override: None,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             auto_enable_launcher: false,
+            auth_store_override: None,
         }
     }
 }
@@ -68,6 +94,11 @@ impl UiServerOptions {
 
     pub fn with_test_connection_timeout(mut self, timeout: Duration) -> Self {
         self.test_connection_timeout_override = Some(timeout);
+        self
+    }
+
+    pub fn with_auth_store_override(mut self, store: Arc<dyn AuthStore>) -> Self {
+        self.auth_store_override = Some(store);
         self
     }
 }
@@ -265,15 +296,6 @@ pub struct SaveSettingsArgs {
     pub account_plan: Option<AccountPlan>,
 }
 
-impl From<ApiKeyPatch> for CoreApiKeyPatch {
-    fn from(patch: ApiKeyPatch) -> Self {
-        match patch {
-            ApiKeyPatch::Clear => Self::Clear,
-            ApiKeyPatch::Set(raw) => Self::Set(raw),
-        }
-    }
-}
-
 impl From<ProxySettingsPatch> for ProxyConfigPatch {
     fn from(patch: ProxySettingsPatch) -> Self {
         Self {
@@ -294,12 +316,43 @@ impl From<CloudCodeSettingsPatch> for CloudCodeConfigPatch {
 impl From<GeminiSettingsPatch> for GeminiConfigPatch {
     fn from(patch: GeminiSettingsPatch) -> Self {
         Self {
-            api_key: patch.api_key.map(Into::into),
             base_url: patch.base_url,
             default_model: patch.default_model,
             enabled_models: patch.enabled_models,
             timeout_secs: None,
         }
+    }
+}
+
+impl SaveSettingsArgs {
+    pub(crate) fn into_config_and_auth_patches(
+        mut self,
+    ) -> Result<(ConfigPatch, Option<ApiKeyPatch>, bool), String> {
+        let api_key_patch = self
+            .providers
+            .as_mut()
+            .and_then(|p| p.gemini.as_mut())
+            .and_then(|g| g.api_key.take());
+
+        let has_config_changes = self
+            .proxy
+            .as_ref()
+            .is_some_and(|p| p.host.is_some() || p.port.is_some())
+            || self
+                .cloudcode
+                .as_ref()
+                .is_some_and(|c| c.upstream.is_some())
+            || self.account_plan.is_some()
+            || self
+                .providers
+                .as_ref()
+                .and_then(|p| p.gemini.as_ref())
+                .is_some_and(|g| {
+                    g.base_url.is_some() || g.default_model.is_some() || g.enabled_models.is_some()
+                });
+
+        let config_patch = ConfigPatch::try_from(self)?;
+        Ok((config_patch, api_key_patch, has_config_changes))
     }
 }
 

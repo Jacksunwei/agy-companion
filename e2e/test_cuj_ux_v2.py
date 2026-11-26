@@ -202,7 +202,6 @@ class TestCujUxV2(E2ETestCase):
         cfg = env.write_config(
             env.make_config_dict(
                 listen_port=port,
-                api_key=None,
                 cloudcode_upstream_url=mock.base_url,
             )
         )
@@ -328,11 +327,11 @@ class TestCujUxV2(E2ETestCase):
         cfg = env.write_config(
             env.make_config_dict(
                 listen_port=port,
-                api_key="test-uxv2-gemini-key-02",
                 base_url=mock.base_url,
                 cloudcode_upstream_url=mock.base_url,
             )
         )
+        env.write_gemini_auth("test-uxv2-gemini-key-02", config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg, port=port)
         mcp = self.start_mcp(env, config_path=cfg)
 
@@ -391,7 +390,6 @@ class TestCujUxV2(E2ETestCase):
         cfg = env.write_config(
             env.make_config_dict(
                 listen_port=port,
-                api_key=None,
                 launcher_auto_start=None,
             )
         )
@@ -485,7 +483,7 @@ class TestCujUxV2(E2ETestCase):
 
         port = find_free_port()
         # Pre-write config so `install` sees an existing config and skips fresh-install port probing.
-        cfg = env.write_config(env.make_config_dict(listen_port=port, api_key=None))
+        cfg = env.write_config(env.make_config_dict(listen_port=port))
         plugins_dir = env.home_dir / ".gemini" / "config" / "plugins"
 
         res = run_cli(
@@ -593,7 +591,6 @@ class TestCujUxV2(E2ETestCase):
         cfg_sym = env_sym.write_config(
             env_sym.make_config_dict(
                 listen_port=sym_port,
-                api_key=None,
                 launcher_auto_start=None,
             )
         )
@@ -633,9 +630,9 @@ class TestCujUxV2(E2ETestCase):
         cfg = env.write_config(
             env.make_config_dict(
                 listen_port=port,
-                api_key="test-uxv2-gemini-key-05",
             )
         )
+        env.write_gemini_auth("test-uxv2-gemini-key-05", config_path=cfg)
 
         # Save `personal` + `enabled_models`, and verify mutual exclusion with `cloudcode.upstream`.
         p1 = self.start_proxy(env, config_path=cfg, port=port)
@@ -760,9 +757,9 @@ class TestCujUxV2(E2ETestCase):
             env.make_config_dict(
                 listen_port=proxy_port,
                 base_url=mock.base_url,
-                api_key="test-sidecar-ui-key-01",
             )
         )
+        env.write_gemini_auth("test-sidecar-ui-key-01", config_path=cfg)
         token = "sidecar-e2e-token-999"
         self.start_proxy(
             env,

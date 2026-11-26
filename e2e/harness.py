@@ -478,6 +478,8 @@ class IsolatedEnv:
         self.config_root = self.root / "config"
         self.config_dir = self.config_root / "agy-companion"
         self.config_path = self.config_dir / "config.json"
+        self.auth_dir = self.config_dir / "auth"
+        self.gemini_auth_path = self.auth_dir / "gemini.json"
         self.data_root = self.root / "data"
         self.data_dir = self.data_root / "agy-companion"
         self.usage_dir = self.data_dir / "usage"
@@ -530,7 +532,6 @@ class IsolatedEnv:
         listen_host: str = "127.0.0.1",
         listen_port: int | None = None,
         base_url: str = "https://generativelanguage.googleapis.com",
-        api_key: str | None = None,
         default_model: str = "gemini-4-hydrogen",
         enabled_models: list[str] | None = None,
         timeout_secs: int = 900,
@@ -540,10 +541,9 @@ class IsolatedEnv:
         cloudcode_upstream_url: str | None = None,
         launcher_auto_start: bool | None = None,
     ) -> dict[str, Any]:
-        """Build a nested schema_version=1 config dict pointing at isolated usage_dir by default."""
+        """Build a nested schema_version=1 non-secret config dict pointing at isolated usage_dir by default."""
         gemini_cfg: dict[str, Any] = {
             "base_url": base_url,
-            "api_key": api_key,
             "default_model": default_model,
             "timeout_secs": timeout_secs,
         }
@@ -590,6 +590,52 @@ class IsolatedEnv:
             os.chmod(tmp_name, mode)
             os.replace(tmp_name, target)
             os.chmod(target, mode)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except (OSError, ValueError):
+                pass
+            raise
+        if mtime_offset_secs is not None:
+            ts = time.time() + mtime_offset_secs
+            os.utime(target, (ts, ts))
+        return target
+
+    @staticmethod
+    def auth_dir_for_config(config_path: Path) -> Path:
+        """Derive the sibling auth/ directory for a given config.json path."""
+        return config_path.parent / "auth"
+
+    def gemini_auth_path_for(self, config_path: Path | None = None) -> Path:
+        """Return sibling auth/gemini.json path for config_path (or default self.config_path)."""
+        target_cfg = config_path if config_path is not None else self.config_path
+        return self.auth_dir_for_config(target_cfg) / "gemini.json"
+
+    def write_gemini_auth(
+        self,
+        api_key: str,
+        *,
+        config_path: Path | None = None,
+        mode: int = 0o600,
+        dir_mode: int = 0o700,
+        schema_version: int = 1,
+        mtime_offset_secs: float | None = None,
+    ) -> Path:
+        """Atomically write sibling auth/gemini.json with 0700 dir / 0600 file permissions on POSIX."""
+        target = self.gemini_auth_path_for(config_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            os.chmod(target.parent, dir_mode)
+        raw_text = json.dumps({"schema_version": schema_version, "api_key": api_key}, indent=2) + "\n"
+        fd, tmp_name = tempfile.mkstemp(prefix=".auth-", suffix=".tmp", dir=str(target.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(raw_text)
+            if os.name != "nt":
+                os.chmod(tmp_name, mode)
+            os.replace(tmp_name, target)
+            if os.name != "nt":
+                os.chmod(target, mode)
         except Exception:
             try:
                 os.unlink(tmp_name)

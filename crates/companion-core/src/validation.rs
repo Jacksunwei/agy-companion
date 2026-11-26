@@ -111,7 +111,7 @@ impl<'de> Deserialize<'de> for ApiKey {
     }
 }
 
-/// Custom serde deserializer for `Option<ApiKey>` on disk (`GeminiConfig.api_key`):
+/// Custom serde deserializer for `Option<ApiKey>` on disk:
 /// normalizes `null`, `""`, `"   "`, and `"agy-companion-local"` (with optional ASCII spaces)
 /// to `None`, while rejecting control chars, non-ASCII, and internal spaces without echoing input.
 pub fn deserialize_optional_api_key<'de, D>(deserializer: D) -> Result<Option<ApiKey>, D::Error>

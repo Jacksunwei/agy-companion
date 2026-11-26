@@ -1,18 +1,20 @@
-use std::path::PathBuf;
-use std::sync::RwLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use companion_core::fs_safe::{inspect_file_stamp, read_verified_bytes_for_stamp};
 use companion_core::{
-    Config, CoreError, FileStamp, FsError, MAX_CONFIG_FILE_BYTES, RejectedReason, validate_path,
+    AuthStore, Config, CoreError, FileStamp, FsError, GEMINI_AUTH_FILENAME, GeminiCredentials,
+    MAX_AUTH_FILE_BYTES, MAX_CONFIG_FILE_BYTES, RejectedReason, inspect_auth_file_stamp,
+    read_verified_auth_bytes_for_stamp, validate_path,
 };
 
 use crate::{ActiveProvider, ProxyError, build_active_provider};
 
 const RACY_CLEAN_WINDOW: Duration = Duration::from_secs(1);
 
-struct HotReloadInner {
-    active: ActiveProvider,
+struct WatchedFileState<T> {
+    value: T,
     stamp: FileStamp,
     raw_bytes: Option<Vec<u8>>,
     checked_at: Instant,
@@ -20,40 +22,34 @@ struct HotReloadInner {
     last_failed_bytes: Option<Vec<u8>>,
 }
 
-pub(crate) struct HotReloadProvider {
-    path: PathBuf,
-    env_fallback: bool,
-    inner: RwLock<HotReloadInner>,
-    reload_lock: tokio::sync::Mutex<()>,
-}
-
-enum FastCheckDecision {
-    ReturnCached(ActiveProvider),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileFastDecision {
+    Cached,
     VerifySameStampBytes { match_failed_bytes: bool },
     NeedsReload,
 }
 
-struct ReloadBaseline {
-    active: ActiveProvider,
+struct WatchedFileBaseline<T> {
+    value: T,
     stamp: FileStamp,
     raw_bytes: Option<Vec<u8>>,
     last_failed_stamp: Option<FileStamp>,
     last_failed_bytes: Option<Vec<u8>>,
 }
 
-enum ReloadOutcome {
+enum FileEvalOutcome<T> {
     Unchanged {
         touch_checked_at: bool,
     },
     Missing {
-        new_active: Option<ActiveProvider>,
         already_missing: bool,
+        default_value: T,
     },
     SameBytesNewStamp {
         stamp: FileStamp,
     },
     Updated {
-        active: ActiveProvider,
+        value: T,
         stamp: FileStamp,
         raw_bytes: Vec<u8>,
     },
@@ -63,94 +59,370 @@ enum ReloadOutcome {
     },
 }
 
+impl<T> FileEvalOutcome<T> {
+    fn changed_value(&self) -> bool {
+        matches!(
+            self,
+            Self::Updated { .. }
+                | Self::Missing {
+                    already_missing: false,
+                    ..
+                }
+        )
+    }
+
+    fn effective_value<'a>(&'a self, baseline: &'a T) -> &'a T {
+        match self {
+            Self::Updated { value, .. } => value,
+            Self::Missing {
+                already_missing: false,
+                default_value,
+            } => default_value,
+            _ => baseline,
+        }
+    }
+
+    fn into_failed_after_rebuild_error(self) -> Self {
+        match self {
+            Self::Updated {
+                stamp, raw_bytes, ..
+            } => Self::Failed {
+                failed_stamp: stamp,
+                failed_bytes: Some(raw_bytes),
+            },
+            Self::Missing {
+                already_missing: false,
+                ..
+            } => Self::Unchanged {
+                touch_checked_at: true,
+            },
+            other => other,
+        }
+    }
+}
+
+impl<T: Clone> WatchedFileState<T> {
+    fn new(value: T, stamp: FileStamp, raw_bytes: Option<Vec<u8>>) -> Self {
+        Self {
+            value,
+            stamp,
+            raw_bytes,
+            checked_at: Instant::now(),
+            last_failed_stamp: None,
+            last_failed_bytes: None,
+        }
+    }
+
+    fn fast_check(&self, current_stamp: &FileStamp) -> FileFastDecision {
+        let outside_racy_window = self.checked_at.elapsed() >= RACY_CLEAN_WINDOW;
+        if *current_stamp == self.stamp {
+            if outside_racy_window
+                || matches!(
+                    current_stamp,
+                    FileStamp::Missing | FileStamp::Rejected(_) | FileStamp::Unreadable(_)
+                )
+            {
+                return FileFastDecision::Cached;
+            }
+            return FileFastDecision::VerifySameStampBytes {
+                match_failed_bytes: false,
+            };
+        }
+
+        if self.last_failed_stamp.as_ref() == Some(current_stamp) {
+            if outside_racy_window
+                || matches!(
+                    current_stamp,
+                    FileStamp::Rejected(_) | FileStamp::Unreadable(_)
+                )
+            {
+                return FileFastDecision::Cached;
+            }
+            return FileFastDecision::VerifySameStampBytes {
+                match_failed_bytes: true,
+            };
+        }
+
+        FileFastDecision::NeedsReload
+    }
+
+    fn matches_cached_bytes(
+        &self,
+        current_stamp: &FileStamp,
+        bytes: &[u8],
+        match_failed_bytes: bool,
+    ) -> bool {
+        if match_failed_bytes {
+            self.last_failed_stamp.as_ref() == Some(current_stamp)
+                && self.last_failed_bytes.as_deref() == Some(bytes)
+        } else {
+            self.stamp == *current_stamp && self.raw_bytes.as_deref() == Some(bytes)
+        }
+    }
+
+    fn snapshot_baseline(&self) -> WatchedFileBaseline<T> {
+        WatchedFileBaseline {
+            value: self.value.clone(),
+            stamp: self.stamp.clone(),
+            raw_bytes: self.raw_bytes.clone(),
+            last_failed_stamp: self.last_failed_stamp.clone(),
+            last_failed_bytes: self.last_failed_bytes.clone(),
+        }
+    }
+
+    fn apply_outcome(&mut self, outcome: FileEvalOutcome<T>) {
+        match outcome {
+            FileEvalOutcome::Unchanged { touch_checked_at } => {
+                if touch_checked_at {
+                    self.checked_at = Instant::now();
+                }
+            }
+            FileEvalOutcome::Missing {
+                already_missing,
+                default_value,
+            } => {
+                if already_missing {
+                    self.last_failed_stamp = None;
+                    self.last_failed_bytes = None;
+                    self.checked_at = Instant::now();
+                } else {
+                    self.value = default_value;
+                    self.stamp = FileStamp::Missing;
+                    self.raw_bytes = None;
+                    self.last_failed_stamp = None;
+                    self.last_failed_bytes = None;
+                    self.checked_at = Instant::now();
+                }
+            }
+            FileEvalOutcome::SameBytesNewStamp { stamp } => {
+                self.stamp = stamp;
+                self.last_failed_stamp = None;
+                self.last_failed_bytes = None;
+                self.checked_at = Instant::now();
+            }
+            FileEvalOutcome::Updated {
+                value,
+                stamp,
+                raw_bytes,
+            } => {
+                self.value = value;
+                self.stamp = stamp;
+                self.raw_bytes = Some(raw_bytes);
+                self.last_failed_stamp = None;
+                self.last_failed_bytes = None;
+                self.checked_at = Instant::now();
+            }
+            FileEvalOutcome::Failed {
+                failed_stamp,
+                failed_bytes,
+            } => {
+                self.last_failed_stamp = Some(failed_stamp);
+                self.last_failed_bytes = failed_bytes;
+                self.checked_at = Instant::now();
+            }
+        }
+    }
+}
+
+struct HotReloadInner {
+    active: ActiveProvider,
+    config_state: WatchedFileState<Config>,
+    auth_state: Option<WatchedFileState<Option<GeminiCredentials>>>,
+}
+
+pub(crate) struct HotReloadProvider {
+    config_path: PathBuf,
+    auth_store: Arc<dyn AuthStore>,
+    auth_dir: Option<PathBuf>,
+    env_fallback: bool,
+    inner: RwLock<HotReloadInner>,
+    reload_lock: tokio::sync::Mutex<()>,
+}
+
+struct ReloadBaseline {
+    active: ActiveProvider,
+    config: WatchedFileBaseline<Config>,
+    auth: Option<WatchedFileBaseline<Option<GeminiCredentials>>>,
+}
+
+struct CombinedReloadOutcome {
+    config_outcome: FileEvalOutcome<Config>,
+    auth_outcome: Option<FileEvalOutcome<Option<GeminiCredentials>>>,
+    new_active: Option<ActiveProvider>,
+}
+
 impl HotReloadProvider {
     pub(crate) fn new(
-        path: PathBuf,
+        config_path: PathBuf,
+        auth_store: Arc<dyn AuthStore>,
+        initial_config: Config,
+        initial_gemini_creds: Option<GeminiCredentials>,
         active: ActiveProvider,
         env_fallback: bool,
     ) -> Result<Self, ProxyError> {
-        validate_path(&path)?;
-        let stamp = inspect_file_stamp(&path);
-        if let FileStamp::Rejected(reason) = stamp {
+        validate_path(&config_path)?;
+        let config_stamp = inspect_file_stamp(&config_path);
+        if let FileStamp::Rejected(reason) = config_stamp {
             return Err(match reason {
-                RejectedReason::Symlink => FsError::SymlinkRejected { path }.into(),
-                RejectedReason::NotRegularFile => FsError::NotRegularFile { path }.into(),
+                RejectedReason::Symlink => FsError::SymlinkRejected { path: config_path }.into(),
+                RejectedReason::NotRegularFile => {
+                    FsError::NotRegularFile { path: config_path }.into()
+                }
             });
         }
-        let raw_bytes = read_verified_bytes_for_stamp(&path, &stamp, MAX_CONFIG_FILE_BYTES)
-            .ok()
-            .flatten();
+        let config_raw_bytes =
+            read_verified_bytes_for_stamp(&config_path, &config_stamp, MAX_CONFIG_FILE_BYTES)
+                .ok()
+                .flatten();
+
+        let auth_dir = auth_store.auth_dir().map(Path::to_path_buf);
+        let auth_state = if let Some(ref dir) = auth_dir {
+            validate_path(dir)?;
+            let auth_stamp = inspect_auth_file_stamp(dir, GEMINI_AUTH_FILENAME);
+            if let FileStamp::Rejected(reason) = auth_stamp {
+                let auth_path = dir.join(GEMINI_AUTH_FILENAME);
+                return Err(match reason {
+                    RejectedReason::Symlink => FsError::SymlinkRejected { path: auth_path }.into(),
+                    RejectedReason::NotRegularFile => {
+                        FsError::NotRegularFile { path: auth_path }.into()
+                    }
+                });
+            }
+            let auth_raw_bytes =
+                read_verified_auth_bytes_for_stamp(dir, GEMINI_AUTH_FILENAME, &auth_stamp)
+                    .ok()
+                    .flatten();
+            Some(WatchedFileState::new(
+                initial_gemini_creds,
+                auth_stamp,
+                auth_raw_bytes,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
-            path,
+            config_path,
+            auth_store,
+            auth_dir,
             env_fallback,
             inner: RwLock::new(HotReloadInner {
                 active,
-                stamp,
-                raw_bytes,
-                checked_at: Instant::now(),
-                last_failed_stamp: None,
-                last_failed_bytes: None,
+                config_state: WatchedFileState::new(initial_config, config_stamp, config_raw_bytes),
+                auth_state,
             }),
             reload_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     pub(crate) async fn active_provider(&self) -> ActiveProvider {
-        // Immediate off-thread stat on every request (zero debounce) so config changes
-        // are observed instantaneously without blocking the Tokio runtime or holding locks.
-        let stat_path = self.path.clone();
-        let current_stamp =
-            match tokio::task::spawn_blocking(move || inspect_file_stamp(&stat_path)).await {
-                Ok(stamp) => stamp,
+        // Immediate off-thread stat of config.json + sibling auth/gemini.json in one blocking call
+        // so config or credential changes are observed instantaneously without holding locks.
+        let stat_config_path = self.config_path.clone();
+        let stat_auth_dir = self.auth_dir.clone();
+        let (cfg_stamp, auth_stamp) = match tokio::task::spawn_blocking(move || {
+            let cfg = inspect_file_stamp(&stat_config_path);
+            let auth = stat_auth_dir
+                .as_deref()
+                .map(|dir| inspect_auth_file_stamp(dir, GEMINI_AUTH_FILENAME));
+            (cfg, auth)
+        })
+        .await
+        {
+            Ok(stamps) => stamps,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "hot-reload stat task failed; retaining previous configuration"
+                );
+                return self.current_active();
+            }
+        };
+
+        let (cfg_dec, auth_dec) = {
+            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            let cfg_dec = guard.config_state.fast_check(&cfg_stamp);
+            let auth_dec = match (&guard.auth_state, &auth_stamp) {
+                (Some(st), Some(stamp)) => st.fast_check(stamp),
+                _ => FileFastDecision::Cached,
+            };
+            if cfg_dec == FileFastDecision::Cached && auth_dec == FileFastDecision::Cached {
+                return guard.active.clone();
+            }
+            (cfg_dec, auth_dec)
+        };
+
+        if cfg_dec != FileFastDecision::NeedsReload && auth_dec != FileFastDecision::NeedsReload {
+            let verify_cfg = matches!(cfg_dec, FileFastDecision::VerifySameStampBytes { .. })
+                .then(|| (self.config_path.clone(), cfg_stamp.clone()));
+            let verify_auth = matches!(auth_dec, FileFastDecision::VerifySameStampBytes { .. })
+                .then(|| self.auth_dir.clone().zip(auth_stamp.clone()))
+                .flatten();
+
+            let verify_res = tokio::task::spawn_blocking(move || {
+                let cfg_bytes = verify_cfg.map(|(path, stamp)| {
+                    read_verified_bytes_for_stamp(&path, &stamp, MAX_CONFIG_FILE_BYTES)
+                });
+                let auth_bytes = verify_auth.map(|(dir, stamp)| {
+                    read_verified_auth_bytes_for_stamp(&dir, GEMINI_AUTH_FILENAME, &stamp)
+                });
+                (cfg_bytes, auth_bytes)
+            })
+            .await;
+
+            match verify_res {
+                Ok((cfg_bytes_opt, auth_bytes_opt)) => {
+                    let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+                    let cfg_ok = match (cfg_dec, cfg_bytes_opt) {
+                        (FileFastDecision::Cached, _) => true,
+                        (
+                            FileFastDecision::VerifySameStampBytes { match_failed_bytes },
+                            Some(Ok(Some(bytes))),
+                        ) => guard.config_state.matches_cached_bytes(
+                            &cfg_stamp,
+                            &bytes,
+                            match_failed_bytes,
+                        ),
+                        _ => false,
+                    };
+                    let auth_ok = match (auth_dec, auth_bytes_opt, &guard.auth_state, &auth_stamp) {
+                        (FileFastDecision::Cached, _, _, _) => true,
+                        (
+                            FileFastDecision::VerifySameStampBytes { match_failed_bytes },
+                            Some(Ok(Some(bytes))),
+                            Some(st),
+                            Some(stamp),
+                        ) => st.matches_cached_bytes(stamp, &bytes, match_failed_bytes),
+                        _ => false,
+                    };
+                    if cfg_ok && auth_ok {
+                        return guard.active.clone();
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        "hot-reload stat task failed; retaining previous configuration"
+                        "hot-reload byte-verification task failed; retaining previous configuration"
                     );
                     return self.current_active();
                 }
-            };
-
-        match self.fast_check(&current_stamp) {
-            FastCheckDecision::ReturnCached(active) => return active,
-            FastCheckDecision::VerifySameStampBytes { match_failed_bytes } => {
-                let verify_path = self.path.clone();
-                let verify_stamp = current_stamp.clone();
-                match tokio::task::spawn_blocking(move || {
-                    read_verified_bytes_for_stamp(
-                        &verify_path,
-                        &verify_stamp,
-                        MAX_CONFIG_FILE_BYTES,
-                    )
-                })
-                .await
-                {
-                    Ok(Ok(Some(bytes))) => {
-                        if let Some(active) =
-                            self.cached_if_bytes_match(&current_stamp, &bytes, match_failed_bytes)
-                        {
-                            return active;
-                        }
-                    }
-                    Ok(Ok(None)) | Ok(Err(_)) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "hot-reload byte-verification task failed; retaining previous configuration"
-                        );
-                        return self.current_active();
-                    }
-                }
             }
-            FastCheckDecision::NeedsReload => {}
         }
 
         let _reload_guard = self.reload_lock.lock().await;
         let baseline = self.snapshot_baseline();
-        let reload_path = self.path.clone();
+        let reload_config_path = self.config_path.clone();
+        let reload_auth_dir = self.auth_dir.clone();
+        let reload_auth_store = Arc::clone(&self.auth_store);
         let env_fallback = self.env_fallback;
         let outcome = match tokio::task::spawn_blocking(move || {
-            evaluate_reload(reload_path, env_fallback, baseline)
+            evaluate_reload(
+                reload_config_path,
+                reload_auth_dir,
+                reload_auth_store,
+                env_fallback,
+                baseline,
+            )
         })
         .await
         {
@@ -172,199 +444,122 @@ impl HotReloadProvider {
         guard.active.clone()
     }
 
-    fn fast_check(&self, current_stamp: &FileStamp) -> FastCheckDecision {
-        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        let outside_racy_window = guard.checked_at.elapsed() >= RACY_CLEAN_WINDOW;
-        if *current_stamp == guard.stamp {
-            if outside_racy_window
-                || matches!(
-                    current_stamp,
-                    FileStamp::Missing | FileStamp::Rejected(_) | FileStamp::Unreadable(_)
-                )
-            {
-                return FastCheckDecision::ReturnCached(guard.active.clone());
-            }
-            return FastCheckDecision::VerifySameStampBytes {
-                match_failed_bytes: false,
-            };
-        }
-
-        if guard.last_failed_stamp.as_ref() == Some(current_stamp) {
-            if outside_racy_window
-                || matches!(
-                    current_stamp,
-                    FileStamp::Rejected(_) | FileStamp::Unreadable(_)
-                )
-            {
-                return FastCheckDecision::ReturnCached(guard.active.clone());
-            }
-            return FastCheckDecision::VerifySameStampBytes {
-                match_failed_bytes: true,
-            };
-        }
-
-        FastCheckDecision::NeedsReload
-    }
-
-    fn cached_if_bytes_match(
-        &self,
-        current_stamp: &FileStamp,
-        bytes: &[u8],
-        match_failed_bytes: bool,
-    ) -> Option<ActiveProvider> {
-        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        let matched = if match_failed_bytes {
-            guard.last_failed_stamp.as_ref() == Some(current_stamp)
-                && guard.last_failed_bytes.as_deref() == Some(bytes)
-        } else {
-            guard.stamp == *current_stamp && guard.raw_bytes.as_deref() == Some(bytes)
-        };
-        matched.then(|| guard.active.clone())
-    }
-
     fn snapshot_baseline(&self) -> ReloadBaseline {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
         ReloadBaseline {
             active: guard.active.clone(),
-            stamp: guard.stamp.clone(),
-            raw_bytes: guard.raw_bytes.clone(),
-            last_failed_stamp: guard.last_failed_stamp.clone(),
-            last_failed_bytes: guard.last_failed_bytes.clone(),
+            config: guard.config_state.snapshot_baseline(),
+            auth: guard
+                .auth_state
+                .as_ref()
+                .map(WatchedFileState::snapshot_baseline),
         }
     }
 
-    fn apply_outcome(&self, outcome: ReloadOutcome) -> ActiveProvider {
+    fn apply_outcome(&self, outcome: CombinedReloadOutcome) -> ActiveProvider {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        match outcome {
-            ReloadOutcome::Unchanged { touch_checked_at } => {
-                if touch_checked_at {
-                    guard.checked_at = Instant::now();
-                }
-            }
-            ReloadOutcome::Missing {
-                new_active,
-                already_missing,
-            } => {
-                if already_missing {
-                    guard.last_failed_stamp = None;
-                    guard.last_failed_bytes = None;
-                    guard.checked_at = Instant::now();
-                } else if let Some(default_active) = new_active {
-                    guard.active = default_active;
-                    guard.stamp = FileStamp::Missing;
-                    guard.raw_bytes = None;
-                    guard.last_failed_stamp = None;
-                    guard.last_failed_bytes = None;
-                    guard.checked_at = Instant::now();
-                }
-            }
-            ReloadOutcome::SameBytesNewStamp { stamp } => {
-                guard.stamp = stamp;
-                guard.last_failed_stamp = None;
-                guard.last_failed_bytes = None;
-                guard.checked_at = Instant::now();
-            }
-            ReloadOutcome::Updated {
-                active,
-                stamp,
-                raw_bytes,
-            } => {
-                guard.active = active;
-                guard.stamp = stamp;
-                guard.raw_bytes = Some(raw_bytes);
-                guard.last_failed_stamp = None;
-                guard.last_failed_bytes = None;
-                guard.checked_at = Instant::now();
-            }
-            ReloadOutcome::Failed {
-                failed_stamp,
-                failed_bytes,
-            } => {
-                guard.last_failed_stamp = Some(failed_stamp);
-                guard.last_failed_bytes = failed_bytes;
-                guard.checked_at = Instant::now();
-            }
+        guard.config_state.apply_outcome(outcome.config_outcome);
+        if let (Some(auth_state), Some(auth_outcome)) =
+            (&mut guard.auth_state, outcome.auth_outcome)
+        {
+            auth_state.apply_outcome(auth_outcome);
+        }
+        if let Some(new_active) = outcome.new_active {
+            guard.active = new_active;
         }
         guard.active.clone()
     }
 }
 
-fn evaluate_missing(env_fallback: bool, baseline: &ReloadBaseline) -> ReloadOutcome {
-    if baseline.stamp == FileStamp::Missing {
-        return ReloadOutcome::Missing {
-            new_active: None,
-            already_missing: true,
-        };
-    }
-    let new_active =
-        build_active_provider(&Config::default(), env_fallback, Some(&baseline.active)).ok();
-    ReloadOutcome::Missing {
-        new_active,
-        already_missing: false,
-    }
-}
-
-fn failed_with_warn(
-    baseline: &ReloadBaseline,
+fn failed_with_warn<T>(
+    baseline: &WatchedFileBaseline<T>,
     failed_stamp: FileStamp,
     warn: impl FnOnce(),
-) -> ReloadOutcome {
+) -> FileEvalOutcome<T> {
     if baseline.last_failed_stamp.as_ref() != Some(&failed_stamp) {
         warn();
     }
-    ReloadOutcome::Failed {
+    FileEvalOutcome::Failed {
         failed_stamp,
         failed_bytes: None,
     }
 }
 
-fn failed_rejected(baseline: &ReloadBaseline, reason: RejectedReason) -> ReloadOutcome {
+fn failed_rejected<T>(
+    baseline: &WatchedFileBaseline<T>,
+    label: &str,
+    reason: RejectedReason,
+) -> FileEvalOutcome<T> {
     failed_with_warn(baseline, FileStamp::Rejected(reason), || {
         tracing::warn!(
+            file = label,
             reason = ?reason,
-            "ignoring rejected config path during hot-reload; retaining previous configuration"
+            "ignoring rejected path during hot-reload; retaining previous state"
         );
     })
 }
 
-fn evaluate_reload(path: PathBuf, env_fallback: bool, baseline: ReloadBaseline) -> ReloadOutcome {
-    let current_stamp = inspect_file_stamp(&path);
+fn evaluate_file<T>(
+    label: &str,
+    max_bytes: u64,
+    baseline: &WatchedFileBaseline<T>,
+    current_stamp: FileStamp,
+    read_bytes: impl FnOnce(&FileStamp) -> Result<Option<Vec<u8>>, FsError>,
+    default_on_missing: impl FnOnce() -> T,
+    parse_bytes: impl FnOnce(&[u8]) -> Result<T, CoreError>,
+) -> FileEvalOutcome<T> {
     match current_stamp {
-        FileStamp::Missing => evaluate_missing(env_fallback, &baseline),
-        FileStamp::Rejected(reason) => failed_rejected(&baseline, reason),
-        FileStamp::Unreadable(kind) => failed_with_warn(&baseline, current_stamp, || {
+        FileStamp::Missing => {
+            if baseline.stamp == FileStamp::Missing {
+                FileEvalOutcome::Missing {
+                    already_missing: true,
+                    default_value: default_on_missing(),
+                }
+            } else {
+                FileEvalOutcome::Missing {
+                    already_missing: false,
+                    default_value: default_on_missing(),
+                }
+            }
+        }
+        FileStamp::Rejected(reason) => failed_rejected(baseline, label, reason),
+        FileStamp::Unreadable(kind) => failed_with_warn(baseline, current_stamp, || {
             tracing::warn!(
+                file = label,
                 error_kind = ?kind,
-                "failed to stat config file during hot-reload; retaining previous configuration"
+                "failed to stat file during hot-reload; retaining previous state"
             );
         }),
         FileStamp::Present { .. } => {
-            let bytes = match read_verified_bytes_for_stamp(
-                &path,
-                &current_stamp,
-                MAX_CONFIG_FILE_BYTES,
-            ) {
+            let bytes = match read_bytes(&current_stamp) {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) => return evaluate_missing(env_fallback, &baseline),
+                Ok(None) => {
+                    return FileEvalOutcome::Missing {
+                        already_missing: baseline.stamp == FileStamp::Missing,
+                        default_value: default_on_missing(),
+                    };
+                }
                 Err(FsError::SizeLimitExceeded { .. }) => {
-                    return failed_with_warn(&baseline, current_stamp, || {
+                    return failed_with_warn(baseline, current_stamp, || {
                         tracing::warn!(
-                            max_bytes = MAX_CONFIG_FILE_BYTES,
-                            "ignoring oversized config file during hot-reload; retaining previous configuration"
+                            file = label,
+                            max_bytes,
+                            "ignoring oversized file during hot-reload; retaining previous state"
                         );
                     });
                 }
                 Err(FsError::SymlinkRejected { .. }) => {
-                    return failed_rejected(&baseline, RejectedReason::Symlink);
+                    return failed_rejected(baseline, label, RejectedReason::Symlink);
                 }
-                Err(FsError::NotRegularFile { .. }) => {
-                    return failed_rejected(&baseline, RejectedReason::NotRegularFile);
+                Err(FsError::NotRegularFile { .. } | FsError::NotDirectory { .. }) => {
+                    return failed_rejected(baseline, label, RejectedReason::NotRegularFile);
                 }
                 Err(FsError::ConcurrentModification { .. }) => {
                     tracing::warn!(
-                        "config file changed concurrently during hot-reload read; retaining previous configuration"
+                        file = label,
+                        "file changed concurrently during hot-reload read; retaining previous state"
                     );
-                    return ReloadOutcome::Unchanged {
+                    return FileEvalOutcome::Unchanged {
                         touch_checked_at: true,
                     };
                 }
@@ -373,17 +568,18 @@ fn evaluate_reload(path: PathBuf, env_fallback: bool, baseline: ReloadBaseline) 
                         FsError::Io { source, .. } => source.kind(),
                         _ => std::io::ErrorKind::InvalidInput,
                     };
-                    return failed_with_warn(&baseline, current_stamp, || {
+                    return failed_with_warn(baseline, current_stamp, || {
                         tracing::warn!(
+                            file = label,
                             error_kind = ?kind,
-                            "failed to read config file during hot-reload; retaining previous configuration"
+                            "failed to read file during hot-reload; retaining previous state"
                         );
                     });
                 }
             };
 
             if baseline.raw_bytes.as_deref() == Some(bytes.as_slice()) {
-                return ReloadOutcome::SameBytesNewStamp {
+                return FileEvalOutcome::SameBytesNewStamp {
                     stamp: current_stamp,
                 };
             }
@@ -391,51 +587,129 @@ fn evaluate_reload(path: PathBuf, env_fallback: bool, baseline: ReloadBaseline) 
             if baseline.last_failed_stamp.as_ref() == Some(&current_stamp)
                 && baseline.last_failed_bytes.as_deref() == Some(bytes.as_slice())
             {
-                return ReloadOutcome::Unchanged {
+                return FileEvalOutcome::Unchanged {
                     touch_checked_at: true,
                 };
             }
 
-            let parsed = match Config::from_json_bytes(&bytes, &path) {
-                Ok(cfg) => cfg,
-                Err(CoreError::ParseConfig { line, column, .. }) => {
-                    tracing::warn!(
-                        line,
-                        column,
-                        "failed to parse config JSON during hot-reload; retaining previous configuration"
-                    );
-                    return ReloadOutcome::Failed {
-                        failed_stamp: current_stamp,
-                        failed_bytes: Some(bytes),
-                    };
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "config validation failed during hot-reload; retaining previous configuration"
-                    );
-                    return ReloadOutcome::Failed {
-                        failed_stamp: current_stamp,
-                        failed_bytes: Some(bytes),
-                    };
-                }
-            };
-
-            match build_active_provider(&parsed, env_fallback, Some(&baseline.active)) {
-                Ok(active) => ReloadOutcome::Updated {
-                    active,
+            match parse_bytes(&bytes) {
+                Ok(value) => FileEvalOutcome::Updated {
+                    value,
                     stamp: current_stamp,
                     raw_bytes: bytes,
                 },
+                Err(
+                    CoreError::ParseConfig { line, column, .. }
+                    | CoreError::ParseAuth { line, column, .. },
+                ) => {
+                    tracing::warn!(
+                        file = label,
+                        line,
+                        column,
+                        "failed to parse JSON during hot-reload; retaining previous state"
+                    );
+                    FileEvalOutcome::Failed {
+                        failed_stamp: current_stamp,
+                        failed_bytes: Some(bytes),
+                    }
+                }
                 Err(_) => {
                     tracing::warn!(
-                        "provider reinitialization failed during hot-reload; retaining previous configuration"
+                        file = label,
+                        "validation failed during hot-reload; retaining previous state"
                     );
-                    ReloadOutcome::Failed {
+                    FileEvalOutcome::Failed {
                         failed_stamp: current_stamp,
                         failed_bytes: Some(bytes),
                     }
                 }
             }
         }
+    }
+}
+
+fn evaluate_reload(
+    config_path: PathBuf,
+    auth_dir: Option<PathBuf>,
+    auth_store: Arc<dyn AuthStore>,
+    env_fallback: bool,
+    baseline: ReloadBaseline,
+) -> CombinedReloadOutcome {
+    let cfg_stamp = inspect_file_stamp(&config_path);
+    let mut config_outcome = evaluate_file(
+        "config.json",
+        MAX_CONFIG_FILE_BYTES,
+        &baseline.config,
+        cfg_stamp,
+        |stamp| read_verified_bytes_for_stamp(&config_path, stamp, MAX_CONFIG_FILE_BYTES),
+        Config::default,
+        |bytes| Config::from_json_bytes(bytes, &config_path),
+    );
+
+    let mut auth_outcome = match (auth_dir.as_deref(), baseline.auth.as_ref()) {
+        (Some(dir), Some(auth_baseline)) => {
+            let auth_path = dir.join(GEMINI_AUTH_FILENAME);
+            let auth_stamp = inspect_auth_file_stamp(dir, GEMINI_AUTH_FILENAME);
+            Some(evaluate_file(
+                "auth/gemini.json",
+                MAX_AUTH_FILE_BYTES,
+                auth_baseline,
+                auth_stamp,
+                |stamp| read_verified_auth_bytes_for_stamp(dir, GEMINI_AUTH_FILENAME, stamp),
+                || None,
+                |bytes| GeminiCredentials::from_json_bytes(bytes, &auth_path),
+            ))
+        }
+        _ => None,
+    };
+
+    let cfg_changed = config_outcome.changed_value();
+    let auth_changed = auth_outcome
+        .as_ref()
+        .is_some_and(FileEvalOutcome::changed_value);
+
+    let new_active = if cfg_changed || auth_changed {
+        let effective_config = config_outcome.effective_value(&baseline.config.value);
+        let fallback_memory_creds;
+        let effective_creds: &Option<GeminiCredentials> =
+            match (auth_outcome.as_ref(), baseline.auth.as_ref()) {
+                (Some(outcome), Some(auth_baseline)) => {
+                    outcome.effective_value(&auth_baseline.value)
+                }
+                _ => {
+                    fallback_memory_creds = auth_store.load_gemini().ok().flatten();
+                    &fallback_memory_creds
+                }
+            };
+
+        match build_active_provider(
+            effective_config,
+            effective_creds.as_ref().map(|c| &c.api_key),
+            env_fallback,
+            Some(&baseline.active),
+        ) {
+            Ok(active) => Some(active),
+            Err(_) => {
+                tracing::warn!(
+                    "provider reinitialization failed during hot-reload; retaining previous configuration"
+                );
+                if cfg_changed {
+                    config_outcome = config_outcome.into_failed_after_rebuild_error();
+                }
+                if auth_changed {
+                    auth_outcome =
+                        auth_outcome.map(FileEvalOutcome::into_failed_after_rebuild_error);
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    CombinedReloadOutcome {
+        config_outcome,
+        auth_outcome,
+        new_active,
     }
 }

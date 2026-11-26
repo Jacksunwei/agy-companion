@@ -8,7 +8,8 @@ use axum::body::Body;
 use axum::response::Response;
 use axum::routing::post;
 use companion_core::{
-    ApiKey, LoopbackHost, MAX_CONFIG_FILE_BYTES, NoopUsageSink, SqliteUsageSink, USAGE_DB_FILENAME,
+    ApiKey, AuthStore, FileAuthStore, GeminiCredentials, LoopbackHost, MAX_AUTH_FILE_BYTES,
+    MAX_CONFIG_FILE_BYTES, MemoryAuthStore, NoopUsageSink, SqliteUsageSink, USAGE_DB_FILENAME,
 };
 use http::{HeaderMap, StatusCode, header};
 use tempfile::TempDir;
@@ -95,6 +96,7 @@ async fn rejects_non_loopback_hosts_ports_and_listeners() {
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: None,
             env_fallback: false,
         },
     )
@@ -119,13 +121,16 @@ async fn serve_on_listener_end_to_end_over_real_tcp_with_graceful_shutdown() {
 
     let mut cfg = Config::default();
     cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaLiveLoopbackKey12345").unwrap());
+    let auth_store = Arc::new(MemoryAuthStore::with_gemini_key(
+        ApiKey::parse_strict("AIzaLiveLoopbackKey12345").unwrap(),
+    ));
 
     let state = ProxyState::from_config_with_options(
         cfg,
         sink,
         ProxyStateOptions {
             config_path: None,
+            auth_store: Some(auth_store),
             env_fallback: false,
         },
     )
@@ -261,11 +266,16 @@ async fn hot_reloads_key_rotation_revocation_base_url_and_file_deletion() {
 
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
 
     let mut cfg = Config::default();
     cfg.providers.gemini.base_url = format!("http://{upstream1_addr}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaInitialKey11111111").unwrap());
     cfg.save_secure(&config_path).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaInitialKey11111111").unwrap(),
+        ))
+        .unwrap();
 
     // env_fallback = false keeps revocation deterministic even when host exports GEMINI_API_KEY.
     let state = ProxyState::from_config_with_options(
@@ -273,16 +283,18 @@ async fn hot_reloads_key_rotation_revocation_base_url_and_file_deletion() {
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: Some(config_path.clone()),
+            auth_store: None,
             env_fallback: false,
         },
     )
     .unwrap();
 
+    let state_for_server = state.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     let (tx_shutdown, rx_shutdown) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        serve_on_listener(listener, state, async move {
+        serve_on_listener(listener, state_for_server, async move {
             let _ = rx_shutdown.await;
         })
         .await
@@ -303,9 +315,12 @@ async fn hot_reloads_key_rotation_revocation_base_url_and_file_deletion() {
         Some("AIzaInitialKey11111111".to_string())
     );
 
-    // 2. Immediate same-millisecond key rotation via Config::save_secure.
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaRotatedKey22222222").unwrap());
-    cfg.save_secure(&config_path).unwrap();
+    // 2. Immediate same-millisecond key rotation via FileAuthStore without touching config.json.
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaRotatedKey22222222").unwrap(),
+        ))
+        .unwrap();
     let r2 = client.post(&url).body("{}").send().await.unwrap();
     assert_eq!(r2.status(), StatusCode::OK);
     let _ = r2.text().await.unwrap();
@@ -314,7 +329,7 @@ async fn hot_reloads_key_rotation_revocation_base_url_and_file_deletion() {
         Some("AIzaRotatedKey22222222".to_string())
     );
 
-    // 3. Base URL switch to upstream 2.
+    // 3. Base URL switch in config.json preserves stored auth/gemini.json key.
     cfg.providers.gemini.base_url = format!("http://{upstream2_addr}");
     cfg.save_secure(&config_path).unwrap();
     let r3 = client.post(&url).body("{}").send().await.unwrap();
@@ -325,23 +340,48 @@ async fn hot_reloads_key_rotation_revocation_base_url_and_file_deletion() {
         Some("AIzaRotatedKey22222222".to_string())
     );
 
-    // 4. Revoke API key (clear_api_key -> None) -> 401 Unauthorized immediately.
-    cfg.providers.gemini.api_key = None;
-    cfg.save_secure(&config_path).unwrap();
+    // 4. Revoke API key via FileAuthStore::clear_gemini -> 401 Unauthorized immediately.
+    auth_store.clear_gemini().unwrap();
     let r4 = client.post(&url).body("{}").send().await.unwrap();
     assert_eq!(r4.status(), StatusCode::UNAUTHORIZED);
 
-    // 5. Re-add key, confirm 200, then delete config file -> immediately revokes key -> 401.
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaReaddedKey33333333").unwrap());
-    cfg.save_secure(&config_path).unwrap();
+    // 5. Re-add key, confirm 200, then delete auth/gemini.json directly -> immediately 401.
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaReaddedKey33333333").unwrap(),
+        ))
+        .unwrap();
     let r5 = client.post(&url).body("{}").send().await.unwrap();
     assert_eq!(r5.status(), StatusCode::OK);
     let _ = r5.text().await.unwrap();
 
-    fs::remove_file(&config_path).unwrap();
+    fs::remove_file(auth_store.gemini_path()).unwrap();
     let r6 = client.post(&url).body("{}").send().await.unwrap();
     assert_eq!(r6.status(), StatusCode::UNAUTHORIZED);
 
+    // 6. Re-add key and delete config.json -> resets non-secret defaults while retaining auth/gemini.json!
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSurvivesCfgDelete1").unwrap(),
+        ))
+        .unwrap();
+    cfg.providers.gemini.default_model = "gemini-4-argon".to_string();
+    cfg.save_secure(&config_path).unwrap();
+    let state_check_resp = client.post(&url).body("{}").send().await.unwrap();
+    assert_eq!(state_check_resp.status(), StatusCode::OK);
+    let _ = state_check_resp.text().await.unwrap();
+
+    fs::remove_file(&config_path).unwrap();
+    let after_cfg_delete = state.active_provider().await;
+    assert_eq!(
+        after_cfg_delete.default_model,
+        companion_core::DEFAULT_GEMINI_MODEL,
+        "deleting config.json must reset non-secret settings to Config::default()"
+    );
+    assert!(
+        after_cfg_delete.has_configured_api_key,
+        "deleting config.json must retain auth/gemini.json credentials"
+    );
     let _ = tx_shutdown.send(());
     server.await.unwrap();
     upstream1_handle.abort();
@@ -354,27 +394,34 @@ async fn hot_reload_survives_corrupt_and_invalid_config_and_recovers_without_lea
 
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
 
     let mut cfg = Config::default();
     cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaValidBeforeCorrupt1").unwrap());
     cfg.save_secure(&config_path).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaValidBeforeCorrupt1").unwrap(),
+        ))
+        .unwrap();
 
     let state = ProxyState::from_config_with_options(
         cfg.clone(),
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: Some(config_path.clone()),
+            auth_store: None,
             env_fallback: false,
         },
     )
     .unwrap();
 
+    let state_for_server = state.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     let (tx_shutdown, rx_shutdown) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        serve_on_listener(listener, state, async move {
+        serve_on_listener(listener, state_for_server, async move {
             let _ = rx_shutdown.await;
         })
         .await
@@ -408,7 +455,6 @@ async fn hot_reload_survives_corrupt_and_invalid_config_and_recovers_without_lea
         "providers": {
             "gemini": {
                 "base_url": format!("http://{upstream_addr}"),
-                "api_key": "AIzaINVALIDHOSTSECRET",
                 "default_model": "gemini-4-hydrogen",
                 "timeout_secs": 900
             }
@@ -423,9 +469,41 @@ async fn hot_reload_survives_corrupt_and_invalid_config_and_recovers_without_lea
         Some("AIzaValidBeforeCorrupt1".to_string())
     );
 
-    // 3. Write valid updated config -> proxy immediately recovers and adopts new key.
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaRecoveredKey9999999").unwrap());
+    // 2b. Write corrupt JSON and oversized (> 64 KiB) auth/gemini.json -> retains last valid key without secret leak.
+    fs::write(
+        auth_store.gemini_path(),
+        "{ \"api_key\": \"AIzaCORRUPTAUTHSECRET\", broken",
+    )
+    .unwrap();
+    let r2b = client.post(&url).body("{}").send().await.unwrap();
+    assert_eq!(r2b.status(), StatusCode::OK);
+    let body2b = r2b.text().await.unwrap();
+    assert!(!body2b.contains("AIzaCORRUPTAUTHSECRET"));
+    assert_eq!(
+        upstream_keys.lock().unwrap().last().cloned().flatten(),
+        Some("AIzaValidBeforeCorrupt1".to_string())
+    );
+
+    fs::write(
+        auth_store.gemini_path(),
+        vec![b' '; (MAX_AUTH_FILE_BYTES as usize) + 64],
+    )
+    .unwrap();
+    let r2c = client.post(&url).body("{}").send().await.unwrap();
+    assert_eq!(r2c.status(), StatusCode::OK);
+    let _ = r2c.text().await.unwrap();
+    assert_eq!(
+        upstream_keys.lock().unwrap().last().cloned().flatten(),
+        Some("AIzaValidBeforeCorrupt1".to_string())
+    );
+
+    // 3. Write valid updated config + auth/gemini.json -> proxy immediately recovers and adopts new key.
     cfg.save_secure(&config_path).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaRecoveredKey9999999").unwrap(),
+        ))
+        .unwrap();
     let r3 = client.post(&url).body("{}").send().await.unwrap();
     assert_eq!(r3.status(), StatusCode::OK);
     let _ = r3.text().await.unwrap();
@@ -444,28 +522,41 @@ async fn hot_reload_survives_corrupt_and_invalid_config_and_recovers_without_lea
 async fn hot_reload_rejects_post_startup_symlink_dangling_symlink_and_fifo_without_blocking() {
     use std::os::unix::fs::symlink;
 
+    use companion_core::AUTH_DIR_NAME;
+
     let (upstream1_addr, upstream1_keys, upstream1_handle) =
         spawn_mock_upstream("good-upstream").await;
     let (upstream2_addr, upstream2_keys, upstream2_handle) =
         spawn_mock_upstream("evil-upstream").await;
 
     let tmp = TempDir::new().unwrap();
-    let config_path = tmp.path().join("config.json");
-    let evil_path = tmp.path().join("evil.json");
+    let good_root = tmp.path().join("good");
+    let config_path = good_root.join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
+    let evil_dir = tmp.path().join("evil");
+    fs::create_dir_all(&evil_dir).unwrap();
+    let evil_path = evil_dir.join("evil.json");
+    let evil_auth_path = evil_dir.join("gemini.json");
 
     let mut good_cfg = Config::default();
     good_cfg.providers.gemini.base_url = format!("http://{upstream1_addr}");
-    good_cfg.providers.gemini.api_key =
-        Some(ApiKey::parse_strict("AIzaGoodOriginalKey1111").unwrap());
     good_cfg.save_secure(&config_path).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaGoodOriginalKey1111").unwrap(),
+        ))
+        .unwrap();
 
     let mut evil_cfg = Config::default();
     evil_cfg.providers.gemini.base_url = format!("http://{upstream2_addr}");
-    evil_cfg.providers.gemini.api_key =
-        Some(ApiKey::parse_strict("AIzaEvilHijackKey22222").unwrap());
     evil_cfg.save_secure(&evil_path).unwrap();
+    fs::write(
+        &evil_auth_path,
+        r#"{"schema_version":1,"api_key":"AIzaEvilHijackKey22222"}"#,
+    )
+    .unwrap();
 
-    // Startup must also reject an initial symlink or FIFO config_path cleanly.
+    // Startup must reject an initial symlink config_path AND symlinked auth/gemini.json or auth/.
     let initial_sym = tmp.path().join("initial_sym.json");
     symlink(&evil_path, &initial_sym).unwrap();
     assert!(matches!(
@@ -474,6 +565,26 @@ async fn hot_reload_rejects_post_startup_symlink_dangling_symlink_and_fifo_witho
             Arc::new(NoopUsageSink),
             ProxyStateOptions {
                 config_path: Some(initial_sym),
+                auth_store: None,
+                env_fallback: false,
+            },
+        ),
+        Err(ProxyError::Core(CoreError::Fs(
+            FsError::SymlinkRejected { .. }
+        )))
+    ));
+
+    let sym_auth_root = tmp.path().join("startup_sym_auth");
+    let sym_auth_cfg_path = sym_auth_root.join("config.json");
+    good_cfg.save_secure(&sym_auth_cfg_path).unwrap();
+    symlink(&evil_dir, sym_auth_root.join(AUTH_DIR_NAME)).unwrap();
+    assert!(matches!(
+        ProxyState::from_config_with_options(
+            good_cfg.clone(),
+            Arc::new(NoopUsageSink),
+            ProxyStateOptions {
+                config_path: Some(sym_auth_cfg_path),
+                auth_store: None,
                 env_fallback: false,
             },
         ),
@@ -487,16 +598,18 @@ async fn hot_reload_rejects_post_startup_symlink_dangling_symlink_and_fifo_witho
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: Some(config_path.clone()),
+            auth_store: None,
             env_fallback: false,
         },
     )
     .unwrap();
 
+    let state_for_server = state.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     let (tx_shutdown, rx_shutdown) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        serve_on_listener(listener, state, async move {
+        serve_on_listener(listener, state_for_server, async move {
             let _ = rx_shutdown.await;
         })
         .await
@@ -559,11 +672,70 @@ async fn hot_reload_rejects_post_startup_symlink_dangling_symlink_and_fifo_witho
     assert_eq!(r3.status(), StatusCode::OK);
     assert!(r3.text().await.unwrap().contains("good-upstream"));
 
-    // (d) Clean recovery when replaced back with regular file via save_secure.
+    // (d) Post-startup swaps on auth/gemini.json (symlink, dangling symlink, FIFO) and symlinked auth/ dir
+    // must retain original key without blocking or leaking to evil upstream.
     fs::remove_file(&config_path).unwrap();
-    good_cfg.providers.gemini.api_key =
-        Some(ApiKey::parse_strict("AIzaRecoveredAfterSwap33").unwrap());
     good_cfg.save_secure(&config_path).unwrap();
+
+    let auth_file = auth_store.gemini_path();
+    fs::remove_file(&auth_file).unwrap();
+    symlink(&evil_auth_path, &auth_file).unwrap();
+    let r_auth_sym = client.post(&url).body("{}").send().await.unwrap();
+    assert_eq!(r_auth_sym.status(), StatusCode::OK);
+    let _ = r_auth_sym.text().await.unwrap();
+    assert_eq!(
+        upstream1_keys.lock().unwrap().last().cloned().flatten(),
+        Some("AIzaGoodOriginalKey1111".to_string())
+    );
+
+    fs::remove_file(&auth_file).unwrap();
+    symlink(tmp.path().join("missing-auth-target.json"), &auth_file).unwrap();
+    let r_auth_dangling = client.post(&url).body("{}").send().await.unwrap();
+    assert_eq!(r_auth_dangling.status(), StatusCode::OK);
+    let _ = r_auth_dangling.text().await.unwrap();
+    assert_eq!(
+        upstream1_keys.lock().unwrap().last().cloned().flatten(),
+        Some("AIzaGoodOriginalKey1111".to_string())
+    );
+
+    fs::remove_file(&auth_file).unwrap();
+    let auth_fifo_status = std::process::Command::new("mkfifo")
+        .arg(&auth_file)
+        .status()
+        .expect("run mkfifo for auth");
+    assert!(auth_fifo_status.success(), "mkfifo auth failed");
+    let r_auth_fifo =
+        tokio::time::timeout(Duration::from_secs(1), client.post(&url).body("{}").send())
+            .await
+            .expect("proxy deadlocked on FIFO auth/gemini.json swap")
+            .expect("request succeeded");
+    assert_eq!(r_auth_fifo.status(), StatusCode::OK);
+    let _ = r_auth_fifo.text().await.unwrap();
+    assert_eq!(
+        upstream1_keys.lock().unwrap().last().cloned().flatten(),
+        Some("AIzaGoodOriginalKey1111".to_string())
+    );
+
+    // Symlinked auth/ dir swap
+    let auth_dir = auth_store.auth_dir().unwrap().to_path_buf();
+    fs::remove_dir_all(&auth_dir).unwrap();
+    symlink(&evil_dir, &auth_dir).unwrap();
+    let r_auth_dir_sym = client.post(&url).body("{}").send().await.unwrap();
+    assert_eq!(r_auth_dir_sym.status(), StatusCode::OK);
+    let _ = r_auth_dir_sym.text().await.unwrap();
+    assert_eq!(
+        upstream1_keys.lock().unwrap().last().cloned().flatten(),
+        Some("AIzaGoodOriginalKey1111".to_string())
+    );
+    assert!(upstream2_keys.lock().unwrap().is_empty());
+
+    // (e) Clean recovery when replaced back with regular auth/ and auth/gemini.json via FileAuthStore.
+    fs::remove_file(&auth_dir).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaRecoveredAfterSwap33").unwrap(),
+        ))
+        .unwrap();
     let r4 = client.post(&url).body("{}").send().await.unwrap();
     assert_eq!(r4.status(), StatusCode::OK);
     let _ = r4.text().await.unwrap();
@@ -583,6 +755,7 @@ async fn hot_reload_preserves_cloudcode_routing_cache_when_upstream_and_timeout_
  {
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
 
     let mut cfg = Config::default();
     cfg.cloudcode.upstream = CloudCodeUpstream::Auto;
@@ -594,6 +767,7 @@ async fn hot_reload_preserves_cloudcode_routing_cache_when_upstream_and_timeout_
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: Some(config_path.clone()),
+            auth_store: None,
             env_fallback: false,
         },
     )
@@ -607,10 +781,13 @@ async fn hot_reload_preserves_cloudcode_routing_cache_when_upstream_and_timeout_
         companion_core::CLOUDCODE_PROD_UPSTREAM_URL
     );
 
-    // Saving a new API key without changing cloudcode.upstream or timeout_secs
+    // Saving a new API key in auth/gemini.json without changing cloudcode.upstream or timeout_secs
     // must preserve the CloudCode routing cache across hot-reload.
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyReloadPreservesLru1").unwrap());
-    cfg.save_secure(&config_path).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSyReloadPreservesLru1").unwrap(),
+        ))
+        .unwrap();
     let after_key_save = state.active_provider().await;
     assert!(after_key_save.has_configured_api_key);
     assert_eq!(after_key_save.cloudcode.mode_label(), "auto");
@@ -705,14 +882,17 @@ async fn activity_tracker_keeps_in_flight_active_across_long_sse_stream_and_rese
 
     let mut cfg = Config::default();
     cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyActivityTestKey123").unwrap());
     cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{upstream_addr}"));
+    let auth_store = Arc::new(MemoryAuthStore::with_gemini_key(
+        ApiKey::parse_strict("AIzaSyActivityTestKey123").unwrap(),
+    ));
 
     let state = ProxyState::from_config_with_options(
         cfg,
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: Some(auth_store),
             env_fallback: false,
         },
     )
@@ -798,6 +978,7 @@ async fn passive_health_and_stats_probes_do_not_reset_idle_duration() {
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: None,
             env_fallback: false,
         },
     )
@@ -897,17 +1078,23 @@ async fn hot_reload_concurrent_readers_see_immediate_rotation_with_zero_sleep() 
     let (upstream_addr, upstream_keys, upstream_handle) = spawn_mock_upstream("concurrent").await;
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
 
     let mut cfg = Config::default();
     cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaConcurrentInit11111").unwrap());
     cfg.save_secure(&config_path).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaConcurrentInit11111").unwrap(),
+        ))
+        .unwrap();
 
     let state = ProxyState::from_config_with_options(
         cfg.clone(),
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: Some(config_path.clone()),
+            auth_store: None,
             env_fallback: false,
         },
     )
@@ -920,8 +1107,12 @@ async fn hot_reload_concurrent_readers_see_immediate_rotation_with_zero_sleep() 
         companion_core::CLOUDCODE_PROD_UPSTREAM_URL
     );
 
-    // Rotate key and default_model immediately with zero sleep and fire 16 concurrent readers.
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaConcurrentNext22222").unwrap());
+    // Rotate key in auth/gemini.json and default_model in config.json immediately with zero sleep and fire 16 concurrent readers.
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaConcurrentNext22222").unwrap(),
+        ))
+        .unwrap();
     cfg.providers.gemini.default_model = "gemini-4-argon".to_string();
     cfg.save_secure(&config_path).unwrap();
 
@@ -978,8 +1169,9 @@ async fn hot_reload_detects_same_second_in_place_edit_with_identical_length() {
 
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
 
-    let make_json = |key: &str| {
+    let make_cfg_json = |model: &str| {
         serde_json::json!({
             "schema_version": 1,
             "proxy": { "host": "127.0.0.1", "port": companion_core::DEFAULT_LISTEN_PORT },
@@ -987,8 +1179,7 @@ async fn hot_reload_detects_same_second_in_place_edit_with_identical_length() {
             "providers": {
                 "gemini": {
                     "base_url": format!("http://{upstream_addr}"),
-                    "api_key": key,
-                    "default_model": "gemini-4-hydrogen",
+                    "default_model": model,
                     "timeout_secs": 900
                 }
             }
@@ -996,27 +1187,43 @@ async fn hot_reload_detects_same_second_in_place_edit_with_identical_length() {
         .to_string()
     };
 
-    let json_v1 = make_json("AIzaSameLenKeyAAAAA1111");
-    let json_v2 = make_json("AIzaSameLenKeyBBBBB2222");
-    assert_eq!(json_v1.len(), json_v2.len());
-    fs::write(&config_path, &json_v1).unwrap();
+    let make_auth_json = |key: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "api_key": key
+        })
+        .to_string()
+    };
 
-    let cfg_v1 = Config::from_json_str(&json_v1, &config_path).unwrap();
+    let cfg_v1_json = make_cfg_json("gemini-4-pro-1");
+    let cfg_v2_json = make_cfg_json("gemini-4-pro-2");
+    assert_eq!(cfg_v1_json.len(), cfg_v2_json.len());
+    fs::write(&config_path, &cfg_v1_json).unwrap();
+
+    let auth_v1 = make_auth_json("AIzaSameLenKeyAAAAA1111");
+    let auth_v2 = make_auth_json("AIzaSameLenKeyBBBBB2222");
+    assert_eq!(auth_v1.len(), auth_v2.len());
+    fs::create_dir_all(auth_store.auth_dir().unwrap()).unwrap();
+    fs::write(auth_store.gemini_path(), &auth_v1).unwrap();
+
+    let cfg_v1 = Config::from_json_str(&cfg_v1_json, &config_path).unwrap();
     let state = ProxyState::from_config_with_options(
         cfg_v1,
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: Some(config_path.clone()),
+            auth_store: None,
             env_fallback: false,
         },
     )
     .unwrap();
 
+    let state_for_server = state.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     let (tx_shutdown, rx_shutdown) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        serve_on_listener(listener, state, async move {
+        serve_on_listener(listener, state_for_server, async move {
             let _ = rx_shutdown.await;
         })
         .await
@@ -1036,14 +1243,21 @@ async fn hot_reload_detects_same_second_in_place_edit_with_identical_length() {
         Some("AIzaSameLenKeyAAAAA1111".to_string())
     );
 
-    // Same-second in-place overwrite with identical byte length, zero sleep.
-    fs::write(&config_path, &json_v2).unwrap();
+    // Same-second in-place overwrite with identical byte length on auth/gemini.json, zero sleep.
+    fs::write(auth_store.gemini_path(), &auth_v2).unwrap();
     let r2 = client.post(&url).body("{}").send().await.unwrap();
     assert_eq!(r2.status(), StatusCode::OK);
     let _ = r2.text().await.unwrap();
     assert_eq!(
         upstream_keys.lock().unwrap().last().cloned().flatten(),
         Some("AIzaSameLenKeyBBBBB2222".to_string())
+    );
+
+    // Same-second in-place overwrite with identical byte length on config.json, zero sleep.
+    fs::write(&config_path, &cfg_v2_json).unwrap();
+    assert_eq!(
+        state.active_provider().await.default_model,
+        "gemini-4-pro-2"
     );
 
     let _ = tx_shutdown.send(());
@@ -1055,16 +1269,22 @@ async fn hot_reload_detects_same_second_in_place_edit_with_identical_length() {
 async fn hot_reload_retains_active_provider_on_oversized_config_and_recovers() {
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
 
     let mut cfg = Config::default();
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaBeforeOversize11111").unwrap());
     cfg.save_secure(&config_path).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaBeforeOversize11111").unwrap(),
+        ))
+        .unwrap();
 
     let state = ProxyState::from_config_with_options(
         cfg.clone(),
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: Some(config_path.clone()),
+            auth_store: None,
             env_fallback: false,
         },
     )
@@ -1092,8 +1312,8 @@ async fn hot_reload_retains_active_provider_on_oversized_config_and_recovers() {
         companion_core::CLOUDCODE_PROD_UPSTREAM_URL
     );
 
-    // Recover immediately with a valid updated config.
-    cfg.providers.gemini.api_key = None;
+    // Recover immediately with a valid updated config and cleared auth key.
+    auth_store.clear_gemini().unwrap();
     cfg.providers.gemini.default_model = "gemini-4-argon".to_string();
     cfg.save_secure(&config_path).unwrap();
     let recovered = state.active_provider().await;
@@ -1108,16 +1328,22 @@ async fn hot_reload_retains_active_provider_on_oversized_config_and_recovers() {
 async fn hot_reload_updates_enabled_models_immediately_and_preserves_cloudcode_routing_cache() {
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
 
     let mut cfg = Config::default();
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaEnabledReloadTest11").unwrap());
     cfg.save_secure(&config_path).unwrap();
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaEnabledReloadTest11").unwrap(),
+        ))
+        .unwrap();
 
     let state = ProxyState::from_config_with_options(
         cfg.clone(),
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: Some(config_path.clone()),
+            auth_store: None,
             env_fallback: false,
         },
     )

@@ -53,7 +53,7 @@ pub fn api_key_hint(key: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ApiKey, Config, PROXY_PLACEHOLDER_API_KEY};
+    use crate::{ApiKey, Config, GeminiCredentials, PROXY_PLACEHOLDER_API_KEY};
 
     #[test]
     fn masks_api_key_without_leaking_middle() {
@@ -84,10 +84,10 @@ mod tests {
     #[test]
     fn redacted_config_never_exposes_plaintext_api_key_and_matches_nested_shape() {
         let secret = "AIzaSyD1234567890abcd";
-        let mut cfg = Config::default();
-        cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(secret).unwrap());
+        let cfg = Config::default();
+        let creds = GeminiCredentials::new(ApiKey::parse_strict(secret).unwrap());
 
-        let redacted = cfg.redacted();
+        let redacted = cfg.redacted_with_auth(Some(&creds));
         assert!(redacted.providers.gemini.api_key_configured);
         assert_eq!(
             redacted.providers.gemini.api_key_hint.as_deref(),
@@ -106,8 +106,7 @@ mod tests {
         assert_eq!(val["providers"]["gemini"]["api_key_configured"], true);
         assert_eq!(val["providers"]["gemini"]["api_key_hint"], "AIza...abcd");
 
-        cfg.providers.gemini.api_key = None;
-        let blank_redacted = cfg.redacted();
+        let blank_redacted = cfg.redacted_with_auth(None);
         assert!(!blank_redacted.providers.gemini.api_key_configured);
         assert_eq!(blank_redacted.providers.gemini.api_key_hint, None);
     }
@@ -126,20 +125,17 @@ mod tests {
             );
         }
 
+        let cfg = Config::default();
         for raw in [PROXY_PLACEHOLDER_API_KEY, "  agy-companion-local  "] {
-            let json = format!(r#"{{"providers":{{"gemini":{{"api_key":"{raw}"}}}}}}"#);
-            let cfg = Config::from_json_str(&json, std::path::Path::new("placeholder.json"))
-                .expect("disk placeholder normalizes to None");
+            let json = format!(r#"{{"schema_version":1,"api_key":"{raw}"}}"#);
+            let creds =
+                GeminiCredentials::from_json_str(&json, std::path::Path::new("gemini.json"))
+                    .expect("disk placeholder normalizes to None");
+            assert!(creds.is_none());
 
-            let redacted = cfg.redacted();
+            let redacted = cfg.redacted_with_auth(creds.as_ref());
             assert!(!redacted.providers.gemini.api_key_configured);
             assert_eq!(redacted.providers.gemini.api_key_hint, None);
-
-            let debug = format!("{:?}", cfg.providers.gemini);
-            assert!(
-                debug.contains("api_key: None"),
-                "expected GeminiConfig Debug to treat placeholder as None, got {debug}"
-            );
         }
     }
 }

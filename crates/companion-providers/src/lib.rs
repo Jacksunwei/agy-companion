@@ -36,7 +36,9 @@ pub enum ProviderError {
     InvalidPath(String),
     #[error("invalid provider configuration: {0}")]
     InvalidConfig(String),
-    #[error("missing Gemini API key: configure gemini.api_key or set GEMINI_API_KEY")]
+    #[error(
+        "missing Gemini API key: configure it in Antigravity Companion settings (auth/gemini.json) or set GEMINI_API_KEY"
+    )]
     MissingApiKey,
     #[error("upstream provider request failed: {0}")]
     Upstream(String),
