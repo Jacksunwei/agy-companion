@@ -241,9 +241,12 @@ pub(crate) fn create_windows_start_menu_shortcut(binary_path: &Path) -> Result<P
     let script = render_windows_shortcut_ps_script(&shortcut_path, binary_path, icon_path);
 
     let output = Command::new("powershell.exe")
+        .stdin(std::process::Stdio::null())
         .args([
             "-NoProfile",
             "-NonInteractive",
+            "-InputFormat",
+            "None",
             "-WindowStyle",
             "Hidden",
             "-Command",

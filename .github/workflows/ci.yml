@@ -7,7 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  agent-check:
+  linux:
+    name: Linux (agent-check + UI + E2E)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -50,12 +51,67 @@ jobs:
           cargo build -p companion-cli
           python3 -B e2e/run_e2e.py --suite all --workers 4 --binary target/debug/agy-companion --repo-root . -v
 
-  rust-windows:
-    runs-on: windows-latest
+  macos:
+    name: macOS (agent-check + E2E)
+    runs-on: macos-latest
     timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install UI dependencies
+        run: npm --prefix ui ci
+      - name: Run agent verification gate
+        run: ./scripts/agent_check.sh
+      - name: Run parallel opaque-box E2E suite
+        run: |
+          cargo build -p companion-cli
+          python3 -B e2e/run_e2e.py --suite all --workers 4 --binary target/debug/agy-companion --repo-root . -v
+
+  windows:
+    name: Windows (clippy + Rust + UI + E2E)
+    runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run Rust clippy on Windows
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run Rust workspace tests on Windows
         run: cargo test --workspace
+      - name: Run UI behavioral tests and SVG validator on Windows
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui test
+          python -B scripts/test_check_plugin_logo.py
+      - name: Run parallel opaque-box E2E suite on Windows
+        run: |
+          cargo build -p companion-cli
+          python -B e2e/run_e2e.py --suite all --workers 4 --binary target\debug\agy-companion.exe --repo-root . -v

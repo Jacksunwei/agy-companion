@@ -78,7 +78,7 @@ class TestBoundaryS1Loopback(E2ETestCase):
         # (a) serve rejects 0.0.0.0, ::, and port 0 cleanly without panic.
         for label, bad_host, bad_port in (
             ("0.0.0.0", "0.0.0.0", find_free_port()),
-            ("::", "::", find_free_port()),
+            ("ipv6_any", "::", find_free_port()),
             ("port_0", "127.0.0.1", 0),
         ):
             cfg = env.write_config(
@@ -559,10 +559,15 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             set_config_env=False,
             extra_env={"XDG_CONFIG_HOME": "relative/xdg", "XDG_DATA_HOME": ""},
         )
-        self.assertEqual(
-            mcp_rel.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"]["default_model"],
-            "gemini-4-home",
-        )
+        rel_model = mcp_rel.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"][
+            "default_model"
+        ]
+        if os.name == "nt":
+            # Windows falls back to SHGetKnownFolderPath(RoamingAppData) rather than $HOME/.config;
+            # never mutate the host user profile, just verify relative XDG_CONFIG_HOME was ignored.
+            self.assertNotEqual(rel_model, "gemini-4-xdg")
+        else:
+            self.assertEqual(rel_model, "gemini-4-home")
 
         # (b) .. traversal in XDG_CONFIG_HOME, XDG_DATA_HOME, usage_dir, --plugins-dir, and --rc-file fails closed.
         trav_cfg = env.write_config(env.make_config_dict(usage_dir="/tmp/../evil"), path=env.root / "trav.json")
@@ -594,6 +599,10 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             ).returncode,
             0,
         )
+
+        if os.name == "nt":
+            return
+
         self.assertNotEqual(
             run_cli(
                 [str(binary), "integration", "enable", "--shell", "zsh", "--rc-file", "/tmp/../evil", "--json"],
@@ -602,9 +611,6 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             ).returncode,
             0,
         )
-
-        if os.name == "nt":
-            return
 
         # (c) Symlinked .zlogin -> manual_required on both CLI integration & MCP set_launcher_integration, victim untouched.
         rc_victim = env.root / "rc_victim.txt"

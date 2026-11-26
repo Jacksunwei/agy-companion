@@ -8,8 +8,11 @@ use super::disable::disable_with_env;
 use super::enable::enable_with_env;
 use super::lifecycle::{LifecycleEnv, status_with_env};
 use super::markers::parse_markers;
-use super::templates::{render_env_sh, render_fish_dropin, wrap_with_markers, write_env_script};
+#[cfg(unix)]
+use super::templates::write_env_script;
+use super::templates::{render_env_sh, render_fish_dropin, wrap_with_markers};
 use super::*;
+#[cfg(unix)]
 use std::process::Command;
 use tempfile::TempDir;
 

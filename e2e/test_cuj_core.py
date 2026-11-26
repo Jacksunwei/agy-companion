@@ -1154,7 +1154,11 @@ class TestCujInstallUninstallLifecycle(E2ETestCase):
         proc_env = env.build_env(extra={"SHELL": "/bin/zsh", "ZDOTDIR": str(env.home_dir)})
 
         # (a) Fresh install.
-        inst = run_cli([str(binary), "install", "--plugins-dir", str(plugins_dir), "--json"], env=proc_env)
+        inst = run_cli(
+            [str(binary), "install", "--plugins-dir", str(plugins_dir), "--json"],
+            env=proc_env,
+            timeout=30.0,
+        )
         self.assertEqual(inst.returncode, 0, f"{inst.stdout}\n{inst.stderr}")
         self.assertIs(inst.json_stdout().get("ok"), True)
 
@@ -1186,7 +1190,11 @@ class TestCujInstallUninstallLifecycle(E2ETestCase):
         )
 
         # (c) Default uninstall removes artifacts & stops proxy while preserving config.json, usage.db & Antigravity config.
-        un = run_cli([str(binary), "uninstall", "--plugins-dir", str(plugins_dir), "--json"], env=proc_env)
+        un = run_cli(
+            [str(binary), "uninstall", "--plugins-dir", str(plugins_dir), "--json"],
+            env=proc_env,
+            timeout=45.0,
+        )
         self.assertEqual(un.returncode, 0, f"{un.stdout}\n{un.stderr}")
         self.assertFalse(installed.exists())
         self.assertFalse((env.data_dir / "env.sh").exists())

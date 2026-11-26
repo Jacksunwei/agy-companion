@@ -11,9 +11,9 @@ use super::bundle::{
     EMBEDDED_PLUGIN_FILES, PLUGIN_DIR_NAME, STABLE_BIN_NAME, is_companion_plugin_dir,
     select_fresh_install_port, swap_plugin_dir_two_step, write_staged_plugin_dir,
 };
-use super::safety::{
-    ExistingDirSafety, inspect_existing_dir, inspect_non_symlink_rel_chain, usage_dir_under_dir,
-};
+#[cfg(unix)]
+use super::safety::inspect_non_symlink_rel_chain;
+use super::safety::{ExistingDirSafety, inspect_existing_dir, usage_dir_under_dir};
 use super::windows::{
     WINDOWS_SHORTCUT_NAME, patch_windows_mcp_config_from_str,
     patch_windows_sidecar_config_from_str, ps_single_quote, reject_ps_path_newlines,
