@@ -22,6 +22,7 @@ import errno
 import http.client
 import json
 import os
+import shutil
 import signal
 import socket
 import socketserver
@@ -53,10 +54,16 @@ SAFE_HOST_ENV_VARS: tuple[str, ...] = (
     "SSL_CERT_DIR",
     "SystemRoot",
     "SYSTEMROOT",
+    "SystemDrive",
+    "SYSTEMDRIVE",
     "COMSPEC",
     "ComSpec",
     "PATHEXT",
     "WINDIR",
+    "ProgramData",
+    "PSModulePath",
+    "OS",
+    "NUMBER_OF_PROCESSORS",
 )
 
 STRIPPED_ENV_VARS: tuple[str, ...] = (

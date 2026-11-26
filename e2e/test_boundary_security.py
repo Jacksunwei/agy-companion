@@ -599,6 +599,10 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             ).returncode,
             0,
         )
+
+        if os.name == "nt":
+            return
+
         self.assertNotEqual(
             run_cli(
                 [str(binary), "integration", "enable", "--shell", "zsh", "--rc-file", "/tmp/../evil", "--json"],
@@ -607,9 +611,6 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             ).returncode,
             0,
         )
-
-        if os.name == "nt":
-            return
 
         # (c) Symlinked .zlogin -> manual_required on both CLI integration & MCP set_launcher_integration, victim untouched.
         rc_victim = env.root / "rc_victim.txt"

@@ -175,9 +175,12 @@ fn inspect_os_process(pid: u32) -> Result<Option<(String, String)>, CliError> {
         "Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}' | Select-Object ExecutablePath,CommandLine | ConvertTo-Json -Compress"
     );
     let output = Command::new("powershell.exe")
+        .stdin(std::process::Stdio::null())
         .args([
             "-NoProfile",
             "-NonInteractive",
+            "-InputFormat",
+            "None",
             "-WindowStyle",
             "Hidden",
             "-Command",
