@@ -1,5 +1,4 @@
 use std::fs;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -9,7 +8,8 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 use crate::common::{
-    ChildGuard, DetachedPidFileGuard, config_with_port, free_loopback_port, isolated_cli_command,
+    CapturedChild, DetachedPidFileGuard, config_with_port, free_loopback_port,
+    isolated_cli_command, run_with_captured_files, spawn_with_captured_files,
 };
 #[cfg(unix)]
 use crate::common::{loopback_http_client, spawn_serve_and_wait_healthy};
@@ -58,7 +58,8 @@ async fn hook_env_cold_starts_detached_daemon_and_fails_open_when_plugin_missing
     let log_path = temp.path().join("runtime").join("proxy.log");
     let _pid_guard = DetachedPidFileGuard::new(pid_path.clone());
 
-    let cold = isolated_cli_command(&home)
+    let mut cold_cmd = isolated_cli_command(&home);
+    cold_cmd
         .args([
             "hook-env",
             "--ensure-running",
@@ -69,8 +70,8 @@ async fn hook_env_cold_starts_detached_daemon_and_fails_open_when_plugin_missing
         ])
         .arg(&cfg_path)
         .arg("--plugins-dir")
-        .arg(&plugins_dir)
-        .output()
+        .arg(&plugins_dir);
+    let cold = run_with_captured_files(&mut cold_cmd, temp.path(), "hook-env-cold")
         .expect("run cold hook-env");
     assert_eq!(cold.status.code(), Some(0));
     assert_eq!(
@@ -408,11 +409,12 @@ async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall
     let log_path = data_dir.join(companion_cli::daemon::PROXY_LOG_FILENAME);
     let _pid_guard = DetachedPidFileGuard::new(pid_path.clone());
 
-    // Launch 3 concurrent cold-start hook-env calls simultaneously, wrapped in ChildGuard.
-    let mut children: Vec<ChildGuard> = Vec::with_capacity(3);
-    for _ in 0..3 {
-        let child = isolated_cli_command(&home)
-            .env("XDG_CONFIG_HOME", &xdg_config)
+    // Launch 3 concurrent cold-start hook-env calls simultaneously, capturing to files
+    // so Windows pipe handles inherited by the detached daemon cannot block wait().
+    let mut children: Vec<CapturedChild> = Vec::with_capacity(3);
+    for idx in 0..3 {
+        let mut cmd = isolated_cli_command(&home);
+        cmd.env("XDG_CONFIG_HOME", &xdg_config)
             .env("XDG_DATA_HOME", &xdg_data)
             .env("ZDOTDIR", &home)
             .args([
@@ -421,12 +423,10 @@ async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall
                 "--print-port",
                 "--plugins-dir",
                 plugins_dir.to_str().unwrap(),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            ]);
+        let child = spawn_with_captured_files(&mut cmd, temp.path(), &format!("hook-env-{idx}"))
             .expect("spawn hook-env");
-        children.push(ChildGuard::new(child));
+        children.push(child);
     }
 
     for (idx, guard) in children.into_iter().enumerate() {
