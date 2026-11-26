@@ -5,6 +5,7 @@ pub mod cloudcode;
 mod hot_reload;
 pub mod routes;
 mod rss;
+pub mod session;
 pub mod sse;
 pub mod stats;
 #[cfg(test)]
@@ -34,6 +35,7 @@ pub use cloudcode::{
 };
 pub use companion_core::protocol::{HealthResponse, PROTOCOL_VERSION, StatsSnapshot};
 pub use routes::{DEFAULT_MAX_JSON_TEE_BYTES, MAX_PROXY_BODY_BYTES, build_router};
+pub use session::{extract_conversation_id, sanitize_conversation_id};
 pub use sse::{DEFAULT_MAX_SSE_EVENT_BYTES, SseUsageTracker};
 pub use stats::ProxyStats;
 

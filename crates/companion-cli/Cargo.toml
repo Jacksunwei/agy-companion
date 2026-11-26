@@ -13,11 +13,13 @@ name = "agy-companion"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
 clap.workspace = true
 companion-core = { workspace = true, features = ["sqlite"] }
 companion-providers.workspace = true
 companion-proxy.workspace = true
 companion-ui-mcp = { workspace = true, features = ["sqlite"] }
+http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -26,6 +28,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true

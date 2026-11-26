@@ -249,6 +249,9 @@ pub(super) async fn cloudcode_or_not_found_handler(
     let should_tee_request = method == Method::POST && is_builtin_generation_path(path_only);
     let builtin_model =
         should_tee_request.then(|| extract_builtin_model_name(path_only, &body_bytes));
+    let conversation_id = should_tee_request
+        .then(|| crate::session::extract_conversation_id(&body_bytes))
+        .flatten();
     let started_at = Instant::now();
 
     let active = state.active_provider().await;
@@ -297,6 +300,7 @@ pub(super) async fn cloudcode_or_not_found_handler(
             usage_sink: Arc::clone(state.usage_sink()),
             origin: UsageOrigin::AntigravityBuiltin,
             model: builtin_model.unwrap_or_else(|| DEFAULT_BUILTIN_MODEL.to_string()),
+            conversation_id,
             started_at,
             finalized: false,
             errored: false,

@@ -182,6 +182,7 @@ pub(super) struct UsageTeeStream {
     pub(super) usage_sink: Arc<dyn UsageSink>,
     pub(super) origin: UsageOrigin,
     pub(super) model: String,
+    pub(super) conversation_id: Option<String>,
     pub(super) started_at: Instant,
     pub(super) finalized: bool,
     pub(super) errored: bool,
@@ -212,12 +213,13 @@ impl Stream for UsageTeeStream {
                     if let Some(usage) = this.collector.finish() {
                         let latency_ms = u64::try_from(this.started_at.elapsed().as_millis())
                             .unwrap_or(u64::MAX);
-                        this.stats.record_call(
+                        this.stats.record_call_for_session(
                             this.origin.provider(),
                             this.origin.source(),
                             &this.model,
                             &usage,
                             latency_ms,
+                            this.conversation_id.as_deref(),
                         );
                         let event = match this.origin {
                             UsageOrigin::GeminiProxy => {

@@ -74,6 +74,7 @@ pub(super) async fn proxy_gemini_handler(
 
     let started_at = Instant::now();
     let has_thought_sig = body_contains_thought_signature(&body);
+    let conversation_id = crate::session::extract_conversation_id(&body);
     let forward_req = ForwardRequest {
         path_and_query: path_and_query.to_string(),
         body: body.clone(),
@@ -166,6 +167,7 @@ pub(super) async fn proxy_gemini_handler(
             usage_sink: Arc::clone(state.usage_sink()),
             origin: UsageOrigin::GeminiProxy,
             model,
+            conversation_id,
             started_at,
             finalized: false,
             errored: false,

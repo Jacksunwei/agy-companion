@@ -13,16 +13,20 @@ MCP App host and verifies:
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from typing import Any
 
 from cdp_smoke import (
+    ChromeBrowser,
     UiCdpSession,
     parse_css_rgb,
     require_chrome_or_skip,
     wcag_contrast_ratio,
 )
-from harness import E2ETestCase
+from harness import E2ETestCase, find_free_port, http_raw_request
+from mock_gemini import JsonAction
 
 
 _MOCK_PROXY_PORT = 24999
@@ -478,3 +482,190 @@ class TestUiSmoke(E2ETestCase):
             session._flush_frames()
             self.assertFalse(session.eval_app(read_footer_js)["popVisible"])
             session.assert_no_console_errors()
+
+    def test_ui_smoke_live_sidecar_web_ui_per_session_monitor_and_theme_sync(self) -> None:
+        """Real `agy-companion serve` Sidecar Web UI renders in Chrome, isolates per-session Monitor stats, and syncs host theme-change."""
+        chrome_bin = require_chrome_or_skip(self)
+        self.require_binary()
+        mock = self.start_mock_gemini()
+        mock.enqueue(
+            JsonAction(
+                status=200,
+                payload={
+                    "candidates": [{"content": {"parts": [{"text": "alpha"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 1200,
+                        "candidatesTokenCount": 40,
+                        "cachedContentTokenCount": 900,
+                        "thoughtsTokenCount": 15,
+                    },
+                },
+            ),
+            path_contains="/v1beta/models/gemini-4-neon:generateContent",
+        )
+        mock.enqueue(
+            JsonAction(
+                status=200,
+                payload={
+                    "candidates": [{"content": {"parts": [{"text": "beta"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 2500,
+                        "candidatesTokenCount": 80,
+                        "cachedContentTokenCount": 0,
+                        "thoughtsTokenCount": 30,
+                    },
+                },
+            ),
+            path_contains="/v1beta/models/gemini-4-carbon:generateContent",
+        )
+
+        env = self.make_env()
+        proxy_port = find_free_port()
+        sidecar_port = find_free_port()
+        while sidecar_port == proxy_port:
+            sidecar_port = find_free_port()
+
+        cfg = env.write_config(
+            env.make_config_dict(
+                listen_port=proxy_port,
+                base_url=mock.base_url,
+                api_key="test-sidecar-cdp-key-01",
+            )
+        )
+        token = "sidecar-cdp-token-42"
+        self.start_proxy(
+            env,
+            config_path=cfg,
+            port=proxy_port,
+            extra_env={
+                "ANTIGRAVITY_SIDECAR_WEB_PORT": str(sidecar_port),
+                "ANTIGRAVITY_SIDECAR_UI_TOKEN": token,
+            },
+        )
+
+        # Send two calls in two distinct Antigravity conversations.
+        for model, conv_id in (
+            ("gemini-4-neon", "conv-alpha-111111"),
+            ("gemini-4-carbon", "conv-beta-222222"),
+        ):
+            payload = json.dumps(
+                {
+                    "systemInstruction": {
+                        "parts": [{"text": f"Conversation ID: {conv_id}\n"}]
+                    },
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                }
+            ).encode("utf-8")
+            resp = http_raw_request(
+                "127.0.0.1",
+                proxy_port,
+                "POST",
+                f"/v1beta/models/{model}:generateContent",
+                headers={"Content-Type": "application/json"},
+                body=payload,
+            )
+            self.assertEqual(resp.status, 200)
+
+        browser = ChromeBrowser(
+            chrome_bin, env.root / "chrome-sidecar-profile", startup_timeout=15.0
+        ).start()
+        self.stack.callback(browser.stop)
+        cdp = browser.open_page_client(timeout=15.0)
+        self.stack.callback(cdp.close)
+        cdp.call("Page.enable")
+        cdp.call("Runtime.enable")
+        cdp.call("Log.enable")
+        cdp.set_viewport(420, 760)
+
+        def wait_expr(expr: str, timeout: float = 8.0) -> Any:
+            deadline = time.monotonic() + timeout
+            last: Any = None
+            while time.monotonic() < deadline:
+                last = cdp.evaluate(expr)
+                if last:
+                    return last
+                time.sleep(0.03)
+            self.fail(f"Timed out waiting for {expr!r} (last={last!r})")
+
+        # 1. Open Sidecar Web UI for conv-alpha-111111: must show Gemini 4 Neon and NOT Gemini 4 Carbon.
+        cdp.call(
+            "Page.navigate",
+            {
+                "url": f"http://127.0.0.1:{sidecar_port}/?token={token}&conversationId=conv-alpha-111111"
+            },
+        )
+        wait_expr(
+            "Boolean(document.body && /Gemini 4 Neon/.test(document.body.innerText || '') && document.querySelector('footer.status-bar'))"
+        )
+        alpha_text = cdp.evaluate("document.body.innerText || ''")
+        self.assertIn("Gemini 4 Neon", alpha_text)
+        self.assertNotIn("Gemini 4 Carbon", alpha_text)
+        self.assertIn("75%", alpha_text)
+        if os.name != "nt":
+            self.assertIn("MB RAM", alpha_text)
+
+        # 2. Live theme-change postMessage from Antigravity host switches Light <-> Dark.
+        cdp.evaluate(
+            """window.postMessage({
+              type: 'theme-change',
+              payload: { cssVariables: { '--background': '#ffffff' } }
+            }, '*')"""
+        )
+        wait_expr("document.documentElement.dataset.theme === 'light'")
+        cdp.evaluate(
+            """window.postMessage({
+              type: 'theme-change',
+              payload: { cssVariables: { '--background': '#141414' } }
+            }, '*')"""
+        )
+        wait_expr("document.documentElement.dataset.theme === 'dark'")
+
+        # 3. Switch to conv-beta-222222: must show Gemini 4 Carbon and NOT Gemini 4 Neon.
+        cdp.call(
+            "Page.navigate",
+            {
+                "url": f"http://127.0.0.1:{sidecar_port}/?token={token}&conversationId=conv-beta-222222"
+            },
+        )
+        wait_expr(
+            "Boolean(document.body && /Gemini 4 Carbon/.test(document.body.innerText || '') && document.querySelector('footer.status-bar'))"
+        )
+        beta_text = cdp.evaluate("document.body.innerText || ''")
+        self.assertIn("Gemini 4 Carbon", beta_text)
+        self.assertNotIn("Gemini 4 Neon", beta_text)
+
+        # 4. Switch to an empty conversation: calm empty Monitor + healthy RAM footer & global Usage tab.
+        cdp.call(
+            "Page.navigate",
+            {
+                "url": f"http://127.0.0.1:{sidecar_port}/?token={token}&conversationId=conv-empty-999999"
+            },
+        )
+        wait_expr(
+            "Boolean(document.body && /Waiting for (?:requests|Antigravity to connect)/.test(document.body.innerText || '') && document.querySelector('footer.status-bar'))"
+        )
+        empty_text = cdp.evaluate("document.body.innerText || ''")
+        self.assertNotIn("Gemini 4 Neon", empty_text)
+        self.assertNotIn("Gemini 4 Carbon", empty_text)
+        if os.name != "nt":
+            self.assertIn("MB RAM", empty_text)
+        # Open Usage tab and confirm global SQLite history loaded both calls across sessions.
+        cdp.evaluate(
+            """(() => {
+              const btn = [...document.querySelectorAll('[role="tablist"] [role="tab"]')].find(
+                (b) => b.getAttribute('aria-label') === 'Usage & Costs'
+              );
+              btn.click();
+              return true;
+            })()"""
+        )
+        wait_expr(
+            """(() => {
+              const panel = document.querySelector('[role="tabpanel"][aria-label="Usage"]');
+              return Boolean(panel && !panel.hidden && /2 calls/i.test(panel.innerText || ''));
+            })()"""
+        )
+
+        cdp.pump_events(0.05)
+        self.assertEqual(cdp.console_errors, [], f"Console errors: {cdp.console_errors}")
+        self.assertEqual(cdp.exceptions, [], f"JS exceptions: {cdp.exceptions}")

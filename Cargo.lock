@@ -314,6 +314,7 @@ dependencies = [
  "companion-providers",
  "companion-proxy",
  "companion-ui-mcp",
+ "http",
  "reqwest",
  "serde",
  "serde_json",

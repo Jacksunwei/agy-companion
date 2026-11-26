@@ -1,23 +1,34 @@
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use companion_core::HealthResponse;
 use companion_providers::{curated_gemini_models, filter_and_order_models};
 use http::{HeaderMap, StatusCode};
+use serde::Deserialize;
 
 use crate::ProxyState;
 
 use super::json_error_response;
 use super::middleware::validate_inbound_api_key;
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct StatsQuery {
+    #[serde(default)]
+    pub(super) conversation_id: Option<String>,
+}
+
 pub(super) async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse::ok(env!("CARGO_PKG_VERSION")))
 }
 
-pub(super) async fn stats_handler(State(state): State<ProxyState>) -> impl IntoResponse {
+pub(super) async fn stats_handler(
+    State(state): State<ProxyState>,
+    Query(query): Query<StatsQuery>,
+) -> impl IntoResponse {
     let active = state.active_provider().await;
     let proxy_rss_bytes = state.sample_rss_bytes().await;
-    Json(state.stats().snapshot_with_cloudcode_and_rss(
+    Json(state.stats().snapshot_for_session(
+        query.conversation_id.as_deref(),
         active.cloudcode.mode_label(),
         active.cloudcode.resolved_upstream_url(),
         proxy_rss_bytes,

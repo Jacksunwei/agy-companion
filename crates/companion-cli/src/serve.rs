@@ -170,6 +170,38 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         }
     });
 
+    let (sidecar_shutdown_tx, mut sidecar_shutdown_rx) = tokio::sync::watch::channel(false);
+    struct SidecarShutdownGuard(tokio::sync::watch::Sender<bool>);
+    impl Drop for SidecarShutdownGuard {
+        fn drop(&mut self) {
+            let _ = self.0.send(true);
+        }
+    }
+    let _sidecar_shutdown_guard = SidecarShutdownGuard(sidecar_shutdown_tx);
+    let _sidecar_ui_handle =
+        if let Some(sidecar_cfg) = crate::sidecar_ui::SidecarUiConfig::from_env() {
+            match crate::sidecar_ui::bind_and_spawn_sidecar_ui(
+                config_path.clone(),
+                sidecar_cfg,
+                async move {
+                    let _ = sidecar_shutdown_rx.wait_for(|&stopped| stopped).await;
+                },
+            )
+            .await
+            {
+                Ok((_, handle)) => Some(handle),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to start sidecar Web UI server; continuing proxy startup"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let adopt_probe = if options.adopt_running {
         Some(LoopbackProxyClient::with_default_timeouts()?)
     } else {

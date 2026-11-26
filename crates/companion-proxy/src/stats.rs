@@ -8,6 +8,7 @@ use companion_core::{
 };
 
 const MAX_TRACKED_MODELS: usize = 128;
+const MAX_TRACKED_SESSIONS: usize = 64;
 const MAX_STATS_MODEL_LEN: usize = 128;
 
 fn sanitize_stats_model(raw: &str) -> String {
@@ -32,17 +33,156 @@ fn unix_timestamp_ms() -> u64 {
 }
 
 #[derive(Debug, Default)]
-struct StatsState {
+struct StatsBucket {
     requests: u64,
     prompt_tokens: u64,
     cached_tokens: u64,
     output_tokens: u64,
     reasoning_tokens: u64,
-    last_catalog_refresh_at_ms: Option<u64>,
-    last_catalog_included_proxy_models: Option<bool>,
     recent_calls: VecDeque<RecentCallSnapshot>,
     by_model: HashMap<(String, String, String), ModelSessionStats>,
     seen_models: HashSet<(String, String)>,
+}
+
+impl StatsBucket {
+    fn record_call(
+        &mut self,
+        provider: &str,
+        source: &str,
+        model: &str,
+        usage: &GeminiUsageMetadata,
+        latency_ms: u64,
+        timestamp_ms: u64,
+    ) {
+        self.requests = self.requests.saturating_add(1);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(usage.prompt_token_count);
+        self.cached_tokens = self
+            .cached_tokens
+            .saturating_add(usage.cached_content_token_count);
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(usage.candidates_token_count);
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(usage.thoughts_token_count);
+
+        let seen_key = (provider.to_string(), model.to_string());
+        let has_prior = self.seen_models.contains(&seen_key);
+        let (cold_start, cache_break) = if !has_prior {
+            (usage.cached_content_token_count == 0, false)
+        } else {
+            (
+                false,
+                usage.prompt_token_count > 0 && usage.cached_content_token_count == 0,
+            )
+        };
+        if !has_prior && self.seen_models.len() < MAX_TRACKED_MODELS {
+            self.seen_models.insert(seen_key);
+        }
+
+        if self.recent_calls.len() >= MAX_RECENT_CALLS {
+            self.recent_calls.pop_front();
+        }
+        self.recent_calls.push_back(RecentCallSnapshot {
+            timestamp_ms,
+            provider: provider.to_string(),
+            source: source.to_string(),
+            model: model.to_string(),
+            input_tokens: usage.prompt_token_count,
+            cached_tokens: usage.cached_content_token_count,
+            output_tokens: usage.candidates_token_count,
+            reasoning_tokens: usage.thoughts_token_count,
+            latency_ms,
+            cold_start,
+            cache_break,
+        });
+
+        let model_key = (provider.to_string(), source.to_string(), model.to_string());
+        if let Some(entry) = self.by_model.get_mut(&model_key) {
+            entry.requests = entry.requests.saturating_add(1);
+            entry.input_tokens = entry.input_tokens.saturating_add(usage.prompt_token_count);
+            entry.cached_tokens = entry
+                .cached_tokens
+                .saturating_add(usage.cached_content_token_count);
+            entry.output_tokens = entry
+                .output_tokens
+                .saturating_add(usage.candidates_token_count);
+            entry.reasoning_tokens = entry
+                .reasoning_tokens
+                .saturating_add(usage.thoughts_token_count);
+            entry.total_latency_ms = entry.total_latency_ms.saturating_add(latency_ms);
+        } else {
+            if self.by_model.len() >= MAX_TRACKED_MODELS
+                && let Some(evict_key) = self
+                    .by_model
+                    .iter()
+                    .min_by_key(|(_, v)| (v.input_tokens, v.requests))
+                    .map(|(k, _)| k.clone())
+            {
+                self.by_model.remove(&evict_key);
+            }
+            self.by_model.insert(
+                model_key,
+                ModelSessionStats {
+                    provider: provider.to_string(),
+                    source: source.to_string(),
+                    model: model.to_string(),
+                    requests: 1,
+                    input_tokens: usage.prompt_token_count,
+                    cached_tokens: usage.cached_content_token_count,
+                    output_tokens: usage.candidates_token_count,
+                    reasoning_tokens: usage.thoughts_token_count,
+                    total_latency_ms: latency_ms,
+                },
+            );
+        }
+    }
+
+    fn to_usage_and_rows(
+        &self,
+    ) -> (
+        UsageStatsSnapshot,
+        Vec<RecentCallSnapshot>,
+        Vec<ModelSessionStats>,
+    ) {
+        let cache_hit_ratio = if self.prompt_tokens > 0 {
+            self.cached_tokens as f64 / self.prompt_tokens as f64
+        } else {
+            0.0
+        };
+        let recent_calls: Vec<RecentCallSnapshot> = self.recent_calls.iter().cloned().collect();
+        let mut by_model: Vec<ModelSessionStats> = self.by_model.values().cloned().collect();
+        by_model.sort_by(|a, b| {
+            b.input_tokens
+                .cmp(&a.input_tokens)
+                .then_with(|| b.requests.cmp(&a.requests))
+                .then_with(|| a.model.cmp(&b.model))
+                .then_with(|| a.provider.cmp(&b.provider))
+                .then_with(|| a.source.cmp(&b.source))
+        });
+        by_model.truncate(MAX_SESSION_MODELS);
+        (
+            UsageStatsSnapshot {
+                requests: self.requests,
+                prompt_tokens: self.prompt_tokens,
+                cached_tokens: self.cached_tokens,
+                output_tokens: self.output_tokens,
+                reasoning_tokens: self.reasoning_tokens,
+                cache_hit_ratio,
+            },
+            recent_calls,
+            by_model,
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct StatsState {
+    global: StatsBucket,
+    sessions: HashMap<String, (u64, StatsBucket)>,
+    touch_seq: u64,
+    last_catalog_refresh_at_ms: Option<u64>,
+    last_catalog_included_proxy_models: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -67,87 +207,44 @@ impl ProxyStats {
         usage: &GeminiUsageMetadata,
         latency_ms: u64,
     ) {
+        self.record_call_for_session(provider, source, model, usage, latency_ms, None);
+    }
+
+    pub fn record_call_for_session(
+        &self,
+        provider: &str,
+        source: &str,
+        model: &str,
+        usage: &GeminiUsageMetadata,
+        latency_ms: u64,
+        conversation_id: Option<&str>,
+    ) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        s.requests = s.requests.saturating_add(1);
-        s.prompt_tokens = s.prompt_tokens.saturating_add(usage.prompt_token_count);
-        s.cached_tokens = s
-            .cached_tokens
-            .saturating_add(usage.cached_content_token_count);
-        s.output_tokens = s.output_tokens.saturating_add(usage.candidates_token_count);
-        s.reasoning_tokens = s
-            .reasoning_tokens
-            .saturating_add(usage.thoughts_token_count);
-
         let model = sanitize_stats_model(model);
-        let seen_key = (provider.to_string(), model.clone());
-        let has_prior = s.seen_models.contains(&seen_key);
-        let (cold_start, cache_break) = if !has_prior {
-            (usage.cached_content_token_count == 0, false)
-        } else {
-            (
-                false,
-                usage.prompt_token_count > 0 && usage.cached_content_token_count == 0,
-            )
-        };
-        if !has_prior && s.seen_models.len() < MAX_TRACKED_MODELS {
-            s.seen_models.insert(seen_key);
-        }
+        let timestamp_ms = unix_timestamp_ms();
+        s.global
+            .record_call(provider, source, &model, usage, latency_ms, timestamp_ms);
 
-        if s.recent_calls.len() >= MAX_RECENT_CALLS {
-            s.recent_calls.pop_front();
-        }
-        s.recent_calls.push_back(RecentCallSnapshot {
-            timestamp_ms: unix_timestamp_ms(),
-            provider: provider.to_string(),
-            source: source.to_string(),
-            model: model.clone(),
-            input_tokens: usage.prompt_token_count,
-            cached_tokens: usage.cached_content_token_count,
-            output_tokens: usage.candidates_token_count,
-            reasoning_tokens: usage.thoughts_token_count,
-            latency_ms,
-            cold_start,
-            cache_break,
-        });
-
-        let model_key = (provider.to_string(), source.to_string(), model.clone());
-        if let Some(entry) = s.by_model.get_mut(&model_key) {
-            entry.requests = entry.requests.saturating_add(1);
-            entry.input_tokens = entry.input_tokens.saturating_add(usage.prompt_token_count);
-            entry.cached_tokens = entry
-                .cached_tokens
-                .saturating_add(usage.cached_content_token_count);
-            entry.output_tokens = entry
-                .output_tokens
-                .saturating_add(usage.candidates_token_count);
-            entry.reasoning_tokens = entry
-                .reasoning_tokens
-                .saturating_add(usage.thoughts_token_count);
-            entry.total_latency_ms = entry.total_latency_ms.saturating_add(latency_ms);
-        } else {
-            if s.by_model.len() >= MAX_TRACKED_MODELS
-                && let Some(evict_key) = s
-                    .by_model
-                    .iter()
-                    .min_by_key(|(_, v)| (v.input_tokens, v.requests))
-                    .map(|(k, _)| k.clone())
-            {
-                s.by_model.remove(&evict_key);
+        if let Some(conv_id) = conversation_id.and_then(crate::session::sanitize_conversation_id) {
+            s.touch_seq = s.touch_seq.saturating_add(1);
+            let seq = s.touch_seq;
+            if let Some((last_seq, bucket)) = s.sessions.get_mut(&conv_id) {
+                *last_seq = seq;
+                bucket.record_call(provider, source, &model, usage, latency_ms, timestamp_ms);
+            } else {
+                if s.sessions.len() >= MAX_TRACKED_SESSIONS
+                    && let Some(evict_id) = s
+                        .sessions
+                        .iter()
+                        .min_by_key(|(_, (last_seq, _))| *last_seq)
+                        .map(|(k, _)| k.clone())
+                {
+                    s.sessions.remove(&evict_id);
+                }
+                let mut bucket = StatsBucket::default();
+                bucket.record_call(provider, source, &model, usage, latency_ms, timestamp_ms);
+                s.sessions.insert(conv_id, (seq, bucket));
             }
-            s.by_model.insert(
-                model_key,
-                ModelSessionStats {
-                    provider: provider.to_string(),
-                    source: source.to_string(),
-                    model,
-                    requests: 1,
-                    input_tokens: usage.prompt_token_count,
-                    cached_tokens: usage.cached_content_token_count,
-                    output_tokens: usage.candidates_token_count,
-                    reasoning_tokens: usage.thoughts_token_count,
-                    total_latency_ms: latency_ms,
-                },
-            );
         }
     }
 
@@ -175,33 +272,33 @@ impl ProxyStats {
         cloudcode_resolved_upstream: Option<String>,
         proxy_rss_bytes: Option<u64>,
     ) -> StatsSnapshot {
+        self.snapshot_for_session(
+            None,
+            cloudcode_mode,
+            cloudcode_resolved_upstream,
+            proxy_rss_bytes,
+        )
+    }
+
+    pub fn snapshot_for_session(
+        &self,
+        conversation_id: Option<&str>,
+        cloudcode_mode: &str,
+        cloudcode_resolved_upstream: Option<String>,
+        proxy_rss_bytes: Option<u64>,
+    ) -> StatsSnapshot {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let cache_hit_ratio = if s.prompt_tokens > 0 {
-            s.cached_tokens as f64 / s.prompt_tokens as f64
-        } else {
-            0.0
-        };
-        let recent_calls: Vec<RecentCallSnapshot> = s.recent_calls.iter().cloned().collect();
-        let mut by_model: Vec<ModelSessionStats> = s.by_model.values().cloned().collect();
-        by_model.sort_by(|a, b| {
-            b.input_tokens
-                .cmp(&a.input_tokens)
-                .then_with(|| b.requests.cmp(&a.requests))
-                .then_with(|| a.model.cmp(&b.model))
-                .then_with(|| a.provider.cmp(&b.provider))
-                .then_with(|| a.source.cmp(&b.source))
-        });
-        by_model.truncate(MAX_SESSION_MODELS);
+        let (usage, recent_calls, by_model) =
+            match conversation_id.and_then(crate::session::sanitize_conversation_id) {
+                Some(conv_id) => match s.sessions.get(&conv_id) {
+                    Some((_, bucket)) => bucket.to_usage_and_rows(),
+                    None => (UsageStatsSnapshot::default(), Vec::new(), Vec::new()),
+                },
+                None => s.global.to_usage_and_rows(),
+            };
 
         StatsSnapshot {
-            usage: UsageStatsSnapshot {
-                requests: s.requests,
-                prompt_tokens: s.prompt_tokens,
-                cached_tokens: s.cached_tokens,
-                output_tokens: s.output_tokens,
-                reasoning_tokens: s.reasoning_tokens,
-                cache_hit_ratio,
-            },
+            usage,
             cloudcode: CloudCodeStatsSnapshot {
                 mode: cloudcode_mode.to_string(),
                 resolved_upstream: cloudcode_resolved_upstream,
@@ -603,5 +700,99 @@ mod tests {
         assert_eq!(tie_snap.by_model.len(), 2);
         assert_eq!(tie_snap.by_model[0].source, "a-source");
         assert_eq!(tie_snap.by_model[1].source, "z-source");
+    }
+
+    #[test]
+    fn isolates_per_conversation_stats_while_preserving_global_and_lru_cap() {
+        let stats = ProxyStats::new();
+        stats.record_catalog_refresh(1_700_000_000_000, true);
+        let usage_a = GeminiUsageMetadata {
+            prompt_token_count: 1000,
+            candidates_token_count: 100,
+            cached_content_token_count: 800,
+            thoughts_token_count: 20,
+        };
+        let usage_b = GeminiUsageMetadata {
+            prompt_token_count: 500,
+            candidates_token_count: 50,
+            cached_content_token_count: 0,
+            thoughts_token_count: 10,
+        };
+
+        stats.record_call_for_session(
+            "gemini",
+            "proxy",
+            "gemini-4-neon",
+            &usage_a,
+            100,
+            Some("conv-session-aaaaaa"),
+        );
+        stats.record_call_for_session(
+            "gemini",
+            "proxy",
+            "gemini-4-carbon",
+            &usage_b,
+            200,
+            Some("conv-session-bbbbbb"),
+        );
+
+        let global = stats.snapshot_for_session(
+            None,
+            "auto",
+            Some("https://cloudcode-pa.googleapis.com".to_string()),
+            Some(20_000_000),
+        );
+        assert_eq!(global.usage.requests, 2);
+        assert_eq!(global.recent_calls.len(), 2);
+        assert_eq!(global.proxy_rss_bytes, Some(20_000_000));
+
+        let snap_a = stats.snapshot_for_session(
+            Some("conv-session-aaaaaa"),
+            "auto",
+            Some("https://cloudcode-pa.googleapis.com".to_string()),
+            Some(20_000_000),
+        );
+        assert_eq!(snap_a.usage.requests, 1);
+        assert_eq!(snap_a.usage.prompt_tokens, 1000);
+        assert_eq!(snap_a.recent_calls.len(), 1);
+        assert_eq!(snap_a.recent_calls[0].model, "gemini-4-neon");
+        assert_eq!(snap_a.proxy_rss_bytes, Some(20_000_000));
+        assert_eq!(
+            snap_a.cloudcode.last_catalog_included_proxy_models,
+            Some(true)
+        );
+
+        let snap_unknown = stats.snapshot_for_session(
+            Some("conv-session-empty1"),
+            "auto",
+            Some("https://cloudcode-pa.googleapis.com".to_string()),
+            Some(20_000_000),
+        );
+        assert_eq!(snap_unknown.usage.requests, 0);
+        assert!(snap_unknown.recent_calls.is_empty());
+        assert!(snap_unknown.by_model.is_empty());
+        assert_eq!(snap_unknown.proxy_rss_bytes, Some(20_000_000));
+
+        // Eviction past MAX_TRACKED_SESSIONS drops oldest session cleanly.
+        for i in 0..(MAX_TRACKED_SESSIONS + 5) {
+            let id = format!("conv-lru-{i:04}");
+            stats.record_call_for_session(
+                "gemini",
+                "proxy",
+                "gemini-4-neon",
+                &usage_b,
+                10,
+                Some(&id),
+            );
+        }
+        let evicted = stats.snapshot_for_session(Some("conv-session-aaaaaa"), "auto", None, None);
+        assert_eq!(evicted.usage.requests, 0);
+        let newest = stats.snapshot_for_session(
+            Some(&format!("conv-lru-{:04}", MAX_TRACKED_SESSIONS + 4)),
+            "auto",
+            None,
+            None,
+        );
+        assert_eq!(newest.usage.requests, 1);
     }
 }

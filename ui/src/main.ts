@@ -44,6 +44,11 @@ import {
   type UsageRange,
   type UsageUnit,
 } from "./types.ts";
+import {
+  callSidecarApi,
+  detectSidecarContext,
+  inferThemeFromCssVars,
+} from "./transport.ts";
 import { buildUsageView } from "./usage.ts";
 
 const FOCUS_RECHECK_MIN_GAP_MS = 2_000;
@@ -56,7 +61,8 @@ async function main(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) return;
 
-  const app = new App({ name: "Antigravity Companion", version: "0.0.2" }, {});
+  const sidecarCtx = detectSidecarContext(window.location.search);
+  const app = sidecarCtx ? null : new App({ name: "Antigravity Companion", version: "0.0.2" }, {});
 
   const state: AppState = {
     connected: false,
@@ -371,6 +377,12 @@ async function main(): Promise<void> {
     args: Record<string, unknown>,
     parser: (raw: unknown) => T | null,
   ): Promise<ToolOutcome<T>> {
+    if (sidecarCtx) {
+      return callSidecarApi(sidecarCtx, name, args, parser);
+    }
+    if (!app) {
+      return { ok: false, error: "Host transport unavailable." };
+    }
     try {
       const result = (await app.callServerTool({
         name,
@@ -463,13 +475,24 @@ async function main(): Promise<void> {
   async function handleOpenExternalUrl(url: string, displayUrl: string): Promise<void> {
     let opened = false;
     if (state.connected && !state.standalone) {
-      try {
-        const res = await app.openLink({ url });
-        if (!res || res.isError !== true) {
-          opened = true;
+      if (sidecarCtx) {
+        try {
+          const popup = window.open(url, "_blank", "noopener,noreferrer");
+          if (popup !== null) {
+            opened = true;
+          }
+        } catch {
+          opened = false;
         }
-      } catch {
-        opened = false;
+      } else if (app) {
+        try {
+          const res = await app.openLink({ url });
+          if (!res || res.isError !== true) {
+            opened = true;
+          }
+        } catch {
+          opened = false;
+        }
       }
     }
     if (!opened) {
@@ -754,8 +777,51 @@ async function main(): Promise<void> {
   });
 
   /* =========================================================================
-   * REGISTER MCP APP HANDLERS BEFORE app.connect() (REQUIRED BY EXT-APPS & S5)
+   * CONNECT TO HOST (SIDECAR WEB UI OR MCP APP)
    * ========================================================================= */
+  if (sidecarCtx) {
+    window.addEventListener("message", (event: MessageEvent) => {
+      const msg = event.data as
+        | { type?: unknown; payload?: { cssVariables?: Record<string, string> } }
+        | null
+        | undefined;
+      if (!msg || msg.type !== "theme-change") return;
+      const vars = msg.payload?.cssVariables;
+      if (!vars || typeof vars !== "object") return;
+      for (const [key, value] of Object.entries(vars)) {
+        if (key.startsWith("--") && typeof value === "string") {
+          document.documentElement.style.setProperty(key, value);
+        }
+      }
+      const theme = inferThemeFromCssVars(vars);
+      if (theme) {
+        applyDocumentTheme(theme);
+        root?.setAttribute("data-theme", theme);
+      }
+    });
+
+    if (
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-color-scheme: light)").matches
+    ) {
+      applyDocumentTheme("light");
+      root?.setAttribute("data-theme", "light");
+    }
+
+    state.connected = true;
+    state.standalone = false;
+    renderAll();
+    void refreshSettings(false);
+    return;
+  }
+
+  if (!app) {
+    state.connected = false;
+    state.standalone = true;
+    renderAll();
+    return;
+  }
+
   app.ontoolinput = () => {
     // Initial snapshot arrives in ontoolresult
   };

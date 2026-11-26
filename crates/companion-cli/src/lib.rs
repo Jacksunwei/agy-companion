@@ -10,6 +10,7 @@ pub mod launch;
 pub mod models;
 pub mod process;
 pub mod serve;
+pub mod sidecar_ui;
 
 use std::path::{Path, PathBuf};
 

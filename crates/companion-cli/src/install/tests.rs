@@ -262,8 +262,13 @@ fn windows_manifest_generators_emit_direct_exe_json_without_bash() {
         serde_json::from_str(&sidecar_raw).expect("parse sidecar json");
     assert_eq!(
         sidecar_json.as_object().expect("sidecar object").len(),
-        5,
-        "Windows sidecar.json must contain only the 5 strict-valid schema keys: {sidecar_raw}"
+        7,
+        "Windows sidecar.json must contain only the 7 strict-valid schema keys: {sidecar_raw}"
+    );
+    assert_eq!(sidecar_json["has_web_ui"], serde_json::json!(true));
+    assert_eq!(
+        sidecar_json["ui_config"]["views"][0]["entrypoint"],
+        "SIDECAR_UI_ENTRYPOINT_AUX_PANE"
     );
     assert!(
         sidecar_json.get("name").is_none(),
@@ -279,10 +284,10 @@ fn windows_manifest_generators_emit_direct_exe_json_without_bash() {
         serde_json::json!(["serve", "--adopt-running", "--auto-enable-launcher"])
     );
     assert_eq!(sidecar_json["restart_policy"], "on-failure");
-    assert_eq!(sidecar_json["display_name"], "Antigravity Companion Proxy");
+    assert_eq!(sidecar_json["display_name"], "Antigravity Companion");
     assert_eq!(
         sidecar_json["description"],
-        "Local loopback Gemini pass-through proxy with SSE usageMetadata telemetry and config hot-reload."
+        "Local loopback Gemini pass-through proxy with live session monitoring, usage analytics, and BYOM settings."
     );
 }
 
