@@ -3139,7 +3139,9 @@ async fn get_usage_missing_db_returns_empty_and_rejects_bad_args_at_json_boundar
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn get_usage_queries_seeded_sqlite_and_rejects_symlink_db() {
-    use companion_core::{GeminiUsageMetadata, SqliteUsageSink, USAGE_DB_FILENAME, UsageEvent};
+    #[cfg(unix)]
+    use companion_core::USAGE_DB_FILENAME;
+    use companion_core::{GeminiUsageMetadata, SqliteUsageSink, UsageEvent};
 
     let tmp = TempDir::new().expect("tempdir");
     let cfg_path = tmp.path().join("config.json");

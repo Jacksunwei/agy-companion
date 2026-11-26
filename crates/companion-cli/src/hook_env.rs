@@ -123,6 +123,7 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::routing::get;
+    #[cfg(unix)]
     use companion_proxy::HealthResponse;
     use tempfile::TempDir;
 

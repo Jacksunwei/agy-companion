@@ -159,7 +159,9 @@ pub async fn run_ui_mcp_with_options(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     use companion_core::{CoreError, FsError};
     use tempfile::TempDir;
