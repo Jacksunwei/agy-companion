@@ -12,7 +12,10 @@ use crate::daemon::{
 use crate::{CliError, load_config_checked, resolve_cli_config_path};
 
 pub const HOOK_ENV_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(windows))]
 pub const HOOK_ENV_STARTUP_TIMEOUT: Duration = Duration::from_millis(2000);
+#[cfg(windows)]
+pub const HOOK_ENV_STARTUP_TIMEOUT: Duration = Duration::from_millis(5000);
 pub const HOOK_ENV_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Default)]

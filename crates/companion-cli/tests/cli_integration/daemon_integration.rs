@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -7,12 +8,14 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-use crate::common::{
-    CapturedChild, DetachedPidFileGuard, config_with_port, free_loopback_port,
-    isolated_cli_command, run_with_captured_files, spawn_with_captured_files,
-};
 #[cfg(unix)]
-use crate::common::{loopback_http_client, spawn_serve_and_wait_healthy};
+use crate::common::{
+    CapturedChild, loopback_http_client, spawn_serve_and_wait_healthy, spawn_with_captured_files,
+};
+use crate::common::{
+    DetachedPidFileGuard, config_with_port, free_loopback_port, isolated_cli_command,
+    run_with_captured_files,
+};
 
 #[tokio::test]
 async fn hook_env_cold_starts_detached_daemon_and_fails_open_when_plugin_missing_or_port_occupied()
@@ -383,6 +386,7 @@ async fn launch_subcommand_spawns_detached_daemon_and_sets_restore_env_preservin
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall_purge() {
     let temp = TempDir::new().expect("tempdir");
