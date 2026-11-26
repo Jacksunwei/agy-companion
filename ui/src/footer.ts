@@ -240,7 +240,7 @@ export function createFooterController(container: HTMLElement): FooterController
       ? formatAccountPlanSummary(snap.account_plan)
       : "Auto";
 
-    const binVer = snap?.binary_version ?? "0.1.0";
+    const binVer = snap?.binary_version ?? "0.0.2";
     if (!snap) {
       versionRow.valueEl.textContent = `\u2014 / v${binVer}`;
     } else if (reachable) {

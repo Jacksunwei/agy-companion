@@ -56,7 +56,7 @@ async function main(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) return;
 
-  const app = new App({ name: "Antigravity Companion", version: "0.1.0" }, {});
+  const app = new App({ name: "Antigravity Companion", version: "0.0.2" }, {});
 
   const state: AppState = {
     connected: false,
@@ -110,7 +110,7 @@ async function main(): Promise<void> {
   const brand = el("div", "brand");
   const mark = el("span", "brand-mark");
   mark.append(createBrandMarkSvg());
-  const verEl = el("span", "hdr-ver", "0.1.0");
+  const verEl = el("span", "hdr-ver", "0.0.2");
   brand.append(mark, el("h1", "brand-name", "Antigravity Companion"), verEl);
 
   const nav = el("nav", "hdr-tabs");
@@ -253,7 +253,7 @@ async function main(): Promise<void> {
   }
 
   function renderHeader(): void {
-    verEl.textContent = state.snapshot?.binary_version || "0.1.0";
+    verEl.textContent = state.snapshot?.binary_version || "0.0.2";
     for (const [id, btn] of tabBtns.entries()) {
       btn.setAttribute("aria-selected", String(state.activeTab === id));
     }

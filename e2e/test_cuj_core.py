@@ -504,7 +504,7 @@ class TestCujUiMcpLifecycle(E2ETestCase):
         mcp.assert_clean_stdout()
         self.assertIn("tools", init.get("capabilities", {}))
         self.assertIn("resources", init.get("capabilities", {}))
-        self.assertEqual(init["serverInfo"]["version"], "0.1.0")
+        self.assertEqual(init["serverInfo"]["version"], "0.0.2")
 
         # (b) Resources list & read.
         res_list = mcp.list_resources()
@@ -680,7 +680,7 @@ class TestCujCliSubcommands(E2ETestCase):
         # (a) --version, --help, unknown subcommand.
         r_ver = run_cli([str(binary), "--version"], env=base_env)
         self.assertEqual(r_ver.returncode, 0, r_ver.stderr)
-        self.assertEqual(r_ver.stdout.strip(), "agy-companion 0.1.0")
+        self.assertEqual(r_ver.stdout.strip(), "agy-companion 0.0.2")
 
         r_help = run_cli([str(binary), "--help"], env=base_env)
         self.assertEqual(r_help.returncode, 0, r_help.stderr)
