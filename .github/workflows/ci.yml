@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  linux:
-    name: Linux (agent-check + UI + E2E)
+  repo-checks:
+    name: Repo checks (hygiene, manifests, UI bundle, guards)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -18,7 +18,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
@@ -29,63 +29,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Build, test, and verify committed UI single-file bundle
-        run: |
-          npm --prefix ui ci
-          npm --prefix ui run typecheck
-          npm --prefix ui test
-          npm --prefix ui run build
-          git diff --exit-code -- ui/dist/index.html
-      # Runs all 7 verification gates:
-      #   [1/7] Antigravity-native governance files (no GEMINI.md)
-      #   [2/7] Tracked file hygiene (incl. __pycache__/*.pyc) & Google API key secret scan (tracked, staged, commits)
-      #   [3/7] Zero AI attribution in commits
-      #   [4/7] Shell syntax (bash -n & /bin/bash -n), executable bit (-x) on scripts/*.sh + plugin/scripts/*.sh, and dev-install safety
-      #   [5/7] 4-way version sync (Cargo.toml, plugin.json, npm package.json + 5 optionalDeps, pyproject.toml), JS/Python shim checks & temp-dir py_compile
-      #   [6/7] Rust workspace (fmt, clippy -D warnings, cargo test), UI tests, 5 static hermeticity guards & UI XSS hygiene / single-file bundle gate (< 512000 bytes)
-      #   [7/7] Plugin JSON manifests, strict Expat SVG logo validator + unit tests & agy plugin validate --strict ./plugin (clean skip if agy absent)
-      - name: Run agent verification gate
-        run: ./scripts/agent_check.sh
-      - name: Run parallel opaque-box E2E suite
-        run: |
-          cargo build -p companion-cli
-          python3 -B e2e/run_e2e.py --suite all --workers 4 --binary target/debug/agy-companion --repo-root . -v
+      - name: Run OS-independent repo checks and verify UI bundle
+        run: python -B scripts/check.py --profile repo --verify-ui-build
 
-  macos:
-    name: macOS (agent-check + E2E)
-    runs-on: macos-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: ui/package-lock.json
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install UI dependencies
-        run: npm --prefix ui ci
-      - name: Run agent verification gate
-        run: ./scripts/agent_check.sh
-      - name: Run parallel opaque-box E2E suite
-        run: |
-          cargo build -p companion-cli
-          python3 -B e2e/run_e2e.py --suite all --workers 4 --binary target/debug/agy-companion --repo-root . -v
-
-  windows:
-    name: Windows (clippy + Rust + UI + E2E)
-    runs-on: windows-latest
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -102,16 +56,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Run Rust clippy on Windows
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run Rust workspace tests on Windows
-        run: cargo test --workspace
-      - name: Run UI behavioral tests and SVG validator on Windows
-        run: |
-          npm --prefix ui ci
-          npm --prefix ui test
-          python -B scripts/test_check_plugin_logo.py
-      - name: Run parallel opaque-box E2E suite on Windows
-        run: |
-          cargo build -p companion-cli
-          python -B e2e/run_e2e.py --suite all --workers 4 --binary target\debug\agy-companion.exe --repo-root . -v
+      - name: Install UI dependencies
+        run: npm --prefix ui ci
+      - name: Run OS-dependent verification and opaque-box E2E suite
+        run: python -B scripts/check.py --profile os --with-e2e

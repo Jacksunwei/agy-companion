@@ -16,10 +16,10 @@ This repository uses **Antigravity customization conventions** as the default ag
 | `plugin/` | Distributable Antigravity plugin bundle | `plugin.json`, `assets/logo.svg`, `mcp_config.json`, `sidecars/proxy/sidecar.json`, `scripts/run-companion.sh`, `skills/companion/SKILL.md`, `README.md`; validated with `agy plugin validate --strict ./plugin` and embedded byte-for-byte into `companion-cli` via `include_str!`. |
 | `packages/` | Cross-platform distribution shims | `packages/npm/agy-companion/` (`agy-companion` & `agyc`, 5 `@agy-companion/<os>-<arch>` `optionalDependencies`, `publishConfig` -> public npm), `packages/npm/generate-platform-pkgs.mjs`, and `packages/python/` (`maturin` `bindings = "bin"`). |
 | `e2e/` | Pure Python 3 stdlib opaque-box E2E suite | Intent-named parallel opaque-box binary CUJ, security boundary, runtime shim, and headless Chrome CDP UI smoke suite (`e2e/run_e2e.py --suite cuj\|boundary\|shims\|ui-smoke\|all --workers 4`, `e2e/README.md`, `docs/design/testing-strategy.md`); never grep repo source/docs inside `e2e/`; always run with `python3 -B` so no `__pycache__` is created. |
-| `scripts/agent_check.sh` | Fast 7-gate local verification script | Run before every commit and PR (paired with strict Expat SVG validator `scripts/check_plugin_logo.py` + `scripts/test_check_plugin_logo.py`). |
+| `scripts/check.py`, `scripts/agent_check.sh` | Unified cross-platform verification runner & POSIX shim | Pure Python 3 stdlib `scripts/check.py` (`--profile repo\|os\|all`, `--verify-ui-build`, `--with-e2e`, paired with strict Expat SVG validator `scripts/check_plugin_logo.py` + `scripts/test_check_plugin_logo.py`); `scripts/agent_check.sh` is a thin POSIX shim executing `python3 -B scripts/check.py --profile all "$@"`. Run before every commit and PR. |
 | `scripts/dev-install.sh` | Local dev build & plugin symlink helper | Supports `--no-build`, `--release`, `--dry-run`, `--uninstall`, `--plugins-dir <dir>`, `-h/--help`; physical `cd -P --` symlink safety; never modifies user Antigravity settings. |
 | `.github/PULL_REQUEST_TEMPLATE.md` | PR template | Every PR includes summary + pasted local verification evidence. |
-| `.github/workflows/ci.yml` | GitHub Actions CI workflow | Runs symmetric 3-OS CI (`ubuntu-latest`, `macos-latest`, `windows-latest`: `scripts/agent_check.sh`, Rust clippy/tests, UI tests/bundle determinism, and parallel opaque-box E2E) on PRs and pushes to `main`. |
+| `.github/workflows/ci.yml` | GitHub Actions CI workflow | Runs 2 non-overlapping jobs on PRs and pushes to `main`: `repo-checks` on `ubuntu-latest` (`python -B scripts/check.py --profile repo --verify-ui-build`) and `test` matrix across `[ubuntu-latest, macos-latest, windows-latest]` (`python -B scripts/check.py --profile os --with-e2e`). |
 | `docs/` | Design specs (`docs/design/architecture.md`, `docs/design/dock-launcher-and-install.md`, `docs/design/testing-strategy.md`, etc.; index at `docs/README.md`) and reserved ADRs (`docs/decisions/`) | Update docs alongside behavior or architecture changes. |
 
 ## Verification Gates
@@ -27,15 +27,25 @@ This repository uses **Antigravity customization conventions** as the default ag
 > **Verification policy:** GitHub Actions CI (`.github/workflows/ci.yml`) is enabled on PRs and pushes to `main`. Run all verification gates locally before pushing, and confirm CI checks are green before merging.
 
 ```bash
-# Gate 1 (Primary): Full 7-gate verification script
-#   [1/7] Antigravity-native governance files (no GEMINI.md)
-#   [2/7] Tracked file hygiene (incl. __pycache__/*.pyc) & Google API key secret scan (tracked, staged, commits)
-#   [3/7] Zero AI attribution in commits
-#   [4/7] Shell syntax (bash -n & /bin/bash -n), executable bit (-x) on scripts/*.sh + plugin/scripts/*.sh, and dev-install safety
-#   [5/7] 4-way version sync (Cargo.toml, plugin.json, npm package.json + 5 optionalDeps, pyproject.toml), generate-platform-pkgs.mjs dry-run, JS/Python shim checks, temp-dir scripts/*.py & e2e/*.py py_compile (zero __pycache__)
-#   [6/7] Rust workspace (fmt, clippy -D warnings, cargo test), zero-dep UI behavioral tests (npm --prefix ui test), 5 automated static hermeticity guards (Gate 6c) & unified full S5 sink + whitespace-aware external-tag scanning across ui/src/ & ui/dist/index.html (< 512,000 bytes / 500 KiB)
-#   [7/7] Plugin JSON manifests, strict fail-closed Expat SVG logo allowlist & unit tests (scripts/check_plugin_logo.py, scripts/test_check_plugin_logo.py) & agy plugin validate --strict ./plugin (clean skip if agy absent)
+# Gate 1 (Primary): Unified cross-platform verification runner (scripts/agent_check.sh -> scripts/check.py --profile all)
+#   --profile repo (OS-independent; run once in CI with --verify-ui-build):
+#     [repo 1/7] Antigravity-native governance files (no GEMINI.md)
+#     [repo 2/7] Tracked file hygiene (incl. __pycache__/*.pyc) & Google API key secret scan (tracked, staged, commits)
+#     [repo 3/7] Zero AI attribution in commits
+#     [repo 4/7] Shell syntax (bash -n & /bin/bash -n), executable bit (-x) on scripts/*.sh + plugin/scripts/*.sh, and dev-install safety
+#     [repo 5/7] 4-way version sync (Cargo.toml, plugin.json, npm package.json + 5 optionalDeps, pyproject.toml), generate-platform-pkgs.mjs dry-run, JS/Python shim checks, temp-dir scripts/*.py & e2e/*.py py_compile (zero __pycache__)
+#     [repo 6/7] cargo fmt --check, 5 automated static hermeticity guards (Gate 6c), unified full S5 sink + whitespace-aware external-tag scanning across ui/src/ & ui/dist/index.html (< 512,000 bytes / 500 KiB), plus optional --verify-ui-build
+#     [repo 7/7] Plugin JSON manifests, strict fail-closed Expat SVG logo allowlist (scripts/check_plugin_logo.py) & agy plugin validate --strict ./plugin (clean skip if agy absent)
+#   --profile os (OS-dependent; run identically across ubuntu-latest, macos-latest, windows-latest in CI with --with-e2e):
+#     [os 1/4] cargo clippy --workspace --all-targets -- -D warnings
+#     [os 2/4] cargo test --workspace
+#     [os 3/4] npm --prefix ui test (zero-dep Node 24 behavioral tests)
+#     [os 4/4] python -B scripts/test_check_plugin_logo.py
+#     [os 5/5] (--with-e2e) cargo build -p companion-cli + python -B e2e/run_e2e.py --suite all --workers 4
 ./scripts/agent_check.sh
+# Or invoke directly on any OS (incl. Windows):
+python3 -B scripts/check.py --profile repo --verify-ui-build
+python3 -B scripts/check.py --profile os --with-e2e
 
 # Targeted workspace checks (when iterating on a slice)
 cargo fmt --all -- --check
