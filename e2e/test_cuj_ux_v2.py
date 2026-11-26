@@ -715,3 +715,152 @@ class TestCujUxV2(E2ETestCase):
         models_list = extract_models_list(mods.json_stdout())
         self.assertGreaterEqual(len(models_list), 1)
         self.assertIn(f"127.0.0.1:{p3.port}", mods.stdout)
+
+    def test_cuj_ux_sidecar_web_ui_and_per_session_monitor_isolation(self) -> None:
+        """Sidecar Web UI serves embedded UI + token-gated APIs scoped to conversation_id."""
+        mock = self.start_mock_gemini()
+        mock.enqueue(
+            JsonAction(
+                status=200,
+                payload={
+                    "candidates": [{"content": {"parts": [{"text": "alpha"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 1200,
+                        "candidatesTokenCount": 40,
+                        "cachedContentTokenCount": 900,
+                        "thoughtsTokenCount": 15,
+                    },
+                },
+            ),
+            path_contains="/v1beta/models/gemini-4-neon:generateContent",
+        )
+        mock.enqueue(
+            JsonAction(
+                status=200,
+                payload={
+                    "candidates": [{"content": {"parts": [{"text": "beta"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 2500,
+                        "candidatesTokenCount": 80,
+                        "cachedContentTokenCount": 0,
+                        "thoughtsTokenCount": 30,
+                    },
+                },
+            ),
+            path_contains="/v1beta/models/gemini-4-carbon:generateContent",
+        )
+
+        env = self.make_env()
+        proxy_port = find_free_port()
+        sidecar_port = find_free_port()
+        while sidecar_port == proxy_port:
+            sidecar_port = find_free_port()
+
+        cfg = env.write_config(
+            env.make_config_dict(
+                listen_port=proxy_port,
+                base_url=mock.base_url,
+                api_key="test-sidecar-ui-key-01",
+            )
+        )
+        token = "sidecar-e2e-token-999"
+        self.start_proxy(
+            env,
+            config_path=cfg,
+            port=proxy_port,
+            extra_env={
+                "ANTIGRAVITY_SIDECAR_WEB_PORT": str(sidecar_port),
+                "ANTIGRAVITY_SIDECAR_UI_TOKEN": token,
+            },
+        )
+
+        # 1. GET / serves embedded HTML with strict CSP (no token required for host readiness probe).
+        root_resp = http_raw_request("127.0.0.1", sidecar_port, "GET", "/")
+        self.assertEqual(root_resp.status, 200)
+        self.assertIn("Antigravity Companion", root_resp.body.decode("utf-8"))
+        self.assertIsNotNone(root_resp.header("content-security-policy"))
+
+        # 2. POST /_api/get_settings rejects missing/wrong token with 401.
+        unauth = http_raw_request(
+            "127.0.0.1",
+            sidecar_port,
+            "POST",
+            "/_api/get_settings",
+            headers={"Content-Type": "application/json"},
+            body=b"{}",
+        )
+        self.assertEqual(unauth.status, 401)
+
+        # 3. Send two proxied requests tagged with distinct Antigravity Conversation IDs.
+        req_alpha = json.dumps(
+            {
+                "systemInstruction": {
+                    "parts": [{"text": "Conversation ID: conv-alpha-111111\n"}]
+                },
+                "contents": [{"role": "user", "parts": [{"text": "hi alpha"}]}],
+            }
+        ).encode("utf-8")
+        resp_a = http_raw_request(
+            "127.0.0.1",
+            proxy_port,
+            "POST",
+            "/v1beta/models/gemini-4-neon:generateContent",
+            headers={"Content-Type": "application/json"},
+            body=req_alpha,
+        )
+        self.assertEqual(resp_a.status, 200)
+
+        req_beta = json.dumps(
+            {
+                "systemInstruction": {
+                    "parts": [{"text": "Conversation ID: conv-beta-222222\n"}]
+                },
+                "contents": [{"role": "user", "parts": [{"text": "hi beta"}]}],
+            }
+        ).encode("utf-8")
+        resp_b = http_raw_request(
+            "127.0.0.1",
+            proxy_port,
+            "POST",
+            "/v1beta/models/gemini-4-carbon:generateContent",
+            headers={"Content-Type": "application/json"},
+            body=req_beta,
+        )
+        self.assertEqual(resp_b.status, 200)
+
+        # 4. Query sidecar API scoped to each conversation and to an empty conversation.
+        def fetch_scoped(conv_id: str | None) -> dict[str, Any]:
+            payload = {"conversation_id": conv_id} if conv_id else {}
+            r = http_raw_request(
+                "127.0.0.1",
+                sidecar_port,
+                "POST",
+                "/_api/get_settings",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Sidecar-Token": token,
+                },
+                body=json.dumps(payload).encode("utf-8"),
+            )
+            self.assertEqual(r.status, 200, f"sidecar get_settings failed: {r.body!r}")
+            return r.json()
+
+        snap_alpha = fetch_scoped("conv-alpha-111111")
+        self.assertEqual(snap_alpha["stats"]["usage"]["requests"], 1)
+        self.assertEqual(snap_alpha["stats"]["usage"]["prompt_tokens"], 1200)
+        self.assertEqual(snap_alpha["stats"]["recent_calls"][0]["model"], "gemini-4-neon")
+        self.assertIsNotNone(snap_alpha["proxy_rss_bytes"])
+
+        snap_beta = fetch_scoped("conv-beta-222222")
+        self.assertEqual(snap_beta["stats"]["usage"]["requests"], 1)
+        self.assertEqual(snap_beta["stats"]["usage"]["prompt_tokens"], 2500)
+        self.assertEqual(snap_beta["stats"]["recent_calls"][0]["model"], "gemini-4-carbon")
+
+        snap_empty = fetch_scoped("conv-other-333333")
+        self.assertEqual(snap_empty["stats"]["usage"]["requests"], 0)
+        self.assertEqual(snap_empty["stats"]["recent_calls"], [])
+        self.assertTrue(snap_empty["proxy"]["reachable"])
+        self.assertIsNotNone(snap_empty["proxy_rss_bytes"])
+
+        snap_global = fetch_scoped(None)
+        self.assertEqual(snap_global["stats"]["usage"]["requests"], 2)

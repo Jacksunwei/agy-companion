@@ -61,7 +61,14 @@ UNSAFE_JS_RE = re.compile(
 UI_S5_SINK_RE = re.compile(
     r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|dangerouslySetInnerHTML"
     r"|localStorage|sessionStorage|document\.cookie|new\s+Function|XMLHttpRequest"
-    r"|(^|[^A-Za-z0-9_$])(eval|alert|confirm|prompt|fetch)\s*\("
+    r"|(^|[^A-Za-z0-9_$])(eval|alert|confirm|prompt)\s*\("
+)
+
+UI_FETCH_RE = re.compile(r"(^|[^A-Za-z0-9_$])fetch\s*\(")
+UI_ALLOWED_SIDECAR_FETCH_RE = re.compile(r"""fetch\(\s*[`'"]/_api/""")
+UI_BUNDLE_EXT_FETCH_RE = re.compile(
+    r"""(^|[^A-Za-z0-9_$])fetch\s*\(\s*[`'"]\s*(https?:|//)""",
+    re.IGNORECASE,
 )
 
 UI_EXTERNAL_TAG_RE = re.compile(
@@ -558,6 +565,31 @@ class CheckRunner:
                 )
                 failed = True
 
+            # S5 same-origin sidecar fetch guard: fetch() is only permitted inside
+            # ui/src/transport.ts and must strictly target relative /_api/ paths.
+            bad_fetch_hits: list[str] = []
+            for path in sorted(ui_src.rglob("*")):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(self.repo_root).as_posix()
+                text = path.read_text(encoding="utf-8", errors="replace")
+                for line_no, line in enumerate(text.splitlines(), start=1):
+                    if UI_FETCH_RE.search(line):
+                        if path.name != "transport.ts":
+                            bad_fetch_hits.append(
+                                f"{rel}:{line_no}: fetch() is only allowed inside ui/src/transport.ts"
+                            )
+                        elif not UI_ALLOWED_SIDECAR_FETCH_RE.search(line):
+                            bad_fetch_hits.append(
+                                f"{rel}:{line_no}: fetch() in ui/src/transport.ts must target relative /_api/ paths only"
+                            )
+            if bad_fetch_hits:
+                self.fail(
+                    f"{tag} Static & UI: S5 fetch() policy violation in ui/src/",
+                    bad_fetch_hits,
+                )
+                failed = True
+
             if not ui_bundle.is_file() or ui_bundle.stat().st_size == 0:
                 self.fail(f"{tag} Static & UI: ui/dist/index.html missing or empty")
                 failed = True
@@ -583,6 +615,16 @@ class CheckRunner:
                     self.fail(
                         f"{tag} Static & UI: forbidden sink(s) detected in ui/dist/index.html",
                         bundle_sink_hits,
+                    )
+                    failed = True
+
+                bundle_ext_fetch_hits = _scan_file_regex(
+                    self.repo_root, ui_bundle, UI_BUNDLE_EXT_FETCH_RE
+                )
+                if bundle_ext_fetch_hits:
+                    self.fail(
+                        f"{tag} Static & UI: external URL fetch() detected in ui/dist/index.html",
+                        bundle_ext_fetch_hits,
                     )
                     failed = True
 

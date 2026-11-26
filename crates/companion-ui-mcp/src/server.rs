@@ -78,6 +78,14 @@ impl CompanionUiServer {
         ListResourcesResult::with_all_items(vec![resource])
     }
 
+    pub async fn load_ui_html(&self) -> Result<String, ErrorData> {
+        let override_path = resolve_ui_html_override_path(&self.options.ui_html_source);
+        match override_path {
+            Some(path) => load_ui_html_override(path).await,
+            None => Ok(EMBEDDED_UI_HTML.to_string()),
+        }
+    }
+
     pub async fn read_ui_resource(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         if uri != UI_RESOURCE_URI {
             return Err(ErrorData::resource_not_found(
@@ -86,11 +94,7 @@ impl CompanionUiServer {
             ));
         }
 
-        let override_path = resolve_ui_html_override_path(&self.options.ui_html_source);
-        let html = match override_path {
-            Some(path) => load_ui_html_override(path).await?,
-            None => EMBEDDED_UI_HTML.to_string(),
-        };
+        let html = self.load_ui_html().await?;
 
         let contents = ResourceContents::text(html, UI_RESOURCE_URI)
             .with_mime_type(UI_MIME_TYPE)
@@ -113,6 +117,7 @@ impl CompanionUiServer {
         &self,
         listen_port: u16,
         binary_version: &str,
+        conversation_id: Option<&str>,
     ) -> (ProxyHealthSummary, bool, Option<StatsSnapshot>) {
         match self.proxy_client.probe_health(listen_port, None).await {
             Ok(raw) => {
@@ -124,7 +129,10 @@ impl CompanionUiServer {
                     proxy.error = Some(eval.version_message);
                 }
                 let stats = if eval.status_ok {
-                    self.proxy_client.probe_stats(listen_port, None).await.ok()
+                    self.proxy_client
+                        .probe_stats_for_session(listen_port, conversation_id, None)
+                        .await
+                        .ok()
                 } else {
                     None
                 };
@@ -160,16 +168,17 @@ impl CompanionUiServer {
     }
 
     pub(crate) async fn build_snapshot(&self, cfg: &Config) -> SettingsSnapshot {
-        self.build_snapshot_with_integration(cfg, None).await
+        self.build_snapshot_with_session(cfg, None, None).await
     }
 
-    pub(crate) async fn build_snapshot_with_integration(
+    pub(crate) async fn build_snapshot_with_session(
         &self,
         cfg: &Config,
         integration_override: Option<IntegrationStatus>,
+        conversation_id: Option<&str>,
     ) -> SettingsSnapshot {
         let binary_version = env!("CARGO_PKG_VERSION").to_string();
-        let probe_fut = self.probe_proxy(cfg.proxy.port.get(), &binary_version);
+        let probe_fut = self.probe_proxy(cfg.proxy.port.get(), &binary_version, conversation_id);
         let integration_fut = async {
             match integration_override {
                 Some(status) => status,

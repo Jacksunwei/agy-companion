@@ -122,10 +122,11 @@ impl LoopbackProxyClient {
         Self::new(DEFAULT_PROBE_TIMEOUT, DEFAULT_PROBE_TIMEOUT)
     }
 
-    async fn read_bounded_json<T: DeserializeOwned>(
+    async fn read_bounded_json_path<T: DeserializeOwned>(
         &self,
         port: u16,
         endpoint: &'static str,
+        path_and_query: &str,
         timeout_override: Option<Duration>,
     ) -> Result<T, ProbeError> {
         let effective_timeout = timeout_override.unwrap_or(self.default_timeout);
@@ -133,7 +134,7 @@ impl LoopbackProxyClient {
             return Err(ProbeError::Timeout { endpoint });
         }
 
-        let url = format!("http://127.0.0.1:{port}{endpoint}");
+        let url = format!("http://127.0.0.1:{port}{path_and_query}");
         let mut req = self.client.get(&url);
         if let Some(timeout) = timeout_override {
             req = req.timeout(timeout);
@@ -186,7 +187,7 @@ impl LoopbackProxyClient {
         port: u16,
         timeout_override: Option<Duration>,
     ) -> Result<HealthResponse, ProbeError> {
-        self.read_bounded_json(port, "/health", timeout_override)
+        self.read_bounded_json_path(port, "/health", "/health", timeout_override)
             .await
     }
 
@@ -208,7 +209,27 @@ impl LoopbackProxyClient {
         port: u16,
         timeout_override: Option<Duration>,
     ) -> Result<StatsSnapshot, ProbeError> {
-        self.read_bounded_json(port, "/api/stats", timeout_override)
+        self.probe_stats_for_session(port, None, timeout_override)
+            .await
+    }
+
+    pub async fn probe_stats_for_session(
+        &self,
+        port: u16,
+        conversation_id: Option<&str>,
+        timeout_override: Option<Duration>,
+    ) -> Result<StatsSnapshot, ProbeError> {
+        let safe_conv = conversation_id.map(str::trim).filter(|id| {
+            (6..=64).contains(&id.len())
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+        let path_and_query = match safe_conv {
+            Some(id) => format!("/api/stats?conversation_id={id}"),
+            None => "/api/stats".to_string(),
+        };
+        self.read_bounded_json_path(port, "/api/stats", &path_and_query, timeout_override)
             .await
     }
 }
