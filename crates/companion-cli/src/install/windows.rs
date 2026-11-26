@@ -57,38 +57,6 @@ fn strip_run_companion_wrapper_arg(
 }
 
 #[cfg(any(windows, test))]
-pub(crate) fn patch_windows_mcp_config_from_str(
-    embedded_json: &str,
-    binary_path: &Path,
-) -> Result<String, CliError> {
-    let mut payload: serde_json::Value =
-        serde_json::from_str(embedded_json).map_err(|e| CliError::Serialization(e.to_string()))?;
-    let hub = payload
-        .get_mut("mcpServers")
-        .and_then(|v| v.get_mut("hub"))
-        .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| {
-            CliError::Install(
-                "embedded mcp_config.json missing 'mcpServers.hub' object".to_string(),
-            )
-        })?;
-    hub.insert(
-        "command".to_string(),
-        serde_json::Value::String(binary_path.to_string_lossy().into_owned()),
-    );
-    strip_run_companion_wrapper_arg(hub.get_mut("args"), "mcp_config.json")?;
-    let mut rendered = serde_json::to_string_pretty(&payload)
-        .map_err(|e| CliError::Serialization(e.to_string()))?;
-    rendered.push('\n');
-    Ok(rendered)
-}
-
-#[cfg(any(windows, test))]
-pub(crate) fn render_windows_mcp_config(binary_path: &Path) -> Result<String, CliError> {
-    patch_windows_mcp_config_from_str(embedded_plugin_content("mcp_config.json")?, binary_path)
-}
-
-#[cfg(any(windows, test))]
 pub(crate) fn patch_windows_sidecar_config_from_str(
     embedded_json: &str,
     binary_path: &Path,

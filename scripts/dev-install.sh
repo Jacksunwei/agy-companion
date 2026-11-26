@@ -262,7 +262,6 @@ fi
 printf 'Linked dev plugin:\n'
 printf '  Plugin symlink : %s -> %s\n' "${LINK_PATH}" "${PLUGIN_SRC}"
 printf '  Local binary   : %s (auto-detected by plugin/scripts/run-companion.sh)\n' "${EXPECTED_BIN}"
-printf '  MCP live reload: Settings > MCP Servers > agy-companion_hub > Restart\n'
-printf '                   (or RefreshMcpServers RPC with {"serverName": "agy-companion_hub"})\n'
 printf '  UI live reload : export AGY_COMPANION_UI_HTML="%s/ui/dist/index.html"\n' "${REPO_ROOT}"
+printf '                   (rebuild ui/ and close/reopen the Antigravity Companion sidecar panel)\n'
 printf '  Sidecar logs   : ~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/\n'

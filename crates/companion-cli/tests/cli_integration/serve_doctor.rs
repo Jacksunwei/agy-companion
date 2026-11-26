@@ -405,12 +405,13 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
         "gemini-api://http://127.0.0.1:5454/models/gemini-4-hydrogen"
     );
 
-    // ui-mcp eagerly rejects path traversal in --data-dir with zero stdout
+    // serve eagerly rejects path traversal in XDG_DATA_HOME with zero stdout
     let out = isolated_cli_command(temp.path())
-        .args(["ui-mcp", "--data-dir=../escape", "--config"])
+        .args(["serve", "--config"])
         .arg(&cli_cfg)
+        .env("XDG_DATA_HOME", "/tmp/../escape")
         .output()
-        .expect("run ui-mcp invalid data-dir");
+        .expect("run serve invalid XDG_DATA_HOME");
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     assert!(!out.stderr.is_empty());

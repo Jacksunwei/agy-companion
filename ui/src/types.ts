@@ -836,14 +836,14 @@ export function extractToolErrorText(result: ToolCallResultLike): string {
     if (structuredError) return structuredError;
   }
   const text = extractToolText(result);
-  return text || "The MCP tool reported an error.";
+  return text || "The companion API reported an error.";
 }
 
 export function formatCaughtError(err: unknown): string {
   if (err instanceof Error && err.message.trim().length > 0) {
     return err.message;
   }
-  return "Request failed. Check the companion MCP server connection.";
+  return "Request failed. Check the companion sidecar connection.";
 }
 
 export function validateApiKey(raw: string): string | null {

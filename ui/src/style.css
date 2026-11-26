@@ -1,5 +1,5 @@
 :root {
-  /* Host MCP App token bindings with dark-first developer-instrument fallbacks */
+  /* Host Sidecar Web UI token bindings with dark-first developer-instrument fallbacks */
   --bg: var(--color-background-primary, #1b1c1f);
   --surface: var(--color-background-secondary, #232428);
   --surface-2: var(--color-background-tertiary, #2c2e33);

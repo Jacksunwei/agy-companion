@@ -117,12 +117,12 @@ describe("buildBannerNode priority queue & interactions", () => {
     assert.ok(standalone.textContent.includes("Preview mode"));
 
     const errBanner = buildBannerNode(
-      makeState({ snapshot: null, loadError: "MCP timeout", refreshing: false }),
+      makeState({ snapshot: null, loadError: "Sidecar timeout", refreshing: false }),
       actions,
     ) as unknown as FakeElement;
     assert.ok(errBanner);
     assert.ok(errBanner.textContent.includes("Unable to load companion state"));
-    assert.ok(errBanner.textContent.includes("MCP timeout"));
+    assert.ok(errBanner.textContent.includes("Sidecar timeout"));
     const retryBtn = errBanner.querySelector("button");
     assert.ok(retryBtn);
     assert.equal(retryBtn.disabled, false);
@@ -130,7 +130,7 @@ describe("buildBannerNode priority queue & interactions", () => {
     assert.equal(calls.recheck, 1);
 
     const refreshingBanner = buildBannerNode(
-      makeState({ snapshot: null, loadError: "MCP timeout", refreshing: true }),
+      makeState({ snapshot: null, loadError: "Sidecar timeout", refreshing: true }),
       actions,
     ) as unknown as FakeElement;
     assert.equal(refreshingBanner.querySelector("button")?.disabled, true);

@@ -4,7 +4,7 @@ members = [
     "crates/companion-core",
     "crates/companion-providers",
     "crates/companion-proxy",
-    "crates/companion-ui-mcp",
+    "crates/companion-ui",
     "crates/companion-cli",
 ]
 
@@ -22,15 +22,13 @@ clap = { version = "4", features = ["derive"] }
 companion-core = { path = "crates/companion-core" }
 companion-providers = { path = "crates/companion-providers" }
 companion-proxy = { path = "crates/companion-proxy" }
-companion-ui-mcp = { path = "crates/companion-ui-mcp" }
+companion-ui = { path = "crates/companion-ui" }
 dirs = "7"
 futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "http2"] }
-rmcp = { version = "3.11", features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
-schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

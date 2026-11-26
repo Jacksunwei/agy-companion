@@ -457,16 +457,16 @@ describe("tool envelope helpers, normalizeHostPlatform & validateApiKey", () => 
       }),
       "Text failure",
     );
-    assert.equal(extractToolErrorText({}), "The MCP tool reported an error.");
+    assert.equal(extractToolErrorText({}), "The companion API reported an error.");
 
     assert.equal(formatCaughtError(new Error("Boom")), "Boom");
     assert.equal(
       formatCaughtError(new Error("   ")),
-      "Request failed. Check the companion MCP server connection.",
+      "Request failed. Check the companion sidecar connection.",
     );
     assert.equal(
       formatCaughtError("plain string"),
-      "Request failed. Check the companion MCP server connection.",
+      "Request failed. Check the companion sidecar connection.",
     );
   });
 

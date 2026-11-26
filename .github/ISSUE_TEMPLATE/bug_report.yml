@@ -1,5 +1,5 @@
 name: Bug Report
-description: Report a bug in agy-companion (proxy, MCP App UI, CLI, or Dock/Launcher integration)
+description: Report a bug in agy-companion (proxy, Sidecar Web UI, CLI, or Dock/Launcher integration)
 labels: ["bug"]
 body:
   - type: markdown
@@ -15,7 +15,7 @@ body:
       description: Where did you encounter the bug?
       options:
         - Antigravity App (Dock / Launcher / Sidecar)
-        - MCP App Settings UI (aux_pane / Plugins sidebar)
+        - Sidecar Web UI (aux_pane / Plugins sidebar)
         - Antigravity CLI (agy) / Gemini SDK
         - Installer / Uninstaller (install / uninstall / integration)
         - Local Proxy (serve / Hybrid Mode / SSE streaming)

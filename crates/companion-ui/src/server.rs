@@ -8,21 +8,9 @@ use companion_core::{
     ProxyHealthSummary, StatsSnapshot, curated_model_presets,
 };
 use companion_providers::{DEFAULT_PROBE_TIMEOUT, LoopbackProxyClient, evaluate_health};
-use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{
-    ErrorData, Implementation, ListResourcesResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ServerCapabilities, ServerConfig,
-};
-use rmcp::service::RequestContext;
-use rmcp::transport::io::stdio;
-use rmcp::{RoleServer, ServerHandler, ServiceExt, tool_handler};
 
-use crate::types::{AccountPlanStatus, SettingsSnapshot, UiMcpError, UiServerOptions};
-use crate::ui_resource::{
-    EMBEDDED_UI_HTML, UI_MIME_TYPE, UI_RESOURCE_URI, companion_icons, load_ui_html_override,
-    resolve_ui_html_override_path, ui_resource_meta,
-};
+use crate::types::{AccountPlanStatus, SettingsSnapshot, UiError, UiServerOptions};
+use crate::ui_resource::{EMBEDDED_UI_HTML, load_ui_html_override, resolve_ui_html_override_path};
 
 pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = DEFAULT_PROBE_TIMEOUT.as_secs();
 
@@ -33,28 +21,24 @@ pub struct CompanionUiServer {
     pub(crate) proxy_client: LoopbackProxyClient,
     pub(crate) config_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) integration_write_lock: Arc<tokio::sync::Mutex<()>>,
-    tool_router: ToolRouter<Self>,
     pub(crate) options: UiServerOptions,
 }
 
 impl CompanionUiServer {
-    pub fn new(config_path: PathBuf) -> Result<Self, UiMcpError> {
+    pub fn new(config_path: PathBuf) -> Result<Self, UiError> {
         Self::with_options(config_path, UiServerOptions::default())
     }
 
-    pub fn with_options(
-        config_path: PathBuf,
-        options: UiServerOptions,
-    ) -> Result<Self, UiMcpError> {
+    pub fn with_options(config_path: PathBuf, options: UiServerOptions) -> Result<Self, UiError> {
         let auth_store: Arc<dyn AuthStore> = match options.auth_store_override.clone() {
             Some(store) => store,
             None => Arc::new(
                 FileAuthStore::for_config_path(&config_path)
-                    .map_err(|err| UiMcpError::Initialize(err.to_string()))?,
+                    .map_err(|err| UiError::Initialize(err.to_string()))?,
             ),
         };
         let proxy_client = LoopbackProxyClient::new(options.probe_timeout, options.probe_timeout)
-            .map_err(|err| UiMcpError::HttpClient(err.to_string()))?;
+            .map_err(|err| UiError::HttpClient(err.to_string()))?;
 
         Ok(Self {
             config_path,
@@ -62,7 +46,6 @@ impl CompanionUiServer {
             proxy_client,
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             integration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            tool_router: Self::tool_router(),
             options,
         })
     }
@@ -71,23 +54,7 @@ impl CompanionUiServer {
         &self.config_path
     }
 
-    pub fn list_tool_definitions(&self) -> Vec<rmcp::model::Tool> {
-        self.tool_router.list_all()
-    }
-
-    pub fn list_ui_resources(&self) -> ListResourcesResult {
-        let resource = Resource::new(UI_RESOURCE_URI, "Antigravity Companion Settings")
-            .with_title("Antigravity Companion Settings")
-            .with_description(
-                "Embedded MCP App UI for configuring Gemini API access and inspecting local proxy telemetry.",
-            )
-            .with_mime_type(UI_MIME_TYPE)
-            .with_icons(companion_icons())
-            .with_meta(ui_resource_meta());
-        ListResourcesResult::with_all_items(vec![resource])
-    }
-
-    pub async fn load_ui_html(&self) -> Result<String, ErrorData> {
+    pub async fn load_ui_html(&self) -> Result<String, String> {
         let override_path = resolve_ui_html_override_path(&self.options.ui_html_source);
         match override_path {
             Some(path) => load_ui_html_override(path).await,
@@ -95,47 +62,27 @@ impl CompanionUiServer {
         }
     }
 
-    pub async fn read_ui_resource(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
-        if uri != UI_RESOURCE_URI {
-            return Err(ErrorData::resource_not_found(
-                format!("unknown resource: {uri}"),
-                None,
-            ));
-        }
-
-        let html = self.load_ui_html().await?;
-
-        let contents = ResourceContents::text(html, UI_RESOURCE_URI)
-            .with_mime_type(UI_MIME_TYPE)
-            .with_meta(ui_resource_meta());
-        Ok(ReadResourceResult::new(vec![contents]))
-    }
-
-    pub(crate) async fn load_config_blocking(
-        &self,
-    ) -> Result<Result<Config, CoreError>, ErrorData> {
+    pub(crate) async fn load_config_blocking(&self) -> Result<Config, String> {
         let config_path = self.config_path.clone();
         tokio::task::spawn_blocking(move || Config::load_or_default(&config_path))
             .await
-            .map_err(|err| {
-                ErrorData::internal_error(format!("config load task failed: {err}"), None)
-            })
+            .map_err(|err| format!("config load task failed: {err}"))?
+            .map_err(|err| err.to_string())
     }
 
     pub(crate) async fn load_config_and_auth_blocking(
         &self,
-    ) -> Result<Result<(Config, Option<GeminiCredentials>), CoreError>, ErrorData> {
+    ) -> Result<(Config, Option<GeminiCredentials>), String> {
         let config_path = self.config_path.clone();
         let auth_store = Arc::clone(&self.auth_store);
         tokio::task::spawn_blocking(move || {
             let cfg = Config::load_or_default(&config_path)?;
             let gemini_creds = auth_store.load_gemini()?;
-            Ok((cfg, gemini_creds))
+            Ok::<_, CoreError>((cfg, gemini_creds))
         })
         .await
-        .map_err(|err| {
-            ErrorData::internal_error(format!("config/auth load task failed: {err}"), None)
-        })
+        .map_err(|err| format!("config/auth load task failed: {err}"))?
+        .map_err(|err| err.to_string())
     }
 
     async fn probe_proxy(
@@ -192,15 +139,6 @@ impl CompanionUiServer {
             .unwrap_or_else(companion_core::integration::detect_hybrid_active)
     }
 
-    pub(crate) async fn build_snapshot(
-        &self,
-        cfg: &Config,
-        gemini_creds: Option<&GeminiCredentials>,
-    ) -> SettingsSnapshot {
-        self.build_snapshot_with_session(cfg, gemini_creds, None, None)
-            .await
-    }
-
     pub(crate) async fn build_snapshot_with_session(
         &self,
         cfg: &Config,
@@ -251,7 +189,7 @@ impl CompanionUiServer {
         );
         let proxy_rss_bytes = stats.as_ref().and_then(|s| s.proxy_rss_bytes);
 
-        // Antigravity's mcp.restoreEnv() strips CLOUD_CODE_URL from MCP children, so a recorded
+        // Sidecar launcher scripts scrub CLOUD_CODE_URL to prevent self-looping, so a recorded
         // fetchAvailableModels refresh on our local proxy is authoritative proof of live Hybrid Mode.
         if stats
             .as_ref()
@@ -275,58 +213,4 @@ impl CompanionUiServer {
             proxy_rss_bytes,
         }
     }
-}
-
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for CompanionUiServer {
-    fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .build(),
-        )
-        .with_server_info(
-            Implementation::new("agy-companion", env!("CARGO_PKG_VERSION"))
-                .with_title("Antigravity Companion")
-                .with_icons(companion_icons()),
-        )
-        .with_instructions(
-            "Antigravity Companion settings and proxy telemetry MCP App. Call open_settings to launch the settings panel.",
-        )
-    }
-
-    async fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(self.list_ui_resources())
-    }
-
-    async fn read_resource(
-        &self,
-        request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResponse, ErrorData> {
-        let result = self.read_ui_resource(&request.uri).await?;
-        Ok(result.into())
-    }
-}
-
-pub async fn serve_stdio(config_path: PathBuf) -> Result<(), UiMcpError> {
-    serve_stdio_with_options(config_path, UiServerOptions::default()).await
-}
-
-pub async fn serve_stdio_with_options(
-    config_path: PathBuf,
-    options: UiServerOptions,
-) -> Result<(), UiMcpError> {
-    let server = CompanionUiServer::with_options(config_path, options)?;
-    let running = server
-        .serve(stdio())
-        .await
-        .map_err(|err| UiMcpError::Initialize(err.to_string()))?;
-    let _quit = running.waiting().await?;
-    Ok(())
 }

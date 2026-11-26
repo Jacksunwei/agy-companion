@@ -1,7 +1,7 @@
 """Lean headless Chrome CDP UI smoke suite (`--suite ui-smoke`).
 
 Renders the compiled `ui/dist/index.html` inside a pure-stdlib loopback mock
-MCP App host and verifies:
+Sidecar Web UI host and verifies:
 1. Multi-viewport (`360px`/`460px`/`760px`) × Dark/Light × 3-tab rendering,
    single-column `.content-wrap` centering, zero horizontal overflow, zero
    legacy copy tokens, WCAG AA `>= 4.5:1` contrast (incl. Light `--brand`

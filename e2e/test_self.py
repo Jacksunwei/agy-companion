@@ -1,11 +1,9 @@
 """Slim pure-Python harness safety guardrails (`python3 -B e2e/run_e2e.py --self-test`).
 
-Covers the 3 essential harness contracts without requiring a compiled binary:
+Covers the essential harness contracts without requiring a compiled binary:
   1. `IsolatedEnv`: hostile env scrubbing (zero in-process `os.environ` mutation),
      ephemeral loopback port outside `RESERVED_PORT_RANGE`, `0600` config write, teardown.
   2. `PidfileReaper`: LIFO `ExitStack` teardown and 5-layer unsafe-target refusal.
-  3. `McpStdioClient`: JSON-RPC 2.0 framing, UX v2 `save_settings` kwargs, stdout purity,
-     fast EOF detection, timeout, and hung-server teardown.
 """
 
 from __future__ import annotations
@@ -28,40 +26,6 @@ from harness import (
     register_pidfile_cleanup,
     run_cli,
 )
-from mcp_client import (
-    McpEofError,
-    McpProtocolViolationError,
-    McpStdioClient,
-    McpTimeoutError,
-)
-
-
-_FAKE_MCP_SERVER_SCRIPT = r"""
-import json, sys, time
-mode = sys.argv[1]
-def send(obj):
-    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-for raw in sys.stdin:
-    msg = json.loads(raw)
-    if "id" not in msg:
-        continue
-    mid = msg["id"]
-    method = msg.get("method", "")
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "0.1.0"}}})
-        if mode == "pollute":
-            sys.stdout.write("STRAY LOG LINE\n")
-            sys.stdout.flush()
-    elif method == "tools/list":
-        if mode == "crash":
-            sys.exit(1)
-        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": "save_settings", "inputSchema": {"type": "object", "properties": {"proxy": {}, "cloudcode": {}, "providers": {}, "account_plan": {}}}}]}})
-    elif method == "tools/call":
-        if mode == "hang":
-            time.sleep(30)
-        send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "ok"}], "structuredContent": {"echo_args": msg.get("params", {}).get("arguments", {})}}})
-"""
 
 
 class TestHarnessGuardrails(E2ETestCase):
@@ -198,64 +162,3 @@ class TestHarnessGuardrails(E2ETestCase):
             if sleeper2.poll() is None:
                 sleeper2.kill()
                 sleeper2.wait(timeout=2.0)
-
-    def test_self_03_mcp_client_framing_ux_v2_kwargs_purity_and_teardown(self) -> None:
-        """McpStdioClient frames JSON-RPC 2.0, forwards UX v2 kwargs, catches stdout pollution/EOF/timeout, and cleans up."""
-        iso = self.make_env()
-        proc_env = iso.build_env()
-
-        def _spawn(mode: str) -> McpStdioClient:
-            return McpStdioClient(
-                [sys.executable, "-B", "-u", "-c", _FAKE_MCP_SERVER_SCRIPT, mode],
-                env=proc_env,
-            )
-
-        with _spawn("normal") as client:
-            init = client.initialize(timeout=5.0)
-            self.assertEqual(init["serverInfo"]["version"], "0.1.0")
-            res = client.save_settings_smart(
-                api_key="test-key-synthetic",
-                enabled_models=["gemini-4-hydrogen"],
-                account_plan="organization",
-                timeout=5.0,
-            )
-            echoed = res["structuredContent"]["echo_args"]
-            self.assertEqual(
-                echoed,
-                {
-                    "account_plan": "organization",
-                    "providers": {
-                        "gemini": {
-                            "api_key": {"set": "test-key-synthetic"},
-                            "enabled_models": ["gemini-4-hydrogen"],
-                        }
-                    },
-                },
-            )
-            client.assert_clean_stdout()
-            normal_pid = client.pid
-        if os.name != "nt" and normal_pid is not None:
-            with self.assertRaises(ProcessLookupError):
-                os.kill(normal_pid, 0)
-
-        with _spawn("pollute") as client:
-            client.initialize(timeout=5.0)
-            client.list_tools(timeout=5.0)
-            with self.assertRaises(McpProtocolViolationError):
-                client.assert_clean_stdout()
-
-        with _spawn("crash") as client:
-            client.initialize(timeout=5.0)
-            t0 = time.monotonic()
-            with self.assertRaises(McpEofError):
-                client.list_tools(timeout=5.0)
-            self.assertLess(time.monotonic() - t0, 1.5)
-
-        with _spawn("hang") as client:
-            client.initialize(timeout=5.0)
-            with self.assertRaises(McpTimeoutError):
-                client.call_tool("save_settings", {}, timeout=0.25)
-            hung_pid = client.pid
-        if os.name != "nt" and hung_pid is not None:
-            with self.assertRaises(ProcessLookupError):
-                os.kill(hung_pid, 0)

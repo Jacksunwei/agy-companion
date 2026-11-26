@@ -39,10 +39,6 @@ def _write_valid_plugin_tree(root: pathlib.Path, *, logo_rel: str = "assets/logo
         json.dumps({"name": "agy-companion", "version": "0.1.0", "logo": logo_rel}),
         encoding="utf-8",
     )
-    (plugin / "mcp_config.json").write_text(
-        json.dumps({"mcpServers": {"hub": {"command": "bash", "args": []}}}),
-        encoding="utf-8",
-    )
     (plugin / "sidecars" / "proxy" / "sidecar.json").write_text(
         json.dumps({"command": "bash", "args": ["serve"]}),
         encoding="utf-8",
@@ -177,7 +173,7 @@ class TestCheckPluginLogo(unittest.TestCase):
             # Malformed manifest JSON
             bad_json_root = root / "bad_json"
             _write_valid_plugin_tree(bad_json_root)
-            (bad_json_root / "plugin" / "mcp_config.json").write_text("{invalid", encoding="utf-8")
+            (bad_json_root / "plugin" / "sidecars" / "proxy" / "sidecar.json").write_text("{invalid", encoding="utf-8")
             self.assertTrue(validate_plugin_dir(bad_json_root))
 
 

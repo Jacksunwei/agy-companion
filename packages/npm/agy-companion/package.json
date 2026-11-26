@@ -1,7 +1,7 @@
 {
   "name": "agy-companion",
   "version": "0.0.2",
-  "description": "Bring your own models (BYOM) and track token usage and costs in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and embedded MCP App Settings UI.",
+  "description": "Bring your own models (BYOM) and track token usage and costs in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and native Sidecar Web UI.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -23,7 +23,6 @@
     "ollama",
     "usage",
     "cost",
-    "mcp",
     "companion"
   ],
   "engines": {

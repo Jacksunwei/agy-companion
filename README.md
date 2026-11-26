@@ -33,7 +33,7 @@
 | --- | --- |
 | **Keep Your Built-In Models (Day-0 Safe)** | Leaves Antigravity's native model picker completely untouched until you save an API key. Once configured, your `(Proxy)` Gemini 3.8+ / 4+ models appear *alongside* your existing Google AI Pro, PayGo, or Enterprise models — never replacing them. |
 | **Zero-Overhead Implicit Prompt Caching** | Forwards Gemini requests byte-for-byte with zero proxy re-serialization or HTTP compression tampering, preserving Gemini's implicit context caching while teeing token and cache metrics off the live SSE stream without buffering. |
-| **Native MCP App UI Inside Antigravity** | Manage write-only API keys, test connections, choose models, toggle Dock auto-start, and watch live token and cache hit-rates directly in Antigravity's side panel (`aux_pane`) or left **Plugins** sidebar (`global`). |
+| **Native Sidecar Web UI Inside Antigravity** | Manage write-only API keys, test connections, choose models, toggle Dock auto-start, and watch per-session live token and cache hit-rates directly in Antigravity's Aux Pane (`sidecar://agy-companion/proxy/`). |
 | **Seamless Dock & Launcher Auto-Start** | Wakes an on-demand local daemon automatically when you launch Antigravity from the stock macOS Dock, Spotlight, Linux desktop launcher, or Windows Start Menu shortcut — with clean idle shutdown and isolated integrated terminals. Never patches `Antigravity.app` or `~/.gemini/config/config.json`. |
 | **Single Local-Only Rust Binary** | Zero runtime dependencies (no Node or Python needed after install), `#![forbid(unsafe_code)]`, strictly bound to `127.0.0.1`, `0600` redacted key storage, and local WAL-mode SQLite `usage.db` recording token counts and latency only. |
 | **Built for Multi-Provider BYOM** | Antigravity speaks one inbound wire protocol (Gemini API), so every new backend plugs in as a direct 1-hop Rust [`ProviderAdapter`](crates/companion-providers/src/lib.rs) — ready for Ollama Cloud, OpenAI-compatible endpoints, Codex, and Claude. |
@@ -67,13 +67,13 @@ uvx --refresh agy-companion install
 <summary>Upgrade, Uninstall, Full Purge, One-Shot Launch &amp; Alternative Modes</summary>
 
 - **Upgrade:** Re-run `npx -y agy-companion@latest install` (or `npm i -g agy-companion@latest && agy-companion install`). Performs an atomic binary and plugin swap and safely replaces any version-skewed background proxy.
-- **Uninstall (preserves `config.json` and `usage/`):**
+- **Uninstall (preserves `config.json`, `auth/`, and `usage/`):**
   ```bash
   npx -y agy-companion@latest uninstall
   # or, if already on $PATH:
   agy-companion uninstall
   ```
-- **Full purge (also deletes `config.json`, `usage/`, `proxy.log`, and `sidecar_data/agy-companion`):**
+- **Full purge (also deletes `config.json`, `auth/`, `usage/`, `proxy.log`, and `sidecar_data/agy-companion`):**
   ```bash
   npx -y agy-companion@latest uninstall --purge
   ```
@@ -150,7 +150,7 @@ Requires Rust (`edition = "2024"`) and Node `>= 18` (for building the embedded U
 # Option A: Build UI + Rust debug binary and symlink ./plugin into ~/.gemini/config/plugins/agy-companion
 ./scripts/dev-install.sh
 
-# Option B: Run the full installer directly from source (embeds the 7-file plugin + Dock/Launcher hook)
+# Option B: Run the full installer directly from source (embeds the 6-file plugin + Dock/Launcher hook)
 cargo run -p companion-cli -- install
 
 # Option C: Run the standalone loopback proxy in the foreground
@@ -164,18 +164,16 @@ cargo run -p companion-cli -- serve
 ```mermaid
 flowchart LR
     Client["Antigravity App / agy CLI / SDKs"]
-    Proxy["Local Loopback Proxy<br/>127.0.0.1:24141 (Axum)"]
+    Proxy["Local Loopback Proxy & Sidecar Web UI<br/>127.0.0.1:24141 + Aux Pane UI (Axum)"]
     Adapter["ProviderAdapter<br/>Gemini byte-for-byte pass-through<br/>(future: Ollama / OpenAI / Claude)"]
     Upstream["Upstream Model API<br/>(Gemini API today)"]
     Usage["Local SQLite usage.db<br/>Token & cache metrics only"]
-    Mcp["Native MCP App UI<br/>Side panel & Plugins sidebar"]
 
     Client -->|"Gemini API / Hybrid Mode"| Proxy
+    Client <-->|"Sidecar Web UI (/_api/*)"| Proxy
     Proxy --> Adapter
     Adapter -->|"HTTPS · x-goog-api-key"| Upstream
     Proxy -.->|"Zero-buffer SSE telemetry tee"| Usage
-    Client <-->|"stdio MCP App"| Mcp
-    Mcp -.->|"0600 config · /health · /api/stats"| Proxy
 ```
 
 ### Workspace Map
@@ -186,10 +184,10 @@ flowchart LR
 | **Core Domain** | [`crates/companion-core`](crates/companion-core/README.md) | Nested v1 config, atomic/TOCTOU-safe file I/O, model catalog, secret redaction, SQLite WAL `UsageSink`, and shell hook integration. |
 | **Provider Layer** | [`crates/companion-providers`](crates/companion-providers/README.md) | `ProviderAdapter` async trait, zero-compression `GeminiProvider`, and shared loopback probe client. |
 | **Loopback Proxy** | [`crates/companion-proxy`](crates/companion-proxy/README.md) | `127.0.0.1` Axum HTTP proxy, Hybrid Mode catalog bridge, non-blocking config hot-reload, idle shutdown, and SSE usage tee. |
-| **MCP App Server** | [`crates/companion-ui-mcp`](crates/companion-ui-mcp/README.md) | Stdio MCP server serving the embedded settings UI and redacted config, health, and launcher tools. |
-| **Unified CLI** | [`crates/companion-cli`](crates/companion-cli/README.md) | Single `agy-companion` binary embedding the plugin bundle with `install`, `uninstall`, `serve`, `ui-mcp`, `doctor`, `models`, `launch`, `hook-env`, and `integration`. |
-| **Embedded UI** | [`ui/`](ui/) | Vite + TypeScript single-file MCP App frontend compiled into `ui/dist/index.html` and embedded at build time. |
-| **Antigravity Plugin** | [`plugin/README.md`](plugin/README.md) | Plugin manifest, bundled SVG icon, MCP & sidecar definitions, hardened launcher script, and companion skill. |
+| **UI Backend** | [`crates/companion-ui`](crates/companion-ui/README.md) | Embedded UI asset loader and redacted settings, health, usage, and launcher integration service backing the Sidecar Web UI. |
+| **Unified CLI** | [`crates/companion-cli`](crates/companion-cli/README.md) | Single `agy-companion` binary embedding the 6-file plugin bundle with `install`, `uninstall`, `serve` (proxy + Sidecar Web UI), `doctor`, `models`, `launch`, `hook-env`, and `integration`. |
+| **Embedded UI** | [`ui/`](ui/) | Zero-runtime-dependency Vite + TypeScript single-file Sidecar Web UI frontend compiled into `ui/dist/index.html` and embedded at build time. |
+| **Antigravity Plugin** | [`plugin/README.md`](plugin/README.md) | Plugin manifest, bundled SVG icon, Sidecar Web UI definition, hardened launcher script, and companion skill. |
 | **Distribution Shims** | [`packages/`](packages/) | Cross-platform npm (`agy-companion` / `agyc` + 5 platform packages) and Python (`maturin`) binary wrappers. |
 | **Opaque-Box E2E** | [`e2e/README.md`](e2e/README.md) | Pure Python 3 stdlib parallel intent-named opaque-box end-to-end test suite verifying binary CUJs, security boundaries, runtime shims, and headless Chrome UI smoke. |
 
@@ -200,9 +198,9 @@ flowchart LR
 Because `agy-companion` sits on your machine and handles model API keys, security is built into the core invariants rather than bolted on later:
 
 - **Loopback-only (`127.0.0.1`):** Refuses `0.0.0.0`, `::`, and non-loopback hosts, re-verifies the bound socket address at startup, and exposes no `--host` CLI flag.
-- **Write-only, redacted secrets:** API keys are written atomically outside workspaces (`0600` on Unix, user-profile ACLs on Windows), never returned in plaintext by MCP tools, and sent upstream strictly via `x-goog-api-key` headers (never `?key=` query strings).
+- **Write-only, redacted secrets:** API keys are written atomically outside workspaces (`0600` on Unix, user-profile ACLs on Windows), never returned in plaintext by UI APIs, and sent upstream strictly via `x-goog-api-key` headers (never `?key=` query strings).
 - **Zero prompt or response logging:** Local SQLite `usage.db` (`0600`, WAL mode) records token counts, cache hits, and latency only — never prompt text, code, or API keys.
-- **Memory-safe Rust + CSP-locked UI:** `#![forbid(unsafe_code)]` across every Rust crate, SSRF and HTTP redirect blocking (`Policy::none()`), upfront 64 MiB request bounds, and a zero-`innerHTML` / zero-network-fetch MCP App frontend.
+- **Memory-safe Rust + CSP-locked UI:** `#![forbid(unsafe_code)]` across every Rust crate, SSRF and HTTP redirect blocking (`Policy::none()`), upfront 64 MiB request bounds, and a zero-`innerHTML` Sidecar Web UI frontend authenticated with per-launch `X-Sidecar-Token`.
 - **Non-invasive & cleanly reversible:** Never patches `Antigravity.app` or mutates `~/.gemini/config/config.json`; `uninstall` removes hooks, plugin files, and binary cleanly without touching unrelated processes or files.
 
 See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and [`AGENTS.md`](AGENTS.md#architecture--security-invariants) for the full S1–S8 security enforcement contract.
@@ -214,13 +212,12 @@ See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and [`AGENT
 
 | Command | Flags & Behavior |
 | --- | --- |
-| `agy-companion install` | `[--config <CONFIG>]` `[--plugins-dir <DIR>]` `[--no-launcher-hook]` `[--no-start-proxy]` `[--force]` `[--json]` — installs the embedded 7-file plugin, stages the native binary, configures Dock/Launcher hook (or Windows Start Menu `.lnk`), and starts/upgrades the local proxy. |
-| `agy-companion uninstall` | `[--config <CONFIG>]` `[--plugins-dir <DIR>]` `[--purge]` `[--dry-run]` `[--json]` — removes shell hooks, plugin directory, and verified proxy daemon; preserves `config.json` and `usage/` unless `--purge` is passed. |
+| `agy-companion install` | `[--config <CONFIG>]` `[--plugins-dir <DIR>]` `[--no-launcher-hook]` `[--no-start-proxy]` `[--force]` `[--json]` — installs the embedded 6-file plugin, stages the native binary, configures Dock/Launcher hook (or Windows Start Menu `.lnk`), and starts/upgrades the local proxy. |
+| `agy-companion uninstall` | `[--config <CONFIG>]` `[--plugins-dir <DIR>]` `[--purge]` `[--dry-run]` `[--json]` — removes shell hooks, plugin directory, and verified proxy daemon; preserves `config.json`, `auth/`, and `usage/` unless `--purge` is passed. |
 | `agy-companion integration` | `enable\|disable\|status [--shell <zsh\|bash\|fish>] [--rc-file <PATH>] [--binary <PATH>] [--follow-rc-symlink] [--json]` — manages Dock/Launcher login-shell integration (`--binary` on `enable`; `--follow-rc-symlink` on `enable`/`disable`). |
 | `agy-companion hook-env` | `[--ensure-running]` `[--print-port]` `[--port <PORT>]` `[--config <CONFIG>]` `[--plugins-dir <DIR>]` — fail-open login-shell helper that wakes the managed daemon and prints its validated port. |
-| `agy-companion serve` | `[--port <PORT>]` (`1–65535`, default `24141`) `[--config <CONFIG>]` `[--adopt-running]` `[--idle-shutdown-secs <SECS>]` — runs the loopback proxy strictly on `127.0.0.1` (no `--host` flag). |
+| `agy-companion serve` | `[--port <PORT>]` (`1–65535`, default `24141`) `[--config <CONFIG>]` `[--adopt-running]` `[--auto-enable-launcher]` `[--idle-shutdown-secs <SECS>]` — runs the loopback proxy strictly on `127.0.0.1` (no `--host` flag) and optional Sidecar Web UI (`ANTIGRAVITY_SIDECAR_WEB_PORT`). |
 | `agy-companion launch` | `[--port <PORT>]` `[--config <CONFIG>]` `[--app <PATH>]` `[--print-env]` — launches Antigravity App directly in Hybrid Mode for a single session. |
-| `agy-companion ui-mcp` | `[--data-dir <DATA_DIR>]` `[--config <CONFIG>]` — stdio MCP App server (`stdout` strictly JSON-RPC, logs to `stderr`). |
 | `agy-companion doctor` | `[--config <CONFIG>]` `[--port <PORT>]` `[--json]` — verifies config permissions, schema, proxy `/health`, version match, and env setup. |
 | `agy-companion models` | `[--json]` `[--port <PORT>]` `[--config <CONFIG>]` — prints `customModelsConfig` JSON for `agy` CLI. |
 | `agy-companion --version` | Prints `agy-companion 0.0.2`. |
@@ -240,13 +237,14 @@ See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and [`AGENT
 | Resource | Precedence Order (Highest → Lowest) |
 | --- | --- |
 | **Config file** | `--config <path>` → `AGY_COMPANION_CONFIG` → `$XDG_CONFIG_HOME/agy-companion/config.json` → Platform default |
+| **Auth credentials (`auth/gemini.json`)** | Sibling `auth/` directory next to the resolved `config.json` (`0700` dir / `0600` file on Unix) |
 | **Data dir (`env.sh`, `proxy.pid`, `proxy.log`, `bin/`)** | `$XDG_DATA_HOME/agy-companion` → Platform default |
 | **Usage dir (`usage.db`)** | `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → Platform default |
 
-| Platform | Default Config File | Default Data / Usage Directory |
+| Platform | Default Config & Auth Files | Default Data / Usage Directory |
 | --- | --- | --- |
-| **macOS & Linux** | `~/.config/agy-companion/config.json` *(no `~/Library/Application Support/` drift)* | `~/.local/share/agy-companion` (`usage/`, `env.sh`, `proxy.pid`, `proxy.log`, `bin/`) |
-| **Windows** | `%APPDATA%\agy-companion\config.json` *(fallback: `%USERPROFILE%\.config\agy-companion\config.json`)* | `%LOCALAPPDATA%\agy-companion` (`usage/`, `proxy.pid`, `proxy.log`, `bin/`; fallback: `%USERPROFILE%\.local\share\agy-companion`) |
+| **macOS & Linux** | `~/.config/agy-companion/config.json` + `auth/gemini.json` *(no `~/Library/Application Support/` drift)* | `~/.local/share/agy-companion` (`usage/`, `env.sh`, `proxy.pid`, `proxy.log`, `bin/`) |
+| **Windows** | `%APPDATA%\agy-companion\config.json` + `auth\gemini.json` *(fallback: `%USERPROFILE%\.config\agy-companion\...`)* | `%LOCALAPPDATA%\agy-companion` (`usage/`, `proxy.pid`, `proxy.log`, `bin/`; fallback: `%USERPROFILE%\.local\share\agy-companion`) |
 
 `XDG_CONFIG_HOME` and `XDG_DATA_HOME` apply only when set, non-empty, and absolute; `..` traversal, NUL bytes, symlinks, and non-regular files are rejected fail-closed.
 
@@ -260,7 +258,7 @@ Full architecture & security enforcement details: [`docs/design/architecture.md`
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| **Core Gemini BYOM (`v0.0.2`)** | Loopback Rust proxy with implicit cache preservation, Day-0 safe Hybrid Mode, Dock/Launcher auto-start, one-command `install`/`uninstall`, native MCP App UI, SQLite WAL `usage.db` capture, cross-platform npm/PyPI shims | Shipped |
+| **Core Gemini BYOM (`v0.0.2`)** | Loopback Rust proxy with implicit cache preservation, Day-0 safe Hybrid Mode, Dock/Launcher auto-start, one-command `install`/`uninstall`, native Sidecar Web UI, SQLite WAL `usage.db` capture, cross-platform npm/PyPI shims | Shipped |
 | **UX v2 & Usage Dashboard** | Multi-select enabled models with tooltips, dedicated **Usage** historical analytics & cost tab backed by `usage.db`, modular multi-provider Settings UI | Shipped ([design spec](docs/design/ui-ux-v2.md)) |
 | **Ollama Cloud & OpenAI-Compatible Adapter** | Direct 1-hop `Gemini ↔ OpenAI Chat Completions` adapter unlocking Ollama Cloud, local Ollama, OpenRouter, vLLM, LM Studio, and OpenAI API | Planned — **Contributors Welcome** |
 | **Codex & Claude Adapters** | First-class provider adapters for OpenAI Codex and Anthropic Claude | Planned — **Contributors Welcome** |
@@ -313,7 +311,7 @@ python3 -B e2e/run_e2e.py --suite all --workers 4 --binary target/debug/agy-comp
 ```
 
 - **Contributor Guide:** [`CONTRIBUTING.md`](CONTRIBUTING.md) — prerequisites, adding a `ProviderAdapter`, UI hot-reload, commit conventions.
-- **Local Dev Runbook:** [`.agents/skills/local-dev/SKILL.md`](.agents/skills/local-dev/SKILL.md) — zero-rebuild UI iteration via `AGY_COMPANION_UI_HTML`, live MCP server reload, log inspection.
+- **Local Dev Runbook:** [`.agents/skills/local-dev/SKILL.md`](.agents/skills/local-dev/SKILL.md) — zero-rebuild UI iteration via `AGY_COMPANION_UI_HTML`, live sidecar reload, log inspection.
 - **Coding Agents:** [`AGENTS.md`](AGENTS.md) — canonical repo contract, verification gates, and S1–S8 invariants.
 - **Security Policy:** [`SECURITY.md`](SECURITY.md) — private vulnerability reporting and security scope.
 

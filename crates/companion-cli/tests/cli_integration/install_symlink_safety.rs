@@ -1,5 +1,5 @@
 //! Minimum Symlink Wiring Matrix (WS4): 9 behavioral CLI wiring tests across all 7 required
-//! surfaces (`install`, `uninstall`/`--purge`, `integration`, `serve`, `usage.db`, `ui-mcp`,
+//! surfaces (`install`, `uninstall`/`--purge`, `integration`, `serve`, `usage.db`, `sidecar_ui`,
 //! `doctor`) plus Stow Fish and default-XDG ancestors. Exhaustive path-chain & normalization
 //! permutations are owned by `companion_core::fs_safe`.
 
@@ -13,12 +13,12 @@ mod symlink_matrix {
     use std::time::{Duration, Instant};
 
     use companion_core::integration::{ENV_SCRIPT_FILENAME, INTEGRATION_LOCK_FILENAME};
-    use serde_json::{Value, json};
+    use serde_json::Value;
     use tempfile::TempDir;
 
     use crate::common::{
         ChildGuard, config_with_port, free_loopback_port, isolated_cli_command,
-        run_ui_mcp_bounded_with_env,
+        loopback_http_client, spawn_serve_and_wait_healthy,
     };
 
     const VICTIM_BYTES: &str = "DO_NOT_DELETE\n";
@@ -494,8 +494,9 @@ mod symlink_matrix {
         assert_victim_intact(&victim_rc, "symlinked .zlogin");
     }
 
-    /// Surface 4 (`serve`): rejects symlinked `config.json`, `usage_dir`, `proxy.pid`, `proxy.log`,
-    /// and `proxy.log.1` before creating `proxy.log` or binding its port, leaving victims intact.
+    /// Surface 4 (`serve`): rejects symlinked `config.json`, `auth/`, `auth/gemini.json`,
+    /// `usage_dir`, `proxy.pid`, `proxy.log`, and `proxy.log.1` before creating `proxy.log` or
+    /// binding its port, leaving victims intact.
     #[test]
     fn matrix_serve_rejects_symlinked_config_usage_dir_pid_and_log() {
         for case in [
@@ -617,90 +618,52 @@ mod symlink_matrix {
         }
     }
 
-    /// Surface 6 (`ui-mcp`): rejects symlinked `config.json` eagerly and fails closed without
-    /// hanging when `AGY_COMPANION_UI_HTML` points to a FIFO.
-    #[test]
-    fn matrix_ui_mcp_rejects_symlinked_config_and_fifo_ui_html_override() {
+    /// Surface 6 (`sidecar_ui`): fails closed without hanging when `AGY_COMPANION_UI_HTML` points
+    /// to a FIFO.
+    #[tokio::test]
+    async fn matrix_sidecar_ui_rejects_fifo_ui_html_override_without_hanging() {
         let temp = TempDir::new().expect("tempdir");
         let home = temp.path().join("home");
-        let data_dir = temp.path().join("data");
+        let usage_dir = temp.path().join("usage");
         fs::create_dir_all(&home).expect("mkdir home");
-        fs::create_dir_all(&data_dir).expect("mkdir data");
+        fs::create_dir_all(&usage_dir).expect("mkdir usage");
 
-        // (a) Symlinked config.json -> exit 1, 0 stdout, victim intact
-        let victim = temp.path().join("victim_cfg.json");
-        write_victim(&victim);
-        let sym_cfg = temp.path().join("sym_cfg.json");
-        symlink(&victim, &sym_cfg).expect("sym config");
-        let (code, stdout, _stderr, timed_out) = run_ui_mcp_bounded_with_env(
-            &home,
-            &sym_cfg,
-            &data_dir,
-            &[],
-            vec![],
-            Duration::from_secs(5),
-        );
-        assert!(!timed_out);
-        assert_eq!(code, Some(1));
-        assert!(stdout.is_empty());
-        assert_victim_intact(&victim, "ui-mcp symlinked config");
-
-        // (a2) Symlinked auth/gemini.json -> exit 1, 0 stdout, victim intact
-        let sym_auth_root = temp.path().join("sym_auth_ui");
-        let sym_auth_cfg = sym_auth_root.join("config.json");
-        config_with_port(free_loopback_port())
-            .save_secure(&sym_auth_cfg)
-            .expect("save sym auth cfg");
-        let sym_auth_dir = sym_auth_root.join("auth");
-        fs::create_dir_all(&sym_auth_dir).expect("mkdir auth");
-        symlink(&victim, sym_auth_dir.join("gemini.json")).expect("sym auth/gemini.json");
-        let (code, stdout, _stderr, timed_out) = run_ui_mcp_bounded_with_env(
-            &home,
-            &sym_auth_cfg,
-            &data_dir,
-            &[],
-            vec![],
-            Duration::from_secs(5),
-        );
-        assert!(!timed_out);
-        assert_eq!(code, Some(1));
-        assert!(stdout.is_empty());
-        assert_victim_intact(&victim, "ui-mcp symlinked auth/gemini.json");
-
-        // (b) FIFO AGY_COMPANION_UI_HTML -> bounded non-hanging JSON-RPC error on resources/read
         let valid_cfg = temp.path().join("valid_cfg.json");
-        config_with_port(free_loopback_port())
-            .save_secure(&valid_cfg)
-            .expect("save valid cfg");
+        let mut cfg = config_with_port(free_loopback_port());
+        cfg.usage_dir = Some(usage_dir);
+        cfg.save_secure(&valid_cfg).expect("save valid cfg");
+
         let fifo_html = temp.path().join("override.html.fifo");
         make_fifo(&fifo_html);
+        let sidecar_port = free_loopback_port();
 
-        let (code, stdout, stderr, timed_out) = run_ui_mcp_bounded_with_env(
-            &home,
-            &valid_cfg,
-            &data_dir,
-            &[("AGY_COMPANION_UI_HTML", fifo_html.as_os_str())],
-            vec![json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "resources/read",
-                "params": { "uri": "ui://companion/settings.html" }
-            })],
+        let client = loopback_http_client();
+        let (_guard, _proxy_port, _health) =
+            spawn_serve_and_wait_healthy(client, &valid_cfg, |p| {
+                let mut cmd = isolated_cli_command(&home);
+                cmd.args(["serve", "--config"])
+                    .arg(&valid_cfg)
+                    .args(["--port", &p.to_string()])
+                    .env("ANTIGRAVITY_SIDECAR_WEB_PORT", sidecar_port.to_string())
+                    .env("ANTIGRAVITY_SIDECAR_UI_TOKEN", "fifo-test-tok")
+                    .env("AGY_COMPANION_UI_HTML", &fifo_html);
+                cmd
+            })
+            .await;
+
+        let resp = tokio::time::timeout(
             Duration::from_secs(5),
-        );
-        assert!(
-            !timed_out,
-            "ui-mcp must not hang on FIFO AGY_COMPANION_UI_HTML"
-        );
-        assert_eq!(code, Some(0), "stderr={stderr}");
-        let resp = stdout
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .find(|v| v["id"] == 2)
-            .unwrap_or_else(|| panic!("missing id=2 response: {stdout}"));
-        assert!(
-            resp.get("error").is_some(),
-            "FIFO UI HTML override must return JSON-RPC error, got: {resp}"
+            client
+                .get(format!("http://127.0.0.1:{sidecar_port}/"))
+                .send(),
+        )
+        .await
+        .expect("sidecar UI GET / must not hang on FIFO AGY_COMPANION_UI_HTML")
+        .expect("http response");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "FIFO UI HTML override must fail closed with HTTP 500"
         );
     }
 

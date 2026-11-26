@@ -3,7 +3,7 @@
 Exercises compiled binary boundaries without inspecting source code:
 - S1: Loopback-only binding (`0.0.0.0` / `::` / port `0` rejected, no `--host` flag, `localhost` allowed)
 - S2: Secret redaction, zero plaintext leaks across all outputs/logs/SQLite, `0600` tightening,
-      placeholder key quarantine, and MCP `deny_unknown_fields` / tool error boundaries
+      placeholder key quarantine, and Sidecar Web UI `deny_unknown_fields` / token / error boundaries
 - S3: Remote `http://`, embedded credentials, path traversal, and upstream HTTP `302` redirect blocking
 - S6: Post-M2 eager fail-closed symlink/FIFO/oversized config & runtime files, hot-reload symlink swap,
       XDG precedence/traversal, and symlink RC / dev-plugin guards
@@ -23,13 +23,13 @@ from typing import Any
 
 from harness import (
     E2ETestCase,
+    SidecarUiClient,
     find_free_port,
     http_raw_request,
     poll_usage_events,
     read_usage_raw_bytes,
     run_cli,
 )
-from mcp_client import McpStdioClient
 from mock_gemini import EchoChecksumAction, JsonAction, RawBytesAction
 
 
@@ -70,7 +70,7 @@ class TestBoundaryS1Loopback(E2ETestCase):
     FEATURE = "S1"
 
     def test_s1_loopback_only_binding_and_no_host_flag(self) -> None:
-        """S1: Rejects 0.0.0.0, ::, port 0, and --host flag across CLI & ui-mcp; accepts localhost."""
+        """S1: Rejects 0.0.0.0, ::, port 0, and --host flag across CLI & Sidecar Web UI; accepts localhost."""
         binary = self.require_binary()
         env = self.make_env()
         proc_env = env.build_env()
@@ -93,15 +93,14 @@ class TestBoundaryS1Loopback(E2ETestCase):
         r_flag = run_cli([str(binary), "serve", "--host", "0.0.0.0"], env=proc_env, timeout=5.0)
         self.assertNotEqual(r_flag.returncode, 0)
 
-        # (c) ui-mcp save_settings rejects 0.0.0.0 & port 0 without corrupting valid config.
+        # (c) Sidecar Web UI save_settings rejects 0.0.0.0 & port 0 without corrupting valid config.
         good_port = find_free_port()
         good_cfg = env.write_config(env.make_config_dict(listen_port=good_port))
         before = good_cfg.read_text(encoding="utf-8")
-        mcp = self.start_mcp(env, config_path=good_cfg)
+        ui = self.start_sidecar_ui(env, config_path=good_cfg)
         for bad_kwargs in ({"listen_host": "0.0.0.0"}, {"listen_port": 0}):
-            res = mcp.save_settings_smart(**bad_kwargs, raw=True)
-            mcp.assert_clean_stdout()
-            self.assertTrue(McpStdioClient.is_tool_error(res), f"Expected rejection for {bad_kwargs}: {res}")
+            res = ui.save_settings_smart(**bad_kwargs, raw=True)
+            self.assertTrue(SidecarUiClient.is_tool_error(res), f"Expected rejection for {bad_kwargs}: {res}")
         self.assertEqual(good_cfg.read_text(encoding="utf-8"), before)
 
         # (d) serve accepts proxy.host = "localhost".
@@ -139,20 +138,17 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
         )
         env.write_gemini_auth(sentinel_key, config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg, port=port, extra_env={"RUST_LOG": "debug"})
-        mcp = self.start_mcp(env, config_path=cfg, extra_env={"RUST_LOG": "debug"})
+        ui = self.start_sidecar_ui(env, config_path=cfg, extra_env={"RUST_LOG": "debug"})
 
-        save_res = mcp.save_settings_smart(default_model="gemini-3.8-flash")
-        mcp.assert_clean_stdout()
+        save_res = ui.save_settings_smart(default_model="gemini-3.8-flash")
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(os.lstat(cfg).st_mode), 0o600)
         cfg_text = cfg.read_text(encoding="utf-8")
         self.assertNotIn(sentinel_key, cfg_text)
         self.assertNotIn("api_key", cfg_text)
 
-        open_res = mcp.call_tool("open_settings", {})
-        get_res = mcp.call_tool("get_settings", {})
-        mcp.assert_clean_stdout()
-        for res in (save_res, open_res, get_res):
+        get_res = ui.call_tool("get_settings", {})
+        for res in (save_res, get_res):
             self.assertEqual(res["structuredContent"]["config"]["providers"]["gemini"]["api_key_hint"], "AIza...9999")
             self.assertNotIn(sentinel_key, json.dumps(res))
 
@@ -163,8 +159,7 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
                 payload={"error": {"code": 400, "message": "API_KEY_INVALID", "status": "INVALID_ARGUMENT"}},
             )
         )
-        tc_res = mcp.call_tool("test_connection", {})
-        mcp.assert_clean_stdout()
+        tc_res = ui.call_tool("test_connection", {})
         self.assertIs(tc_res["structuredContent"]["ok"], False)
         self.assertNotIn(sentinel_key, json.dumps(tc_res))
 
@@ -209,8 +204,7 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
         usage_raw = read_usage_raw_bytes(env.usage_dir)
 
         text_surfaces = {
-            "mcp_stdout": mcp.stdout_text,
-            "mcp_stderr": mcp.stderr_text,
+            "sidecar_ui_stderr": ui.stderr_text,
             "proxy_stderr": proxy.stderr_text,
             "health": health_text,
             "stats": stats_text,
@@ -220,7 +214,7 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
                 self.assertNotIn(secret, content, f"Leaked {secret!r} into {surface_name}")
             self.assertNotIn(secret.encode("utf-8"), usage_raw, f"Leaked {secret!r} into usage.db raw bytes")
 
-    def test_s2_placeholder_api_key_quarantine_across_cli_proxy_and_mcp(self) -> None:
+    def test_s2_placeholder_api_key_quarantine_across_cli_proxy_and_sidecar_ui(self) -> None:
         """S2: Quarantines PROXY_PLACEHOLDER_API_KEY across save_settings, doctor, Gemini 401, and Day-0 CloudCode."""
         binary = self.require_binary()
         env = self.make_env()
@@ -231,12 +225,11 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
         )
         auth_file = env.write_gemini_auth(real_key, config_path=cfg)
 
-        # (a) ui-mcp rejects exact & whitespace-padded placeholder key, preserving real key in auth/gemini.json.
-        mcp = self.start_mcp(env, config_path=cfg)
+        # (a) Sidecar Web UI rejects exact & whitespace-padded placeholder key, preserving real key in auth/gemini.json.
+        ui = self.start_sidecar_ui(env, config_path=cfg)
         for bad_key in (_PLACEHOLDER_KEY, f"  {_PLACEHOLDER_KEY}  "):
-            res = mcp.save_settings_smart(api_key=bad_key, raw=True)
-            mcp.assert_clean_stdout()
-            self.assertTrue(McpStdioClient.is_tool_error(res), f"Should reject placeholder {bad_key!r}: {res}")
+            res = ui.save_settings_smart(api_key=bad_key, raw=True)
+            self.assertTrue(SidecarUiClient.is_tool_error(res), f"Should reject placeholder {bad_key!r}: {res}")
         self.assertEqual(json.loads(auth_file.read_text(encoding="utf-8"))["api_key"], real_key)
         self.assertNotIn("api_key", json.loads(cfg.read_text(encoding="utf-8"))["providers"]["gemini"])
 
@@ -284,15 +277,20 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
         self.assertEqual(r_cc.body, day0_raw)
         self.assertNotIn("companion/", r_cc.text)
 
-    def test_s2_mcp_deny_unknown_fields_and_tool_error_boundaries(self) -> None:
-        """S2: MCP enforces deny_unknown_fields across all tools, mutually exclusive account_plan+cloudcode, and bad URI."""
+    def test_s2_sidecar_ui_deny_unknown_fields_and_error_boundaries(self) -> None:
+        """S2: Sidecar Web UI enforces X-Sidecar-Token (401), JSON Content-Type (415), deny_unknown_fields, and mutual exclusion."""
         env = self.make_env()
         cfg = env.write_config(env.make_config_dict())
         env.write_gemini_auth("AIzaSySchemaKeep1234", config_path=cfg)
         before = cfg.read_text(encoding="utf-8")
-        mcp = self.start_mcp(env, config_path=cfg)
+        ui = self.start_sidecar_ui(env, config_path=cfg)
 
-        # (a) save_settings unknown fields at every level + mutually exclusive account_plan & cloudcode.upstream.
+        # (a) Missing/wrong X-Sidecar-Token -> 401; non-JSON Content-Type -> 415.
+        self.assertEqual(ui.call_api("get_settings", {}, token="").status, 401)
+        self.assertEqual(ui.call_api("get_settings", {}, token="wrong-token").status, 401)
+        self.assertEqual(ui.call_api("get_settings", {}, content_type="text/plain").status, 415)
+
+        # (b) save_settings unknown fields at every level + mutually exclusive account_plan & cloudcode.upstream.
         bad_save_payloads: list[dict[str, Any]] = [
             {"bogus": 1},
             {"proxy": {"extra_proxy_field": 1}},
@@ -302,29 +300,24 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
             {"account_plan": "personal", "cloudcode": {"upstream": "auto"}},
         ]
         for payload in bad_save_payloads:
-            res = mcp.call_tool_raw("save_settings", payload)
-            mcp.assert_clean_stdout()
-            self.assertTrue(McpStdioClient.is_tool_error(res), f"Expected error for save_settings({payload}): {res}")
+            res = ui.call_tool_raw("save_settings", payload)
+            self.assertTrue(SidecarUiClient.is_tool_error(res), f"Expected error for save_settings({payload}): {res}")
         self.assertEqual(cfg.read_text(encoding="utf-8"), before)
 
-        # (b) set_launcher_integration unknown fields.
+        # (c) set_launcher_integration unknown fields.
         for payload in ({"enabled": True, "rc_file": "/tmp/x"}, {"enabled": True, "follow_rc_symlink": True}):
-            res = mcp.call_tool_raw("set_launcher_integration", payload)
-            mcp.assert_clean_stdout()
-            self.assertTrue(McpStdioClient.is_tool_error(res), f"Expected error for {payload}: {res}")
+            res = ui.call_tool_raw("set_launcher_integration", payload)
+            self.assertTrue(SidecarUiClient.is_tool_error(res), f"Expected error for {payload}: {res}")
 
-        # (c) get_usage invalid range & unknown field.
+        # (d) get_usage invalid range & unknown field.
         for payload in ({"range": "999d"}, {"range": "7d", "extra": 1}):
-            res = mcp.call_tool_raw("get_usage", payload)
-            mcp.assert_clean_stdout()
-            self.assertTrue(McpStdioClient.is_tool_error(res), f"Expected error for get_usage({payload}): {res}")
+            res = ui.call_tool_raw("get_usage", payload)
+            self.assertTrue(SidecarUiClient.is_tool_error(res), f"Expected error for get_usage({payload}): {res}")
 
-        # (d) Unknown resource URI returns JSON-RPC error while server stays healthy.
-        bad_uri = mcp.read_resource_raw("ui://companion/does-not-exist.html")
-        mcp.assert_clean_stdout()
-        self.assertIn("error", bad_uri)
-        ok_after = mcp.call_tool("get_settings", {})
-        mcp.assert_clean_stdout()
+        # (e) Unknown endpoint returns 404 while server stays healthy.
+        bad_ep = ui.call_api("does_not_exist", {})
+        self.assertEqual(bad_ep.status, 404)
+        ok_after = ui.call_tool("get_settings", {})
         self.assertIn("structuredContent", ok_after)
 
 
@@ -354,16 +347,16 @@ class TestBoundaryS3UpstreamSsrfAndRedirects(E2ETestCase):
             r = run_cli([str(binary), "serve", "--config", str(cfg)], env=proc_env, timeout=5.0)
             self.assertNotEqual(r.returncode, 0, f"Expected serve to reject {bad_url}")
 
-        # (b) ui-mcp save_settings rejects remote http:// without corrupting disk config.
+        # (b) Sidecar Web UI save_settings rejects remote http:// without corrupting disk config.
         mock = self.start_mock_gemini()
         good_cfg = env.write_config(env.make_config_dict(base_url=mock.base_url))
         env.write_gemini_auth("AIzaSySsrfTest1234", config_path=good_cfg)
         before = good_cfg.read_text(encoding="utf-8")
-        mcp = self.start_mcp(env, config_path=good_cfg)
-        bad_res = mcp.save_settings_smart(base_url="http://example.com", raw=True)
-        mcp.assert_clean_stdout()
-        self.assertTrue(McpStdioClient.is_tool_error(bad_res))
+        ui = self.start_sidecar_ui(env, config_path=good_cfg)
+        bad_res = ui.save_settings_smart(base_url="http://example.com", raw=True)
+        self.assertTrue(SidecarUiClient.is_tool_error(bad_res))
         self.assertEqual(good_cfg.read_text(encoding="utf-8"), before)
+        ui.close()
 
         # (c) Live proxy rejects path traversal & NUL encodings with 400/404 and 0 upstream calls.
         proxy = self.start_proxy(env, config_path=good_cfg)
@@ -415,9 +408,8 @@ class TestBoundaryS3UpstreamSsrfAndRedirects(E2ETestCase):
         self.assertEqual(r_gen.status, 302, r_gen.text)
         self.assertEqual(len(sink.requests), 0, "Proxy must never follow upstream 302 redirect")
 
-        mcp = self.start_mcp(env, config_path=cfg)
-        tc = mcp.call_tool("test_connection", {})
-        mcp.assert_clean_stdout()
+        ui = self.start_sidecar_ui(env, config_path=cfg)
+        tc = ui.call_tool("test_connection", {})
         self.assertIs(tc["structuredContent"]["ok"], False)
         self.assertIn("302", tc["structuredContent"].get("message", ""))
         self.assertEqual(len(sink.requests), 0, "test_connection must never follow upstream 302 redirect")
@@ -448,7 +440,7 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
         if os.name == "nt":
             return
 
-        # (b) Symlink config fails closed on serve, doctor, ui-mcp startup, and post-startup TOCTOU swap.
+        # (b) Symlink config fails closed on serve, doctor, and post-startup Sidecar Web UI TOCTOU swap.
         victim = env.root / "victim.txt"
         victim.write_text("DO_NOT_TOUCH", encoding="utf-8")
         os.chmod(victim, 0o644)
@@ -457,16 +449,14 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
 
         self.assertNotEqual(run_cli([str(binary), "serve", "--config", str(sym_cfg)], env=proc_env, timeout=5.0).returncode, 0)
         self.assertNotEqual(run_cli([str(binary), "doctor", "--json", "--config", str(sym_cfg)], env=proc_env, timeout=5.0).returncode, 0)
-        r_mcp_sym = run_cli([str(binary), "ui-mcp", "--config", str(sym_cfg)], env=proc_env, stdin_bytes=b"", timeout=5.0)
-        self.assertEqual(r_mcp_sym.stdout, "")
 
         toctou_cfg = env.write_config(env.make_config_dict(), path=env.root / "toctou" / "config.json")
         env.write_gemini_auth("AIzaSyToctouKey1234", config_path=toctou_cfg)
-        mcp = self.start_mcp(env, config_path=toctou_cfg)
+        ui = self.start_sidecar_ui(env, config_path=toctou_cfg)
         os.unlink(toctou_cfg)
         os.symlink(victim, toctou_cfg)
-        self.assertTrue(McpStdioClient.is_tool_error(mcp.call_tool_raw("get_settings", {})))
-        self.assertTrue(McpStdioClient.is_tool_error(mcp.save_settings_smart(default_model="gemini-3.8-flash", raw=True)))
+        self.assertTrue(SidecarUiClient.is_tool_error(ui.call_tool_raw("get_settings", {})))
+        self.assertTrue(SidecarUiClient.is_tool_error(ui.save_settings_smart(default_model="gemini-3.8-flash", raw=True)))
         self.assertEqual(victim.read_text(encoding="utf-8"), "DO_NOT_TOUCH")
         self.assertEqual(stat.S_IMODE(os.lstat(victim).st_mode), 0o644)
 
@@ -569,32 +559,36 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
         env.write_config(env.make_config_dict(default_model="gemini-4-env"), path=env_cfg)
         env.write_config(env.make_config_dict(default_model="gemini-4-cli"), path=cli_cfg)
 
-        mcp_cli = self.start_mcp(env, config_path=cli_cfg, extra_env={"AGY_COMPANION_CONFIG": str(env_cfg)})
+        ui_cli = self.start_sidecar_ui(env, config_path=cli_cfg, extra_env={"AGY_COMPANION_CONFIG": str(env_cfg)})
         self.assertEqual(
-            mcp_cli.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"]["default_model"],
+            ui_cli.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"]["default_model"],
             "gemini-4-cli",
         )
-        mcp_env = self.start_mcp(
+        ui_cli.close()
+        ui_env = self.start_sidecar_ui(
             env, pass_config_flag=False, set_config_env=False, extra_env={"AGY_COMPANION_CONFIG": str(env_cfg)}
         )
         self.assertEqual(
-            mcp_env.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"]["default_model"],
+            ui_env.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"]["default_model"],
             "gemini-4-env",
         )
-        mcp_xdg = self.start_mcp(env, pass_config_flag=False, set_config_env=False)
+        ui_env.close()
+        ui_xdg = self.start_sidecar_ui(env, pass_config_flag=False, set_config_env=False)
         self.assertEqual(
-            mcp_xdg.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"]["default_model"],
+            ui_xdg.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"]["default_model"],
             "gemini-4-xdg",
         )
-        mcp_rel = self.start_mcp(
+        ui_xdg.close()
+        ui_rel = self.start_sidecar_ui(
             env,
             pass_config_flag=False,
             set_config_env=False,
             extra_env={"XDG_CONFIG_HOME": "relative/xdg", "XDG_DATA_HOME": ""},
         )
-        rel_model = mcp_rel.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"][
+        rel_model = ui_rel.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"][
             "default_model"
         ]
+        ui_rel.close()
         if os.name == "nt":
             # Windows falls back to SHGetKnownFolderPath(RoamingAppData) rather than $HOME/.config;
             # never mutate the host user profile, just verify relative XDG_CONFIG_HOME was ignored.
@@ -645,7 +639,7 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             0,
         )
 
-        # (c) Symlinked .zlogin -> manual_required on both CLI integration & MCP set_launcher_integration, victim untouched.
+        # (c) Symlinked .zlogin -> manual_required on both CLI integration & Sidecar Web UI set_launcher_integration, victim untouched.
         rc_victim = env.root / "rc_victim.txt"
         rc_victim.write_text("# victim rc\n", encoding="utf-8")
         os.symlink(rc_victim, env.home_dir / ".zlogin")
@@ -655,10 +649,9 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
         self.assertEqual(r_int.returncode, 0, r_int.stderr)
         self.assertEqual(r_int.json_stdout()["state"], "manual_required")
 
-        mcp_rc = self.start_mcp(env, config_path=xdg_cfg, extra_env={"SHELL": "/bin/zsh", "ZDOTDIR": str(env.home_dir)})
-        r_mcp_rc = mcp_rc.call_tool("set_launcher_integration", {"enabled": True})
-        mcp_rc.assert_clean_stdout()
-        self.assertEqual(r_mcp_rc["structuredContent"]["launcher_integration"]["state"], "manual_required")
+        ui_rc = self.start_sidecar_ui(env, config_path=xdg_cfg, extra_env={"SHELL": "/bin/zsh", "ZDOTDIR": str(env.home_dir)})
+        r_ui_rc = ui_rc.call_tool("set_launcher_integration", {"enabled": True})
+        self.assertEqual(r_ui_rc["structuredContent"]["launcher_integration"]["state"], "manual_required")
         self.assertEqual(rc_victim.read_text(encoding="utf-8"), "# victim rc\n")
 
         # (d) install refuses symlinked dev plugin without --force & never overwrites unrelated ~/.local/bin/agy-companion.

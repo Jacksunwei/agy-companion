@@ -29,10 +29,15 @@ export function sanitizeConversationId(raw: string | null | undefined): string |
   return trimmed;
 }
 
-export function detectSidecarContext(search: string): SidecarContext | null {
-  if (!search) return null;
-  const params = new URLSearchParams(search);
-  if (!params.has("token") && !params.has("conversationId")) {
+export function detectSidecarContext(
+  search: string,
+  protocol?: string,
+): SidecarContext | null {
+  if (protocol && protocol !== "http:" && protocol !== "https:") {
+    return null;
+  }
+  const params = new URLSearchParams(search || "");
+  if (!protocol && !params.has("token") && !params.has("conversationId")) {
     return null;
   }
   return {

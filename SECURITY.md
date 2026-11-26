@@ -27,10 +27,10 @@ We aim to acknowledge private reports within **72 hours** and coordinate remedia
 Because `agy-companion` runs locally and handles model API keys on behalf of Antigravity, the following surfaces are explicitly in scope:
 
 - **Loopback isolation (S1):** Any way to bind or expose `companion-proxy` beyond `127.0.0.1` / `localhost`.
-- **Secret handling & storage (S2):** Plaintext API key exposure via MCP tools, logs, error responses, query strings (`?key=`), or weak file permissions on `config.json`, `env.sh`, `proxy.pid`, `proxy.log`, or `usage.db`.
+- **Secret handling & storage (S2):** Plaintext API key exposure via Sidecar `/_api/*` endpoints, logs, error responses, query strings (`?key=`), or weak file permissions on `config.json`, `auth/gemini.json` (`0700` `auth/` dir), `env.sh`, `proxy.pid`, `proxy.log`, or `usage.db`.
 - **Upstream auth & SSRF (S3):** Bypassing `https://` enforcement on remote `base_url`, HTTP redirect following, credential smuggling, or unauthorized retry of non-idempotent requests.
 - **Shell RC & launcher integrity (S8):** Command injection in generated shell hooks (`env.sh`, `~/.zlogin`, `~/.profile`, `fish/conf.d/`), symlink traversal during install/uninstall, or download/archive verification bypasses in `run-companion.sh`.
-- **MCP App UI XSS & CSP (S5):** Injection into the embedded UI (`ui/`), forbidden DOM sinks, or external network/resource loads.
+- **Sidecar Web UI XSS & CSP (S5):** Injection into the embedded UI (`ui/`), forbidden DOM sinks, or unauthorized network/resource loads.
 - **Filesystem & TOCTOU safety (S6):** Path traversal (`..`), NUL byte handling, symlink/FIFO attacks against config, usage database, or `AGY_COMPANION_UI_HTML`.
 
 ## Security Architecture Reference

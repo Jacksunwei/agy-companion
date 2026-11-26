@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
     name = "agy-companion",
     bin_name = "agy-companion",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Antigravity Companion: local Gemini pass-through proxy and MCP App settings UI"
+    about = "Antigravity Companion: local Gemini pass-through proxy and Aux Pane Sidecar Web UI"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -16,7 +16,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum Commands {
-    /// Run the loopback Gemini pass-through HTTP proxy.
+    /// Run the loopback Gemini pass-through HTTP proxy and optional Sidecar Web UI.
     Serve {
         /// Loopback listen port (1-65535; overrides config.proxy.port).
         #[arg(long, value_parser = parse_nonzero_port)]
@@ -35,18 +35,6 @@ pub enum Commands {
         /// (0 or omitted disables idle shutdown).
         #[arg(long = "idle-shutdown-secs")]
         idle_shutdown_secs: Option<u64>,
-    },
-    /// Run the embedded MCP App settings UI server over stdio.
-    UiMcp {
-        /// Plugin data directory (supports --data-dir <path> and --data-dir=<path>).
-        #[arg(long = "data-dir")]
-        data_dir: Option<PathBuf>,
-        /// Path to config.json (overrides AGY_COMPANION_CONFIG).
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Auto-enable the login-shell launcher hook once on first open_settings call (intended for plugin MCP config).
-        #[arg(long = "auto-enable-launcher")]
-        auto_enable_launcher: bool,
     },
     /// Inspect local config permissions, proxy /health, version skew, and environment.
     Doctor {
@@ -313,23 +301,6 @@ mod tests {
                 adopt_running: true,
                 auto_enable_launcher: true,
                 idle_shutdown_secs: Some(0),
-            }
-        );
-
-        assert_eq!(
-            Cli::try_parse_from([
-                "agy-companion",
-                "ui-mcp",
-                "--data-dir=/tmp/plugin-data",
-                "--config=/tmp/c.json",
-                "--auto-enable-launcher",
-            ])
-            .expect("ui-mcp equals form")
-            .command,
-            Commands::UiMcp {
-                data_dir: Some(PathBuf::from("/tmp/plugin-data")),
-                config: Some(PathBuf::from("/tmp/c.json")),
-                auto_enable_launcher: true,
             }
         );
 

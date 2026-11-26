@@ -3,7 +3,7 @@
 Exercises the compiled `agy-companion` binary end-to-end across:
 - Gemini unary + chunked SSE byte-for-byte pass-through, usage tee, faults & concurrency
 - Model discovery (`GET /v1beta/models`) & Gemini 3.8+/4+/5+ routing
-- `ui-mcp` stdio 6-tool lifecycle, hot-reload, `get_usage`, launcher toggle, HTML override & key clear
+- Sidecar Web UI HTTP lifecycle, hot-reload, `get_usage`, launcher toggle, HTML override & key clear
 - CLI subcommands (`--version`, `models`, `doctor`/skew, `integration`, `hook-env`, `launch`)
 - Daemon `serve --adopt-running`, `SIGTERM`, and active-SSE idle guard
 - CloudCode Day-0 -> Day-1 catalog merge & Enterprise 403 per-account LRU
@@ -473,16 +473,16 @@ class TestCujGeminiProxy(E2ETestCase):
         self.assertEqual(len(mock.requests), 0)
 
 
-class TestCujUiMcpLifecycle(E2ETestCase):
+class TestCujSidecarUiLifecycle(E2ETestCase):
     SUITE = "cuj"
-    FEATURE = "UI_MCP"
+    FEATURE = "SIDECAR_UI"
 
-    def test_cuj_ui_mcp_handshake_6_tools_hot_reload_and_usage(self) -> None:
-        """ui-mcp serves 6 tools + UI resource, hot-reloads key into live proxy, tests connection, and queries get_usage."""
+    def test_cuj_sidecar_ui_5_endpoints_hot_reload_and_usage(self) -> None:
+        """Sidecar Web UI serves embedded HTML + 5 token-gated endpoints, hot-reloads key into live proxy, tests connection, and queries get_usage."""
         env = self.make_env()
         mock = self.start_mock_gemini()
-        key_v1 = "AIzaSyMcpKeyV1_1111"
-        key_v2 = "AIzaSyMcpKeyV2_2222"
+        key_v1 = "AIzaSyUiKeyV1_1111"
+        key_v2 = "AIzaSyUiKeyV2_2222"
         port = find_free_port()
         cfg = env.write_config(
             env.make_config_dict(
@@ -493,71 +493,36 @@ class TestCujUiMcpLifecycle(E2ETestCase):
         )
         env.write_gemini_auth(key_v1, config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg, port=port)
-        mcp = self.start_mcp(
+        ui = self.start_sidecar_ui(
             env,
             config_path=cfg,
             extra_env={"RUST_LOG": "debug", "SHELL": "/bin/zsh", "ZDOTDIR": str(env.home_dir)},
-            auto_initialize=False,
         )
 
-        # (a) Initialize handshake.
-        init = mcp.initialize(timeout=10.0)
-        mcp.assert_clean_stdout()
-        self.assertIn("tools", init.get("capabilities", {}))
-        self.assertIn("resources", init.get("capabilities", {}))
-        self.assertEqual(init["serverInfo"]["version"], "0.0.2")
-
-        # (b) Resources list & read.
-        res_list = mcp.list_resources()
-        mcp.assert_clean_stdout()
-        uris = [r["uri"] for r in res_list.get("resources", [])]
-        self.assertIn("ui://companion/settings.html", uris)
-        res_read = mcp.read_resource("ui://companion/settings.html")
-        mcp.assert_clean_stdout()
-        item = res_read["contents"][0]
-        self.assertEqual(item.get("mimeType"), "text/html;profile=mcp-app")
-        html_text = item.get("text", "")
-        self.assertGreater(len(html_text), 0)
+        # (a) Embedded HTML served on GET / with strict CSP and < 512 KiB size.
+        html_resp = ui.get_html()
+        self.assertEqual(html_resp.status, 200)
+        self.assertIsNotNone(html_resp.header("content-security-policy"))
+        html_text = html_resp.text
+        self.assertIn("Antigravity Companion", html_text)
         self.assertLess(len(html_text.encode("utf-8")), 512_000)
 
-        # (c) Exact 6 tools with _meta.ui contracts.
-        tools = {t["name"]: t for t in mcp.list_tools().get("tools", [])}
-        mcp.assert_clean_stdout()
-        expected_tools = {
-            "open_settings",
-            "get_settings",
-            "save_settings",
-            "test_connection",
-            "set_launcher_integration",
-            "get_usage",
-        }
-        self.assertEqual(set(tools.keys()), expected_tools)
-        open_meta = tools["open_settings"].get("_meta") or {}
-        self.assertEqual((open_meta.get("ui") or {}).get("resourceUri"), "ui://companion/settings.html")
-        self.assertTrue((open_meta.get("com.google.antigravity/ui") or {}).get("entrypoints"))
-        for app_tool in expected_tools - {"open_settings"}:
-            self.assertEqual(((tools[app_tool].get("_meta") or {}).get("ui") or {}).get("visibility"), ["app"])
+        # (b) get_settings returns live snapshot with masked key and proxy telemetry.
+        res = ui.call_tool("get_settings", {})
+        sc = res["structuredContent"]
+        self.assertIs(sc["proxy"]["reachable"], True)
+        if os.name != "nt":
+            self.assertIsInstance(sc.get("proxy_rss_bytes"), int)
+            self.assertGreater(sc["proxy_rss_bytes"], 0)
+        self.assertIn("account_plan", sc)
+        self.assertTrue(sc.get("supported_models"))
+        gem = sc["config"]["providers"]["gemini"]
+        self.assertIs(gem["api_key_configured"], True)
+        self.assertEqual(gem["api_key_hint"], "AIza...1111")
+        self.assertNotIn(key_v1, json.dumps(res))
 
-        # (d) open_settings & get_settings dual content + structuredContent.
-        for tool_name in ("open_settings", "get_settings"):
-            res = mcp.call_tool(tool_name, {})
-            mcp.assert_clean_stdout()
-            self.assertTrue(res.get("content"))
-            sc = res["structuredContent"]
-            self.assertIs(sc["proxy"]["reachable"], True)
-            if os.name != "nt":
-                self.assertIsInstance(sc.get("proxy_rss_bytes"), int)
-                self.assertGreater(sc["proxy_rss_bytes"], 0)
-            self.assertIn("account_plan", sc)
-            self.assertTrue(sc.get("supported_models"))
-            gem = sc["config"]["providers"]["gemini"]
-            self.assertIs(gem["api_key_configured"], True)
-            self.assertEqual(gem["api_key_hint"], "AIza...1111")
-            self.assertNotIn(key_v1, json.dumps(res))
-
-        # (e) save_settings updates key_v1 -> key_v2 atomically in auth/gemini.json at 0700/0600, live proxy hot-reloads.
-        save_res = mcp.save_settings_smart(api_key=key_v2, default_model="gemini-3.8-flash")
-        mcp.assert_clean_stdout()
+        # (c) save_settings updates key_v1 -> key_v2 atomically in auth/gemini.json at 0700/0600, live proxy hot-reloads.
+        save_res = ui.save_settings_smart(api_key=key_v2, default_model="gemini-3.8-flash")
         self.assertEqual(save_res["structuredContent"]["config"]["providers"]["gemini"]["api_key_hint"], "AIza...2222")
         auth_file = env.gemini_auth_path_for(cfg)
         self.assertNotIn("api_key", cfg.read_text(encoding="utf-8"))
@@ -582,25 +547,23 @@ class TestCujUiMcpLifecycle(E2ETestCase):
         self.assertEqual(r_gen.status, 200, r_gen.text)
         self.assertEqual(mock.requests[-1].header("x-goog-api-key"), key_v2)
 
-        # (f) test_connection hits GET /v1beta/models?pageSize=1 with key_v2.
+        # (d) test_connection hits GET /v1beta/models?pageSize=1 with key_v2.
         mock.expected_api_key = key_v2
-        tc_res = mcp.call_tool("test_connection", {})
-        mcp.assert_clean_stdout()
+        tc_res = ui.call_tool("test_connection", {})
         self.assertIs(tc_res["structuredContent"]["ok"], True, tc_res)
         self.assertEqual(mock.requests[-1].method, "GET")
         self.assertEqual(mock.requests[-1].path, "/v1beta/models")
         self.assertEqual(mock.requests[-1].query_params.get("pageSize"), ["1"])
         self.assertEqual(mock.requests[-1].header("x-goog-api-key"), key_v2)
 
-        # (g) get_usage("1d") reflects SQLite usage.db row from proxy call above.
+        # (e) get_usage("1d") reflects SQLite usage.db row from proxy call above.
         poll_usage_events(env.usage_dir, min_count=1, timeout=3.0)
-        usage_res = mcp.call_tool("get_usage", {"range": "1d"})
-        mcp.assert_clean_stdout()
+        usage_res = ui.call_tool("get_usage", {"range": "1d"})
         us = usage_res["structuredContent"]
         self.assertEqual(us.get("range"), "1d")
         self.assertGreaterEqual(us.get("totals", {}).get("requests", 0), 1)
 
-    def test_cuj_ui_mcp_launcher_integration_and_html_override(self) -> None:
+    def test_cuj_sidecar_ui_launcher_integration_and_html_override(self) -> None:
         """AGY_COMPANION_UI_HTML reloads dynamically without restart; set_launcher_integration toggles env.sh & .zlogin."""
         if os.name == "nt":
             self.skipTest("POSIX launcher integration test")
@@ -615,19 +578,18 @@ class TestCujUiMcpLifecycle(E2ETestCase):
             "SHELL": "/bin/zsh",
             "ZDOTDIR": str(env.home_dir),
         }
-        mcp = self.start_mcp(env, config_path=cfg, extra_env=extra_env)
+        ui = self.start_sidecar_ui(env, config_path=cfg, extra_env=extra_env)
 
-        r1 = mcp.read_resource("ui://companion/settings.html")
-        mcp.assert_clean_stdout()
-        self.assertIn("V1-OVERRIDE", r1["contents"][0]["text"])
+        r1 = ui.get_html()
+        self.assertEqual(r1.status, 200)
+        self.assertIn("V1-OVERRIDE", r1.text)
 
         html_file.write_text("<html><body>V2-RELOADED</body></html>", encoding="utf-8")
-        r2 = mcp.read_resource("ui://companion/settings.html")
-        mcp.assert_clean_stdout()
-        self.assertIn("V2-RELOADED", r2["contents"][0]["text"])
+        r2 = ui.get_html()
+        self.assertEqual(r2.status, 200)
+        self.assertIn("V2-RELOADED", r2.text)
 
-        en = mcp.call_tool("set_launcher_integration", {"enabled": True})
-        mcp.assert_clean_stdout()
+        en = ui.call_tool("set_launcher_integration", {"enabled": True})
         self.assertIs(en["structuredContent"]["launcher_integration"]["enabled"], True)
         env_sh = env.data_dir / "env.sh"
         zlogin = env.home_dir / ".zlogin"
@@ -642,22 +604,20 @@ class TestCujUiMcpLifecycle(E2ETestCase):
         self.assertEqual(cli_st.returncode, 0, cli_st.stderr)
         self.assertIs(cli_st.json_stdout().get("enabled"), True)
 
-        dis = mcp.call_tool("set_launcher_integration", {"enabled": False})
-        mcp.assert_clean_stdout()
+        dis = ui.call_tool("set_launcher_integration", {"enabled": False})
         self.assertIs(dis["structuredContent"]["launcher_integration"]["enabled"], False)
         self.assertFalse(env_sh.exists())
         self.assertFalse(zlogin.exists())
 
-    def test_cuj_ui_mcp_key_preservation_and_clear(self) -> None:
+    def test_cuj_sidecar_ui_key_preservation_and_clear(self) -> None:
         """Omitting api_key preserves saved key; explicit clear removes key from disk and get_settings."""
         env = self.make_env()
         cfg = env.write_config(env.make_config_dict())
-        mcp = self.start_mcp(env, config_path=cfg)
+        ui = self.start_sidecar_ui(env, config_path=cfg)
 
         key_v1 = "AIzaSyPreserveMe1234"
-        mcp.save_settings_smart(api_key=key_v1)
-        mcp.save_settings_smart(default_model="gemini-3.8-flash")
-        mcp.assert_clean_stdout()
+        ui.save_settings_smart(api_key=key_v1)
+        ui.save_settings_smart(default_model="gemini-3.8-flash")
 
         on_disk = json.loads(cfg.read_text(encoding="utf-8"))
         self.assertNotIn("api_key", on_disk["providers"]["gemini"])
@@ -667,16 +627,15 @@ class TestCujUiMcpLifecycle(E2ETestCase):
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(os.lstat(auth_file.parent).st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(os.lstat(auth_file).st_mode), 0o600)
-        snap1 = mcp.call_tool("get_settings", {})["structuredContent"]
+        snap1 = ui.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(snap1["config"]["providers"]["gemini"]["api_key_configured"], True)
         self.assertEqual(snap1["config"]["providers"]["gemini"]["default_model"], "gemini-3.8-flash")
 
-        mcp.save_settings_smart(clear_api_key=True)
-        mcp.assert_clean_stdout()
+        ui.save_settings_smart(clear_api_key=True)
         on_disk2 = json.loads(cfg.read_text(encoding="utf-8"))
         self.assertNotIn("api_key", on_disk2["providers"]["gemini"])
         self.assertFalse(auth_file.exists())
-        snap2 = mcp.call_tool("get_settings", {})["structuredContent"]
+        snap2 = ui.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(snap2["config"]["providers"]["gemini"]["api_key_configured"], False)
         self.assertIsNone(snap2["config"]["providers"]["gemini"].get("api_key_hint"))
 
@@ -686,7 +645,7 @@ class TestCujCliSubcommands(E2ETestCase):
     FEATURE = "CLI"
 
     def test_cuj_cli_version_models_doctor_and_version_skew(self) -> None:
-        """--version, --help (9 subcommands), models --json routing, doctor healthy/skew/unbound/0644 checks."""
+        """--version, --help (8 subcommands), models --json routing, doctor healthy/skew/unbound/0644 checks."""
         binary = self.require_binary()
         env = self.make_env()
         mock = self.start_mock_gemini()
@@ -699,7 +658,7 @@ class TestCujCliSubcommands(E2ETestCase):
 
         r_help = run_cli([str(binary), "--help"], env=base_env)
         self.assertEqual(r_help.returncode, 0, r_help.stderr)
-        for sub in ("serve", "ui-mcp", "doctor", "models", "launch", "hook-env", "integration", "install", "uninstall"):
+        for sub in ("serve", "doctor", "models", "launch", "hook-env", "integration", "install", "uninstall"):
             self.assertIn(sub, r_help.stdout)
 
         r_unk = run_cli([str(binary), "no-such-subcommand"], env=base_env)
@@ -742,7 +701,7 @@ class TestCujCliSubcommands(E2ETestCase):
         self.assertIs(d_ok["ok"], True, d_ok)
         self.assertIs(d_ok["version_skew"], False, d_ok)
 
-        # (d) Version skew against MockHealthServer(version="9.9.9") on both doctor and ui-mcp.
+        # (d) Version skew against MockHealthServer(version="9.9.9") on both doctor and Sidecar Web UI.
         skew_srv = self.start_mock_health(version="9.9.9")
         skew_cfg = env.write_config(
             env.make_config_dict(listen_port=skew_srv.port),
@@ -757,9 +716,8 @@ class TestCujCliSubcommands(E2ETestCase):
         self.assertNotEqual(r_skew.returncode, 0)
         self.assertIs(r_skew.json_stdout()["version_skew"], True)
 
-        mcp = self.start_mcp(env, config_path=skew_cfg)
-        snap = mcp.call_tool("get_settings", {})["structuredContent"]
-        mcp.assert_clean_stdout()
+        ui_skew = self.start_sidecar_ui(env, config_path=skew_cfg)
+        snap = ui_skew.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(snap["version_skew"], True)
 
         # (e) Unbound ephemeral port + 0644 config fails doctor.
@@ -1150,7 +1108,7 @@ class TestCujInstallUninstallLifecycle(E2ETestCase):
     FEATURE = "INSTALL"
 
     def test_cuj_install_upgrade_and_default_uninstall_preserving_data(self) -> None:
-        """install deploys binary/7-file plugin/env.sh/RC/proxy; upgrade is idempotent; default uninstall keeps config & usage."""
+        """install deploys binary/6-file plugin/env.sh/RC/proxy; upgrade is idempotent; default uninstall keeps config & usage."""
         binary = self.require_binary()
         env = self.make_env()
         self.register_pidfile_cleanup(env=env)
@@ -1180,8 +1138,8 @@ class TestCujInstallUninstallLifecycle(E2ETestCase):
         self.assertTrue((env.data_dir / "bin" / ".version").is_file())
         installed = plugins_dir / "agy-companion"
         installed_files = [p for p in installed.rglob("*") if p.is_file() and not p.is_symlink()]
-        self.assertEqual(len(installed_files), 7, f"Expected 7 regular plugin files, got {installed_files}")
-        for rel in ("plugin.json", "mcp_config.json", "sidecars/proxy/sidecar.json"):
+        self.assertEqual(len(installed_files), 6, f"Expected 6 regular plugin files, got {installed_files}")
+        for rel in ("plugin.json", "sidecars/proxy/sidecar.json"):
             self.assertIsInstance(json.loads((installed / rel).read_text(encoding="utf-8")), dict)
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(os.lstat(env.data_dir / "env.sh").st_mode), 0o600)

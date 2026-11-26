@@ -15,9 +15,8 @@ use super::bundle::{
 use super::safety::inspect_non_symlink_rel_chain;
 use super::safety::{ExistingDirSafety, inspect_existing_dir, usage_dir_under_dir};
 use super::windows::{
-    WINDOWS_SHORTCUT_NAME, patch_windows_mcp_config_from_str,
-    patch_windows_sidecar_config_from_str, ps_single_quote, reject_ps_path_newlines,
-    render_windows_mcp_config, render_windows_shortcut_ps_script, render_windows_sidecar_config,
+    WINDOWS_SHORTCUT_NAME, patch_windows_sidecar_config_from_str, ps_single_quote,
+    reject_ps_path_newlines, render_windows_shortcut_ps_script, render_windows_sidecar_config,
     resolve_windows_shortcut_path,
 };
 use crate::CliError;
@@ -67,8 +66,8 @@ fn embedded_plugin_bundle_matches_repo_plugin_dir_byte_for_byte() {
 
     assert_eq!(
         EMBEDDED_PLUGIN_FILES.len(),
-        7,
-        "expected exactly 7 embedded plugin files"
+        6,
+        "expected exactly 6 embedded plugin files"
     );
     assert_eq!(
         EMBEDDED_PLUGIN_FILES.last().expect("non-empty").rel_path,
@@ -135,7 +134,6 @@ fn embedded_plugin_docs_enforce_open_source_copy_hygiene_and_ux_v2_contracts() {
         "README.md",
         "skills/companion/SKILL.md",
         "plugin.json",
-        "mcp_config.json",
         "sidecars/proxy/sidecar.json",
     ] {
         let lower = find_embedded(rel_path).to_lowercase();
@@ -171,17 +169,17 @@ fn embedded_plugin_docs_enforce_open_source_copy_hygiene_and_ux_v2_contracts() {
             .any(|l| l.trim_start().starts_with("description:")),
         "SKILL.md frontmatter must declare `description:`"
     );
-    for tool_name in [
-        "open_settings",
-        "get_settings",
-        "save_settings",
-        "test_connection",
-        "set_launcher_integration",
-        "get_usage",
+    for endpoint_name in [
+        "sidecar://agy-companion/proxy/",
+        "/_api/get_settings",
+        "/_api/save_settings",
+        "/_api/test_connection",
+        "/_api/set_launcher_integration",
+        "/_api/get_usage",
     ] {
         assert!(
-            skill.contains(tool_name),
-            "embedded SKILL.md must document MCP tool `{tool_name}`"
+            skill.contains(endpoint_name),
+            "embedded SKILL.md must document Sidecar Web UI endpoint `{endpoint_name}`"
         );
     }
     let skill_lower = skill.to_lowercase();
@@ -233,25 +231,6 @@ fn embedded_plugin_docs_enforce_open_source_copy_hygiene_and_ux_v2_contracts() {
 fn windows_manifest_generators_emit_direct_exe_json_without_bash() {
     let bin_path = Path::new(r"C:\Users\alice\AppData\Local\agy-companion\bin\agy-companion.exe");
 
-    let mcp_raw = render_windows_mcp_config(bin_path).expect("render windows mcp config");
-    assert!(
-        !mcp_raw.contains("bash") && !mcp_raw.contains("run-companion.sh"),
-        "Windows mcp_config.json must not reference bash: {mcp_raw}"
-    );
-    let mcp_json: serde_json::Value = serde_json::from_str(&mcp_raw).expect("parse mcp json");
-    assert_eq!(
-        mcp_json["mcpServers"]["hub"]["command"],
-        bin_path.to_string_lossy().as_ref()
-    );
-    assert_eq!(
-        mcp_json["mcpServers"]["hub"]["args"],
-        serde_json::json!([
-            "ui-mcp",
-            "--data-dir=${PLUGIN_DATA}",
-            "--auto-enable-launcher"
-        ])
-    );
-
     let sidecar_raw =
         render_windows_sidecar_config(bin_path).expect("render windows sidecar config");
     assert!(
@@ -295,42 +274,7 @@ fn windows_manifest_generators_emit_direct_exe_json_without_bash() {
 fn windows_manifest_generators_derive_from_embedded_json_and_preserve_future_fields() {
     let bin_path = Path::new(r"C:\Users\alice\AppData\Local\agy-companion\bin\agy-companion.exe");
 
-    // 1. Live embedded manifests: every non-command field and post-wrapper arg must match verbatim.
-    let embedded_mcp: serde_json::Value = serde_json::from_str(
-        EMBEDDED_PLUGIN_FILES
-            .iter()
-            .find(|f| f.rel_path == "mcp_config.json")
-            .expect("embedded mcp_config.json")
-            .content,
-    )
-    .expect("parse embedded mcp_config.json");
-    let rendered_mcp: serde_json::Value =
-        serde_json::from_str(&render_windows_mcp_config(bin_path).expect("render mcp"))
-            .expect("parse rendered mcp");
-    let expected_mcp_args: Vec<serde_json::Value> = embedded_mcp["mcpServers"]["hub"]["args"]
-        .as_array()
-        .expect("embedded mcp args")
-        .iter()
-        .skip(1)
-        .cloned()
-        .collect();
-    assert_eq!(
-        rendered_mcp["mcpServers"]["hub"]["args"],
-        serde_json::Value::Array(expected_mcp_args)
-    );
-    for (key, val) in embedded_mcp["mcpServers"]["hub"]
-        .as_object()
-        .expect("embedded hub object")
-    {
-        if key != "command" && key != "args" {
-            assert_eq!(
-                rendered_mcp["mcpServers"]["hub"].get(key),
-                Some(val),
-                "Windows mcp_config.json drifted on field '{key}'"
-            );
-        }
-    }
-
+    // 1. Live embedded manifest: every non-command field and post-wrapper arg must match verbatim.
     let embedded_sidecar: serde_json::Value = serde_json::from_str(
         EMBEDDED_PLUGIN_FILES
             .iter()
@@ -367,36 +311,6 @@ fn windows_manifest_generators_derive_from_embedded_json_and_preserve_future_fie
     }
 
     // 2. Synthetic future fields and extra args MUST flow through automatically without drift.
-    let synthetic_mcp = r#"{
-      "mcpServers": {
-        "hub": {
-          "command": "bash",
-          "args": ["${PLUGIN_ROOT}/scripts/run-companion.sh", "ui-mcp", "--data-dir=${PLUGIN_DATA}", "--extra-flag"],
-          "env": { "FOO": "bar" },
-          "timeout_secs": 30
-        }
-      },
-      "futureTopLevel": true
-    }"#;
-    let patched_mcp: serde_json::Value = serde_json::from_str(
-        &patch_windows_mcp_config_from_str(synthetic_mcp, bin_path).expect("patch synthetic mcp"),
-    )
-    .expect("parse patched synthetic mcp");
-    assert_eq!(
-        patched_mcp["mcpServers"]["hub"]["command"],
-        bin_path.to_string_lossy().as_ref()
-    );
-    assert_eq!(
-        patched_mcp["mcpServers"]["hub"]["args"],
-        serde_json::json!(["ui-mcp", "--data-dir=${PLUGIN_DATA}", "--extra-flag"])
-    );
-    assert_eq!(
-        patched_mcp["mcpServers"]["hub"]["env"],
-        serde_json::json!({ "FOO": "bar" })
-    );
-    assert_eq!(patched_mcp["mcpServers"]["hub"]["timeout_secs"], 30);
-    assert_eq!(patched_mcp["futureTopLevel"], true);
-
     let synthetic_sidecar = r#"{
       "command": "bash",
       "args": ["../../scripts/run-companion.sh", "serve", "--adopt-running", "--idle-shutdown-secs=900"],
@@ -428,11 +342,6 @@ fn windows_manifest_generators_derive_from_embedded_json_and_preserve_future_fie
     assert!(
         patch_windows_sidecar_config_from_str(missing_wrapper, bin_path).is_err(),
         "sidecar manifest without leading run-companion.sh wrapper must fail closed"
-    );
-    let missing_hub = r#"{"mcpServers": {}}"#;
-    assert!(
-        patch_windows_mcp_config_from_str(missing_hub, bin_path).is_err(),
-        "mcp manifest without mcpServers.hub must fail closed"
     );
 }
 
@@ -477,7 +386,7 @@ fn windows_shortcut_path_and_ps_script_escape_quotes_and_hide_console() {
 fn is_companion_serve_process_handles_quoted_windows_cmdline_with_serve_in_dir_name() {
     assert!(!is_companion_serve_process(
         r"C:\Users\My serve dir\agy-companion.exe",
-        r#""C:\Users\My serve dir\agy-companion.exe" ui-mcp"#,
+        r#""C:\Users\My serve dir\agy-companion.exe" doctor"#,
         ""
     ));
     assert!(is_companion_serve_process(
@@ -490,29 +399,29 @@ fn is_companion_serve_process_handles_quoted_windows_cmdline_with_serve_in_dir_n
 #[test]
 fn is_companion_serve_process_requires_serve_as_first_arg_and_handles_quoted_nul_and_mixed_case_exe()
  {
-    // 1. ui-mcp with `serve` inside --data-dir value (quoted Windows & unquoted Unix) -> false
+    // 1. doctor with `serve` inside --config value (quoted Windows & unquoted Unix) -> false
     assert!(!is_companion_serve_process(
         r"C:\Users\Alice\agy-companion.exe",
-        r#""C:\Users\Alice\agy-companion.exe" ui-mcp --data-dir="C:\Users\my serve dir\data""#,
+        r#""C:\Users\Alice\agy-companion.exe" doctor --config="C:\Users\my serve dir\config.json""#,
         ""
     ));
     assert!(!is_companion_serve_process(
         "/Users/alice/agy-companion",
-        "/Users/alice/agy-companion ui-mcp --data-dir=/tmp/my serve dir/data",
+        "/Users/alice/agy-companion doctor --config=/tmp/my serve dir/config.json",
         ""
     ));
 
-    // 2. ui-mcp with flag value literally named `serve` -> false
+    // 2. doctor with flag value literally named `serve` -> false
     assert!(!is_companion_serve_process(
         "/Users/alice/agy-companion",
-        "/Users/alice/agy-companion ui-mcp --config serve",
+        "/Users/alice/agy-companion doctor --config serve",
         ""
     ));
 
-    // 3. Windows case-mismatched quoted CommandLine -> false for ui-mcp, true for serve
+    // 3. Windows case-mismatched quoted CommandLine -> false for doctor, true for serve
     assert!(!is_companion_serve_process(
         r"C:\Users\My serve dir\agy-companion.exe",
-        r#""c:\users\my serve dir\agy-companion.exe" ui-mcp"#,
+        r#""c:\users\my serve dir\agy-companion.exe" doctor"#,
         ""
     ));
     assert!(is_companion_serve_process(
@@ -521,15 +430,15 @@ fn is_companion_serve_process_requires_serve_as_first_arg_and_handles_quoted_nul
         ""
     ));
 
-    // 4. Linux NUL-delimited symlinked argv[0] containing ` serve ` -> false for ui-mcp, true for serve
+    // 4. Linux NUL-delimited symlinked argv[0] containing ` serve ` -> false for doctor, true for serve
     assert!(!is_companion_serve_process(
         "/private/tmp/my serve dir/agy-companion",
-        "/tmp/my serve dir/agy-companion\0ui-mcp\0",
+        "/tmp/my serve dir/agy-companion\0doctor\0",
         ""
     ));
     assert!(!is_companion_serve_process(
         "/private/tmp/my serve dir/agy-companion",
-        "/tmp/my serve dir/agy-companion\0ui-mcp\0--config\0serve\0",
+        "/tmp/my serve dir/agy-companion\0doctor\0--config\0serve\0",
         ""
     ));
     assert!(is_companion_serve_process(
@@ -566,7 +475,7 @@ fn is_companion_serve_process_requires_serve_as_first_arg_and_handles_quoted_nul
     ));
     assert!(!is_companion_serve_process(
         r"C:\real\agy-companion.exe",
-        r"C:\Users\my serve dir\agy-companion.exe ui-mcp",
+        r"C:\Users\my serve dir\agy-companion.exe doctor",
         ""
     ));
     assert!(is_companion_serve_process(
@@ -608,7 +517,7 @@ fn is_companion_serve_process_accepts_companion_and_rejects_unrelated_processes(
     // Non-serve subcommand of agy-companion MUST be rejected.
     assert!(!is_companion_serve_process(
         "/Users/alice/.local/share/agy-companion/bin/agy-companion",
-        "/Users/alice/.local/share/agy-companion/bin/agy-companion ui-mcp",
+        "/Users/alice/.local/share/agy-companion/bin/agy-companion doctor",
         ""
     ));
     // PID sanity checks reject PID 0, PID 1, self PID, and overflow PIDs.

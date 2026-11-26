@@ -284,7 +284,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let listen_port = config.proxy.port.get();
     let runtime_data_dir = resolve_runtime_data_dir(&config)?;
 
-    // 2. Stage binary, .version, and 7-file plugin directory BEFORE swapping anything.
+    // 2. Stage binary, .version, and 6-file plugin directory BEFORE swapping anything.
     ensure_non_symlink_dir(&plugins_root, 0o755)?;
     ensure_non_symlink_dir(&data_dir, 0o700)?;
     let bin_dir = data_dir.join("bin");

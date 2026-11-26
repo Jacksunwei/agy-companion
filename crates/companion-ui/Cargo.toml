@@ -1,5 +1,5 @@
 [package]
-name = "companion-ui-mcp"
+name = "companion-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,8 +15,6 @@ sqlite = ["companion-core/sqlite"]
 [dependencies]
 companion-core.workspace = true
 companion-providers.workspace = true
-rmcp.workspace = true
-schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

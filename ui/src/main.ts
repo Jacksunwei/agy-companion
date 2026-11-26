@@ -1,9 +1,3 @@
-import {
-  App,
-  applyDocumentTheme,
-  applyHostStyleVariables,
-  type McpUiHostContext,
-} from "@modelcontextprotocol/ext-apps";
 import { buildBannerNode } from "./banners.ts";
 import {
   copyTextWithFallback,
@@ -27,9 +21,6 @@ import {
 import "./style.css";
 import {
   DEFAULT_ENABLED_MODELS,
-  extractStructuredPayload,
-  extractToolErrorText,
-  formatCaughtError,
   parseSettingsSnapshot,
   parseTestConnectionPayload,
   parseUsageSummary,
@@ -39,7 +30,6 @@ import {
   type AppState,
   type SaveSettingsArgs,
   type SettingsSnapshot,
-  type ToolCallResultLike,
   type UsageGroup,
   type UsageRange,
   type UsageUnit,
@@ -61,8 +51,7 @@ async function main(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) return;
 
-  const sidecarCtx = detectSidecarContext(window.location.search);
-  const app = sidecarCtx ? null : new App({ name: "Antigravity Companion", version: "0.0.2" }, {});
+  const sidecarCtx = detectSidecarContext(window.location.search, window.location.protocol);
 
   const state: AppState = {
     connected: false,
@@ -358,48 +347,24 @@ async function main(): Promise<void> {
     renderAll();
   }
 
-  function applyHostContext(ctx: McpUiHostContext | null | undefined): void {
-    if (!ctx) return;
-    if (ctx.theme) {
-      applyDocumentTheme(ctx.theme);
-      root?.setAttribute("data-theme", ctx.theme);
-    }
-    if (ctx.styles?.variables) {
-      applyHostStyleVariables(ctx.styles.variables);
-    }
+  function applyTheme(theme: "dark" | "light"): void {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    root?.setAttribute("data-theme", theme);
   }
 
   /* =========================================================================
-   * MCP TOOL INVOCATION HELPERS
+   * SIDECAR API INVOCATION HELPERS
    * ========================================================================= */
   async function callTool<T>(
     name: string,
     args: Record<string, unknown>,
     parser: (raw: unknown) => T | null,
   ): Promise<ToolOutcome<T>> {
-    if (sidecarCtx) {
-      return callSidecarApi(sidecarCtx, name, args, parser);
+    if (!sidecarCtx) {
+      return { ok: false, error: "Sidecar Web UI transport unavailable." };
     }
-    if (!app) {
-      return { ok: false, error: "Host transport unavailable." };
-    }
-    try {
-      const result = (await app.callServerTool({
-        name,
-        arguments: args,
-      })) as ToolCallResultLike;
-      if (result.isError) {
-        return { ok: false, error: extractToolErrorText(result) };
-      }
-      const payload = extractStructuredPayload(result);
-      const parsed = parser(payload);
-      if (parsed === null) {
-        return { ok: false, error: `Unexpected response from ${name}.` };
-      }
-      return { ok: true, data: parsed };
-    } catch (err) {
-      return { ok: false, error: formatCaughtError(err) };
-    }
+    return callSidecarApi(sidecarCtx, name, args, parser);
   }
 
   async function refreshSettings(isBackgroundPoll: boolean): Promise<void> {
@@ -475,24 +440,13 @@ async function main(): Promise<void> {
   async function handleOpenExternalUrl(url: string, displayUrl: string): Promise<void> {
     let opened = false;
     if (state.connected && !state.standalone) {
-      if (sidecarCtx) {
-        try {
-          const popup = window.open(url, "_blank", "noopener,noreferrer");
-          if (popup !== null) {
-            opened = true;
-          }
-        } catch {
-          opened = false;
+      try {
+        const popup = window.open(url, "_blank", "noopener,noreferrer");
+        if (popup !== null) {
+          opened = true;
         }
-      } else if (app) {
-        try {
-          const res = await app.openLink({ url });
-          if (!res || res.isError !== true) {
-            opened = true;
-          }
-        } catch {
-          opened = false;
-        }
+      } catch {
+        opened = false;
       }
     }
     if (!opened) {
@@ -777,15 +731,22 @@ async function main(): Promise<void> {
   });
 
   /* =========================================================================
-   * CONNECT TO HOST (SIDECAR WEB UI OR MCP APP)
+   * CONNECT TO SIDECAR WEB UI HOST
    * ========================================================================= */
-  if (sidecarCtx) {
-    window.addEventListener("message", (event: MessageEvent) => {
-      const msg = event.data as
-        | { type?: unknown; payload?: { cssVariables?: Record<string, string> } }
-        | null
-        | undefined;
-      if (!msg || msg.type !== "theme-change") return;
+  if (!sidecarCtx) {
+    state.connected = false;
+    state.standalone = true;
+    renderAll();
+    return;
+  }
+
+  window.addEventListener("message", (event: MessageEvent) => {
+    const msg = event.data as
+      | { type?: unknown; payload?: { cssVariables?: Record<string, string> } }
+      | null
+      | undefined;
+    if (!msg) return;
+    if (msg.type === "theme-change") {
       const vars = msg.payload?.cssVariables;
       if (!vars || typeof vars !== "object") return;
       for (const [key, value] of Object.entries(vars)) {
@@ -795,79 +756,24 @@ async function main(): Promise<void> {
       }
       const theme = inferThemeFromCssVars(vars);
       if (theme) {
-        applyDocumentTheme(theme);
-        root?.setAttribute("data-theme", theme);
+        applyTheme(theme);
       }
-    });
-
-    if (
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-color-scheme: light)").matches
-    ) {
-      applyDocumentTheme("light");
-      root?.setAttribute("data-theme", "light");
+    } else if (msg.type === "companion-refresh") {
+      void refreshSettings(false);
     }
+  });
 
-    state.connected = true;
-    state.standalone = false;
-    renderAll();
-    void refreshSettings(false);
-    return;
+  if (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-color-scheme: light)").matches
+  ) {
+    applyTheme("light");
   }
 
-  if (!app) {
-    state.connected = false;
-    state.standalone = true;
-    renderAll();
-    return;
-  }
-
-  app.ontoolinput = () => {
-    // Initial snapshot arrives in ontoolresult
-  };
-
-  app.ontoolresult = (result) => {
-    const typed = result as ToolCallResultLike;
-    if (typed.isError) {
-      state.loadError = extractToolErrorText(typed);
-      renderAll();
-      return;
-    }
-    const payload = extractStructuredPayload(typed);
-    const parsed = parseSettingsSnapshot(payload);
-    if (parsed) {
-      state.hydratedFromInitialResult = true;
-      state.snapshotEpoch += 1;
-      applySnapshot(parsed);
-      scheduleNextPoll();
-    }
-  };
-
-  app.onhostcontextchanged = (ctx) => {
-    applyHostContext(ctx);
-  };
-
+  state.connected = true;
+  state.standalone = false;
   renderAll();
-
-  try {
-    await app.connect();
-    state.connected = true;
-    state.standalone = false;
-    applyHostContext(app.getHostContext());
-    renderAll();
-
-    window.setTimeout(() => {
-      if (!state.hydratedFromInitialResult && !state.refreshing) {
-        void refreshSettings(false);
-      } else {
-        scheduleNextPoll();
-      }
-    }, 120);
-  } catch {
-    state.connected = false;
-    state.standalone = true;
-    renderAll();
-  }
+  void refreshSettings(false);
 }
 
 void main();

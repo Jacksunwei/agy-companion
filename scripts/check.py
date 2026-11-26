@@ -668,14 +668,14 @@ class CheckRunner:
         agy_bin = self.tool("agy")
         if not agy_bin:
             self.pass_(
-                f"{tag} Plugin bundle: all 3 plugin JSON manifests and logo valid; "
+                f"{tag} Plugin bundle: all 2 plugin JSON manifests and logo valid; "
                 "skipped agy plugin validate --strict ./plugin (agy CLI not found on PATH)"
             )
             return
 
         if self.run_stream([agy_bin, "plugin", "validate", "--strict", str(self.repo_root / "plugin")]) == 0:
             self.pass_(
-                f"{tag} Plugin bundle: all 3 plugin JSON manifests, logo, "
+                f"{tag} Plugin bundle: all 2 plugin JSON manifests, logo, "
                 "and agy plugin validate --strict ./plugin passed"
             )
         else:
@@ -1094,13 +1094,13 @@ def _run_static_hermeticity_guards(root: pathlib.Path) -> list[str]:
                 )
 
     # Guard 2: Zero bare CompanionUiServer::new( or unisolated CompanionUiServer::with_options(
-    # in crates/companion-ui-mcp/src/tests.rs outside isolated_ui_server_with and
+    # in crates/companion-ui/src/tests.rs outside isolated_ui_server_with and
     # ui_resource_reads_process_env_var_dynamically.
-    ui_mcp_tests = root / "crates" / "companion-ui-mcp" / "src" / "tests.rs"
-    if not ui_mcp_tests.is_file():
-        errors.append("Guard 2: missing crates/companion-ui-mcp/src/tests.rs")
+    ui_tests = root / "crates" / "companion-ui" / "src" / "tests.rs"
+    if not ui_tests.is_file():
+        errors.append("Guard 2: missing crates/companion-ui/src/tests.rs")
     else:
-        cleaned = _strip_rust_comments(ui_mcp_tests.read_text(encoding="utf-8"))
+        cleaned = _strip_rust_comments(ui_tests.read_text(encoding="utf-8"))
         fn_re = re.compile(
             r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b"
         )
@@ -1109,7 +1109,7 @@ def _run_static_hermeticity_guards(root: pathlib.Path) -> list[str]:
         fn_names = {m.group(1) for m in fn_matches}
         if "isolated_ui_server_with" not in fn_names:
             errors.append(
-                "Guard 2: isolated_ui_server_with helper not found in companion-ui-mcp/src/tests.rs"
+                "Guard 2: isolated_ui_server_with helper not found in companion-ui/src/tests.rs"
             )
 
         slices: list[tuple[str, int, str]] = []
@@ -1131,7 +1131,7 @@ def _run_static_hermeticity_guards(root: pathlib.Path) -> list[str]:
                 if not allowed:
                     line_no = cleaned.count("\n", 0, offset + match.start()) + 1
                     errors.append(
-                        f"Guard 2 (crates/companion-ui-mcp/src/tests.rs:{line_no} in {fn_name}): "
+                        f"Guard 2 (crates/companion-ui/src/tests.rs:{line_no} in {fn_name}): "
                         f"disallowed CompanionUiServer::{ctor}("
                     )
 
