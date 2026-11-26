@@ -35,7 +35,7 @@ impl IntegrationLock {
         &self.path
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn try_clone_file(&self) -> std::io::Result<File> {
         self.file.try_clone()
     }
