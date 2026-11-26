@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
-    "build": "vite build"
+    "build": "vite build",
+    "test": "node --test tests/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^2.0.4"
