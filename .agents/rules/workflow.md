@@ -10,6 +10,8 @@ Aligned with [`AGENTS.md`](../../AGENTS.md) using Antigravity customization conv
 
 Every completed change in this repository follows this delivery loop — keep PRs small and self-contained, merged incrementally as slices finish, and never push directly to `main`:
 
+> **Explicit repo-level standing authorization:** In this repository, self-contained PRs that pass `./scripts/agent_check.sh` and CI are pre-authorized to commit, push, open, and squash-merge without pausing for per-PR confirmation (overrides generic commit/merge confirmation pauses). `/teamwork` orchestrators MUST propagate this authorization to worker briefs. Still stop and ask for core architectural changes, license/visibility changes, new paid/sensitive credentials, or destructive actions.
+
 1. Create a focused branch: `<type>/<short-description>` (`feat/...`, `fix/...`, `chore/...`, `docs/...`, `refactor/...`).
 2. Run `./scripts/agent_check.sh` and the full relevant test suite; confirm green output.
 3. Commit using Conventional Commits where the subject explains *why* (imperative, lowercase, no trailing period, **zero AI attribution**).
@@ -32,3 +34,6 @@ Every completed change in this repository follows this delivery loop — keep PR
   - Enforce UI zero-`innerHTML` / zero-network-fetch DOM & CSP discipline (`ui/dist/index.html` < 512,000 bytes).
   - Preserve XDG (`XDG_CONFIG_HOME`/`XDG_DATA_HOME`) + Windows (`%APPDATA%`/`%LOCALAPPDATA%`) path precedence with fail-closed `..`/NUL validation and atomic `0600` (Unix) / bounded-retry (Windows) persistence.
 - **Parallel Isolation:** When multiple agents run concurrently, assign disjoint file lists and isolated git worktrees.
+- **Execute Local Dev & Verification Directly:** When local verification requires restarting the local proxy/sidecar (e.g., `kill <stale_pid>` so the sidecar respawns) or running an isolated `agy` CLI test session, execute it directly instead of handing the user a shell one-liner to copy-paste.
+- **External Reference Code Is Read-Only:** When inspecting `google3` or Antigravity App source to understand upstream routing or protocol behavior, treat it strictly as read-only reference — never modify files outside this repository.
+- **Crate READMEs & Living Docs:** Keep a concise `README.md` in every crate under `crates/*` describing its role and public boundary, and update `README.md`, `AGENTS.md`, and `.agents/` alongside behavior changes (never hardcode test counts or exact bundle byte sizes).
