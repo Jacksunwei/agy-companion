@@ -11,10 +11,9 @@ pub mod models;
 pub mod process;
 pub mod serve;
 
-use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use companion_core::fs_safe;
 use companion_core::{Config, CoreError, FsError};
 use companion_providers::ProbeError;
 use companion_proxy::ProxyError;
@@ -59,9 +58,7 @@ impl From<FsError> for CliError {
 }
 
 pub(crate) fn normalized_metadata_path(path: &Path) -> PathBuf {
-    // Normalizing trailing slashes prevents POSIX lstat(2) from dereferencing a symlink path
-    // passed with a trailing separator (e.g. `--data-dir=/tmp/link/`).
-    path.components().collect()
+    fs_safe::normalize_path(path)
 }
 
 pub fn resolve_cli_config_path(cli_config: Option<&Path>) -> Result<PathBuf, CoreError> {
@@ -75,56 +72,40 @@ pub fn resolve_cli_config_path(cli_config: Option<&Path>) -> Result<PathBuf, Cor
 }
 
 pub fn precheck_existing_config_file(path: &Path) -> Result<bool, CliError> {
-    let check_path = normalized_metadata_path(path);
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(CliError::InvalidConfigFile {
-                    path: path.to_path_buf(),
-                    reason: "symbolic links are not allowed for config files".to_string(),
-                });
-            }
-            if !meta.file_type().is_file() {
-                return Err(CliError::InvalidConfigFile {
-                    path: path.to_path_buf(),
-                    reason: "config path must be a regular file".to_string(),
-                });
-            }
-            if meta.len() > MAX_CONFIG_FILE_BYTES {
-                return Err(CliError::InvalidConfigFile {
-                    path: path.to_path_buf(),
-                    reason: format!(
-                        "config file exceeds maximum allowed size of {MAX_CONFIG_FILE_BYTES} bytes"
-                    ),
-                });
-            }
-            Ok(true)
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(CliError::Io(err)),
+    match fs_safe::inspect_regular_file_if_exists(path, Some(MAX_CONFIG_FILE_BYTES)) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(FsError::SymlinkRejected { .. }) => Err(CliError::InvalidConfigFile {
+            path: path.to_path_buf(),
+            reason: "symbolic links are not allowed for config files".to_string(),
+        }),
+        Err(FsError::NotRegularFile { .. }) => Err(CliError::InvalidConfigFile {
+            path: path.to_path_buf(),
+            reason: "config path must be a regular file".to_string(),
+        }),
+        Err(FsError::SizeLimitExceeded { max_bytes, .. }) => Err(CliError::InvalidConfigFile {
+            path: path.to_path_buf(),
+            reason: format!("config file exceeds maximum allowed size of {max_bytes} bytes"),
+        }),
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
     }
 }
 
 pub fn precheck_existing_data_dir(path: &Path) -> Result<bool, CliError> {
-    let check_path = normalized_metadata_path(path);
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(CliError::InvalidDataDir {
-                    path: path.to_path_buf(),
-                    reason: "symbolic links are not allowed for data directories".to_string(),
-                });
-            }
-            if !meta.file_type().is_dir() {
-                return Err(CliError::InvalidDataDir {
-                    path: path.to_path_buf(),
-                    reason: "data directory path must be a directory".to_string(),
-                });
-            }
-            Ok(true)
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(CliError::Io(err)),
+    match fs_safe::inspect_existing_dir(path) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(FsError::SymlinkRejected { .. }) => Err(CliError::InvalidDataDir {
+            path: path.to_path_buf(),
+            reason: "symbolic links are not allowed for data directories".to_string(),
+        }),
+        Err(FsError::NotDirectory { .. }) => Err(CliError::InvalidDataDir {
+            path: path.to_path_buf(),
+            reason: "data directory path must be a directory".to_string(),
+        }),
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
     }
 }
 

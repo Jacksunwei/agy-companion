@@ -8,12 +8,12 @@ mod windows;
 #[cfg(test)]
 mod tests;
 
-use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use companion_core::DEFAULT_LISTEN_PORT;
+use companion_core::fs_safe::{self, FsError, PathLeafKind, inspect_leaf_kind};
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_providers::LoopbackProxyClient;
 use serde::{Deserialize, Serialize};
@@ -141,8 +141,8 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let plugin_target = plugins_root.join(PLUGIN_DIR_NAME);
 
     if plugins_root_safety == ExistingDirSafety::SafeDir {
-        match fs::symlink_metadata(normalized_metadata_path(&plugin_target)) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+        match inspect_leaf_kind(&plugin_target) {
+            Ok(PathLeafKind::Symlink) => {
                 if !opts.force {
                     return Err(CliError::Install(format!(
                         "plugin path '{}' is a symlink (likely linked via scripts/dev-install.sh); re-run with --force to replace the symlink without deleting its target",
@@ -150,7 +150,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
                     )));
                 }
             }
-            Ok(meta) if meta.file_type().is_dir() => {
+            Ok(PathLeafKind::Directory) => {
                 if !opts.force && !is_companion_plugin_dir(&plugin_target)? {
                     return Err(CliError::Install(format!(
                         "refusing to overwrite '{}' because it does not contain a valid agy-companion plugin.json (re-run with --force to override)",
@@ -158,21 +158,20 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
                     )));
                 }
             }
-            Ok(_) => {
+            Ok(PathLeafKind::RegularFile | PathLeafKind::Other) => {
                 return Err(CliError::Install(format!(
                     "plugin path '{}' exists and is not a directory",
                     plugin_target.display()
                 )));
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => return Err(CliError::Io(err)),
+            Ok(PathLeafKind::Missing) => {}
+            Err(FsError::Io { source, .. }) => return Err(CliError::Io(source)),
+            Err(err) => return Err(CliError::from(err)),
         }
     }
 
     let config_path = resolve_cli_config_path(opts.config.as_deref())?;
     let norm_config_path = normalized_metadata_path(&config_path);
-    let probe =
-        LoopbackProxyClient::new(INSTALL_HEALTH_PROBE_TIMEOUT, INSTALL_HEALTH_PROBE_TIMEOUT)?;
     let data_dir = companion_core::default_data_dir()?;
     let mut data_dir_warnings = Vec::new();
     let data_dir_safety = inspect_data_dir(&home, &data_dir, &mut data_dir_warnings)?;
@@ -202,7 +201,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
             ));
         }
         let lock_path = data_dir.join(companion_core::integration::INTEGRATION_LOCK_FILENAME);
-        companion_core::fs_safe::inspect_regular_file_if_exists(&lock_path, None)?;
+        fs_safe::inspect_regular_file_if_exists(&lock_path, None)?;
     }
     #[cfg(not(windows))]
     if !opts.no_launcher_hook
@@ -211,21 +210,26 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
             != companion_core::integration::ShellKind::Fish
     {
         let env_path = data_dir.join(companion_core::integration::ENV_SCRIPT_FILENAME);
-        match fs::symlink_metadata(normalized_metadata_path(&env_path)) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+        match fs_safe::inspect_regular_file_if_exists(&env_path, None) {
+            Ok(_) => {}
+            Err(FsError::SymlinkRejected { .. }) => {
                 return Err(CliError::Install(format!(
                     "refusing to use symlinked env script '{}'",
                     env_path.display()
                 )));
             }
-            Ok(meta) if !meta.file_type().is_file() => {
+            Err(FsError::NotRegularFile { .. }) => {
                 return Err(CliError::Install(format!(
                     "refusing to use non-regular env script '{}'",
                     env_path.display()
                 )));
             }
-            Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(FsError::Io { source, .. }) => {
+                return Err(CliError::Install(format!(
+                    "failed to inspect env script '{}': {source}",
+                    env_path.display()
+                )));
+            }
             Err(err) => {
                 return Err(CliError::Install(format!(
                     "failed to inspect env script '{}': {err}",
@@ -255,11 +259,17 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let mut config = load_config_checked(&config_path)?;
 
     // Fresh-install port 24141..=24150 fallback runs even when --no-start-proxy is set.
-    // Defer persisting config.json until preconditions, staging, and swaps succeed.
+    // Defer LoopbackProxyClient creation (and TLS root-cert init) until a probe is actually needed,
+    // and defer persisting config.json until preconditions, staging, and swaps succeed.
+    let mut probe: Option<LoopbackProxyClient> = None;
     let mut port_auto_selected = false;
     if !config_existed {
+        let probe_ref = probe.get_or_insert(LoopbackProxyClient::new(
+            INSTALL_HEALTH_PROBE_TIMEOUT,
+            INSTALL_HEALTH_PROBE_TIMEOUT,
+        )?);
         let (selected_port, auto_selected) = select_fresh_install_port(
-            &probe,
+            probe_ref,
             DEFAULT_LISTEN_PORT,
             DEFAULT_LISTEN_PORT + PORT_FALLBACK_SPAN,
             true,
@@ -319,9 +329,16 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let proxy_outcome = if opts.no_start_proxy {
         InstallProxyOutcome::default()
     } else {
+        let probe_ref = match probe.as_ref() {
+            Some(client) => client,
+            None => probe.insert(LoopbackProxyClient::new(
+                INSTALL_HEALTH_PROBE_TIMEOUT,
+                INSTALL_HEALTH_PROBE_TIMEOUT,
+            )?),
+        };
         ensure_installed_proxy_running(
             &InstallProxyContext {
-                probe: &probe,
+                probe: probe_ref,
                 stable_bin: &stable_bin,
                 config_path: &config_path,
                 data_dir: &data_dir,

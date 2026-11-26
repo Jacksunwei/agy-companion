@@ -633,7 +633,7 @@ async fn select_fresh_install_port_falls_back_when_first_port_is_occupied_and_fa
     // otherwise race on macOS when a sibling test spawns a subprocess between socket() and
     // FIOCLEX and transiently holds the dropped listener fd).
     let mut exhausted: Option<(u16, TcpListener, TcpListener, TcpListener)> = None;
-    for candidate in (24_000u16..26_000).step_by(3) {
+    for candidate in (24_200u16..26_000).step_by(3) {
         if let (Ok(e1), Ok(e2), Ok(e3)) = (
             TcpListener::bind((Ipv4Addr::LOCALHOST, candidate)),
             TcpListener::bind((Ipv4Addr::LOCALHOST, candidate + 1)),

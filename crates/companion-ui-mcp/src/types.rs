@@ -39,8 +39,9 @@ pub enum UiHtmlSource {
 pub struct UiServerOptions {
     pub ui_html_source: UiHtmlSource,
     pub env_api_key_fallback: bool,
-    pub test_connection_timeout_override: Option<u64>,
+    pub test_connection_timeout_override: Option<Duration>,
     pub integration_options_override: Option<IntegrationOptions>,
+    pub hybrid_active_override: Option<bool>,
     pub probe_timeout: Duration,
     pub auto_enable_launcher: bool,
 }
@@ -52,9 +53,22 @@ impl Default for UiServerOptions {
             env_api_key_fallback: true,
             test_connection_timeout_override: None,
             integration_options_override: None,
+            hybrid_active_override: None,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             auto_enable_launcher: false,
         }
+    }
+}
+
+impl UiServerOptions {
+    pub fn with_hybrid_active_override(mut self, hybrid_active: Option<bool>) -> Self {
+        self.hybrid_active_override = hybrid_active;
+        self
+    }
+
+    pub fn with_test_connection_timeout(mut self, timeout: Duration) -> Self {
+        self.test_connection_timeout_override = Some(timeout);
+        self
     }
 }
 

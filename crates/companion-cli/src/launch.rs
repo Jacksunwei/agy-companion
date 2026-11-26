@@ -218,7 +218,9 @@ pub(crate) fn discover_windows_antigravity_exe(
             .map(|dir| dir.join("Antigravity").join("Antigravity.exe")),
     ];
     for candidate in candidates.into_iter().flatten() {
-        if std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_file()) {
+        if companion_core::fs_safe::inspect_regular_file_if_exists(&candidate, None)
+            .is_ok_and(|meta| meta.is_some())
+        {
             return candidate;
         }
     }
@@ -565,6 +567,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
+        tokio::task::yield_now().await;
         (port, handle)
     }
 

@@ -1,11 +1,13 @@
 use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use companion_core::fs_safe::{DirChainStatus, ensure_dir_no_symlink, inspect_dir_chain};
 use companion_core::fs_safe::{
-    FsError, SymlinkPolicy, TempPathGuard, read_regular_file_bounded, rename_with_retry,
-    unique_temp_suffix, unlink_symlink,
+    FsError, PathLeafKind, SymlinkPolicy, TempPathGuard, inspect_leaf_kind,
+    read_regular_file_bounded, rename_with_retry, unique_temp_suffix, unlink_symlink,
 };
 use companion_providers::LoopbackProxyClient;
 
@@ -144,7 +146,14 @@ pub(crate) fn stage_binary_copy(
         open_opts.mode(0o755);
     }
     let mut writer = open_opts.open(&staged_path)?;
-    std::io::copy(&mut reader, &mut writer)?;
+    let mut copy_buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut copy_buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&copy_buf[..n])?;
+    }
     writer.sync_all()?;
     drop(writer);
 
@@ -273,56 +282,38 @@ pub(crate) fn install_local_bin_symlink(
     let local_bin_link = local_bin_dir.join(BINARY_NAME);
 
     // Ensure ~/.local and ~/.local/bin are non-symlink directories (or create them).
-    match fs::symlink_metadata(normalized_metadata_path(&dot_local_dir)) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_dir() => {
+    match inspect_dir_chain(home, &[".local", "bin"]) {
+        Ok(DirChainStatus::SafeDir) => {}
+        Ok(DirChainStatus::Missing) => {
+            for dir in [&dot_local_dir, &local_bin_dir] {
+                match ensure_dir_no_symlink(dir, 0o755) {
+                    Ok(()) => {}
+                    Err(FsError::SymlinkRejected { path } | FsError::NotDirectory { path }) => {
+                        warnings.push(format!(
+                            "skipping {} symlink because '{}' is not a regular directory",
+                            local_bin_link.display(),
+                            path.display()
+                        ));
+                        return None;
+                    }
+                    Err(FsError::Io { source, .. }) => {
+                        warnings.push(format!("failed to create '{}': {source}", dir.display()));
+                        return None;
+                    }
+                    Err(err) => {
+                        warnings.push(format!("failed to create '{}': {err}", dir.display()));
+                        return None;
+                    }
+                }
+            }
+        }
+        Ok(DirChainStatus::Symlink { path, .. } | DirChainStatus::NotDirectory { path }) => {
             warnings.push(format!(
                 "skipping {} symlink because '{}' is not a regular directory",
                 local_bin_link.display(),
-                dot_local_dir.display()
+                path.display()
             ));
             return None;
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => {
-            warnings.push(format!(
-                "failed to inspect '{}': {err}",
-                dot_local_dir.display()
-            ));
-            return None;
-        }
-    }
-
-    match fs::symlink_metadata(normalized_metadata_path(&local_bin_dir)) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                warnings.push(format!(
-                    "skipping {} symlink because '{}' is not a regular directory",
-                    local_bin_link.display(),
-                    local_bin_dir.display()
-                ));
-                return None;
-            }
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            if let Err(create_err) = fs::create_dir_all(&local_bin_dir) {
-                warnings.push(format!(
-                    "failed to create '{}': {create_err}",
-                    local_bin_dir.display()
-                ));
-                return None;
-            }
-            match fs::symlink_metadata(normalized_metadata_path(&local_bin_dir)) {
-                Ok(meta) if !meta.file_type().is_symlink() && meta.file_type().is_dir() => {}
-                _ => {
-                    warnings.push(format!(
-                        "skipping {} symlink because '{}' is not a regular directory",
-                        local_bin_link.display(),
-                        local_bin_dir.display()
-                    ));
-                    return None;
-                }
-            }
         }
         Err(err) => {
             warnings.push(format!(
@@ -333,8 +324,8 @@ pub(crate) fn install_local_bin_symlink(
         }
     }
 
-    match fs::symlink_metadata(normalized_metadata_path(&local_bin_link)) {
-        Err(err) if err.kind() == ErrorKind::NotFound => {
+    match inspect_leaf_kind(&local_bin_link) {
+        Ok(PathLeafKind::Missing) => {
             if let Err(sym_err) = symlink(stable_bin, &local_bin_link) {
                 warnings.push(format!(
                     "failed to create symlink '{}': {sym_err}",
@@ -344,7 +335,7 @@ pub(crate) fn install_local_bin_symlink(
             }
             Some(local_bin_link)
         }
-        Ok(meta) if meta.file_type().is_symlink() => {
+        Ok(PathLeafKind::Symlink) => {
             if !symlink_points_to_path(&local_bin_link, stable_bin) {
                 warnings.push(format!(
                     "leaving existing foreign symlink '{}' untouched",
@@ -372,7 +363,7 @@ pub(crate) fn install_local_bin_symlink(
             tmp_guard.disarm();
             Some(local_bin_link)
         }
-        Ok(_) => {
+        Ok(PathLeafKind::RegularFile | PathLeafKind::Directory | PathLeafKind::Other) => {
             warnings.push(format!(
                 "leaving existing non-symlink '{}' untouched",
                 local_bin_link.display()
@@ -436,14 +427,13 @@ pub(crate) fn swap_plugin_dir_two_step(
     mut stage_guard: TempPathGuard,
     warnings: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    let check_target = normalized_metadata_path(plugin_target);
-    match fs::symlink_metadata(&check_target) {
-        Err(err) if err.kind() == ErrorKind::NotFound => {
+    match inspect_leaf_kind(plugin_target) {
+        Ok(PathLeafKind::Missing) => {
             rename_with_retry(stage_dir, plugin_target)?;
             stage_guard.disarm();
             Ok(())
         }
-        Ok(meta) if meta.file_type().is_symlink() => {
+        Ok(PathLeafKind::Symlink) => {
             #[cfg(unix)]
             let orig_target = fs::read_link(plugin_target).ok();
             unlink_symlink(plugin_target)?;
@@ -457,7 +447,7 @@ pub(crate) fn swap_plugin_dir_two_step(
             stage_guard.disarm();
             Ok(())
         }
-        Ok(meta) if meta.file_type().is_dir() => {
+        Ok(PathLeafKind::Directory) => {
             let backup_dir = plugins_root.join(format!(
                 ".{PLUGIN_DIR_NAME}.backup.{}",
                 unique_temp_suffix()
@@ -476,11 +466,12 @@ pub(crate) fn swap_plugin_dir_two_step(
             }
             Ok(())
         }
-        Ok(_) => Err(CliError::Install(format!(
+        Ok(PathLeafKind::RegularFile | PathLeafKind::Other) => Err(CliError::Install(format!(
             "cannot install plugin at '{}': path exists and is not a directory",
             plugin_target.display()
         ))),
-        Err(err) => Err(CliError::Io(err)),
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
     }
 }
 

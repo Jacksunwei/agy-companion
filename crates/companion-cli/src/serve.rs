@@ -9,8 +9,9 @@ use companion_providers::LoopbackProxyClient;
 use companion_proxy::{ProxyError, ProxyState, ProxyStateOptions};
 
 use crate::daemon::{
-    MAX_PROXY_LOG_BYTES, PROXY_LOG_FILENAME, PROXY_PID_FILENAME, ProxyPidInfo, RotatingFileWriter,
-    ServeLogTarget, resolve_runtime_data_dir, write_proxy_pid,
+    MAX_PROXY_LOG_BYTES, PROXY_LOG_FILENAME, PROXY_LOG_ROTATED_FILENAME, PROXY_PID_FILENAME,
+    ProxyPidInfo, RotatingFileWriter, ServeLogTarget, reject_non_regular_target,
+    resolve_runtime_data_dir, write_proxy_pid,
 };
 use crate::{CliError, load_config_checked, precheck_existing_data_dir, resolve_cli_config_path};
 
@@ -63,8 +64,30 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
 
     let usage_dir = config.effective_usage_dir()?;
     precheck_existing_data_dir(&usage_dir)?;
+    let usage_db = usage_dir.join(companion_core::USAGE_DB_FILENAME);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let candidate = if suffix.is_empty() {
+            usage_db.clone()
+        } else {
+            companion_core::fs_safe::append_os_suffix(&usage_db, suffix)
+        };
+        companion_core::fs_safe::inspect_regular_file_if_exists(&candidate, None)?;
+    }
     let runtime_data_dir = resolve_runtime_data_dir(&config)?;
-    precheck_existing_data_dir(&runtime_data_dir)?;
+    if precheck_existing_data_dir(&runtime_data_dir)? {
+        reject_non_regular_target(
+            &runtime_data_dir.join(PROXY_PID_FILENAME),
+            "proxy PID files",
+        )?;
+        reject_non_regular_target(
+            &runtime_data_dir.join(PROXY_LOG_FILENAME),
+            "proxy log files",
+        )?;
+        reject_non_regular_target(
+            &runtime_data_dir.join(PROXY_LOG_ROTATED_FILENAME),
+            "rotated proxy log files",
+        )?;
+    }
 
     if options.auto_enable_launcher {
         let auto_cfg_path = config_path.clone();
@@ -233,7 +256,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
             None => signal_shutdown_fut.await,
             Some(timeout) => {
                 let poll_interval =
-                    (timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
+                    (timeout / 40).clamp(Duration::from_millis(25), Duration::from_secs(1));
                 let idle_fut = async move {
                     loop {
                         if idle_state.in_flight_requests() == 0

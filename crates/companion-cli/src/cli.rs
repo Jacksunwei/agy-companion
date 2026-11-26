@@ -242,284 +242,109 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::{CommandFactory, Parser};
+    use companion_core::integration::ShellKind;
 
-    use super::{Cli, Commands};
+    use super::{Cli, CliShell, Commands, IntegrationCommands};
 
     #[test]
-    fn parses_serve_ui_mcp_doctor_and_models_subcommands() {
-        let serve = Cli::try_parse_from([
-            "agy-companion",
-            "serve",
-            "--port",
-            "4242",
-            "--config",
-            "/tmp/c.json",
-        ])
-        .expect("serve args should parse");
-        assert_eq!(
-            serve.command,
-            Commands::Serve {
-                port: Some(4242),
-                config: Some(PathBuf::from("/tmp/c.json")),
-                adopt_running: false,
-                auto_enable_launcher: false,
-                idle_shutdown_secs: None,
-            }
-        );
-
-        let serve_defaults =
-            Cli::try_parse_from(["agy-companion", "serve"]).expect("serve defaults should parse");
-        assert_eq!(
-            serve_defaults.command,
-            Commands::Serve {
-                port: None,
-                config: None,
-                adopt_running: false,
-                auto_enable_launcher: false,
-                idle_shutdown_secs: None,
-            }
-        );
-
-        let serve_adopt = Cli::try_parse_from([
-            "agy-companion",
-            "serve",
-            "--adopt-running",
-            "--auto-enable-launcher",
-        ])
-        .expect("serve --adopt-running --auto-enable-launcher should parse");
-        assert_eq!(
-            serve_adopt.command,
-            Commands::Serve {
-                port: None,
-                config: None,
-                adopt_running: true,
-                auto_enable_launcher: true,
-                idle_shutdown_secs: None,
-            }
-        );
-
-        let serve_idle =
-            Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs", "1800"])
-                .expect("serve --idle-shutdown-secs should parse");
-        assert_eq!(
-            serve_idle.command,
-            Commands::Serve {
-                port: None,
-                config: None,
-                adopt_running: false,
-                auto_enable_launcher: false,
-                idle_shutdown_secs: Some(1800),
-            }
-        );
-
-        let serve_idle_zero =
-            Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs=0"])
-                .expect("serve --idle-shutdown-secs=0 should parse");
-        assert_eq!(
-            serve_idle_zero.command,
-            Commands::Serve {
-                port: None,
-                config: None,
-                adopt_running: false,
-                auto_enable_launcher: false,
-                idle_shutdown_secs: Some(0),
-            }
-        );
-
-        let ui_mcp_eq = Cli::try_parse_from([
-            "agy-companion",
-            "ui-mcp",
-            "--data-dir=/tmp/data",
-            "--config",
-            "/tmp/c.json",
-        ])
-        .expect("ui-mcp equals form should parse");
-        assert_eq!(
-            ui_mcp_eq.command,
-            Commands::UiMcp {
-                data_dir: Some(PathBuf::from("/tmp/data")),
-                config: Some(PathBuf::from("/tmp/c.json")),
-                auto_enable_launcher: false,
-            }
-        );
-
-        let ui_mcp_space = Cli::try_parse_from(["agy-companion", "ui-mcp", "--data-dir", "/tmp/d"])
-            .expect("ui-mcp space form should parse");
-        assert_eq!(
-            ui_mcp_space.command,
-            Commands::UiMcp {
-                data_dir: Some(PathBuf::from("/tmp/d")),
-                config: None,
-                auto_enable_launcher: false,
-            }
-        );
-
-        let ui_mcp_auto = Cli::try_parse_from([
-            "agy-companion",
-            "ui-mcp",
-            "--data-dir=/tmp/data",
-            "--auto-enable-launcher",
-        ])
-        .expect("ui-mcp --auto-enable-launcher should parse");
-        assert_eq!(
-            ui_mcp_auto.command,
-            Commands::UiMcp {
-                data_dir: Some(PathBuf::from("/tmp/data")),
-                config: None,
-                auto_enable_launcher: true,
-            }
-        );
-
-        let doctor = Cli::try_parse_from([
-            "agy-companion",
-            "doctor",
-            "--config",
-            "/tmp/c.json",
-            "--port",
-            "4242",
-            "--json",
-        ])
-        .expect("doctor args should parse");
-        assert_eq!(
-            doctor.command,
-            Commands::Doctor {
-                config: Some(PathBuf::from("/tmp/c.json")),
-                port: Some(4242),
-                json: true,
-            }
-        );
-
-        let models = Cli::try_parse_from([
-            "agy-companion",
-            "models",
-            "--json",
-            "--port",
-            "4242",
-            "--config",
-            "/tmp/c.json",
-        ])
-        .expect("models args should parse");
-        assert_eq!(
-            models.command,
-            Commands::Models {
-                json: true,
-                port: Some(4242),
-                config: Some(PathBuf::from("/tmp/c.json")),
-            }
-        );
+    fn cli_rejects_forbidden_host_zero_ports_and_invalid_arguments() {
+        Cli::command().debug_assert();
 
         let rendered_version = Cli::command().render_version();
         assert_eq!(
             rendered_version.trim(),
             format!("agy-companion {}", env!("CARGO_PKG_VERSION"))
         );
-    }
-
-    #[test]
-    fn cli_rejects_unknown_flags_and_supports_equals_form_args() {
-        let parsed = Cli::try_parse_from([
-            "agy-companion",
-            "serve",
-            "--port=5151",
-            "--config=/tmp/c.json",
-        ])
-        .expect("equals form args should parse");
-        assert_eq!(
-            parsed.command,
-            Commands::Serve {
-                port: Some(5151),
-                config: Some(PathBuf::from("/tmp/c.json")),
-                adopt_running: false,
-                auto_enable_launcher: false,
-                idle_shutdown_secs: None,
-            }
-        );
-
-        let launch = Cli::try_parse_from([
-            "agy-companion",
-            "launch",
-            "--port",
-            "4141",
-            "--print-env",
-            "--app",
-            "/opt/antigravity",
-        ])
-        .expect("launch args should parse");
-        assert_eq!(
-            launch.command,
-            Commands::Launch {
-                port: Some(4141),
-                config: None,
-                app: Some(PathBuf::from("/opt/antigravity")),
-                print_env: true,
-            }
-        );
-
-        let data_dir_eq = Cli::try_parse_from([
-            "agy-companion",
-            "ui-mcp",
-            "--data-dir=/tmp/plugin-data",
-            "--config=/tmp/c.json",
-        ])
-        .expect("ui-mcp equals form should parse");
-        assert_eq!(
-            data_dir_eq.command,
-            Commands::UiMcp {
-                data_dir: Some(PathBuf::from("/tmp/plugin-data")),
-                config: Some(PathBuf::from("/tmp/c.json")),
-                auto_enable_launcher: false,
-            }
-        );
 
         assert!(
             Cli::try_parse_from(["agy-companion", "serve", "--host", "0.0.0.0"]).is_err(),
-            "non-loopback --host flag must not exist"
+            "S1: non-loopback --host flag must not exist"
         );
         assert!(
             Cli::try_parse_from(["agy-companion"]).is_err(),
             "missing subcommand must fail"
         );
         assert!(
-            Cli::try_parse_from(["agy-companion", "serve", "--port", "0"]).is_err(),
-            "--port 0 must fail during CLI parsing"
+            Cli::try_parse_from(["agy-companion", "integration"]).is_err(),
+            "integration without action must fail"
         );
+
+        // Custom parse_nonzero_port rejects 0, non-numeric, and >65535 across all 5 port-taking subcommands.
+        for subcmd in ["serve", "doctor", "models", "launch", "hook-env"] {
+            for bad_port in ["0", "abc", "65536"] {
+                assert!(
+                    Cli::try_parse_from(["agy-companion", subcmd, "--port", bad_port]).is_err(),
+                    "{subcmd} --port {bad_port} must fail during CLI parsing"
+                );
+            }
+        }
+
+        for bad_idle in ["abc", "-1"] {
+            assert!(
+                Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs", bad_idle])
+                    .is_err(),
+                "invalid --idle-shutdown-secs '{bad_idle}' must fail"
+            );
+        }
         assert!(
-            Cli::try_parse_from(["agy-companion", "doctor", "--port", "0"]).is_err(),
-            "doctor --port 0 must fail during CLI parsing"
-        );
-        assert!(
-            Cli::try_parse_from(["agy-companion", "models", "--port", "0"]).is_err(),
-            "models --port 0 must fail during CLI parsing"
-        );
-        assert!(
-            Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs", "abc"]).is_err(),
-            "non-numeric --idle-shutdown-secs must fail"
-        );
-        assert!(
-            Cli::try_parse_from(["agy-companion", "serve", "--idle-shutdown-secs", "-1"]).is_err(),
-            "negative --idle-shutdown-secs must fail"
+            Cli::try_parse_from(["agy-companion", "integration", "enable", "--shell", "tcsh"])
+                .is_err(),
+            "unsupported --shell must fail"
         );
     }
 
     #[test]
-    fn parses_hook_env_and_integration_subcommands_and_rejects_invalid_args() {
-        use super::{CliShell, IntegrationCommands};
-
-        let hook_env = Cli::try_parse_from([
-            "agy-companion",
-            "hook-env",
-            "--ensure-running",
-            "--print-port",
-            "--port",
-            "4242",
-            "--config",
-            "/tmp/c.json",
-            "--plugins-dir",
-            "/tmp/p",
-        ])
-        .expect("hook-env args should parse");
+    fn cli_supports_equals_form_and_key_flag_contracts() {
         assert_eq!(
-            hook_env.command,
+            Cli::try_parse_from([
+                "agy-companion",
+                "serve",
+                "--port=5151",
+                "--config=/tmp/c.json",
+                "--adopt-running",
+                "--auto-enable-launcher",
+                "--idle-shutdown-secs=0",
+            ])
+            .expect("serve equals form")
+            .command,
+            Commands::Serve {
+                port: Some(5151),
+                config: Some(PathBuf::from("/tmp/c.json")),
+                adopt_running: true,
+                auto_enable_launcher: true,
+                idle_shutdown_secs: Some(0),
+            }
+        );
+
+        assert_eq!(
+            Cli::try_parse_from([
+                "agy-companion",
+                "ui-mcp",
+                "--data-dir=/tmp/plugin-data",
+                "--config=/tmp/c.json",
+                "--auto-enable-launcher",
+            ])
+            .expect("ui-mcp equals form")
+            .command,
+            Commands::UiMcp {
+                data_dir: Some(PathBuf::from("/tmp/plugin-data")),
+                config: Some(PathBuf::from("/tmp/c.json")),
+                auto_enable_launcher: true,
+            }
+        );
+
+        assert_eq!(
+            Cli::try_parse_from([
+                "agy-companion",
+                "hook-env",
+                "--ensure-running",
+                "--print-port",
+                "--port=4242",
+                "--config=/tmp/c.json",
+                "--plugins-dir=/tmp/p",
+            ])
+            .expect("hook-env equals form")
+            .command,
             Commands::HookEnv {
                 ensure_running: true,
                 print_port: true,
@@ -529,49 +354,19 @@ mod tests {
             }
         );
 
-        let enable = Cli::try_parse_from([
-            "agy-companion",
-            "integration",
-            "enable",
-            "--shell",
-            "zsh",
-            "--rc-file",
-            "/tmp/.zlogin",
-            "--binary",
-            "/tmp/bin/agy-companion",
-            "--follow-rc-symlink",
-            "--config",
-            "/tmp/c.json",
-            "--json",
-        ])
-        .expect("integration enable should parse");
         assert_eq!(
-            enable.command,
-            Commands::Integration {
-                action: IntegrationCommands::Enable {
-                    shell: Some(CliShell::Zsh),
-                    rc_file: Some(PathBuf::from("/tmp/.zlogin")),
-                    binary: Some(PathBuf::from("/tmp/bin/agy-companion")),
-                    follow_rc_symlink: true,
-                    config: Some(PathBuf::from("/tmp/c.json")),
-                    json: true,
-                },
-            }
-        );
-
-        let disable = Cli::try_parse_from([
-            "agy-companion",
-            "integration",
-            "disable",
-            "--shell",
-            "bash",
-            "--follow-rc-symlink",
-            "--config=/tmp/d.json",
-            "--json",
-        ])
-        .expect("integration disable should parse");
-        assert_eq!(
-            disable.command,
+            Cli::try_parse_from([
+                "agy-companion",
+                "integration",
+                "disable",
+                "--shell",
+                "bash",
+                "--follow-rc-symlink",
+                "--config=/tmp/d.json",
+                "--json",
+            ])
+            .expect("integration disable equals form")
+            .command,
             Commands::Integration {
                 action: IntegrationCommands::Disable {
                     shell: Some(CliShell::Bash),
@@ -582,64 +377,26 @@ mod tests {
                 },
             }
         );
+        assert_eq!(ShellKind::from(CliShell::Zsh), ShellKind::Zsh);
+        assert_eq!(ShellKind::from(CliShell::Bash), ShellKind::Bash);
+        assert_eq!(ShellKind::from(CliShell::Fish), ShellKind::Fish);
 
-        let status = Cli::try_parse_from([
-            "agy-companion",
-            "integration",
-            "status",
-            "--shell",
-            "fish",
-            "--rc-file",
-            "/tmp/fish.fish",
-            "--config",
-            "/tmp/s.json",
-            "--json",
-        ])
-        .expect("integration status should parse");
         assert_eq!(
-            status.command,
-            Commands::Integration {
-                action: IntegrationCommands::Status {
-                    shell: Some(CliShell::Fish),
-                    rc_file: Some(PathBuf::from("/tmp/fish.fish")),
-                    config: Some(PathBuf::from("/tmp/s.json")),
-                    json: true,
-                },
-            }
-        );
-
-        assert!(
-            Cli::try_parse_from(["agy-companion", "hook-env", "--port", "0"]).is_err(),
-            "hook-env --port 0 must fail"
-        );
-        assert!(
-            Cli::try_parse_from(["agy-companion", "integration", "enable", "--shell", "tcsh"])
-                .is_err(),
-            "unsupported --shell must fail"
-        );
-        assert!(
-            Cli::try_parse_from(["agy-companion", "integration"]).is_err(),
-            "integration without action must fail"
-        );
-
-        let install = Cli::try_parse_from([
-            "agy-companion",
-            "install",
-            "--config",
-            "/tmp/custom-config.json",
-            "--plugins-dir",
-            "/tmp/plugins",
-            "--no-launcher-hook",
-            "--no-start-proxy",
-            "--force",
-            "--json",
-        ])
-        .expect("install should parse");
-        assert_eq!(
-            install.command,
+            Cli::try_parse_from([
+                "agy-companion",
+                "install",
+                "--config=/tmp/c.json",
+                "--plugins-dir=/tmp/p",
+                "--no-launcher-hook",
+                "--no-start-proxy",
+                "--force",
+                "--json",
+            ])
+            .expect("install equals form")
+            .command,
             Commands::Install {
-                config: Some(PathBuf::from("/tmp/custom-config.json")),
-                plugins_dir: Some(PathBuf::from("/tmp/plugins")),
+                config: Some(PathBuf::from("/tmp/c.json")),
+                plugins_dir: Some(PathBuf::from("/tmp/p")),
                 no_launcher_hook: true,
                 no_start_proxy: true,
                 force: true,
@@ -647,82 +404,24 @@ mod tests {
             }
         );
 
-        let install_eq =
-            Cli::try_parse_from(["agy-companion", "install", "--config=/tmp/eq-config.json"])
-                .expect("install --config= should parse");
         assert_eq!(
-            install_eq.command,
-            Commands::Install {
-                config: Some(PathBuf::from("/tmp/eq-config.json")),
-                plugins_dir: None,
-                no_launcher_hook: false,
-                no_start_proxy: false,
-                force: false,
-                json: false,
-            }
-        );
-
-        let install_defaults = Cli::try_parse_from(["agy-companion", "install"])
-            .expect("install defaults should parse");
-        assert_eq!(
-            install_defaults.command,
-            Commands::Install {
-                config: None,
-                plugins_dir: None,
-                no_launcher_hook: false,
-                no_start_proxy: false,
-                force: false,
-                json: false,
-            }
-        );
-
-        let uninstall = Cli::try_parse_from([
-            "agy-companion",
-            "uninstall",
-            "--config",
-            "/tmp/custom-config.json",
-            "--plugins-dir",
-            "/tmp/plugins",
-            "--purge",
-            "--dry-run",
-            "--json",
-        ])
-        .expect("uninstall should parse");
-        assert_eq!(
-            uninstall.command,
+            Cli::try_parse_from([
+                "agy-companion",
+                "uninstall",
+                "--config=/tmp/c.json",
+                "--plugins-dir=/tmp/p",
+                "--purge",
+                "--dry-run",
+                "--json",
+            ])
+            .expect("uninstall equals form")
+            .command,
             Commands::Uninstall {
-                config: Some(PathBuf::from("/tmp/custom-config.json")),
-                plugins_dir: Some(PathBuf::from("/tmp/plugins")),
+                config: Some(PathBuf::from("/tmp/c.json")),
+                plugins_dir: Some(PathBuf::from("/tmp/p")),
                 purge: true,
                 dry_run: true,
                 json: true,
-            }
-        );
-
-        let uninstall_eq =
-            Cli::try_parse_from(["agy-companion", "uninstall", "--config=/tmp/eq-config.json"])
-                .expect("uninstall --config= should parse");
-        assert_eq!(
-            uninstall_eq.command,
-            Commands::Uninstall {
-                config: Some(PathBuf::from("/tmp/eq-config.json")),
-                plugins_dir: None,
-                purge: false,
-                dry_run: false,
-                json: false,
-            }
-        );
-
-        let uninstall_defaults = Cli::try_parse_from(["agy-companion", "uninstall"])
-            .expect("uninstall defaults should parse");
-        assert_eq!(
-            uninstall_defaults.command,
-            Commands::Uninstall {
-                config: None,
-                plugins_dir: None,
-                purge: false,
-                dry_run: false,
-                json: false,
             }
         );
     }

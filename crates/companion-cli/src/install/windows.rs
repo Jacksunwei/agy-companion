@@ -1,14 +1,14 @@
 #[cfg(windows)]
 use std::fs;
-#[cfg(windows)]
-use std::io::ErrorKind;
 #[cfg(any(windows, test))]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
 
 #[cfg(windows)]
-use companion_core::fs_safe::default_platform_config_dir;
+use companion_core::fs_safe::{
+    FsError, default_platform_config_dir, inspect_regular_file_if_exists,
+};
 
 #[cfg(any(windows, test))]
 use super::bundle::EMBEDDED_PLUGIN_FILES;
@@ -16,8 +16,6 @@ use super::bundle::EMBEDDED_PLUGIN_FILES;
 use super::safety::{ExistingDirSafety, ensure_non_symlink_dir, inspect_non_symlink_rel_chain};
 #[cfg(any(windows, test))]
 use crate::CliError;
-#[cfg(windows)]
-use crate::normalized_metadata_path;
 #[cfg(windows)]
 use crate::process::CREATE_NO_WINDOW;
 
@@ -221,16 +219,16 @@ pub(crate) fn create_windows_start_menu_shortcut(binary_path: &Path) -> Result<P
     if let Some(parent) = shortcut_path.parent() {
         ensure_non_symlink_dir(parent, 0o755)?;
     }
-    match fs::symlink_metadata(normalized_metadata_path(&shortcut_path)) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => {
+    match inspect_regular_file_if_exists(&shortcut_path, None) {
+        Ok(_) => {}
+        Err(FsError::SymlinkRejected { .. } | FsError::NotRegularFile { .. }) => {
             return Err(CliError::Install(format!(
                 "refusing to overwrite symlinked/non-regular Start Menu shortcut '{}'",
                 shortcut_path.display()
             )));
         }
-        Ok(_) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => return Err(CliError::Io(err)),
+        Err(FsError::Io { source, .. }) => return Err(CliError::Io(source)),
+        Err(err) => return Err(CliError::from(err)),
     }
 
     let discovered_app = crate::launch::default_antigravity_app_path();
@@ -290,16 +288,17 @@ pub(crate) fn remove_windows_start_menu_shortcut(
         return Ok(false);
     }
     let shortcut_path = resolve_windows_shortcut_path(&app_data);
-    let check_path = normalized_metadata_path(&shortcut_path);
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
+    match inspect_regular_file_if_exists(&shortcut_path, None) {
+        Ok(Some(_)) => {
             if !dry_run {
                 fs::remove_file(&shortcut_path)?;
             }
             Ok(true)
         }
-        Ok(_) => Ok(false),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(CliError::Io(err)),
+        Ok(None) | Err(FsError::SymlinkRejected { .. } | FsError::NotRegularFile { .. }) => {
+            Ok(false)
+        }
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
     }
 }

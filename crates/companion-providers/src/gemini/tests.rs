@@ -53,7 +53,7 @@ fn provider_for(base_url: &str, api_key: Option<&str>, env_key: Option<&str>) ->
     GeminiProvider::build(
         base_url.to_string(),
         api_key.map(str::to_owned),
-        DEFAULT_TIMEOUT_SECS,
+        Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         EnvKeySource::Fixed(env_key.map(str::to_owned)),
     )
     .expect("construct test provider")
@@ -450,6 +450,21 @@ async fn normalizes_base_url_with_and_without_v1beta_and_trailing_slashes() {
     let err = GeminiProvider::new("http://127.0.0.1:4141", None, 0)
         .expect_err("must reject timeout_secs == 0");
     assert!(matches!(err, ProviderError::InvalidConfig(_)));
+    let err = GeminiProvider::new_with_timeout("http://127.0.0.1:4141", None, Duration::ZERO)
+        .expect_err("must reject Duration::ZERO");
+    assert!(matches!(err, ProviderError::InvalidConfig(_)));
+    let err = GeminiProvider::from_config_with_timeout(
+        &config_for("http://127.0.0.1:4141", None, 30),
+        Duration::ZERO,
+    )
+    .expect_err("must reject from_config_with_timeout Duration::ZERO");
+    assert!(matches!(err, ProviderError::InvalidConfig(_)));
+    let sub_sec = GeminiProvider::from_config_with_timeout(
+        &config_for("http://127.0.0.1:4141", None, 30),
+        Duration::from_millis(150),
+    )
+    .expect("construct sub-second timeout provider");
+    assert_eq!(sub_sec.timeout(), Duration::from_millis(150));
 
     // End-to-end wire URI verification across trailing `/`, `/v1beta`, `/v1beta/`, `/gw/v1beta`, `/myv1beta`
     let seen_uris = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1328,9 +1343,13 @@ async fn enforces_request_timeout_and_sanitizes_timeout_error() {
     ))
     .await;
 
-    let cfg = config_for(&slow_server.base_url, Some("AIzaSyTimeoutSecret99"), 1);
-    let provider =
-        GeminiProvider::with_env_api_key(&cfg, None).expect("construct 1s timeout provider");
+    let provider = GeminiProvider::new_with_timeout(
+        &slow_server.base_url,
+        Some("AIzaSyTimeoutSecret99".to_string()),
+        Duration::from_millis(150),
+    )
+    .expect("construct 150ms timeout provider")
+    .with_env_fallback(false);
 
     let start = Instant::now();
     let err = provider
@@ -1345,7 +1364,7 @@ async fn enforces_request_timeout_and_sanitizes_timeout_error() {
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < Duration::from_millis(4000),
+        elapsed < Duration::from_millis(1500),
         "timeout took too long: {elapsed:?}"
     );
     assert!(matches!(err, ProviderError::Upstream(_)));
@@ -1892,7 +1911,7 @@ async fn quarantines_placeholder_api_key_across_config_override_and_env() {
             GeminiProvider::build(
                 server.base_url.clone(),
                 Some(bad_placeholder.to_string()),
-                30,
+                Duration::from_secs(30),
                 EnvKeySource::Disabled,
             ),
             Err(ProviderError::InvalidConfig(_))

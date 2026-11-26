@@ -1,14 +1,15 @@
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use companion_core::fs_safe::{self, FsError, OpenRegularMode, SymlinkPolicy};
 use companion_core::{Config, CoreError, HealthResponse};
 use companion_providers::LoopbackProxyClient;
 use serde::{Deserialize, Serialize};
 
-use crate::{CliError, normalized_metadata_path};
+use crate::CliError;
 
 pub const PROXY_PID_FILENAME: &str = "proxy.pid";
 pub const PROXY_LOG_FILENAME: &str = "proxy.log";
@@ -17,18 +18,22 @@ pub const MAX_PROXY_LOG_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_IDLE_SHUTDOWN_SECS: u64 = 1800;
 const MAX_PID_FILE_BYTES: u64 = 64 * 1024;
 
-#[cfg(any(windows, test))]
-const WINDOWS_RENAME_BACKOFFS: [std::time::Duration; 2] = [
-    std::time::Duration::from_millis(25),
-    std::time::Duration::from_millis(50),
-];
-
 /// Derives the runtime directory for `proxy.pid` and `proxy.log`.
 ///
 /// When `config.usage_dir` is explicitly configured (for example in isolated tests
 /// setting `<tmp>/usage`), runtime files stay isolated alongside `usage_dir` rather
 /// than touching the user's real `$XDG_DATA_HOME/agy-companion` directory.
 pub fn resolve_runtime_data_dir(config: &Config) -> Result<PathBuf, CoreError> {
+    resolve_runtime_data_dir_with_default(config, companion_core::default_data_dir)
+}
+
+fn resolve_runtime_data_dir_with_default<F>(
+    config: &Config,
+    default_dir: F,
+) -> Result<PathBuf, CoreError>
+where
+    F: FnOnce() -> Result<PathBuf, CoreError>,
+{
     if let Some(ref usage_dir) = config.usage_dir {
         companion_core::validate_path(usage_dir)?;
         let normalized: PathBuf = usage_dir.components().collect();
@@ -40,7 +45,7 @@ pub fn resolve_runtime_data_dir(config: &Config) -> Result<PathBuf, CoreError> {
         }
         return Ok(normalized);
     }
-    companion_core::default_data_dir()
+    default_dir()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,90 +99,50 @@ impl Drop for ProxyPidGuard {
 }
 
 fn ensure_secure_dir(dir: &Path) -> Result<(), CliError> {
-    companion_core::validate_path(dir)?;
-    let check_dir = normalized_metadata_path(dir);
-    match fs::symlink_metadata(&check_dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(CliError::InvalidDataDir {
-                    path: dir.to_path_buf(),
-                    reason: "symbolic links are not allowed for data directories".to_string(),
-                });
-            }
-            if !meta.file_type().is_dir() {
-                return Err(CliError::InvalidDataDir {
-                    path: dir.to_path_buf(),
-                    reason: "data directory path must be a directory".to_string(),
-                });
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            builder.create(dir)?;
-
-            let created = fs::symlink_metadata(&check_dir)?;
-            if created.file_type().is_symlink() || !created.file_type().is_dir() {
-                return Err(CliError::InvalidDataDir {
-                    path: dir.to_path_buf(),
-                    reason: "data directory path must be a non-symlink directory".to_string(),
-                });
-            }
-            Ok(())
-        }
-        Err(err) => Err(CliError::Io(err)),
+    match fs_safe::ensure_dir_no_symlink(dir, 0o700) {
+        Ok(()) => Ok(()),
+        Err(FsError::SymlinkRejected { path }) => Err(CliError::InvalidDataDir {
+            path,
+            reason: "symbolic links are not allowed for data directories".to_string(),
+        }),
+        Err(FsError::NotDirectory { path }) => Err(CliError::InvalidDataDir {
+            path,
+            reason: "data directory path must be a directory".to_string(),
+        }),
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
     }
 }
 
-fn reject_non_regular_target(path: &Path, label: &str) -> Result<(), CliError> {
-    let check_path = normalized_metadata_path(path);
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(CliError::InvalidDataDir {
-                    path: path.to_path_buf(),
-                    reason: format!("symbolic links are not allowed for {label}"),
-                });
-            }
-            if !meta.file_type().is_file() {
-                return Err(CliError::InvalidDataDir {
-                    path: path.to_path_buf(),
-                    reason: format!("{label} path must be a regular file"),
-                });
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(CliError::Io(err)),
+pub(crate) fn reject_non_regular_target(path: &Path, label: &str) -> Result<(), CliError> {
+    match fs_safe::inspect_regular_file_if_exists(path, None) {
+        Ok(_) => Ok(()),
+        Err(FsError::SymlinkRejected { .. }) => Err(CliError::InvalidDataDir {
+            path: path.to_path_buf(),
+            reason: format!("symbolic links are not allowed for {label}"),
+        }),
+        Err(FsError::NotRegularFile { .. }) => Err(CliError::InvalidDataDir {
+            path: path.to_path_buf(),
+            reason: format!("{label} path must be a regular file"),
+        }),
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
     }
 }
 
 fn check_regular_or_missing_io(path: &Path, label: &str) -> io::Result<Option<fs::Metadata>> {
-    let check_path = normalized_metadata_path(path);
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("symbolic links are not allowed for {label}"),
-                ));
-            }
-            if !meta.file_type().is_file() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("{label} path must be a regular file"),
-                ));
-            }
-            Ok(Some(meta))
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
+    match fs_safe::inspect_regular_file_if_exists(path, None) {
+        Ok(meta) => Ok(meta),
+        Err(FsError::SymlinkRejected { .. }) => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("symbolic links are not allowed for {label}"),
+        )),
+        Err(FsError::NotRegularFile { .. }) => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{label} path must be a regular file"),
+        )),
+        Err(FsError::Io { source, .. }) => Err(source),
+        Err(err) => Err(io::Error::new(ErrorKind::InvalidInput, err.to_string())),
     }
 }
 
@@ -202,161 +167,64 @@ pub fn write_proxy_pid(pid_path: &Path, info: &ProxyPidInfo) -> Result<ProxyPidG
 }
 
 pub fn read_proxy_pid(pid_path: &Path) -> Result<Option<ProxyPidInfo>, CliError> {
-    companion_core::validate_path(pid_path)?;
-    let check_path = normalized_metadata_path(pid_path);
-    let pre_meta = match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(CliError::InvalidDataDir {
-                    path: pid_path.to_path_buf(),
-                    reason: "symbolic links are not allowed for proxy PID files".to_string(),
-                });
-            }
-            if !meta.file_type().is_file() {
-                return Err(CliError::InvalidDataDir {
-                    path: pid_path.to_path_buf(),
-                    reason: "proxy PID file path must be a regular file".to_string(),
-                });
-            }
-            if meta.len() > MAX_PID_FILE_BYTES {
-                return Err(CliError::InvalidDataDir {
-                    path: pid_path.to_path_buf(),
-                    reason: format!(
-                        "proxy PID file exceeds maximum allowed size of {MAX_PID_FILE_BYTES} bytes"
-                    ),
-                });
-            }
-            meta
+    let read = match fs_safe::read_regular_file_bounded(
+        pid_path,
+        MAX_PID_FILE_BYTES,
+        SymlinkPolicy::Reject,
+    ) {
+        Ok(Some(read)) => read,
+        Ok(None) => return Ok(None),
+        Err(FsError::SymlinkRejected { .. }) => {
+            return Err(CliError::InvalidDataDir {
+                path: pid_path.to_path_buf(),
+                reason: "symbolic links are not allowed for proxy PID files".to_string(),
+            });
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(CliError::Io(err)),
-    };
-
-    let file = match File::open(pid_path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(CliError::Io(err)),
-    };
-
-    let open_meta = file.metadata()?;
-    if !open_meta.file_type().is_file() {
-        return Err(CliError::InvalidDataDir {
-            path: pid_path.to_path_buf(),
-            reason: "proxy PID file path must be a regular file".to_string(),
-        });
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if open_meta.dev() != pre_meta.dev() || open_meta.ino() != pre_meta.ino() {
+        Err(FsError::NotRegularFile { .. }) => {
+            return Err(CliError::InvalidDataDir {
+                path: pid_path.to_path_buf(),
+                reason: "proxy PID file path must be a regular file".to_string(),
+            });
+        }
+        Err(FsError::SizeLimitExceeded { max_bytes, .. }) => {
+            return Err(CliError::InvalidDataDir {
+                path: pid_path.to_path_buf(),
+                reason: format!("proxy PID file exceeds maximum allowed size of {max_bytes} bytes"),
+            });
+        }
+        Err(FsError::ConcurrentModification { .. }) => {
             return Err(CliError::InvalidDataDir {
                 path: pid_path.to_path_buf(),
                 reason: "proxy PID file changed concurrently during open".to_string(),
             });
         }
-    }
-    #[cfg(not(unix))]
-    let _ = pre_meta;
-
-    let mut buf = Vec::new();
-    file.take(MAX_PID_FILE_BYTES + 1).read_to_end(&mut buf)?;
-    if (buf.len() as u64) > MAX_PID_FILE_BYTES {
-        return Err(CliError::InvalidDataDir {
-            path: pid_path.to_path_buf(),
-            reason: format!(
-                "proxy PID file exceeds maximum allowed size of {MAX_PID_FILE_BYTES} bytes"
-            ),
-        });
-    }
+        Err(FsError::Io { source, .. }) => return Err(CliError::Io(source)),
+        Err(err) => return Err(CliError::from(err)),
+    };
 
     let info: ProxyPidInfo =
-        serde_json::from_slice(&buf).map_err(|e| CliError::Serialization(e.to_string()))?;
+        serde_json::from_slice(&read.bytes).map_err(|e| CliError::Serialization(e.to_string()))?;
     Ok(Some(info))
 }
 
 fn open_verified_append_file(path: &Path) -> io::Result<(File, u64)> {
-    let check_path = normalized_metadata_path(path);
-    let pre_open_meta = check_regular_or_missing_io(path, "proxy log files")?;
-
-    let mut open_opts = fs::OpenOptions::new();
-    open_opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-    }
-
-    let file = open_opts.open(path)?;
-    let open_meta = file.metadata()?;
-    if !open_meta.file_type().is_file() {
-        return Err(io::Error::new(
+    match fs_safe::open_verified_regular_file_0600(path, OpenRegularMode::AppendCreate) {
+        Ok((file, meta)) => Ok((file, meta.len())),
+        Err(FsError::SymlinkRejected { .. }) => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "symbolic links are not allowed for proxy log files",
+        )),
+        Err(FsError::NotRegularFile { .. }) => Err(io::Error::new(
             ErrorKind::InvalidInput,
             "proxy log file path must be a regular file",
-        ));
+        )),
+        Err(FsError::ConcurrentModification { .. }) => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "proxy log file changed concurrently during open",
+        )),
+        Err(FsError::Io { source, .. }) => Err(source),
+        Err(err) => Err(io::Error::new(ErrorKind::InvalidInput, err.to_string())),
     }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if let Some(lstat_meta) = pre_open_meta {
-            if open_meta.dev() != lstat_meta.dev() || open_meta.ino() != lstat_meta.ino() {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "proxy log file changed concurrently during open",
-                ));
-            }
-        } else {
-            let post_lstat = fs::symlink_metadata(&check_path)?;
-            if post_lstat.file_type().is_symlink()
-                || !post_lstat.file_type().is_file()
-                || post_lstat.dev() != open_meta.dev()
-                || post_lstat.ino() != open_meta.ino()
-            {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "proxy log file changed concurrently during open",
-                ));
-            }
-        }
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    let _ = (check_path, pre_open_meta);
-
-    Ok((file, open_meta.len()))
-}
-
-#[cfg(any(windows, test))]
-fn retry_rename_with_backoff<F, S>(
-    backoffs: &[std::time::Duration],
-    mut rename_op: F,
-    mut sleep_op: S,
-) -> io::Result<()>
-where
-    F: FnMut() -> io::Result<()>,
-    S: FnMut(std::time::Duration),
-{
-    let mut attempt = 0;
-    loop {
-        match rename_op() {
-            Ok(()) => return Ok(()),
-            Err(err) if err.kind() == ErrorKind::PermissionDenied && attempt < backoffs.len() => {
-                sleep_op(backoffs[attempt]);
-                attempt += 1;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-#[cfg(windows)]
-fn retry_rename_on_permission_denied(from: &Path, to: &Path) -> io::Result<()> {
-    retry_rename_with_backoff(
-        &WINDOWS_RENAME_BACKOFFS,
-        || fs::rename(from, to),
-        std::thread::sleep,
-    )
 }
 
 struct RotatingFileInner {
@@ -424,15 +292,11 @@ impl RotatingFileWriter {
             let _ = check_regular_or_missing_io(&inner.path, "proxy log files")?;
             let _ = check_regular_or_missing_io(&inner.rotated_path, "rotated proxy log files")?;
 
-            #[cfg(windows)]
-            let rename_res = retry_rename_on_permission_denied(&inner.path, &inner.rotated_path);
-            #[cfg(not(windows))]
-            let rename_res = fs::rename(&inner.path, &inner.rotated_path);
-
-            match rename_res {
+            match fs_safe::rename_with_retry(&inner.path, &inner.rotated_path) {
                 Ok(()) => {}
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
+                Err(FsError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {}
+                Err(FsError::Io { source, .. }) => return Err(source),
+                Err(err) => return Err(io::Error::new(ErrorKind::InvalidInput, err.to_string())),
             }
 
             let (fresh_file, fresh_size) = open_verified_append_file(&inner.path)?;
@@ -700,6 +564,8 @@ pub async fn wait_for_daemon_healthy(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
 
     use tempfile::TempDir;
@@ -750,12 +616,18 @@ mod tests {
             Err(CoreError::Fs(companion_core::FsError::ParentDirTraversal))
         ));
 
-        // None -> companion_core::default_data_dir()
+        // None -> delegates to default_dir provider without touching ambient XDG/HOME
         cfg.usage_dir = None;
+        let fake_default = temp.path().join("fake-default-data");
         assert_eq!(
-            resolve_runtime_data_dir(&cfg).expect("default data dir"),
-            companion_core::default_data_dir().expect("core default")
+            resolve_runtime_data_dir_with_default(&cfg, || Ok(fake_default.clone()))
+                .expect("default data dir"),
+            fake_default
         );
+        assert!(matches!(
+            resolve_runtime_data_dir_with_default(&cfg, || Err(CoreError::HomeDirUnavailable)),
+            Err(CoreError::HomeDirUnavailable)
+        ));
     }
 
     #[test]
@@ -929,27 +801,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_rename_with_backoff_retries_transient_permission_denied() {
-        let mut attempts = 0usize;
-        let mut slept = Vec::new();
-        retry_rename_with_backoff(
-            &WINDOWS_RENAME_BACKOFFS,
-            || {
-                attempts += 1;
-                if attempts < 3 {
-                    Err(io::Error::new(ErrorKind::PermissionDenied, "locked"))
-                } else {
-                    Ok(())
-                }
-            },
-            |d| slept.push(d),
-        )
-        .expect("should succeed on third attempt");
-        assert_eq!(attempts, 3);
-        assert_eq!(slept, WINDOWS_RENAME_BACKOFFS.to_vec());
-    }
-
-    #[test]
     fn read_proxy_pid_accepts_minimal_json_with_defaults() {
         let temp = TempDir::new().expect("tempdir");
         let pid_path = temp.path().join(PROXY_PID_FILENAME);
@@ -1050,7 +901,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_for_daemon_healthy_succeeds_via_final_probe_when_child_exits_after_winner_binds()
     {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1085,6 +936,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
+        tokio::task::yield_now().await;
 
         let mut child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
             .arg("--exact")
@@ -1112,7 +964,7 @@ mod tests {
                 // Deliberately longer than total_timeout so a second probe can ONLY happen via
                 // the post-exit final bind-race probe inside the child.try_wait() branch.
                 poll_interval: Duration::from_secs(5),
-                probe_timeout: Duration::from_millis(250),
+                probe_timeout: Duration::from_millis(1000),
                 expected_version: None,
             },
         )
@@ -1135,7 +987,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_for_daemon_healthy_requires_exact_version_match_and_tracks_stale_version() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1155,6 +1007,7 @@ mod tests {
         let stale_handle = tokio::spawn(async move {
             let _ = axum::serve(stale_listener, stale_router).await;
         });
+        tokio::task::yield_now().await;
 
         let mut running_child = spawn_long_lived_child();
         let stale_outcome = wait_for_daemon_healthy(
@@ -1162,9 +1015,9 @@ mod tests {
             &mut running_child.0,
             WaitHealthyOptions {
                 port: stale_port,
-                total_timeout: Duration::from_millis(180),
+                total_timeout: Duration::from_millis(300),
                 poll_interval: Duration::from_millis(25),
-                probe_timeout: Duration::from_millis(150),
+                probe_timeout: Duration::from_millis(1000),
                 expected_version: Some("0.1.0"),
             },
         )
@@ -1198,6 +1051,7 @@ mod tests {
         let upgrade_handle = tokio::spawn(async move {
             let _ = axum::serve(upgrade_listener, upgrade_router).await;
         });
+        tokio::task::yield_now().await;
 
         let upgrade_outcome = wait_for_daemon_healthy(
             &probe,
@@ -1206,7 +1060,7 @@ mod tests {
                 port: upgrade_port,
                 total_timeout: Duration::from_secs(2),
                 poll_interval: Duration::from_millis(20),
-                probe_timeout: Duration::from_millis(200),
+                probe_timeout: Duration::from_millis(1000),
                 expected_version: Some("0.1.0"),
             },
         )

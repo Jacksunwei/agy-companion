@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use companion_core::config::ConfigPatch;
 use companion_core::integration::IntegrationState;
-use companion_core::{Config, CoreError, GeminiConfig, UsageRange, UsageSummary};
+use companion_core::{Config, CoreError, UsageRange, UsageSummary};
 use companion_providers::{GeminiProvider, ProviderAdapter};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
@@ -115,8 +117,13 @@ impl CompanionUiServer {
             let config_path = self.config_path.clone();
             let mut opts = self.integration_options();
             opts.follow_rc_symlink = false;
+            let hybrid_override = self.options.hybrid_active_override;
             let auto_outcome = tokio::task::spawn_blocking(move || {
-                companion_core::integration::ensure_first_run_launcher_enabled(&config_path, &opts)
+                companion_core::integration::ensure_first_run_launcher_enabled_with_hybrid_active(
+                    &config_path,
+                    &opts,
+                    hybrid_override,
+                )
             })
             .await
             .map_err(|err| {
@@ -212,29 +219,28 @@ impl CompanionUiServer {
             Err(err) => return Ok(tool_error(err.to_string())),
         };
 
-        let timeout_secs = self
+        let timeout = self
             .options
             .test_connection_timeout_override
             .unwrap_or_else(|| {
-                cfg.providers
-                    .gemini
-                    .timeout_secs
-                    .clamp(1, MAX_TEST_CONNECTION_TIMEOUT_SECS)
+                Duration::from_secs(
+                    cfg.providers
+                        .gemini
+                        .timeout_secs
+                        .clamp(1, MAX_TEST_CONNECTION_TIMEOUT_SECS),
+                )
             });
 
-        let test_cfg = GeminiConfig {
-            timeout_secs,
-            ..cfg.providers.gemini.clone()
-        };
-        let provider = match GeminiProvider::from_config(&test_cfg) {
-            Ok(provider) => provider.with_env_fallback(self.options.env_api_key_fallback),
-            Err(err) => {
-                return test_connection_result(&TestConnectionPayload {
-                    ok: false,
-                    message: err.to_string(),
-                });
-            }
-        };
+        let provider =
+            match GeminiProvider::from_config_with_timeout(&cfg.providers.gemini, timeout) {
+                Ok(provider) => provider.with_env_fallback(self.options.env_api_key_fallback),
+                Err(err) => {
+                    return test_connection_result(&TestConnectionPayload {
+                        ok: false,
+                        message: err.to_string(),
+                    });
+                }
+            };
 
         let payload = match provider.health_check().await {
             Ok(()) => TestConnectionPayload {
@@ -270,15 +276,24 @@ impl CompanionUiServer {
         let mut opts = self.integration_options();
         // Hard invariant: MCP tool NEVER follows RC symlinks.
         opts.follow_rc_symlink = false;
+        let hybrid_override = self.options.hybrid_active_override;
         let enabled = args.enabled;
         let outcome = tokio::task::spawn_blocking(move || -> Result<(Config, _), CoreError> {
             // Fail closed on corrupt/symlinked config on ALL platforms (including Windows where
             // enable_and_persist / disable_and_persist return Unsupported before reading config).
             let _ = Config::load_or_default(&config_path)?;
             let status = if enabled {
-                companion_core::integration::enable_and_persist(&config_path, &opts)?
+                companion_core::integration::enable_and_persist_with_hybrid_active(
+                    &config_path,
+                    &opts,
+                    hybrid_override,
+                )?
             } else {
-                companion_core::integration::disable_and_persist(&config_path, &opts)?
+                companion_core::integration::disable_and_persist_with_hybrid_active(
+                    &config_path,
+                    &opts,
+                    hybrid_override,
+                )?
             };
             // Reload updated config so SettingsSnapshot reflects persisted launcher_auto_start.
             let updated_cfg = Config::load_or_default(&config_path)?;

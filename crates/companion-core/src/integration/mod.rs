@@ -26,8 +26,9 @@ use self::lifecycle::LifecycleEnv;
 use self::templates::validate_shell_safe_path;
 
 pub use self::auto_enable::{
-    AutoEnableOutcome, disable_and_persist, enable_and_persist, ensure_first_run_launcher_enabled,
-    set_launcher_auto_start_locked,
+    AutoEnableOutcome, disable_and_persist, disable_and_persist_with_hybrid_active,
+    enable_and_persist, enable_and_persist_with_hybrid_active, ensure_first_run_launcher_enabled,
+    ensure_first_run_launcher_enabled_with_hybrid_active, set_launcher_auto_start_locked,
 };
 pub use self::lock::{INTEGRATION_LOCK_FILENAME, IntegrationLock};
 pub use self::strip::strip_all_known_rc_files;
@@ -440,8 +441,19 @@ pub(super) const fn is_platform_supported() -> bool {
 }
 
 pub fn status(opts: &IntegrationOptions) -> Result<IntegrationStatus, CoreError> {
+    status_with_hybrid_active(opts, None)
+}
+
+pub fn status_with_hybrid_active(
+    opts: &IntegrationOptions,
+    hybrid_active_override: Option<bool>,
+) -> Result<IntegrationStatus, CoreError> {
     let inputs = lifecycle::read_process_env_inputs()?;
-    let env = LifecycleEnv::from_process(&inputs, detect_hybrid_active(), is_platform_supported());
+    let env = LifecycleEnv::from_process(
+        &inputs,
+        hybrid_active_override.unwrap_or_else(detect_hybrid_active),
+        is_platform_supported(),
+    );
     lifecycle::status_with_env(opts, &env)
 }
 

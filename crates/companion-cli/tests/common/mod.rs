@@ -1,10 +1,12 @@
 #![allow(dead_code)]
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufReader, Write};
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::num::NonZeroU16;
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -16,10 +18,35 @@ use tokio::net::TcpListener;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_agy-companion");
 
+const ISOLATED_PASSTHROUGH_ENV_VARS: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "ComSpec",
+    "PATHEXT",
+    "WINDIR",
+];
+
 pub fn config_with_port(port: u16) -> Config {
     let mut cfg = Config::default();
     cfg.proxy.port = NonZeroU16::new(port).expect("non-zero port");
     cfg
+}
+
+pub fn loopback_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build loopback http client")
+    })
 }
 
 pub struct ChildGuard {
@@ -35,8 +62,30 @@ impl ChildGuard {
         self.child.as_ref().expect("child present").id()
     }
 
-    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.as_mut().expect("child present").stdin.take()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.as_mut().expect("child present").stdout.take()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.as_mut().expect("child present").stderr.take()
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.child.as_mut().expect("child present").try_wait()
+    }
+
+    pub fn wait(mut self) -> std::io::Result<ExitStatus> {
+        self.child.take().expect("child present").wait()
+    }
+
+    pub fn kill_and_wait(mut self) -> std::io::Result<ExitStatus> {
+        let mut child = self.child.take().expect("child present");
+        let _ = child.kill();
+        child.wait()
     }
 
     pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
@@ -100,7 +149,7 @@ impl Drop for DetachedPidFileGuard {
                 if !alive {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(20));
             }
             let _ = Command::new("kill").args(["-KILL", &pid_str]).status();
         }
@@ -113,30 +162,53 @@ impl Drop for DetachedPidFileGuard {
     }
 }
 
-pub fn isolated_cli_command(home: &std::path::Path) -> Command {
-    let mut cmd = Command::new(BIN);
-    for var in [
-        "CLOUD_CODE_URL",
-        "GOOGLE_GEMINI_BASE_URL",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "AGY_COMPANION_CONFIG",
-        "AGY_COMPANION_HOOK_ACTIVE",
-        "AGY_COMPANION_INJECTED_URL",
-        "AGY_COMPANION_ALLOW_REMOTE_SSH",
-        "JETSKI_MCP_ENV_RESTORE_PREFIX",
-        "JETSKI_MCP_ENV_RESTORE_VARS",
-        "ANTIGRAVITY_RESOLVING_ENVIRONMENT",
-        "SSH_CONNECTION",
-        "SSH_CLIENT",
-        "ZDOTDIR",
-        "SHELL",
-    ] {
-        cmd.env_remove(var);
+fn isolated_env_pairs(home: &Path) -> Vec<(OsString, OsString)> {
+    let tmp_dir = home.join(".test-tmp");
+    fs::create_dir_all(&tmp_dir).expect("create isolated TMPDIR");
+
+    let mut pairs = Vec::with_capacity(ISOLATED_PASSTHROUGH_ENV_VARS.len() + 10);
+    for var in ISOLATED_PASSTHROUGH_ENV_VARS {
+        if let Some(val) = std::env::var_os(var) {
+            pairs.push((OsString::from(var), val));
+        }
     }
-    cmd.env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
-        .env("XDG_DATA_HOME", home.join("xdg-data"));
+
+    let xdg_config = home.join("xdg-config");
+    let xdg_data = home.join("xdg-data");
+    let xdg_cache = home.join("xdg-cache");
+    pairs.push((OsString::from("HOME"), home.as_os_str().to_os_string()));
+    pairs.push((
+        OsString::from("XDG_CONFIG_HOME"),
+        xdg_config.clone().into_os_string(),
+    ));
+    pairs.push((
+        OsString::from("XDG_DATA_HOME"),
+        xdg_data.clone().into_os_string(),
+    ));
+    pairs.push((OsString::from("XDG_CACHE_HOME"), xdg_cache.into_os_string()));
+    pairs.push((OsString::from("TMPDIR"), tmp_dir.clone().into_os_string()));
+    pairs.push((OsString::from("TEMP"), tmp_dir.clone().into_os_string()));
+    pairs.push((OsString::from("TMP"), tmp_dir.into_os_string()));
+    pairs.push((
+        OsString::from("USERPROFILE"),
+        home.as_os_str().to_os_string(),
+    ));
+    pairs.push((OsString::from("APPDATA"), xdg_config.into_os_string()));
+    pairs.push((OsString::from("LOCALAPPDATA"), xdg_data.into_os_string()));
+    pairs
+}
+
+pub fn isolated_cli_command(home: &Path) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env_clear();
+    cmd.envs(isolated_env_pairs(home));
+    cmd
+}
+
+pub fn isolated_tokio_cli_command(home: &Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(BIN);
+    cmd.env_clear();
+    cmd.envs(isolated_env_pairs(home));
     cmd
 }
 
@@ -175,7 +247,7 @@ pub fn free_loopback_port() -> u16 {
     for _ in 0..RANGE_SPAN {
         let candidate = RANGE_START + state.cursor;
         state.cursor = (state.cursor + 1) % RANGE_SPAN;
-        if state.claimed.contains(&candidate) {
+        if (24_140..=24_160).contains(&candidate) || state.claimed.contains(&candidate) {
             continue;
         }
         if let Ok(listener) = StdTcpListener::bind((Ipv4Addr::LOCALHOST, candidate)) {
@@ -231,6 +303,10 @@ where
             cfg.save_secure(cfg_path)
                 .expect("update temp config proxy.port");
         }
+        assert!(
+            cfg.usage_dir.is_some(),
+            "spawn_serve_with_port_picker requires an isolated cfg.usage_dir"
+        );
         let pid_path = companion_cli::daemon::resolve_runtime_data_dir(&cfg)
             .expect("resolve runtime data dir")
             .join(companion_cli::daemon::PROXY_PID_FILENAME);
@@ -331,7 +407,7 @@ where
                 );
             }
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -348,7 +424,24 @@ pub async fn spawn_serve_and_wait_healthy<F>(
 where
     F: FnMut(u16) -> Command,
 {
-    spawn_serve_with_port_picker(client, cfg_path, |_| free_loopback_port(), build_cmd).await
+    let initial_port = Config::load_or_default(cfg_path)
+        .ok()
+        .map(|cfg| cfg.proxy.port.get())
+        .filter(|port| !(24_140..=24_160).contains(port));
+    spawn_serve_with_port_picker(
+        client,
+        cfg_path,
+        move |attempt| {
+            if attempt == 1
+                && let Some(port) = initial_port
+            {
+                return port;
+            }
+            free_loopback_port()
+        },
+        build_cmd,
+    )
+    .await
 }
 
 pub async fn spawn_mock_health(
@@ -373,29 +466,34 @@ pub async fn spawn_mock_health(
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
+    tokio::task::yield_now().await;
     (port, handle)
 }
 
-pub fn run_ui_mcp_bounded_with_calls(
-    config_path: &std::path::Path,
-    data_dir: &std::path::Path,
+pub fn run_ui_mcp_bounded_with_env(
+    home: &Path,
+    config_path: &Path,
+    data_dir: &Path,
+    extra_env: &[(&str, &OsStr)],
     calls: Vec<Value>,
     timeout: Duration,
 ) -> (Option<i32>, String, String, bool) {
-    let mut child = Command::new(BIN)
-        .arg("ui-mcp")
+    let mut cmd = isolated_cli_command(home);
+    cmd.arg("ui-mcp")
         .arg(format!("--data-dir={}", data_dir.display()))
         .arg("--config")
         .arg(config_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ui-mcp");
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut guard = ChildGuard::new(cmd.spawn().expect("spawn ui-mcp"));
 
-    let stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let stderr = child.stderr.take().expect("stderr");
+    let stdin = guard.take_stdin().expect("stdin");
+    let stdout = guard.take_stdout().expect("stdout");
+    let stderr = guard.take_stderr().expect("stderr");
 
     // Send initialize + requests on a helper thread so a hung FIFO open cannot block the test.
     let writer_thread = std::thread::spawn(move || {
@@ -436,15 +534,14 @@ pub fn run_ui_mcp_bounded_with_calls(
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let exit_code = loop {
-        match child.try_wait().expect("try_wait ui-mcp") {
+        match guard.try_wait().expect("try_wait ui-mcp") {
             Some(status) => break status.code(),
             None if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             None => {
                 timed_out = true;
-                let _ = child.kill();
-                let status = child.wait().expect("wait killed ui-mcp");
+                let status = guard.kill_and_wait().expect("wait killed ui-mcp");
                 break status.code();
             }
         }
@@ -456,12 +553,24 @@ pub fn run_ui_mcp_bounded_with_calls(
     (exit_code, stdout_str, stderr_str, timed_out)
 }
 
+pub fn run_ui_mcp_bounded_with_calls(
+    home: &Path,
+    config_path: &Path,
+    data_dir: &Path,
+    calls: Vec<Value>,
+    timeout: Duration,
+) -> (Option<i32>, String, String, bool) {
+    run_ui_mcp_bounded_with_env(home, config_path, data_dir, &[], calls, timeout)
+}
+
 pub fn run_ui_mcp_bounded(
-    config_path: &std::path::Path,
-    data_dir: &std::path::Path,
+    home: &Path,
+    config_path: &Path,
+    data_dir: &Path,
     timeout: Duration,
 ) -> (Option<i32>, String, String, bool) {
     run_ui_mcp_bounded_with_calls(
+        home,
         config_path,
         data_dir,
         vec![json!({

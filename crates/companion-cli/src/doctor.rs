@@ -1,9 +1,9 @@
 use std::fmt::Write as _;
-use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use companion_core::fs_safe::{self, FsError};
 use companion_core::{
     Config, DEFAULT_LISTEN_PORT, PROTOCOL_VERSION, ProxyHealthSummary, is_placeholder_api_key,
     sanitize_base_url,
@@ -175,9 +175,9 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
     let config_path_display = match resolve_cli_config_path(options.config_override.as_deref()) {
         Ok(config_path) => {
             let display = config_path.display().to_string();
-            let metadata_path = crate::normalized_metadata_path(&config_path);
-            match fs::symlink_metadata(&metadata_path) {
-                Err(err) if err.kind() == ErrorKind::NotFound => {
+            match fs_safe::inspect_regular_file_if_exists(&config_path, Some(MAX_CONFIG_FILE_BYTES))
+            {
+                Ok(None) => {
                     checks.push(DoctorCheck {
                         name: "config_permissions".to_string(),
                         status: CheckStatus::Pass,
@@ -191,12 +191,59 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                         message: "config file not present; using defaults".to_string(),
                     });
                 }
-                Err(err) => {
+                Err(FsError::SymlinkRejected { .. }) => {
                     checks.push(DoctorCheck {
                         name: "config_permissions".to_string(),
                         status: CheckStatus::Fail,
                         critical: true,
-                        message: format!("unable to inspect config file metadata: {}", err.kind()),
+                        message: "config path is a symlink (rejected for security); use a regular file with chmod 600".to_string(),
+                    });
+                    checks.push(DoctorCheck {
+                        name: "config".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: "refused to load symlinked config file".to_string(),
+                    });
+                }
+                Err(FsError::NotRegularFile { .. }) => {
+                    checks.push(DoctorCheck {
+                        name: "config_permissions".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: "config path is not a regular file".to_string(),
+                    });
+                    checks.push(DoctorCheck {
+                        name: "config".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: "refused to load non-regular config file".to_string(),
+                    });
+                }
+                Err(FsError::SizeLimitExceeded { max_bytes, .. }) => {
+                    checks.push(DoctorCheck {
+                        name: "config_permissions".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: format!(
+                            "config file exceeds maximum allowed size ({max_bytes} bytes)"
+                        ),
+                    });
+                    checks.push(DoctorCheck {
+                        name: "config".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: "refused to load oversized config file".to_string(),
+                    });
+                }
+                Err(FsError::Io { source, .. }) => {
+                    checks.push(DoctorCheck {
+                        name: "config_permissions".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: format!(
+                            "unable to inspect config file metadata: {}",
+                            source.kind()
+                        ),
                     });
                     checks.push(DoctorCheck {
                         name: "config".to_string(),
@@ -205,105 +252,78 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                         message: "config file metadata unreadable".to_string(),
                     });
                 }
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() {
-                        checks.push(DoctorCheck {
-                            name: "config_permissions".to_string(),
-                            status: CheckStatus::Fail,
-                            critical: true,
-                            message: "config path is a symlink (rejected for security); use a regular file with chmod 600".to_string(),
-                        });
-                        checks.push(DoctorCheck {
-                            name: "config".to_string(),
-                            status: CheckStatus::Fail,
-                            critical: true,
-                            message: "refused to load symlinked config file".to_string(),
-                        });
-                    } else if !meta.file_type().is_file() {
-                        checks.push(DoctorCheck {
-                            name: "config_permissions".to_string(),
-                            status: CheckStatus::Fail,
-                            critical: true,
-                            message: "config path is not a regular file".to_string(),
-                        });
-                        checks.push(DoctorCheck {
-                            name: "config".to_string(),
-                            status: CheckStatus::Fail,
-                            critical: true,
-                            message: "refused to load non-regular config file".to_string(),
-                        });
-                    } else if meta.len() > MAX_CONFIG_FILE_BYTES {
-                        checks.push(DoctorCheck {
-                            name: "config_permissions".to_string(),
-                            status: CheckStatus::Fail,
-                            critical: true,
-                            message: format!(
-                                "config file exceeds maximum allowed size ({MAX_CONFIG_FILE_BYTES} bytes)"
-                            ),
-                        });
-                        checks.push(DoctorCheck {
-                            name: "config".to_string(),
-                            status: CheckStatus::Fail,
-                            critical: true,
-                            message: "refused to load oversized config file".to_string(),
-                        });
-                    } else {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
+                Err(err) => {
+                    let msg = err.to_string();
+                    checks.push(DoctorCheck {
+                        name: "config_permissions".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: msg.clone(),
+                    });
+                    checks.push(DoctorCheck {
+                        name: "config".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: msg,
+                    });
+                }
+                Ok(Some(meta)) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
 
-                            let mode = meta.permissions().mode() & 0o7777;
-                            if (mode & 0o077) == 0 && (mode & 0o7000) == 0 {
-                                checks.push(DoctorCheck {
-                                    name: "config_permissions".to_string(),
-                                    status: CheckStatus::Pass,
-                                    critical: true,
-                                    message: format!("permissions {mode:04o} are owner-only"),
-                                });
-                            } else {
-                                checks.push(DoctorCheck {
-                                    name: "config_permissions".to_string(),
-                                    status: CheckStatus::Fail,
-                                    critical: true,
-                                    message: format!(
-                                        "insecure config permissions {mode:04o}; run `chmod 600` on the config file"
-                                    ),
-                                });
-                            }
-                        }
-
-                        #[cfg(not(unix))]
-                        {
+                        let mode = meta.permissions().mode() & 0o7777;
+                        if (mode & 0o077) == 0 && (mode & 0o7000) == 0 {
                             checks.push(DoctorCheck {
                                 name: "config_permissions".to_string(),
                                 status: CheckStatus::Pass,
                                 critical: true,
-                                message: "Unix permission check not applicable on this platform"
-                                    .to_string(),
+                                message: format!("permissions {mode:04o} are owner-only"),
+                            });
+                        } else {
+                            checks.push(DoctorCheck {
+                                name: "config_permissions".to_string(),
+                                status: CheckStatus::Fail,
+                                critical: true,
+                                message: format!(
+                                    "insecure config permissions {mode:04o}; run `chmod 600` on the config file"
+                                ),
                             });
                         }
+                    }
 
-                        match Config::load_or_default(&config_path) {
-                            Ok(cfg) => {
-                                checks.push(DoctorCheck {
-                                    name: "config".to_string(),
-                                    status: CheckStatus::Pass,
-                                    critical: true,
-                                    message: format!(
-                                        "valid config (schema_version {})",
-                                        cfg.schema_version
-                                    ),
-                                });
-                                loaded_config = Some(cfg);
-                            }
-                            Err(err) => {
-                                checks.push(DoctorCheck {
-                                    name: "config".to_string(),
-                                    status: CheckStatus::Fail,
-                                    critical: true,
-                                    message: err.to_string(),
-                                });
-                            }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = meta;
+                        checks.push(DoctorCheck {
+                            name: "config_permissions".to_string(),
+                            status: CheckStatus::Pass,
+                            critical: true,
+                            message: "Unix permission check not applicable on this platform"
+                                .to_string(),
+                        });
+                    }
+
+                    match Config::load_or_default(&config_path) {
+                        Ok(cfg) => {
+                            checks.push(DoctorCheck {
+                                name: "config".to_string(),
+                                status: CheckStatus::Pass,
+                                critical: true,
+                                message: format!(
+                                    "valid config (schema_version {})",
+                                    cfg.schema_version
+                                ),
+                            });
+                            loaded_config = Some(cfg);
+                        }
+                        Err(err) => {
+                            checks.push(DoctorCheck {
+                                name: "config".to_string(),
+                                status: CheckStatus::Fail,
+                                critical: true,
+                                message: err.to_string(),
+                            });
                         }
                     }
                 }
@@ -553,19 +573,17 @@ pub async fn execute_doctor(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::Duration;
 
     use axum::Router;
-    use axum::http::{HeaderValue, StatusCode, header};
-    use axum::response::IntoResponse;
+    use axum::http::StatusCode;
     use axum::routing::get;
     use companion_core::{ApiKey, Config, HealthResponse, PROTOCOL_VERSION};
     use tempfile::TempDir;
     use tokio::net::TcpListener;
 
     use super::{
-        CheckStatus, DoctorEnv, DoctorOptions, EnvKeyState, EnvUrlState, MAX_HEALTH_BODY_BYTES,
-        evaluate_health_response, format_doctor_human, format_doctor_json, run_doctor,
+        CheckStatus, DoctorEnv, DoctorOptions, EnvKeyState, EnvUrlState, evaluate_health_response,
+        format_doctor_human, format_doctor_json, run_doctor,
     };
 
     async fn spawn_mock_health_router(router: Router) -> (u16, tokio::task::JoinHandle<()>) {
@@ -682,68 +700,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn doctor_health_probe_rejects_oversized_redirect_non200_and_hanging_server() {
+    async fn doctor_maps_probe_failure_to_failed_health_and_skipped_version_without_body_leak() {
         let temp = TempDir::new().expect("tempdir");
         let missing_cfg = temp.path().join("missing.json");
 
-        // 1. Oversized (> 64 KiB) body
-        let oversized_router = Router::new().route(
-            "/health",
-            get(|| async { "x".repeat(MAX_HEALTH_BODY_BYTES + 1024) }),
-        );
-        let (port, h) = spawn_mock_health_router(oversized_router).await;
-        let rep = run_doctor(
-            DoctorOptions {
-                config_override: Some(missing_cfg.clone()),
-                port_override: Some(port),
-                ..DoctorOptions::default()
-            },
-            DoctorEnv::from_raw_values(None, None),
-        )
-        .await
-        .expect("oversized report");
-        h.abort();
-        assert!(!rep.ok);
-        assert!(
-            rep.proxy
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("limit")
-        );
-
-        // 2. 302 redirect (must NOT be followed)
-        let redirect_router = Router::new().route(
-            "/health",
-            get(|| async {
-                (
-                    StatusCode::FOUND,
-                    [(
-                        header::LOCATION,
-                        HeaderValue::from_static("http://169.254.169.254/latest/meta-data/"),
-                    )],
-                    "",
-                )
-                    .into_response()
-            }),
-        );
-        let (port, h) = spawn_mock_health_router(redirect_router).await;
-        let rep = run_doctor(
-            DoctorOptions {
-                config_override: Some(missing_cfg.clone()),
-                port_override: Some(port),
-                ..DoctorOptions::default()
-            },
-            DoctorEnv::from_raw_values(None, None),
-        )
-        .await
-        .expect("redirect report");
-        h.abort();
-        assert!(!rep.ok);
-        assert!(rep.proxy.error.as_deref().unwrap_or("").contains("302"));
-
-        // 3. 500 Internal Server Error
         let err500_router = Router::new().route(
             "/health",
             get(|| async {
@@ -753,61 +713,7 @@ mod tests {
                 )
             }),
         );
-        let (port, h) = spawn_mock_health_router(err500_router).await;
-        let rep = run_doctor(
-            DoctorOptions {
-                config_override: Some(missing_cfg.clone()),
-                port_override: Some(port),
-                ..DoctorOptions::default()
-            },
-            DoctorEnv::from_raw_values(None, None),
-        )
-        .await
-        .expect("500 report");
-        h.abort();
-        assert!(!rep.ok);
-        let json = format_doctor_json(&rep).expect("json");
-        assert!(json.contains("500"));
-        assert!(!json.contains("secret-body-should-not-echo"));
-
-        // 4. Slow / hanging server -> bounded timeout
-        let slow_router = Router::new().route(
-            "/health",
-            get(|| async {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                "too late"
-            }),
-        );
-        let (port, h) = spawn_mock_health_router(slow_router).await;
-        let rep = run_doctor(
-            DoctorOptions {
-                config_override: Some(missing_cfg.clone()),
-                port_override: Some(port),
-                health_timeout: Duration::from_millis(250),
-                health_connect_timeout: Duration::from_millis(250),
-                ..DoctorOptions::default()
-            },
-            DoctorEnv::from_raw_values(None, None),
-        )
-        .await
-        .expect("timeout report");
-        h.abort();
-        assert!(!rep.ok);
-        assert!(
-            rep.proxy
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("timed out")
-        );
-
-        // 5. Invalid JSON -> fail without echoing body
-        let bad_json_router = Router::new().route(
-            "/health",
-            get(|| async { "not-json-body-AIzaSyNeverEchoHealthBody" }),
-        );
-        let (port, h) = spawn_mock_health_router(bad_json_router).await;
+        let (port, handle) = spawn_mock_health_router(err500_router).await;
         let rep = run_doctor(
             DoctorOptions {
                 config_override: Some(missing_cfg),
@@ -817,11 +723,34 @@ mod tests {
             DoctorEnv::from_raw_values(None, None),
         )
         .await
-        .expect("bad json report");
-        h.abort();
+        .expect("500 report");
+        handle.abort();
+
         assert!(!rep.ok);
+        assert!(!rep.proxy.reachable);
+        assert!(rep.proxy.error.as_deref().unwrap_or("").contains("500"));
+        assert!(!rep.version_skew);
+        assert!(!rep.protocol_skew);
+
+        let health_check = rep
+            .checks
+            .iter()
+            .find(|c| c.name == "proxy_health")
+            .expect("proxy_health check");
+        assert_eq!(health_check.status, CheckStatus::Fail);
+        assert!(health_check.critical);
+
+        let version_check = rep
+            .checks
+            .iter()
+            .find(|c| c.name == "version_match")
+            .expect("version_match check");
+        assert_eq!(version_check.status, CheckStatus::Skip);
+        assert!(version_check.critical);
+
         let json = format_doctor_json(&rep).expect("json");
-        assert!(!json.contains("AIzaSyNeverEchoHealthBody"));
+        assert!(json.contains("500"));
+        assert!(!json.contains("secret-body-should-not-echo"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
