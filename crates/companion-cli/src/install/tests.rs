@@ -111,6 +111,125 @@ fn embedded_plugin_bundle_matches_repo_plugin_dir_byte_for_byte() {
 }
 
 #[test]
+fn embedded_plugin_docs_enforce_open_source_copy_hygiene_and_ux_v2_contracts() {
+    let find_embedded = |rel_path: &str| -> &'static str {
+        EMBEDDED_PLUGIN_FILES
+            .iter()
+            .find(|f| f.rel_path == rel_path)
+            .unwrap_or_else(|| panic!("missing embedded plugin file '{rel_path}'"))
+            .content
+    };
+
+    // 1. Open-source copy hygiene: zero internal codenames, raw *-pa endpoints, or stale labels
+    // across all user-facing plugin docs and JSON manifests.
+    let forbidden_ci = [
+        "cloudcode",
+        "jetski",
+        "-cloudcode-pa.googleapis.com",
+        "-pa.googleapis.com",
+        "restart required",
+        "agy companion",
+        "coming soon",
+    ];
+    for rel_path in [
+        "README.md",
+        "skills/companion/SKILL.md",
+        "plugin.json",
+        "mcp_config.json",
+        "sidecars/proxy/sidecar.json",
+    ] {
+        let lower = find_embedded(rel_path).to_lowercase();
+        for token in forbidden_ci {
+            assert!(
+                !lower.contains(token),
+                "forbidden open-source hygiene token `{token}` found in embedded plugin/{rel_path}"
+            );
+        }
+    }
+
+    // 2. SKILL.md structural & UX v2 contract (mirrors agy plugin validate + E2E R25/F10).
+    let skill = find_embedded("skills/companion/SKILL.md");
+    assert!(
+        skill.len() <= 24_000,
+        "embedded SKILL.md exceeds 24,000-byte budget ({} bytes)",
+        skill.len()
+    );
+    assert!(
+        skill.starts_with("---\n") || skill.starts_with("---\r\n"),
+        "embedded SKILL.md must start with YAML frontmatter"
+    );
+    let mut parts = skill.splitn(3, "---");
+    let _ = parts.next();
+    let frontmatter = parts.next().expect("SKILL.md frontmatter block");
+    assert!(
+        frontmatter.lines().any(|l| l.trim() == "name: companion"),
+        "SKILL.md frontmatter must declare `name: companion`"
+    );
+    assert!(
+        frontmatter
+            .lines()
+            .any(|l| l.trim_start().starts_with("description:")),
+        "SKILL.md frontmatter must declare `description:`"
+    );
+    for tool_name in [
+        "open_settings",
+        "get_settings",
+        "save_settings",
+        "test_connection",
+        "set_launcher_integration",
+        "get_usage",
+    ] {
+        assert!(
+            skill.contains(tool_name),
+            "embedded SKILL.md must document MCP tool `{tool_name}`"
+        );
+    }
+    let skill_lower = skill.to_lowercase();
+    for ux_term in [
+        "monitor",
+        "usage",
+        "settings",
+        "enabled models",
+        "antigravity plan",
+    ] {
+        assert!(
+            skill_lower.contains(ux_term),
+            "embedded SKILL.md missing UX v2 concept `{ux_term}`"
+        );
+    }
+
+    // 3. plugin/README.md UX v2 & install essentials.
+    let readme = find_embedded("README.md");
+    assert!(
+        readme.starts_with("# Antigravity Companion"),
+        "embedded plugin/README.md must start with `# Antigravity Companion`"
+    );
+    let readme_lower = readme.to_lowercase();
+    for ux_term in [
+        "monitor",
+        "usage",
+        "settings",
+        "enabled models",
+        "antigravity plan",
+        "npx -y agy-companion@latest install",
+        "uninstall",
+    ] {
+        assert!(
+            readme_lower.contains(ux_term),
+            "embedded plugin/README.md missing UX v2 / install term `{ux_term}`"
+        );
+    }
+
+    // 4. Runtime protocol guard: run-companion.sh MUST retain MCP env-restore scrubbing.
+    let launcher = find_embedded("scripts/run-companion.sh");
+    assert!(
+        launcher.contains("JETSKI_MCP_ENV_RESTORE_PREFIX")
+            && launcher.contains("JETSKI_MCP_ENV_RESTORE_VARS"),
+        "plugin/scripts/run-companion.sh must preserve runtime MCP env-restore scrubbing"
+    );
+}
+
+#[test]
 fn windows_manifest_generators_emit_direct_exe_json_without_bash() {
     let bin_path = Path::new(r"C:\Users\alice\AppData\Local\agy-companion\bin\agy-companion.exe");
 
