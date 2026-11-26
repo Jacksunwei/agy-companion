@@ -88,10 +88,10 @@ Invoke the bundled MCP tool **`open_settings`** (on server `agy-companion_hub`, 
 | `agy-companion ui-mcp [--data-dir <DATA_DIR>] [--config <CONFIG>] [--auto-enable-launcher]` | Run the stdio MCP App server (stdout strictly JSON-RPC; logs to stderr) with optional locked first-run launcher fallback |
 | `agy-companion doctor [--config <CONFIG>] [--port <PORT>] [--json]` | Check config permissions (Unix `0600`; skipped on Windows), config validity, proxy `/health`, version/protocol skew, and env vars |
 | `agy-companion models [--json] [--port <PORT>] [--config <CONFIG>]` | Emit `customModelsConfig` JSON for `~/.gemini/antigravity-cli/settings.json` |
-| `agy-companion --version` | Print the binary version (`agy-companion 0.1.0`) |
+| `agy-companion --version` | Print the binary version (`agy-companion 0.0.2`) |
 
 Local proxy HTTP endpoints (`127.0.0.1:24141`):
-- `GET /health` — `{"status":"ok","version":"0.1.0","protocol_version":1}`
+- `GET /health` — `{"status":"ok","version":"0.0.2","protocol_version":1}`
 - `GET /api/stats` — live session totals (`usage`: requests, prompt/cached/output/reasoning tokens, cache hit ratio), `proxy_rss_bytes`, bounded `recent_calls` ring buffer (max 32), `by_model` session rollups (max 32), and routing/catalog-refresh status.
 - `POST /v1beta/models/{model}:generateContent` & `:streamGenerateContent?alt=sse` — byte-for-byte streaming pass-through for BYOM Gemini requests; built-in Antigravity pass-through calls are also passively teed for uncompressed `usageMetadata` into session stats and SQLite `usage.db`.
 

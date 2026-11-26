@@ -1,6 +1,6 @@
 {
   "name": "agy-companion",
-  "version": "0.1.0",
+  "version": "0.0.2",
   "description": "Bring your own models (BYOM) and track token usage and costs in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and embedded MCP App Settings UI.",
   "license": "Apache-2.0",
   "repository": {
@@ -37,11 +37,11 @@
     "bin/"
   ],
   "optionalDependencies": {
-    "@agy-companion/darwin-arm64": "0.1.0",
-    "@agy-companion/darwin-x64": "0.1.0",
-    "@agy-companion/linux-x64": "0.1.0",
-    "@agy-companion/linux-arm64": "0.1.0",
-    "@agy-companion/win32-x64": "0.1.0"
+    "@agy-companion/darwin-arm64": "0.0.2",
+    "@agy-companion/darwin-x64": "0.0.2",
+    "@agy-companion/linux-x64": "0.0.2",
+    "@agy-companion/linux-arm64": "0.0.2",
+    "@agy-companion/win32-x64": "0.0.2"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",

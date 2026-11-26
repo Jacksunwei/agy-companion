@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0" /></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-informational.svg" alt="Version 0.1.0" />
+  <img src="https://img.shields.io/badge/version-0.0.2-informational.svg" alt="Version 0.0.2" />
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-2024%20%7C%20forbid%28unsafe__code%29-orange.svg" alt="Rust 2024 forbid(unsafe_code)" /></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platforms: macOS, Linux, Windows" />
   <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
@@ -55,7 +55,7 @@ npm i -g agy-companion && agy-companion install
 uvx --refresh agy-companion install
 ```
 
-> **Pre-release status:** `v0.1.0` packaging is staged in-repo awaiting the first tagged release (`0.0.1` placeholder packages are currently reserved on npm and PyPI). To run `agy-companion` right now, use [Build from Source (Works Today)](#build-from-source-works-today) below.
+> **Pre-release status:** `v0.0.2` packaging is staged in-repo awaiting the first tagged release (`0.0.1` placeholder packages are currently reserved on npm and PyPI). To run `agy-companion` right now, use [Build from Source (Works Today)](#build-from-source-works-today) below.
 
 **First run (3 steps):**
 
@@ -223,7 +223,7 @@ See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and [`AGENT
 | `agy-companion ui-mcp` | `[--data-dir <DATA_DIR>]` `[--config <CONFIG>]` — stdio MCP App server (`stdout` strictly JSON-RPC, logs to `stderr`). |
 | `agy-companion doctor` | `[--config <CONFIG>]` `[--port <PORT>]` `[--json]` — verifies config permissions, schema, proxy `/health`, version match, and env setup. |
 | `agy-companion models` | `[--json]` `[--port <PORT>]` `[--config <CONFIG>]` — prints `customModelsConfig` JSON for `agy` CLI. |
-| `agy-companion --version` | Prints `agy-companion 0.1.0`. |
+| `agy-companion --version` | Prints `agy-companion 0.0.2`. |
 
 #### Local HTTP Endpoints (`127.0.0.1:24141`)
 
@@ -260,7 +260,7 @@ Full architecture & security enforcement details: [`docs/design/architecture.md`
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| **Core Gemini BYOM (`v0.1.0`)** | Loopback Rust proxy with implicit cache preservation, Day-0 safe Hybrid Mode, Dock/Launcher auto-start, one-command `install`/`uninstall`, native MCP App UI, SQLite WAL `usage.db` capture, cross-platform npm/PyPI shims | Shipped |
+| **Core Gemini BYOM (`v0.0.2`)** | Loopback Rust proxy with implicit cache preservation, Day-0 safe Hybrid Mode, Dock/Launcher auto-start, one-command `install`/`uninstall`, native MCP App UI, SQLite WAL `usage.db` capture, cross-platform npm/PyPI shims | Shipped |
 | **UX v2 & Usage Dashboard** | Multi-select enabled models with tooltips, dedicated **Usage** historical analytics & cost tab backed by `usage.db`, modular multi-provider Settings UI | Shipped ([design spec](docs/design/ui-ux-v2.md)) |
 | **Ollama Cloud & OpenAI-Compatible Adapter** | Direct 1-hop `Gemini ↔ OpenAI Chat Completions` adapter unlocking Ollama Cloud, local Ollama, OpenRouter, vLLM, LM Studio, and OpenAI API | Planned — **Contributors Welcome** |
 | **Codex & Claude Adapters** | First-class provider adapters for OpenAI Codex and Anthropic Claude | Planned — **Contributors Welcome** |

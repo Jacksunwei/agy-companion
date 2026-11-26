@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | --- | --- |
-| `0.1.x` | Yes |
-| `< 0.1.0` | No (pre-release placeholders) |
+| `0.0.x` | Yes (`>= 0.0.2`) |
+| `< 0.0.2` | No (pre-release placeholder) |
 
 ## Reporting a Vulnerability
 

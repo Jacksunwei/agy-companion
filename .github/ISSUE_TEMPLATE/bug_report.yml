@@ -28,7 +28,7 @@ body:
     attributes:
       label: agy-companion Version
       description: Output of `agy-companion --version` (or commit SHA if built from source)
-      placeholder: "e.g., agy-companion 0.1.0 (or git commit abc1234)"
+      placeholder: "e.g., agy-companion 0.0.2 (or git commit abc1234)"
     validations:
       required: true
 
