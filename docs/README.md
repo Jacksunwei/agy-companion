@@ -11,7 +11,7 @@ Keep design intent and architectural decisions close to the code:
 - [Usage & Cost Tracking (TODO)](design/usage-tracking-todo.md) — Post-M1 usage/cost aggregation & `ccusage`-style reporting design notes + day-1 `UsageSink` seam.
 - [User Version Upgrades (TODO)](design/upgrade-lifecycle-todo.md) — Post-M1 binary + plugin upgrade design notes + day-1 version/skew seams.
 - [Testing Strategy & CUJ Verification Guide](design/testing-strategy.md) — Enduring CUJ-first Testing Trophy, Single-Owner layer matrix, strict hermetic local-config/port isolation, fast latency SLOs, anti-slop rules, UI & Rust↔TS contract testing, and UX v2 testing standards.
-- [Testing Infrastructure Improvement Plan](design/testing-infra-improvement-plan.md) — Point-in-time `2026-11-25` audit, canonical metrics, 4-bucket anti-slop inventory, `ISO-1..ISO-11` hermeticity & speed bottleneck audits, S1–S8 red lines, and zero-conflict phased roadmap (`WS1–WS6`).
+- [Testing Infrastructure Improvement Plan](design/testing-infra-improvement-plan.md) — Implemented Phase 0–3 overhaul record (`PRs #47–#51` + final doc sync): `ISO-1..ISO-11` hermeticity remediations, S1–S8 red lines, `WS1–WS6` deliverables, and achieved warm SLO verification posture.
 
 ## Architecture Decision Records (`docs/decisions/`)
 

@@ -191,7 +191,7 @@ flowchart LR
 | **Embedded UI** | [`ui/`](ui/) | Vite + TypeScript single-file MCP App frontend compiled into `ui/dist/index.html` and embedded at build time. |
 | **Antigravity Plugin** | [`plugin/README.md`](plugin/README.md) | Plugin manifest, bundled SVG icon, MCP & sidecar definitions, hardened launcher script, and companion skill. |
 | **Distribution Shims** | [`packages/`](packages/) | Cross-platform npm (`agy-companion` / `agyc` + 5 platform packages) and Python (`maturin`) binary wrappers. |
-| **Opaque-Box E2E** | [`e2e/README.md`](e2e/README.md) | Pure Python 3 stdlib 4-tier end-to-end test suite verifying binary, proxy, MCP, installer, and rollout contracts. |
+| **Opaque-Box E2E** | [`e2e/README.md`](e2e/README.md) | Pure Python 3 stdlib parallel intent-named opaque-box end-to-end test suite verifying binary CUJs, security boundaries, runtime shims, and headless Chrome UI smoke. |
 
 ---
 
@@ -230,7 +230,7 @@ See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and [`AGENT
 | Method & Route | Behavior |
 | --- | --- |
 | `GET /health` | `200 OK` JSON `{status, version, protocol_version}` (`nosniff`, `no-store`). |
-| `GET /api/stats` | `200 OK` JSON with live session request, token, implicit cache hit-ratio, and Hybrid Mode catalog telemetry (`nosniff`, `no-store`). |
+| `GET /api/stats` | `200 OK` JSON with live session request, token, implicit cache hit-ratio, process RAM RSS (`proxy_rss_bytes`), and Hybrid Mode catalog telemetry (`nosniff`, `no-store`). |
 | `GET /v1beta/models` | Filtered Gemini 3.8+ & 4+ chat model catalog (`default_model` first) with curated fallback. |
 | `POST /v1beta/models/{*rest}` | `:generateContent` and `:streamGenerateContent?alt=sse`; 64 MiB cap, byte-for-byte streaming pass-through, zero-buffer `usageMetadata` tee. |
 | `POST /v1internal:fetchAvailableModels`<br>`GET/POST /v1internal:*` | Transparent Hybrid Mode bridge preserving native Antigravity models alongside configured `(Proxy)` models (Day-0 untouched until an API key is saved). Non-`GET`/`POST` methods return `405`. |
@@ -261,7 +261,7 @@ Full architecture & security enforcement details: [`docs/design/architecture.md`
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | **Core Gemini BYOM (`v0.1.0`)** | Loopback Rust proxy with implicit cache preservation, Day-0 safe Hybrid Mode, Dock/Launcher auto-start, one-command `install`/`uninstall`, native MCP App UI, SQLite WAL `usage.db` capture, cross-platform npm/PyPI shims | Shipped |
-| **UX v2 & Usage Dashboard** | Multi-select enabled models with tooltips, dedicated **Usage** historical analytics & cost tab backed by `usage.db`, modular multi-provider Settings UI | In Progress ([design spec](docs/design/ui-ux-v2.md)) |
+| **UX v2 & Usage Dashboard** | Multi-select enabled models with tooltips, dedicated **Usage** historical analytics & cost tab backed by `usage.db`, modular multi-provider Settings UI | Shipped ([design spec](docs/design/ui-ux-v2.md)) |
 | **Ollama Cloud & OpenAI-Compatible Adapter** | Direct 1-hop `Gemini ↔ OpenAI Chat Completions` adapter unlocking Ollama Cloud, local Ollama, OpenRouter, vLLM, LM Studio, and OpenAI API | Planned — **Contributors Welcome** |
 | **Codex & Claude Adapters** | First-class provider adapters for OpenAI Codex and Anthropic Claude | Planned — **Contributors Welcome** |
 | **Usage CLI & Upgrade Lifecycle** | `agy-companion usage` terminal rollups and `agy-companion upgrade` lifecycle | Planned ([usage](docs/design/usage-tracking-todo.md), [upgrade](docs/design/upgrade-lifecycle-todo.md)) |
@@ -307,9 +307,9 @@ Contributions are welcome — especially new `ProviderAdapter` backends, UX impr
 # 2. Run the full 7-gate local verification script (fmt, clippy -D warnings, tests, UI CSP, plugin validation)
 ./scripts/agent_check.sh
 
-# 3. Run the pure Python 3 stdlib opaque-box E2E suite (-B avoids __pycache__)
+# 3. Run the pure Python 3 stdlib parallel opaque-box E2E suite (-B avoids __pycache__)
 cargo build -p companion-cli
-python3 -B e2e/run_e2e.py --tier all --binary target/debug/agy-companion --repo-root . -v
+python3 -B e2e/run_e2e.py --suite all --workers 4 --binary target/debug/agy-companion --repo-root . -v
 ```
 
 - **Contributor Guide:** [`CONTRIBUTING.md`](CONTRIBUTING.md) — prerequisites, adding a `ProviderAdapter`, UI hot-reload, commit conventions.
