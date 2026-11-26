@@ -402,6 +402,9 @@ else:
     e2e_runner = root / "e2e" / "run_e2e.py"
     if e2e_runner.is_file():
         py_files.extend(sorted((root / "e2e").glob("*.py")))
+    scripts_dir = root / "scripts"
+    if scripts_dir.is_dir():
+        py_files.extend(sorted(scripts_dir.glob("*.py")))
     with tempfile.TemporaryDirectory() as td:
         for idx, py_file in enumerate(py_files):
             py_compile.compile(
@@ -531,17 +534,8 @@ PYEOF
     fi
   fi
 
-  # 5d. Run pure-stdlib E2E harness self-test when e2e/run_e2e.py is present (gracefully skipped in minimal repos)
-  local e2e_runner="${REPO_ROOT}/e2e/run_e2e.py"
-  if [[ -f "${e2e_runner}" ]]; then
-    if ! python3 -B "${e2e_runner}" --self-test >/dev/null 2>&1; then
-      fail "[5/${TOTAL_CHECKS}] Version sync & packaging: python3 -B e2e/run_e2e.py --self-test failed"
-      pkg_failed=1
-    fi
-  fi
-
   if [[ ${pkg_failed} -eq 0 ]]; then
-    pass "[5/${TOTAL_CHECKS}] Version sync & packaging: 4-way version ${py_out}, publishConfig, 5 platform manifests, node --check, execFileSync hygiene, py_compile & e2e self-test passed"
+    pass "[5/${TOTAL_CHECKS}] Version sync & packaging: 4-way version ${py_out}, publishConfig, 5 platform manifests, node --check, execFileSync hygiene & py_compile passed"
   fi
 }
 
@@ -595,6 +589,14 @@ check_rust_and_ui() {
       check6_failed=1
     fi
 
+    if ! command -v npm >/dev/null 2>&1; then
+      fail "[6/${TOTAL_CHECKS}] Rust & UI: npm not found on PATH for UI behavioral tests"
+      check6_failed=1
+    elif ! npm --prefix "${REPO_ROOT}/ui" test; then
+      fail "[6/${TOTAL_CHECKS}] Rust & UI: npm --prefix ui test failed"
+      check6_failed=1
+    fi
+
     if [[ ! -f "${ui_bundle}" || ! -s "${ui_bundle}" ]]; then
       fail "[6/${TOTAL_CHECKS}] Rust & UI: ui/dist/index.html missing or empty"
       check6_failed=1
@@ -633,8 +635,256 @@ check_rust_and_ui() {
     fi
   fi
 
+  # 6c. 5 Automated Static Hermeticity Guards
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail "[6/${TOTAL_CHECKS}] Rust & UI: python3 not found on PATH for static hermeticity guards"
+    check6_failed=1
+  elif ! python3 -B - "${REPO_ROOT}" <<'PYEOF'
+from __future__ import annotations
+
+import ast
+import io
+import pathlib
+import re
+import sys
+import tokenize
+
+root = pathlib.Path(sys.argv[1])
+errors: list[str] = []
+
+_RUST_TOKEN_RE = re.compile(
+    r'b?r(#*)"[\s\S]*?"\1'
+    r"|b?'(?:\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}|.)|[^'\\])'"
+    r'|b?"(?:\\[\s\S]|[^"\\])*"'
+    r"|//[^\n]*"
+    r"|/\*[\s\S]*?\*/"
+)
+
+
+def strip_rust_comments(text: str) -> str:
+    def _repl(match: re.Match[str]) -> str:
+        tok = match.group(0)
+        if tok.startswith("//"):
+            return ""
+        if tok.startswith("/*"):
+            return "\n" * tok.count("\n")
+        return tok
+
+    return _RUST_TOKEN_RE.sub(_repl, text)
+
+
+def strip_py_comments(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except tokenize.TokenError:
+        return text
+    comment_tokens = [tok for tok in tokens if tok.type == tokenize.COMMENT]
+    for tok in reversed(comment_tokens):
+        row = tok.start[0] - 1
+        lines[row] = lines[row][: tok.start[1]] + lines[row][tok.end[1] :]
+    return "".join(lines)
+
+
+# Guard 1: Zero raw Command::new(BIN) / tokio::process::Command::new(BIN) or
+# CARGO_BIN_EXE_agy-companion in crates/companion-cli/tests/**/*.rs outside tests/common/mod.rs.
+cli_tests_dir = root / "crates" / "companion-cli" / "tests"
+common_mod = cli_tests_dir / "common" / "mod.rs"
+raw_bin_re = re.compile(
+    r"\b(?:tokio::process::|std::process::)?Command::new\s*\(\s*(?:[\w:]+::)?BIN\b"
+    r"|\bCARGO_BIN_EXE_agy-companion\b"
+)
+if not cli_tests_dir.is_dir():
+    errors.append("Guard 1: missing crates/companion-cli/tests directory")
+else:
+    for rs_file in sorted(cli_tests_dir.rglob("*.rs")):
+        if rs_file == common_mod:
+            continue
+        cleaned = strip_rust_comments(rs_file.read_text(encoding="utf-8"))
+        for match in raw_bin_re.finditer(cleaned):
+            line_no = cleaned.count("\n", 0, match.start()) + 1
+            rel = rs_file.relative_to(root)
+            errors.append(
+                f"Guard 1 ({rel}:{line_no}): raw Command::new(BIN) or CARGO_BIN_EXE_agy-companion outside tests/common/mod.rs"
+            )
+
+# Guard 2: Zero bare CompanionUiServer::new( or unisolated CompanionUiServer::with_options(
+# in crates/companion-ui-mcp/src/tests.rs outside isolated_ui_server_with and
+# ui_resource_reads_process_env_var_dynamically.
+ui_mcp_tests = root / "crates" / "companion-ui-mcp" / "src" / "tests.rs"
+if not ui_mcp_tests.is_file():
+    errors.append("Guard 2: missing crates/companion-ui-mcp/src/tests.rs")
+else:
+    cleaned = strip_rust_comments(ui_mcp_tests.read_text(encoding="utf-8"))
+    fn_re = re.compile(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+    ctor_re = re.compile(r"\bCompanionUiServer\s*::\s*(new|with_options)\s*\(")
+    fn_matches = list(fn_re.finditer(cleaned))
+    fn_names = {m.group(1) for m in fn_matches}
+    if "isolated_ui_server_with" not in fn_names:
+        errors.append("Guard 2: isolated_ui_server_with helper not found in companion-ui-mcp/src/tests.rs")
+
+    slices: list[tuple[str, int, str]] = []
+    if fn_matches:
+        slices.append(("<module>", 0, cleaned[: fn_matches[0].start()]))
+        for idx, m in enumerate(fn_matches):
+            end = fn_matches[idx + 1].start() if idx + 1 < len(fn_matches) else len(cleaned)
+            slices.append((m.group(1), m.start(), cleaned[m.start() : end]))
+    else:
+        slices.append(("<module>", 0, cleaned))
+
+    for fn_name, offset, body in slices:
+        for match in ctor_re.finditer(body):
+            ctor = match.group(1)
+            allowed = (
+                (ctor == "with_options" and fn_name == "isolated_ui_server_with")
+                or (ctor == "new" and fn_name == "ui_resource_reads_process_env_var_dynamically")
+            )
+            if not allowed:
+                line_no = cleaned.count("\n", 0, offset + match.start()) + 1
+                errors.append(
+                    f"Guard 2 (crates/companion-ui-mcp/src/tests.rs:{line_no} in {fn_name}): "
+                    f"disallowed CompanionUiServer::{ctor}("
+                )
+
+# Guard 3: Zero direct 24141 binds or live port literals in crates/ tests or e2e/.
+rust_port_patterns = (
+    re.compile(r"\bbind\s*\([^;{}]{0,200}24141\b"),
+    re.compile(r"(?<![:\w])(?:listen_)?port\s*=\s*24141\b"),
+    re.compile(r"\b(?:NonZeroU16::new|ProxyPort::new)\s*\(\s*24141\s*\)"),
+)
+crates_dir = root / "crates"
+for rs_file in sorted(crates_dir.rglob("*.rs")):
+    rel = rs_file.relative_to(root)
+    raw_text = rs_file.read_text(encoding="utf-8")
+    is_test_file = "tests" in rel.parts or rs_file.name == "tests.rs"
+    if is_test_file:
+        test_offset = 0
+        test_text = strip_rust_comments(raw_text)
+    else:
+        cfg_idx = raw_text.find("#[cfg(test)]")
+        if cfg_idx == -1:
+            continue
+        test_offset = cfg_idx
+        test_text = strip_rust_comments(raw_text[cfg_idx:])
+    for pat in rust_port_patterns:
+        for match in pat.finditer(test_text):
+            line_no = raw_text.count("\n", 0, test_offset) + test_text.count("\n", 0, match.start()) + 1
+            errors.append(f"Guard 3 ({rel}:{line_no}): direct 24141 bind/port literal in Rust test")
+
+py_port_patterns = (
+    re.compile(r"\bbind\s*\([^;\n]{0,200}24141\b"),
+    re.compile(r"\b(?:listen_)?port\s*=\s*24141\b"),
+    re.compile(r"""["'][^"']*:24141\b"""),
+)
+e2e_dir = root / "e2e"
+if e2e_dir.is_dir():
+    for py_file in sorted(e2e_dir.rglob("*.py")):
+        if "__pycache__" in py_file.parts:
+            continue
+        rel = py_file.relative_to(root)
+        cleaned = strip_py_comments(py_file.read_text(encoding="utf-8"))
+        for pat in py_port_patterns:
+            for match in pat.finditer(cleaned):
+                line_no = cleaned.count("\n", 0, match.start()) + 1
+                errors.append(f"Guard 3 ({rel}:{line_no}): direct 24141 bind/port literal in e2e")
+
+# Guard 4 & Guard 5: e2e opaque-box hygiene & explicit non-None env= on run_cli().
+forbidden_repo_substr = re.compile(r"(?:^|/)(?:crates|docs|ui/src)(?:/|$)|(?:^|/)(?:README\.md|AGENTS\.md)$")
+forbidden_repo_segments = frozenset({"crates", "docs", "README.md", "AGENTS.md"})
+
+
+def extract_repo_root_segments(node: ast.AST) -> list[str] | None:
+    if isinstance(node, ast.Name) and node.id == "repo_root":
+        return []
+    if isinstance(node, ast.Attribute) and node.attr == "repo_root":
+        return []
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        base = extract_repo_root_segments(node.left)
+        if base is not None:
+            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, str):
+                return base + [p for p in node.right.value.split("/") if p]
+            return base
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "joinpath":
+            base = extract_repo_root_segments(node.func.value)
+            if base is not None:
+                segs = list(base)
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        segs.extend(p for p in arg.value.split("/") if p)
+                return segs
+        if (
+            (isinstance(node.func, ast.Attribute) and node.func.attr == "join")
+            or (isinstance(node.func, ast.Name) and node.func.id == "Path")
+        ) and node.args:
+            base = extract_repo_root_segments(node.args[0])
+            if base is not None:
+                segs = list(base)
+                for arg in node.args[1:]:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        segs.extend(p for p in arg.value.split("/") if p)
+                return segs
+    return None
+
+
+if e2e_dir.is_dir():
+    for py_file in sorted(e2e_dir.rglob("*.py")):
+        if "__pycache__" in py_file.parts:
+            continue
+        rel = py_file.relative_to(root)
+        src = py_file.read_text(encoding="utf-8")
+        tree = ast.parse(src, filename=str(rel))
+        cleaned = strip_py_comments(src)
+        if "agent_check.sh" in cleaned:
+            errors.append(f"Guard 4 ({rel}): forbidden agent_check.sh reference in e2e")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "agent_check.sh" in node.value:
+                    errors.append(f"Guard 4 ({rel}:{node.lineno}): forbidden agent_check.sh string in e2e")
+
+        if not py_file.name.startswith("test_"):
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if forbidden_repo_substr.search(node.value):
+                    errors.append(
+                        f"Guard 4 ({rel}:{node.lineno}): white-box repo path string {node.value!r}"
+                    )
+            segs = extract_repo_root_segments(node)
+            if segs:
+                if segs[0] in forbidden_repo_segments or segs[:2] == ["ui", "src"]:
+                    errors.append(
+                        f"Guard 4 ({rel}:{getattr(node, 'lineno', 0)}): white-box repo_root read {'/'.join(segs)!r}"
+                    )
+            if isinstance(node, ast.Call):
+                is_run_cli = (
+                    (isinstance(node.func, ast.Name) and node.func.id == "run_cli")
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == "run_cli")
+                )
+                if is_run_cli:
+                    env_kw = next((kw for kw in node.keywords if kw.arg == "env"), None)
+                    if env_kw is None:
+                        errors.append(
+                            f"Guard 5 ({rel}:{node.lineno}): run_cli() missing explicit env= keyword"
+                        )
+                    elif isinstance(env_kw.value, ast.Constant) and env_kw.value.value is None:
+                        errors.append(
+                            f"Guard 5 ({rel}:{node.lineno}): run_cli() passed env=None"
+                        )
+
+if errors:
+    for err in errors:
+        print(err, file=sys.stderr)
+    sys.exit(1)
+PYEOF
+  then
+    fail "[6/${TOTAL_CHECKS}] Rust & UI: static hermeticity guard(s) failed"
+    check6_failed=1
+  fi
+
   if [[ ${check6_failed} -eq 0 ]]; then
-    pass "[6/${TOTAL_CHECKS}] Rust & UI: fmt/clippy/test passed, 0 forbidden sinks/external tags, ui/dist/index.html is ${bundle_bytes} bytes (< ${max_bytes})"
+    pass "[6/${TOTAL_CHECKS}] Rust & UI: fmt/clippy/test, UI tests, 5 static hermeticity guards, 0 forbidden sinks/external tags, ui/dist/index.html is ${bundle_bytes} bytes (< ${max_bytes})"
   fi
 }
 
@@ -649,618 +899,27 @@ check_plugin_bundle() {
     return
   fi
 
-  if ! python3 -B - "${REPO_ROOT}" <<'PYEOF'
-import json
-import pathlib
-import re
-import sys
-import xml.parsers.expat as expat
+  local logo_validator="${REPO_ROOT}/scripts/check_plugin_logo.py"
+  local logo_tests="${REPO_ROOT}/scripts/test_check_plugin_logo.py"
 
-MAX_LOGO_BYTES = 1_048_576
-MAX_SVG_DEPTH = 64
-MAX_SVG_ELEMENTS = 10_000
-
-SVG_NS = "http://www.w3.org/2000/svg"
-XLINK_NS = "http://www.w3.org/1999/xlink"
-XML_NS = "http://www.w3.org/XML/1998/namespace"
-ALLOWED_NAMESPACES = frozenset({SVG_NS, XLINK_NS, XML_NS})
-
-ALLOWED_SVG_TAGS = frozenset({
-    "svg",
-    "g",
-    "defs",
-    "title",
-    "desc",
-    "symbol",
-    "use",
-    "rect",
-    "circle",
-    "ellipse",
-    "line",
-    "polyline",
-    "polygon",
-    "path",
-    "linearGradient",
-    "radialGradient",
-    "stop",
-    "clipPath",
-    "mask",
-    "pattern",
-    "marker",
-    "filter",
-    "feBlend",
-    "feColorMatrix",
-    "feComponentTransfer",
-    "feFuncR",
-    "feFuncG",
-    "feFuncB",
-    "feFuncA",
-    "feComposite",
-    "feDropShadow",
-    "feFlood",
-    "feGaussianBlur",
-    "feMerge",
-    "feMergeNode",
-    "feMorphology",
-    "feOffset",
-    "feTurbulence",
-})
-
-TEXT_ONLY_TAGS = frozenset({"title", "desc"})
-HREF_ALLOWED_TAGS = frozenset({"use", "linearGradient", "radialGradient", "pattern"})
-ALLOWED_XLINK_ATTRS = frozenset({"href"})
-ALLOWED_XML_ATTRS = frozenset({"id", "lang", "space"})
-ALLOWED_UNNS_ATTRS = frozenset({
-    "id",
-    "role",
-    "aria-labelledby",
-    "aria-hidden",
-    "focusable",
-    "lang",
-    "version",
-    "width",
-    "height",
-    "viewBox",
-    "preserveAspectRatio",
-    "x",
-    "y",
-    "x1",
-    "y1",
-    "x2",
-    "y2",
-    "cx",
-    "cy",
-    "r",
-    "rx",
-    "ry",
-    "fx",
-    "fy",
-    "fr",
-    "d",
-    "points",
-    "pathLength",
-    "transform",
-    "transform-origin",
-    "gradientUnits",
-    "gradientTransform",
-    "spreadMethod",
-    "patternUnits",
-    "patternContentUnits",
-    "patternTransform",
-    "clipPathUnits",
-    "maskUnits",
-    "maskContentUnits",
-    "filterUnits",
-    "primitiveUnits",
-    "markerUnits",
-    "markerWidth",
-    "markerHeight",
-    "refX",
-    "refY",
-    "orient",
-    "overflow",
-    "fill",
-    "fill-opacity",
-    "fill-rule",
-    "stroke",
-    "stroke-opacity",
-    "stroke-width",
-    "stroke-linecap",
-    "stroke-linejoin",
-    "stroke-miterlimit",
-    "stroke-dasharray",
-    "stroke-dashoffset",
-    "opacity",
-    "color",
-    "stop-color",
-    "stop-opacity",
-    "flood-color",
-    "flood-opacity",
-    "visibility",
-    "display",
-    "paint-order",
-    "shape-rendering",
-    "color-interpolation",
-    "color-interpolation-filters",
-    "image-rendering",
-    "vector-effect",
-    "isolation",
-    "mix-blend-mode",
-    "mask-type",
-    "clip-path",
-    "clip-rule",
-    "mask",
-    "filter",
-    "marker-start",
-    "marker-mid",
-    "marker-end",
-    "offset",
-    "href",
-    "in",
-    "in2",
-    "result",
-    "mode",
-    "type",
-    "values",
-    "operator",
-    "k1",
-    "k2",
-    "k3",
-    "k4",
-    "stdDeviation",
-    "edgeMode",
-    "radius",
-    "dx",
-    "dy",
-    "baseFrequency",
-    "numOctaves",
-    "seed",
-    "stitchTiles",
-    "slope",
-    "intercept",
-    "amplitude",
-    "exponent",
-    "tableValues",
-})
-
-URL_ATTRS = frozenset({
-    "fill",
-    "stroke",
-    "clip-path",
-    "mask",
-    "filter",
-    "marker-start",
-    "marker-mid",
-    "marker-end",
-})
-COLOR_FUNC_ATTRS = frozenset({
-    "fill",
-    "stroke",
-    "stop-color",
-    "flood-color",
-    "color",
-})
-TRANSFORM_ATTRS = frozenset({
-    "transform",
-    "gradientTransform",
-    "patternTransform",
-})
-PAREN_ALLOWED_ATTRS = URL_ATTRS | COLOR_FUNC_ATTRS | TRANSFORM_ATTRS
-COLOR_FUNCS = frozenset({"rgb", "rgba", "hsl", "hsla"})
-TRANSFORM_FUNCS = frozenset({"matrix", "translate", "scale", "rotate", "skewX", "skewY"})
-
-LOCAL_FRAG_RE = re.compile(r"^#[A-Za-z_][A-Za-z0-9_.:-]*$")
-CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
-FORBIDDEN_ATTR_TOKENS_RE = re.compile(
-    r"(?:\\|/\*|\*/|//|@import|-moz-binding|expression\s*\()",
-    re.IGNORECASE,
-)
-FUNC_CALL_RE = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z_-][A-Za-z0-9_-]*)(\s*)\(([^()]*)\)")
-NUMERIC_FUNC_ARGS_RE = re.compile(r"^[0-9.,eE% /+-]+$")
-RFC3986_SCHEME_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-"
-)
-
-
-class _SvgAbort(Exception):
-    pass
-
-
-def _has_rfc3986_scheme(text):
-    if ":" not in text:
-        return False
-    for piece in text.split(":")[:-1]:
-        head = piece.rstrip()
-        idx = len(head)
-        while idx > 0 and head[idx - 1] in RFC3986_SCHEME_CHARS:
-            idx -= 1
-        if any(("A" <= ch <= "Z") or ("a" <= ch <= "z") for ch in head[idx:]):
-            return True
-    return False
-
-
-def _split_ns(name):
-    if " " in name:
-        return name.rsplit(" ", 1)
-    return "", name
-
-
-def _validate_attr_value(local_attr, attr_val):
-    if CTRL_CHAR_RE.search(attr_val):
-        raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains forbidden control character")
-    if FORBIDDEN_ATTR_TOKENS_RE.search(attr_val):
-        raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains forbidden CSS/URI token")
-
-    paren_depth = 0
-    open_count = 0
-    for ch in attr_val:
-        if ch == "(":
-            paren_depth += 1
-            open_count += 1
-            if paren_depth > 1:
-                raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains nested parentheses")
-        elif ch == ")":
-            paren_depth -= 1
-            if paren_depth < 0:
-                raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains unbalanced parentheses")
-    if paren_depth != 0:
-        raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains unclosed parentheses")
-
-    url_spans = []
-    url_targets = []
-    if open_count > 0:
-        if local_attr not in PAREN_ALLOWED_ATTRS:
-            raise _SvgAbort(f"SVG logo attribute '{local_attr}' does not permit functional notation")
-        matched_parens = 0
-        for m in FUNC_CALL_RE.finditer(attr_val):
-            matched_parens += 1
-            fn_name = m.group(1)
-            fn_ws = m.group(2)
-            fn_arg = m.group(3)
-            fn_lower = fn_name.lower()
-            if fn_lower == "url":
-                if local_attr not in URL_ATTRS:
-                    raise _SvgAbort(f"SVG logo attribute '{local_attr}' does not permit url()")
-                if fn_ws:
-                    raise _SvgAbort(
-                        f"SVG logo attribute '{local_attr}' must not have whitespace between url and '('"
-                    )
-                inner = fn_arg.strip(" ")
-                if len(inner) >= 2 and inner[0] in ("'", '"') and inner[-1] == inner[0]:
-                    inner = inner[1:-1]
-                if not LOCAL_FRAG_RE.fullmatch(inner):
-                    raise _SvgAbort(
-                        f"SVG logo attribute '{local_attr}' contains non-local url() reference"
-                    )
-                url_spans.append((m.start(), m.end()))
-                url_targets.append(inner[1:])
-            elif fn_lower in COLOR_FUNCS:
-                if local_attr not in COLOR_FUNC_ATTRS:
-                    raise _SvgAbort(f"SVG logo attribute '{local_attr}' does not permit {fn_name}()")
-                if fn_ws:
-                    raise _SvgAbort(
-                        f"SVG logo attribute '{local_attr}' must not have whitespace before '(' in {fn_name}()"
-                    )
-                if not NUMERIC_FUNC_ARGS_RE.fullmatch(fn_arg) or not fn_arg.strip(" "):
-                    raise _SvgAbort(
-                        f"SVG logo attribute '{local_attr}' contains invalid {fn_name}() arguments"
-                    )
-            elif fn_name in TRANSFORM_FUNCS:
-                if local_attr not in TRANSFORM_ATTRS:
-                    raise _SvgAbort(f"SVG logo attribute '{local_attr}' does not permit {fn_name}()")
-                if fn_ws and fn_ws.strip(" "):
-                    raise _SvgAbort(
-                        f"SVG logo attribute '{local_attr}' contains forbidden whitespace before '('"
-                    )
-                if not NUMERIC_FUNC_ARGS_RE.fullmatch(fn_arg) or not fn_arg.strip(" "):
-                    raise _SvgAbort(
-                        f"SVG logo attribute '{local_attr}' contains invalid {fn_name}() arguments"
-                    )
-            else:
-                raise _SvgAbort(
-                    f"SVG logo attribute '{local_attr}' contains disallowed function '{fn_name}()'"
-                )
-        if matched_parens != open_count:
-            raise _SvgAbort(
-                f"SVG logo attribute '{local_attr}' contains invalid parenthesized expression"
-            )
-
-    if local_attr not in ("id", "href"):
-        if url_spans:
-            parts = []
-            pos = 0
-            for start_idx, end_idx in url_spans:
-                parts.append(attr_val[pos:start_idx])
-                pos = end_idx
-            parts.append(attr_val[pos:])
-            remainder = " ".join(parts)
-        else:
-            remainder = attr_val
-        if _has_rfc3986_scheme(remainder):
-            raise _SvgAbort(f"SVG logo attribute '{local_attr}' contains forbidden URI scheme")
-
-    return url_targets
-
-
-def _validate_svg_bytes(raw):
-    try:
-        raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        return [f"plugin/plugin.json: SVG logo is not valid UTF-8 ({exc})"]
-
-    stack = []
-    id_stack = []
-    ref_graph = {}
-    seen_root = False
-    elem_count = 0
-    xml_id_key = f"{XML_NS} id"
-
-    def _abort(msg):
-        raise _SvgAbort(msg)
-
-    def _on_xml_decl(version, encoding, _standalone):
-        if version not in (None, "1.0"):
-            _abort(f"SVG logo XML declaration version must be 1.0, got {version!r}")
-        if encoding is not None and encoding.lower() != "utf-8":
-            _abort(f"SVG logo XML declaration encoding must be UTF-8, got {encoding!r}")
-
-    def _on_start_ns(_prefix, uri):
-        if uri not in ALLOWED_NAMESPACES:
-            _abort(f"SVG logo declares forbidden XML namespace {uri!r}")
-
-    def _on_start_elem(name, attrs):
-        nonlocal seen_root, elem_count
-        elem_ns, local_tag = _split_ns(name)
-        if not seen_root:
-            seen_root = True
-            if (elem_ns, local_tag) != (SVG_NS, "svg"):
-                _abort(
-                    f"SVG logo root element must be {{{SVG_NS}}}svg, got {{{elem_ns}}}{local_tag}"
-                )
-        else:
-            if elem_ns != SVG_NS:
-                _abort(f"SVG logo element <{local_tag}> uses forbidden namespace {elem_ns!r}")
-            if stack and stack[-1] in TEXT_ONLY_TAGS:
-                _abort(f"SVG logo element <{stack[-1]}> must not contain child elements")
-
-        if local_tag not in ALLOWED_SVG_TAGS:
-            _abort(f"SVG logo contains disallowed element <{local_tag}>")
-
-        elem_count += 1
-        if elem_count > MAX_SVG_ELEMENTS:
-            _abort(f"SVG logo exceeds maximum element count ({MAX_SVG_ELEMENTS})")
-        if len(stack) + 1 > MAX_SVG_DEPTH:
-            _abort(f"SVG logo exceeds maximum nesting depth ({MAX_SVG_DEPTH})")
-
-        parent_ids = id_stack[-1] if id_stack else ()
-        elem_ids = []
-        raw_id = attrs.get("id")
-        if raw_id:
-            elem_ids.append(raw_id)
-        raw_xml_id = attrs.get(xml_id_key)
-        if raw_xml_id and raw_xml_id not in elem_ids:
-            elem_ids.append(raw_xml_id)
-        for pid in parent_ids:
-            for eid in elem_ids:
-                ref_graph.setdefault(pid, set()).add(eid)
-        effective_ids = tuple(elem_ids) if elem_ids else parent_ids
-        owner_ids = elem_ids if elem_ids else list(parent_ids)
-
-        for attr_name, attr_val in attrs.items():
-            attr_ns, local_attr = _split_ns(attr_name)
-            if local_attr.lower().startswith("on"):
-                _abort(f"SVG logo contains forbidden event handler attribute '{local_attr}'")
-            if attr_ns == "":
-                if local_attr not in ALLOWED_UNNS_ATTRS:
-                    _abort(
-                        f"SVG logo element <{local_tag}> contains disallowed attribute '{local_attr}'"
-                    )
-            elif attr_ns == XLINK_NS:
-                if local_attr not in ALLOWED_XLINK_ATTRS:
-                    _abort(
-                        f"SVG logo element <{local_tag}> contains disallowed xlink attribute '{local_attr}'"
-                    )
-            elif attr_ns == XML_NS:
-                if local_attr not in ALLOWED_XML_ATTRS:
-                    _abort(
-                        f"SVG logo element <{local_tag}> contains disallowed xml attribute '{local_attr}'"
-                    )
-            else:
-                _abort(
-                    f"SVG logo element <{local_tag}> contains attribute in forbidden namespace {attr_ns!r}"
-                )
-
-            if local_attr == "href" and attr_ns in ("", XLINK_NS):
-                if local_tag not in HREF_ALLOWED_TAGS:
-                    _abort(
-                        f"SVG logo element <{local_tag}> does not permit '{local_attr}' attribute"
-                    )
-                if not LOCAL_FRAG_RE.fullmatch(attr_val):
-                    _abort(
-                        f"SVG logo element <{local_tag}> '{local_attr}' must be a local #id fragment"
-                    )
-                target_id = attr_val[1:]
-                for owner in owner_ids:
-                    ref_graph.setdefault(owner, set()).add(target_id)
-
-            for target_id in _validate_attr_value(local_attr, attr_val):
-                for owner in owner_ids:
-                    ref_graph.setdefault(owner, set()).add(target_id)
-
-        stack.append(local_tag)
-        id_stack.append(effective_ids)
-
-    def _on_end_elem(_name):
-        stack.pop()
-        id_stack.pop()
-
-    def _on_char_data(data):
-        if not data.strip(" \t\r\n"):
-            return
-        if not stack or stack[-1] not in TEXT_ONLY_TAGS:
-            parent = stack[-1] if stack else "document"
-            _abort(f"SVG logo element <{parent}> must not contain text content")
-
-    parser = expat.ParserCreate(namespace_separator=" ")
-    parser.XmlDeclHandler = _on_xml_decl
-    parser.StartDoctypeDeclHandler = lambda *_a: _abort(
-        "SVG logo must not contain DOCTYPE or DTD declarations"
-    )
-    parser.EntityDeclHandler = lambda *_a: _abort(
-        "SVG logo must not contain ENTITY declarations"
-    )
-    parser.UnparsedEntityDeclHandler = lambda *_a: _abort(
-        "SVG logo must not contain unparsed ENTITY declarations"
-    )
-    parser.NotationDeclHandler = lambda *_a: _abort(
-        "SVG logo must not contain NOTATION declarations"
-    )
-    parser.AttlistDeclHandler = lambda *_a: _abort(
-        "SVG logo must not contain ATTLIST declarations"
-    )
-    parser.ElementDeclHandler = lambda *_a: _abort(
-        "SVG logo must not contain ELEMENT declarations"
-    )
-    parser.ExternalEntityRefHandler = lambda *_a: _abort(
-        "SVG logo must not reference external entities"
-    )
-    parser.ProcessingInstructionHandler = lambda target, _data: _abort(
-        f"SVG logo must not contain XML processing instructions (<?{target}?>)"
-    )
-    parser.StartCdataSectionHandler = lambda: _abort(
-        "SVG logo must not contain CDATA sections"
-    )
-    parser.StartNamespaceDeclHandler = _on_start_ns
-    parser.StartElementHandler = _on_start_elem
-    parser.EndElementHandler = _on_end_elem
-    parser.CharacterDataHandler = _on_char_data
-
-    try:
-        parser.Parse(raw, True)
-    except _SvgAbort as exc:
-        return [f"plugin/plugin.json: {exc}"]
-    except expat.ExpatError as exc:
-        return [f"plugin/plugin.json: SVG logo is not valid XML ({exc})"]
-
-    if not seen_root:
-        return ["plugin/plugin.json: SVG logo has no root element"]
-
-    # Iterative 3-color DFS cycle detection for local fragment references (<use>/gradient/pattern)
-    color = {}
-    for start in list(ref_graph.keys()):
-        if color.get(start, 0) != 0:
-            continue
-        dfs_stack = [(start, iter(ref_graph.get(start, ())))]
-        color[start] = 1
-        while dfs_stack:
-            node, it = dfs_stack[-1]
-            try:
-                nxt = next(it)
-            except StopIteration:
-                color[node] = 2
-                dfs_stack.pop()
-                continue
-            state = color.get(nxt, 0)
-            if state == 1:
-                return ["plugin/plugin.json: SVG logo contains cyclic local fragment reference"]
-            if state == 0:
-                color[nxt] = 1
-                dfs_stack.append((nxt, iter(ref_graph.get(nxt, ()))))
-
-    return []
-
-root = pathlib.Path(sys.argv[1])
-manifests = [
-    "plugin/plugin.json",
-    "plugin/mcp_config.json",
-    "plugin/sidecars/proxy/sidecar.json",
-]
-errors = []
-parsed = {}
-for rel in manifests:
-    path = root / rel
-    if not path.is_file():
-        errors.append(f"missing {rel}")
-        continue
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            errors.append(f"{rel}: top-level JSON must be an object")
-        else:
-            parsed[rel] = data
-    except Exception as exc:
-        errors.append(f"{rel}: invalid JSON ({exc})")
-
-plugin_manifest = parsed.get("plugin/plugin.json")
-if isinstance(plugin_manifest, dict):
-    logo = plugin_manifest.get("logo")
-    if not isinstance(logo, str) or not logo.strip() or logo != logo.strip():
-        errors.append("plugin/plugin.json: 'logo' must be a non-empty trimmed string")
-    elif "\x00" in logo or logo.startswith("/") or "\\" in logo:
-        errors.append(f"plugin/plugin.json: invalid 'logo' path {logo!r}")
-    else:
-        raw_parts = logo.split("/")
-        logo_rel = pathlib.PurePosixPath(logo)
-        if (
-            not raw_parts
-            or any(seg in {"", ".", ".."} for seg in raw_parts)
-            or logo_rel.is_absolute()
-            or ".." in logo_rel.parts
-            or not logo_rel.parts
-        ):
-            errors.append(
-                f"plugin/plugin.json: 'logo' must be a canonical relative path without '.', '..', or empty segments: {logo!r}"
-            )
-        elif logo_rel.suffix.lower() not in {".svg", ".png", ".jpg", ".jpeg", ".webp"}:
-            errors.append(f"plugin/plugin.json: unsupported 'logo' extension {logo_rel.suffix!r}")
-        else:
-            plugin_dir = root / "plugin"
-            plugin_dir_resolved = plugin_dir.resolve()
-            logo_path = plugin_dir.joinpath(*logo_rel.parts)
-            cur = plugin_dir
-            symlink_segment = False
-            for part in logo_rel.parts:
-                cur = cur / part
-                if cur.is_symlink():
-                    symlink_segment = True
-                    break
-            if symlink_segment or logo_path.is_symlink():
-                errors.append(f"plugin/plugin.json: 'logo' must not traverse or point to a symlink: {logo!r}")
-            elif not logo_path.exists() or not logo_path.is_file():
-                errors.append(f"plugin/plugin.json: 'logo' target is missing or not a regular file: {logo!r}")
-            else:
-                try:
-                    logo_resolved = logo_path.resolve()
-                    logo_resolved.relative_to(plugin_dir_resolved)
-                except Exception:
-                    errors.append(f"plugin/plugin.json: 'logo' escapes plugin root: {logo!r}")
-                else:
-                    logo_size = logo_path.stat().st_size
-                    if logo_size == 0:
-                        errors.append(f"plugin/plugin.json: 'logo' file is empty: {logo!r}")
-                    elif logo_size > MAX_LOGO_BYTES:
-                        errors.append(
-                            f"plugin/plugin.json: 'logo' file exceeds {MAX_LOGO_BYTES} bytes ({logo_size}): {logo!r}"
-                        )
-                    else:
-                        raw = logo_path.read_bytes()
-                        if len(raw) == 0:
-                            errors.append(f"plugin/plugin.json: 'logo' file is empty: {logo!r}")
-                        elif len(raw) > MAX_LOGO_BYTES:
-                            errors.append(
-                                f"plugin/plugin.json: 'logo' file exceeds {MAX_LOGO_BYTES} bytes ({len(raw)}): {logo!r}"
-                            )
-                        elif logo_rel.suffix.lower() == ".svg":
-                            errors.extend(_validate_svg_bytes(raw))
-
-if errors:
-    for err in errors:
-        print(err, file=sys.stderr)
-    sys.exit(1)
-PYEOF
-  then
-    fail "[7/${TOTAL_CHECKS}] Plugin bundle: JSON manifest and logo validation failed"
+  if [[ ! -f "${logo_validator}" ]]; then
+    fail "[7/${TOTAL_CHECKS}] Plugin bundle: missing scripts/check_plugin_logo.py"
     plugin_failed=1
+  elif ! python3 -B "${logo_validator}" "${REPO_ROOT}"; then
+    fail "[7/${TOTAL_CHECKS}] Plugin bundle: JSON manifest and Expat SVG logo validation failed"
+    plugin_failed=1
+  fi
+
+  if [[ ! -f "${logo_tests}" ]]; then
+    fail "[7/${TOTAL_CHECKS}] Plugin bundle: missing scripts/test_check_plugin_logo.py"
+    plugin_failed=1
+  else
+    local logo_test_out=""
+    if ! logo_test_out="$(python3 -B "${logo_tests}" 2>&1)"; then
+      fail "[7/${TOTAL_CHECKS}] Plugin bundle: scripts/test_check_plugin_logo.py failed"
+      printf '%s\n' "${logo_test_out}" | sed 's/^/  /'
+      plugin_failed=1
+    fi
   fi
 
   if [[ ${plugin_failed} -ne 0 ]]; then
