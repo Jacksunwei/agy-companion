@@ -16,14 +16,20 @@ import {
 import { createFooterController } from "./footer.ts";
 import { buildMonitorView } from "./monitor.ts";
 import { createSettingsView } from "./settings.ts";
+import {
+  UNHEALTHY_BACKOFF_MS,
+  chooseInitialTab,
+  needsSettingsAttention,
+  nextPollDelayMs,
+  shouldApplyRefresh,
+  toggleEnabledModel,
+} from "./state.ts";
 import "./style.css";
 import {
-  CURATED_MODEL_CATALOG,
   DEFAULT_ENABLED_MODELS,
   extractStructuredPayload,
   extractToolErrorText,
   formatCaughtError,
-  normalizeHostPlatform,
   parseSettingsSnapshot,
   parseTestConnectionPayload,
   parseUsageSummary,
@@ -31,7 +37,6 @@ import {
   type AccountPlanChoice,
   type ActiveTab,
   type AppState,
-  type HostPlatform,
   type SaveSettingsArgs,
   type SettingsSnapshot,
   type ToolCallResultLike,
@@ -41,8 +46,6 @@ import {
 } from "./types.ts";
 import { buildUsageView } from "./usage.ts";
 
-const HEALTHY_POLL_MS = 10_000;
-const UNHEALTHY_BACKOFF_MS: ReadonlyArray<number> = [3_000, 5_000, 10_000];
 const FOCUS_RECHECK_MIN_GAP_MS = 2_000;
 
 type ToolOutcome<T> =
@@ -98,10 +101,6 @@ async function main(): Promise<void> {
 
   function isWriteInFlight(): boolean {
     return state.saving || state.clearing || state.updatingIntegration;
-  }
-
-  function activePlatform(): HostPlatform {
-    return state.snapshot?.platform ?? normalizeHostPlatform(null);
   }
 
   /* =========================================================================
@@ -259,21 +258,9 @@ async function main(): Promise<void> {
       btn.setAttribute("aria-selected", String(state.activeTab === id));
     }
 
-    const snap = state.snapshot;
-    const li = snap?.launcher_integration ?? null;
-    const platform = activePlatform();
-    const unixDisabled =
-      platform !== "windows" &&
-      li !== null &&
-      !li.enabled &&
-      li.state !== "unsupported";
-    const needsAttention =
-      snap !== null &&
-      (!snap.config.providers.gemini.api_key_configured ||
-        unixDisabled ||
-        li?.state === "manual_required" ||
-        li?.hybrid_active !== true);
-    settingsDot.hidden = !(needsAttention && state.activeTab !== "settings");
+    settingsDot.hidden = !(
+      needsSettingsAttention(state.snapshot) && state.activeTab !== "settings"
+    );
   }
 
   function renderBanner(): void {
@@ -358,9 +345,7 @@ async function main(): Promise<void> {
     }
 
     if (!state.initialTabApplied && !state.tabPinnedByUser) {
-      const hybridActive = snap.launcher_integration?.hybrid_active === true;
-      const apiKeyConfigured = snap.config.providers.gemini.api_key_configured;
-      state.activeTab = hybridActive || apiKeyConfigured ? "monitor" : "settings";
+      state.activeTab = chooseInitialTab(snap);
       state.initialTabApplied = true;
     }
 
@@ -420,7 +405,7 @@ async function main(): Promise<void> {
     state.refreshing = false;
     lastPollCompletedAt = Date.now();
 
-    if (state.snapshotEpoch !== epoch || isWriteInFlight()) {
+    if (!shouldApplyRefresh(epoch, state.snapshotEpoch, isWriteInFlight())) {
       scheduleNextPoll();
       return;
     }
@@ -632,24 +617,7 @@ async function main(): Promise<void> {
   async function handleToggleModel(modelId: string): Promise<void> {
     const current =
       state.snapshot?.config.providers.gemini.enabled_models ?? [...DEFAULT_ENABLED_MODELS];
-    const nextSet = new Set(current);
-    if (nextSet.has(modelId)) {
-      nextSet.delete(modelId);
-    } else {
-      nextSet.add(modelId);
-    }
-    // Preserve canonical catalog order, followed by any extra persisted IDs
-    const ordered: string[] = [];
-    for (const m of CURATED_MODEL_CATALOG) {
-      if (nextSet.has(m.id)) {
-        ordered.push(m.id);
-        nextSet.delete(m.id);
-      }
-    }
-    for (const extra of nextSet) {
-      ordered.push(extra);
-    }
-    await saveEnabledModels(ordered, null);
+    await saveEnabledModels(toggleEnabledModel(current, modelId), null);
   }
 
   async function handleRestoreDefaultModels(): Promise<void> {
@@ -733,27 +701,16 @@ async function main(): Promise<void> {
     }
   }
 
-  function nextPollDelayMs(): number {
-    const reachable = state.snapshot?.proxy.reachable ?? true;
-    if (reachable && state.unhealthyStreak === 0) {
-      return HEALTHY_POLL_MS;
-    }
-    const idx = Math.min(
-      Math.max(0, state.unhealthyStreak - 1),
-      UNHEALTHY_BACKOFF_MS.length - 1,
-    );
-    return UNHEALTHY_BACKOFF_MS[idx];
-  }
-
   function scheduleNextPoll(): void {
     clearPollTimer();
     if (!state.connected || state.standalone || document.hidden) return;
+    const reachable = state.snapshot?.proxy.reachable ?? true;
     pollTimer = window.setTimeout(() => {
       pollTimer = null;
       if (!document.hidden) {
         void refreshSettings(true);
       }
-    }, nextPollDelayMs());
+    }, nextPollDelayMs(reachable, state.unhealthyStreak));
   }
 
   function triggerThrottledRecheck(): void {

@@ -1,0 +1,155 @@
+{
+  "config": {
+    "schema_version": 1,
+    "proxy": {
+      "host": "127.0.0.1",
+      "port": 24141
+    },
+    "cloudcode": {
+      "upstream": "auto"
+    },
+    "providers": {
+      "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com",
+        "default_model": "gemini-4-hydrogen",
+        "enabled_models": [
+          "gemini-4-carbon",
+          "gemini-4-neon",
+          "gemini-4-hydrogen"
+        ],
+        "timeout_secs": 900,
+        "api_key_configured": true,
+        "api_key_hint": "AIza...1234"
+      }
+    },
+    "launcher_auto_start": true
+  },
+  "binary_version": "0.1.0",
+  "proxy": {
+    "reachable": true,
+    "status": "ok",
+    "version": "0.1.0",
+    "protocol_version": 1,
+    "error": null
+  },
+  "version_skew": false,
+  "stats": {
+    "usage": {
+      "requests": 2,
+      "prompt_tokens": 4000,
+      "cached_tokens": 2500,
+      "output_tokens": 800,
+      "reasoning_tokens": 160,
+      "cache_hit_ratio": 0.625
+    },
+    "cloudcode": {
+      "mode": "auto",
+      "resolved_upstream": "https://cloudcode-pa.googleapis.com",
+      "last_catalog_refresh_at_ms": 1747299990000,
+      "last_catalog_included_proxy_models": true
+    },
+    "proxy_rss_bytes": 25165824,
+    "recent_calls": [
+      {
+        "timestamp_ms": 1747300000000,
+        "provider": "antigravity",
+        "source": "builtin",
+        "model": "gemini-3.8-pro",
+        "input_tokens": 1000,
+        "cached_tokens": 0,
+        "output_tokens": 200,
+        "reasoning_tokens": 40,
+        "latency_ms": 320,
+        "cold_start": true,
+        "cache_break": false
+      },
+      {
+        "timestamp_ms": 1747300060000,
+        "provider": "gemini",
+        "source": "proxy",
+        "model": "gemini-4-carbon",
+        "input_tokens": 3000,
+        "cached_tokens": 2500,
+        "output_tokens": 600,
+        "reasoning_tokens": 120,
+        "latency_ms": 480,
+        "cold_start": false,
+        "cache_break": false
+      }
+    ],
+    "by_model": [
+      {
+        "provider": "gemini",
+        "source": "proxy",
+        "model": "gemini-4-carbon",
+        "requests": 1,
+        "input_tokens": 3000,
+        "cached_tokens": 2500,
+        "output_tokens": 600,
+        "reasoning_tokens": 120,
+        "total_latency_ms": 480
+      },
+      {
+        "provider": "antigravity",
+        "source": "builtin",
+        "model": "gemini-3.8-pro",
+        "requests": 1,
+        "input_tokens": 1000,
+        "cached_tokens": 0,
+        "output_tokens": 200,
+        "reasoning_tokens": 40,
+        "total_latency_ms": 320
+      }
+    ]
+  },
+  "launcher_integration": {
+    "state": "active",
+    "enabled": true,
+    "hybrid_active": true,
+    "shell": "zsh",
+    "rc_path": "/Users/dev/.zlogin",
+    "env_script_path": "/Users/dev/.local/share/agy-companion/env.sh",
+    "binary_path": "/Users/dev/.local/share/agy-companion/bin/agy-companion",
+    "symlink_target": null,
+    "manual_snippet": null,
+    "message": null
+  },
+  "cloudcode": {
+    "mode": "auto",
+    "configured_upstream": "auto",
+    "resolved_upstream": "https://cloudcode-pa.googleapis.com"
+  },
+  "supported_models": [
+    {
+      "id": "gemini-4-carbon",
+      "display_name": "Gemini 4 Carbon",
+      "short_label": "4 Carbon"
+    },
+    {
+      "id": "gemini-4-neon",
+      "display_name": "Gemini 4 Neon",
+      "short_label": "4 Neon"
+    },
+    {
+      "id": "gemini-4-hydrogen",
+      "display_name": "Gemini 4 Hydrogen",
+      "short_label": "4 Hydrogen"
+    },
+    {
+      "id": "gemini-4-argon",
+      "display_name": "Gemini 4 Argon",
+      "short_label": "4 Argon"
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "display_name": "Gemini 3.8 Flash",
+      "short_label": "3.8 Flash"
+    }
+  ],
+  "platform": "macos",
+  "account_plan": {
+    "mode": "auto",
+    "resolved": "organization"
+  },
+  "proxy_rss_bytes": 25165824
+}

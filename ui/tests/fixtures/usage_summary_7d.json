@@ -1,0 +1,134 @@
+{
+  "range": "7d",
+  "since_utc": "2026-05-09T00:00:00Z",
+  "totals": {
+    "label": "",
+    "requests": 3,
+    "input_tokens": 3500,
+    "cached_tokens": 2000,
+    "output_tokens": 850,
+    "reasoning_tokens": 170
+  },
+  "buckets": [
+    {
+      "label": "2026-05-09",
+      "requests": 0,
+      "input_tokens": 0,
+      "cached_tokens": 0,
+      "output_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    {
+      "label": "2026-05-10",
+      "requests": 0,
+      "input_tokens": 0,
+      "cached_tokens": 0,
+      "output_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    {
+      "label": "2026-05-11",
+      "requests": 0,
+      "input_tokens": 0,
+      "cached_tokens": 0,
+      "output_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    {
+      "label": "2026-05-12",
+      "requests": 1,
+      "input_tokens": 500,
+      "cached_tokens": 100,
+      "output_tokens": 150,
+      "reasoning_tokens": 20
+    },
+    {
+      "label": "2026-05-13",
+      "requests": 0,
+      "input_tokens": 0,
+      "cached_tokens": 0,
+      "output_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    {
+      "label": "2026-05-14",
+      "requests": 0,
+      "input_tokens": 0,
+      "cached_tokens": 0,
+      "output_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    {
+      "label": "2026-05-15",
+      "requests": 2,
+      "input_tokens": 3000,
+      "cached_tokens": 1900,
+      "output_tokens": 700,
+      "reasoning_tokens": 150
+    }
+  ],
+  "by_model": [
+    {
+      "key": "gemini-4-carbon",
+      "provider": "gemini",
+      "source": "proxy",
+      "model_count": null,
+      "requests": 1,
+      "input_tokens": 2000,
+      "cached_tokens": 1500,
+      "output_tokens": 500,
+      "reasoning_tokens": 100,
+      "avg_latency_ms": 500
+    },
+    {
+      "key": "gemini-3.8-pro",
+      "provider": "antigravity",
+      "source": "builtin",
+      "model_count": null,
+      "requests": 1,
+      "input_tokens": 1000,
+      "cached_tokens": 400,
+      "output_tokens": 200,
+      "reasoning_tokens": 50,
+      "avg_latency_ms": 300
+    },
+    {
+      "key": "gemini-4-neon",
+      "provider": "gemini",
+      "source": "proxy",
+      "model_count": null,
+      "requests": 1,
+      "input_tokens": 500,
+      "cached_tokens": 100,
+      "output_tokens": 150,
+      "reasoning_tokens": 20,
+      "avg_latency_ms": 100
+    }
+  ],
+  "by_provider": [
+    {
+      "key": "gemini",
+      "provider": "gemini",
+      "source": null,
+      "model_count": 2,
+      "requests": 2,
+      "input_tokens": 2500,
+      "cached_tokens": 1600,
+      "output_tokens": 650,
+      "reasoning_tokens": 120,
+      "avg_latency_ms": 300
+    },
+    {
+      "key": "antigravity",
+      "provider": "antigravity",
+      "source": null,
+      "model_count": 1,
+      "requests": 1,
+      "input_tokens": 1000,
+      "cached_tokens": 400,
+      "output_tokens": 200,
+      "reasoning_tokens": 50,
+      "avg_latency_ms": 300
+    }
+  ]
+}
