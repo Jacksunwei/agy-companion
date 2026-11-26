@@ -51,6 +51,12 @@ SAFE_HOST_ENV_VARS: tuple[str, ...] = (
     "TERM",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "ComSpec",
+    "PATHEXT",
+    "WINDIR",
 )
 
 STRIPPED_ENV_VARS: tuple[str, ...] = (
@@ -69,6 +75,7 @@ STRIPPED_ENV_VARS: tuple[str, ...] = (
     "AGY_COMPANION_CONFIG",
     "AGY_COMPANION_UI_HTML",
     "AGY_COMPANION_BIN",
+    "AGY_COMPANION_E2E_BIN",
     "AGY_COMPANION_HOOK_ACTIVE",
     "AGY_COMPANION_ALLOW_REMOTE_SSH",
     "JETSKI_MCP_ENV_RESTORE_PREFIX",
@@ -79,6 +86,7 @@ STRIPPED_ENV_VARS: tuple[str, ...] = (
     "SSH_CLIENT",
     "ZDOTDIR",
     "SHELL",
+    "RUST_LOG",
 )
 
 _ACTIVE_COMPANION_PIDS: set[int] = set()
@@ -94,7 +102,7 @@ def _cleanup_active_companion_pids() -> None:
     for pid in pids:
         try:
             os.killpg(pid, signal.SIGKILL)
-        except OSError:
+        except (OSError, AttributeError):
             try:
                 os.kill(pid, signal.SIGKILL)
             except (OSError, ValueError):
@@ -267,7 +275,7 @@ def reap_pidfile_daemon(
     while time.monotonic() < deadline:
         if not _is_pid_alive(pid):
             return True
-        time.sleep(0.05)
+        time.sleep(0.015)
 
     # Re-verify identity before SIGKILL escalation to prevent killing a recycled PID.
     recheck_cmdline = _read_process_cmdline(pid)
@@ -281,7 +289,7 @@ def reap_pidfile_daemon(
         while time.monotonic() < kill_deadline:
             if not _is_pid_alive(pid):
                 break
-            time.sleep(0.05)
+            time.sleep(0.015)
     return not _is_pid_alive(pid)
 
 
@@ -383,11 +391,30 @@ def resolve_binary(
     return root / "target" / "debug" / "agy-companion"
 
 
+RESERVED_PORT_RANGE = range(24140, 24161)
+
+
 def find_free_port(host: str = "127.0.0.1") -> int:
-    """Allocate an available ephemeral TCP port on loopback."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        return int(sock.getsockname()[1])
+    """Allocate an available ephemeral TCP port on loopback, excluding RESERVED_PORT_RANGE."""
+    held: list[socket.socket] = []
+    try:
+        for _ in range(64):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind((host, 0))
+            port = int(sock.getsockname()[1])
+            if port not in RESERVED_PORT_RANGE:
+                sock.close()
+                return port
+            held.append(sock)
+        raise RuntimeError(
+            f"Unable to allocate ephemeral port outside {RESERVED_PORT_RANGE.start}..{RESERVED_PORT_RANGE.stop - 1}"
+        )
+    finally:
+        for sock in held:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 def find_key_recursive(obj: Any, target_key: str) -> tuple[bool, Any]:
@@ -447,8 +474,9 @@ class IsolatedEnv:
         self.data_root = self.root / "data"
         self.data_dir = self.data_root / "agy-companion"
         self.usage_dir = self.data_dir / "usage"
+        self.cache_root = self.root / "cache"
         self.tmp_dir = self.root / "tmp"
-        for d in (self.home_dir, self.config_dir, self.usage_dir, self.tmp_dir):
+        for d in (self.home_dir, self.config_dir, self.usage_dir, self.cache_root, self.tmp_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     def build_env(
@@ -470,7 +498,14 @@ class IsolatedEnv:
         env["HOME"] = str(self.home_dir)
         env["XDG_CONFIG_HOME"] = str(self.config_root)
         env["XDG_DATA_HOME"] = str(self.data_root)
+        env["XDG_CACHE_HOME"] = str(self.cache_root)
         env["TMPDIR"] = str(self.tmp_dir)
+        env["TEMP"] = str(self.tmp_dir)
+        env["TMP"] = str(self.tmp_dir)
+        env["APPDATA"] = str(self.config_root)
+        env["LOCALAPPDATA"] = str(self.data_root)
+        env["USERPROFILE"] = str(self.home_dir)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         if set_config_env:
             env["AGY_COMPANION_CONFIG"] = str(self.config_path)
 
@@ -486,7 +521,7 @@ class IsolatedEnv:
         self,
         *,
         listen_host: str = "127.0.0.1",
-        listen_port: int = 24141,
+        listen_port: int | None = None,
         base_url: str = "https://generativelanguage.googleapis.com",
         api_key: str | None = None,
         default_model: str = "gemini-4-hydrogen",
@@ -507,11 +542,12 @@ class IsolatedEnv:
         }
         if enabled_models is not None:
             gemini_cfg["enabled_models"] = list(enabled_models)
+        resolved_port = listen_port if listen_port is not None else find_free_port()
         cfg: dict[str, Any] = {
             "schema_version": schema_version,
             "proxy": {
                 "host": listen_host,
-                "port": listen_port,
+                "port": resolved_port,
             },
             "cloudcode": {
                 "upstream": cloudcode_upstream_url if cloudcode_upstream_url is not None else "auto",
@@ -664,7 +700,7 @@ def poll_usage_events(
     *,
     min_count: int = 1,
     timeout: float = 2.0,
-    interval: float = 0.05,
+    interval: float = 0.02,
 ) -> tuple[list[Path], list[dict[str, Any]]]:
     """Poll `<usage_dir>/usage.db` until at least `min_count` valid usage rows exist (Guard A13)."""
     deadline = time.monotonic() + timeout
@@ -695,7 +731,7 @@ def poll_stats(
     host: str = "127.0.0.1",
     min_requests: int = 1,
     timeout: float = 2.0,
-    interval: float = 0.05,
+    interval: float = 0.02,
 ) -> dict[str, Any]:
     """Poll `GET /api/stats` until `requests >= min_requests` (Guard A13 SSE EOF race guard)."""
     deadline = time.monotonic() + timeout
@@ -735,12 +771,14 @@ class CliResult:
 def run_cli(
     cmd: list[str],
     *,
-    env: dict[str, str] | None = None,
+    env: dict[str, str],
     cwd: str | Path | None = None,
     timeout: float = 15.0,
     stdin_bytes: bytes | None = None,
 ) -> CliResult:
     """Run a CLI command to completion with timeout and captured stdout/stderr."""
+    if env is None:
+        raise ValueError("run_cli requires an explicit isolated env= dict (ISO-10)")
     start = time.monotonic()
     completed = subprocess.run(
         cmd,
@@ -1133,6 +1171,9 @@ class CompanionProcess:
                 if attempt + 1 < attempts and ("address already in use" in err_lower or "eaddrinuse" in err_lower):
                     continue
                 raise
+            except BaseException:
+                self.stop()
+                raise
         assert last_exc is not None
         raise last_exc
 
@@ -1146,7 +1187,7 @@ class CompanionProcess:
             rc = proc.poll()
             if rc is not None:
                 # Let reader threads flush remaining output briefly.
-                time.sleep(0.05)
+                time.sleep(0.02)
                 raise CompanionStartError(
                     f"Companion process exited prematurely with code {rc}\n"
                     f"stdout:\n{self.stdout_text}\nstderr:\n{self.stderr_text}"
@@ -1158,7 +1199,7 @@ class CompanionProcess:
                 last_err = f"HTTP {resp.status}: {resp.text[:200]}"
             except OSError as exc:
                 last_err = str(exc)
-            time.sleep(0.05)
+            time.sleep(0.015)
 
         raise CompanionStartError(
             f"Companion process did not become ready on 127.0.0.1:{self.port}{self._ready_path} "
@@ -1177,7 +1218,7 @@ class CompanionProcess:
         if proc.poll() is None:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
+            except (ProcessLookupError, PermissionError, OSError, AttributeError):
                 try:
                     proc.terminate()
                 except OSError:
@@ -1187,7 +1228,7 @@ class CompanionProcess:
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
+                except (ProcessLookupError, PermissionError, OSError, AttributeError):
                     try:
                         proc.kill()
                     except OSError:
@@ -1294,7 +1335,7 @@ class MockConnectProxy:
         self.port = int(self._server.server_address[1])
         self._thread = threading.Thread(
             target=self._server.serve_forever,
-            kwargs={"poll_interval": 0.05},
+            kwargs={"poll_interval": 0.01},
             daemon=True,
         )
         self._thread.start()
@@ -1355,8 +1396,9 @@ class MockConnectProxy:
 
 
 class E2ETestCase(unittest.TestCase):
-    """Base TestCase for all E2E tiers with deterministic ExitStack resource teardown."""
+    """Base TestCase for all E2E suites with deterministic ExitStack resource teardown."""
 
+    SUITE: str = ""
     TIER: int = 0
     FEATURE: str = "GENERIC"
 
@@ -1487,11 +1529,18 @@ class E2ETestCase(unittest.TestCase):
         config_path: Path | None = None,
         data_dir: Path | None = None,
         extra_env: dict[str, str | None] | None = None,
+        extra_args: tuple[str, ...] | list[str] = (),
         pass_config_flag: bool = True,
         pass_data_dir_flag: bool = True,
         set_config_env: bool = True,
         auto_initialize: bool = True,
     ) -> McpStdioClient:
+        """Start `agy-companion ui-mcp` over stdio.
+
+        Callers invoking `open_settings` or `get_settings` should seed
+        `env_obj.write_config(env_obj.make_config_dict())` first so `ui-mcp`
+        probes an isolated ephemeral port instead of falling back to defaults.
+        """
         binary = self.require_binary()
         cmd = [str(binary), "ui-mcp"]
         if pass_config_flag:
@@ -1500,6 +1549,7 @@ class E2ETestCase(unittest.TestCase):
         if pass_data_dir_flag:
             ddir = data_dir if data_dir is not None else env_obj.data_dir
             cmd.extend(["--data-dir", str(ddir)])
+        cmd.extend(extra_args)
         proc_env = env_obj.build_env(extra=extra_env, set_config_env=set_config_env)
         client = self.stack.enter_context(McpStdioClient(cmd, env=proc_env))
         if auto_initialize:

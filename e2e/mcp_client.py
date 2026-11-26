@@ -30,7 +30,7 @@ def _cleanup_active_mcp_pids() -> None:
     for pid in pids:
         try:
             os.killpg(pid, signal.SIGKILL)
-        except OSError:
+        except (OSError, AttributeError):
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
@@ -397,10 +397,12 @@ class McpStdioClient:
         *,
         api_key: Any = _UNSET,
         default_model: Any = _UNSET,
+        enabled_models: Any = _UNSET,
         base_url: Any = _UNSET,
         listen_port: Any = _UNSET,
         listen_host: Any = _UNSET,
         cloudcode_upstream: Any = _UNSET,
+        account_plan: Any = _UNSET,
         clear_api_key: Any = _UNSET,
         usage_dir: Any = _UNSET,
         extra: dict[str, Any] | None = None,
@@ -422,6 +424,8 @@ class McpStdioClient:
 
             if cloudcode_upstream is not _UNSET:
                 args["cloudcode"] = {"upstream": cloudcode_upstream}
+            if account_plan is not _UNSET:
+                args["account_plan"] = account_plan
 
             gemini_patch: dict[str, Any] = {}
             if clear_api_key is True:
@@ -433,6 +437,8 @@ class McpStdioClient:
                     gemini_patch["api_key"] = {"set": api_key}
             if default_model is not _UNSET:
                 gemini_patch["default_model"] = default_model
+            if enabled_models is not _UNSET:
+                gemini_patch["enabled_models"] = enabled_models
             if base_url is not _UNSET:
                 gemini_patch["base_url"] = base_url
             if gemini_patch:
@@ -454,6 +460,8 @@ class McpStdioClient:
             args[pick(("api_key", "gemini_api_key"))] = api_key
         if default_model is not _UNSET:
             args[pick(("default_model", "gemini_default_model"))] = default_model
+        if enabled_models is not _UNSET:
+            args[pick(("enabled_models", "gemini_enabled_models"))] = enabled_models
         if base_url is not _UNSET:
             args[pick(("base_url", "gemini_base_url"))] = base_url
         if listen_port is not _UNSET:
@@ -462,6 +470,8 @@ class McpStdioClient:
             args[pick(("listen_host", "host"))] = listen_host
         if cloudcode_upstream is not _UNSET:
             args[pick(("cloudcode_upstream_url", "upstream"))] = cloudcode_upstream
+        if account_plan is not _UNSET:
+            args[pick(("account_plan",))] = account_plan
         if clear_api_key is not _UNSET:
             args[pick(("clear_api_key",))] = clear_api_key
         if usage_dir is not _UNSET:
@@ -475,10 +485,12 @@ class McpStdioClient:
         *,
         api_key: Any = _UNSET,
         default_model: Any = _UNSET,
+        enabled_models: Any = _UNSET,
         base_url: Any = _UNSET,
         listen_port: Any = _UNSET,
         listen_host: Any = _UNSET,
         cloudcode_upstream: Any = _UNSET,
+        account_plan: Any = _UNSET,
         clear_api_key: Any = _UNSET,
         usage_dir: Any = _UNSET,
         extra: dict[str, Any] | None = None,
@@ -489,10 +501,12 @@ class McpStdioClient:
         args = self.build_save_settings_args(
             api_key=api_key,
             default_model=default_model,
+            enabled_models=enabled_models,
             base_url=base_url,
             listen_port=listen_port,
             listen_host=listen_host,
             cloudcode_upstream=cloudcode_upstream,
+            account_plan=account_plan,
             clear_api_key=clear_api_key,
             usage_dir=usage_dir,
             extra=extra,
@@ -529,12 +543,12 @@ class McpStdioClient:
 
         # 2. Wait briefly for clean exit.
         try:
-            proc.wait(timeout=2.0)
+            proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
             # 3. SIGTERM entire process group.
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
+            except (ProcessLookupError, PermissionError, OSError, AttributeError):
                 try:
                     proc.terminate()
                 except OSError:
@@ -545,7 +559,7 @@ class McpStdioClient:
                 # 4. SIGKILL entire process group.
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
+                except (ProcessLookupError, PermissionError, OSError, AttributeError):
                     try:
                         proc.kill()
                     except OSError:
