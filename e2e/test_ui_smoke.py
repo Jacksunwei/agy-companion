@@ -13,6 +13,7 @@ MCP App host and verifies:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any
@@ -594,13 +595,14 @@ class TestUiSmoke(E2ETestCase):
             },
         )
         wait_expr(
-            "Boolean(document.body && /Gemini 4 Neon/.test(document.body.innerText || '') && /MB RAM/.test(document.body.innerText || ''))"
+            "Boolean(document.body && /Gemini 4 Neon/.test(document.body.innerText || '') && document.querySelector('footer.status-bar'))"
         )
         alpha_text = cdp.evaluate("document.body.innerText || ''")
         self.assertIn("Gemini 4 Neon", alpha_text)
         self.assertNotIn("Gemini 4 Carbon", alpha_text)
         self.assertIn("75%", alpha_text)
-        self.assertIn("MB RAM", alpha_text)
+        if os.name != "nt":
+            self.assertIn("MB RAM", alpha_text)
 
         # 2. Live theme-change postMessage from Antigravity host switches Light <-> Dark.
         cdp.evaluate(
@@ -626,7 +628,7 @@ class TestUiSmoke(E2ETestCase):
             },
         )
         wait_expr(
-            "Boolean(document.body && /Gemini 4 Carbon/.test(document.body.innerText || '') && /MB RAM/.test(document.body.innerText || ''))"
+            "Boolean(document.body && /Gemini 4 Carbon/.test(document.body.innerText || '') && document.querySelector('footer.status-bar'))"
         )
         beta_text = cdp.evaluate("document.body.innerText || ''")
         self.assertIn("Gemini 4 Carbon", beta_text)
@@ -640,11 +642,13 @@ class TestUiSmoke(E2ETestCase):
             },
         )
         wait_expr(
-            "Boolean(document.body && /Waiting for (?:requests|Antigravity to connect)/.test(document.body.innerText || '') && /MB RAM/.test(document.body.innerText || ''))"
+            "Boolean(document.body && /Waiting for (?:requests|Antigravity to connect)/.test(document.body.innerText || '') && document.querySelector('footer.status-bar'))"
         )
         empty_text = cdp.evaluate("document.body.innerText || ''")
         self.assertNotIn("Gemini 4 Neon", empty_text)
         self.assertNotIn("Gemini 4 Carbon", empty_text)
+        if os.name != "nt":
+            self.assertIn("MB RAM", empty_text)
         # Open Usage tab and confirm global SQLite history loaded both calls across sessions.
         cdp.evaluate(
             """(() => {

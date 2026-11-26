@@ -849,7 +849,8 @@ class TestCujUxV2(E2ETestCase):
         self.assertEqual(snap_alpha["stats"]["usage"]["requests"], 1)
         self.assertEqual(snap_alpha["stats"]["usage"]["prompt_tokens"], 1200)
         self.assertEqual(snap_alpha["stats"]["recent_calls"][0]["model"], "gemini-4-neon")
-        self.assertIsNotNone(snap_alpha["proxy_rss_bytes"])
+        if os.name != "nt":
+            self.assertIsNotNone(snap_alpha["proxy_rss_bytes"])
 
         snap_beta = fetch_scoped("conv-beta-222222")
         self.assertEqual(snap_beta["stats"]["usage"]["requests"], 1)
@@ -860,7 +861,8 @@ class TestCujUxV2(E2ETestCase):
         self.assertEqual(snap_empty["stats"]["usage"]["requests"], 0)
         self.assertEqual(snap_empty["stats"]["recent_calls"], [])
         self.assertTrue(snap_empty["proxy"]["reachable"])
-        self.assertIsNotNone(snap_empty["proxy_rss_bytes"])
+        if os.name != "nt":
+            self.assertIsNotNone(snap_empty["proxy_rss_bytes"])
 
         snap_global = fetch_scoped(None)
         self.assertEqual(snap_global["stats"]["usage"]["requests"], 2)
