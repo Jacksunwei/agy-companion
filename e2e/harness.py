@@ -614,6 +614,16 @@ class IsolatedEnv:
         return events
 
     def close(self) -> None:
+        if os.name == "nt":
+            for attempt in range(10):
+                try:
+                    self._tempdir.cleanup()
+                    return
+                except PermissionError:
+                    if attempt == 9:
+                        shutil.rmtree(self._tempdir.name, ignore_errors=True)
+                        return
+                    time.sleep(0.05)
         self._tempdir.cleanup()
 
     def __enter__(self) -> IsolatedEnv:
