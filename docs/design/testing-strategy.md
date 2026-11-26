@@ -40,10 +40,10 @@ Tests exist to guarantee **critical user journeys (CUJs)**, **public boundary co
 
 | Concern / Invariant | Authoritative Owning Layer | Target Runtime | Never Duplicate Here |
 | --- | --- | --- | --- |
-| Governance (no `GEMINI.md`), tracked-file hygiene, `AIza...` secret scan, zero AI attribution | **Layer 1:** `scripts/agent_check.sh` (Gates 1–3) | `< 1s` | `e2e/`, Rust tests |
-| Shell syntax (`bash -n`), `-x` bits, `dev-install.sh` safety, 4-way version sync, npm/Python syntax | **Layer 1:** `scripts/agent_check.sh` (Gates 4–5) | `< 2s` | `e2e/` static readers |
-| `ui/src/` & `ui/dist/index.html` S5 XSS/CSP sink scan + `< 512,000` byte bundle limit + 5 static hermeticity guards | **Layer 1:** `scripts/agent_check.sh` (Gates `6b` & `6c`) | `< 1s` | `companion-ui-mcp`, `e2e/` |
-| Plugin JSON manifests, strict fail-closed Expat SVG logo allowlist (`scripts/check_plugin_logo.py` + `scripts/test_check_plugin_logo.py`), `agy plugin validate --strict ./plugin` | **Layer 1:** `scripts/agent_check.sh` (Gate 7) | `< 1s` | Multi-fork bash `e2e/` loops |
+| Governance (no `GEMINI.md`), tracked-file hygiene, `AIza...` secret scan, zero AI attribution | **Layer 1:** `scripts/check.py --profile repo` (via `scripts/agent_check.sh`) | `< 1s` | `e2e/`, Rust tests |
+| Shell syntax (`bash -n`), `-x` bits, `dev-install.sh` safety, 4-way version sync, npm/Python syntax | **Layer 1:** `scripts/check.py --profile repo` (via `scripts/agent_check.sh`) | `< 2s` | `e2e/` static readers |
+| `ui/src/` & `ui/dist/index.html` S5 XSS/CSP sink scan + `< 512,000` byte bundle limit + 5 static hermeticity guards | **Layer 1:** `scripts/check.py --profile repo` (via `scripts/agent_check.sh`) | `< 1s` | `companion-ui-mcp`, `e2e/` |
+| Plugin JSON manifests, strict fail-closed Expat SVG logo allowlist (`scripts/check_plugin_logo.py` + `scripts/test_check_plugin_logo.py`), `agy plugin validate --strict ./plugin` | **Layer 1:** `scripts/check.py` (`repo` + `os`, via `scripts/agent_check.sh`) | `< 1s` | Multi-fork bash `e2e/` loops |
 | Pure domain & security primitives (`fs_safe`, `redaction`, `validation`, `models`, XDG/Windows path precedence, SQLite WAL `0600` & `usage/query.rs` range rollups, `integration/{auto_enable,lock}`) | **Layer 2:** `cargo test -p companion-core` (`--lib`) | `< 1.5s` | `e2e/` subprocess loops, consumer crate copy-paste |
 | Upstream Gemini HTTP adapter (`S2`/`S3`/`S4` raw zero-compression, `x-goog-api-key`, no redirects) & `LoopbackProxyClient` | **Layer 2:** `cargo test -p companion-providers` (`--lib`) | `< 1.5s` | `doctor.rs` probe copies, `e2e/` T1/T2 |
 | Loopback proxy HTTP wire (`S1`/`S3`/`S4`/`S7`), SSE `usageMetadata` tee, `thoughtSignature` retry, CloudCode auto/403/LRU/slots, `rss.rs` process RAM telemetry, hot-reload, idle shutdown | **Layer 2:** `cargo test -p companion-proxy` (`--lib`) | `< 1.5s` | `e2e/` CloudCode/header duplication |
@@ -273,16 +273,16 @@ RUST_LOG=trace \
 cargo test --workspace
 ```
 
-### Automated Static Hermeticity Checks (`scripts/agent_check.sh` Gate `6c`, `< 0.1s`)
+### Automated Static Hermeticity Checks (`scripts/check.py --profile repo`, `< 0.1s`)
 
-Five fast static guards in `scripts/agent_check.sh` Gate `6c` block hermeticity regressions automatically on every run (compatible with both stock macOS Python 3.9+ and Python 3.14+):
+Five fast static guards in `scripts/check.py` (invoked by `scripts/agent_check.sh` and CI `repo-checks`) block hermeticity regressions automatically on every run (compatible with both stock macOS Python 3.9+ and Python 3.12+):
 
 | # | Automated Check | Enforced Rule |
 | --- | --- | --- |
 | 1 | No raw `Command::new(BIN)` or `CARGO_BIN_EXE_agy-companion` in `crates/companion-cli/tests/` outside `tests/common/mod.rs` | All CLI integration spawns MUST go through `isolated_cli_command` / `isolated_tokio_cli_command` (`env_clear()` + allowlist). |
 | 2 | No bare `CompanionUiServer::new(` or unisolated `with_options(` in `crates/companion-ui-mcp/src/tests.rs` | Require `isolated_ui_server*` setting `integration_options_override`, `ui_html_source: Fixed(None)`, `env_api_key_fallback: false`, and `hybrid_active_override: Some(false)` (allowlisting only `isolated_ui_server_with` and `ui_resource_reads_process_env_var_dynamically`). |
 | 3 | No direct `24141` bind or live port literal in tests | Fail on `bind(...24141)`, `port = 24141`, `listen_port = 24141`, or `:24141` across `crates/` tests and `e2e/` (outside pure constant/serde unit tests). |
-| 4 | No `e2e/` white-box repo reads or `agent_check.sh` recursion | Fail if `e2e/test_*.py` reads `crates/`, `ui/src/`, `README.md`, `AGENTS.md`, or `docs/` via `repo_root` or string literals, or if any `e2e/*.py` references `agent_check.sh`. |
+| 4 | No `e2e/` white-box repo reads or `agent_check.sh` / `scripts/check.py` recursion | Fail if `e2e/test_*.py` reads `crates/`, `ui/src/`, `README.md`, `AGENTS.md`, or `docs/` via `repo_root` or string literals, or if any `e2e/*.py` references `agent_check.sh` or `scripts/check.py`. |
 | 5 | No `run_cli(` without explicit non-`None` `env=` in `e2e/test_*.py` | Python AST check requiring explicit non-`None` `env=` on every `run_cli(...)` call. |
 
 ---
