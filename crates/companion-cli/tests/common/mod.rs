@@ -102,6 +102,60 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Captures a child's `stdout`/`stderr` to regular temp files instead of pipes.
+///
+/// On Windows, `std::process::Command::spawn()` passes `bInheritHandles = TRUE`
+/// without `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so a detached grandchild daemon
+/// inherits the child's pipe write-ends and blocks `Command::output()` until the
+/// daemon exits. Redirecting to files lets `wait()` return as soon as the direct
+/// child exits while still capturing full `stdout`/`stderr`.
+pub struct CapturedChild {
+    guard: ChildGuard,
+    stdout_path: std::path::PathBuf,
+    stderr_path: std::path::PathBuf,
+}
+
+impl CapturedChild {
+    pub fn wait_with_output(self) -> std::io::Result<std::process::Output> {
+        let status = self.guard.wait()?;
+        let stdout = fs::read(&self.stdout_path).unwrap_or_default();
+        let stderr = fs::read(&self.stderr_path).unwrap_or_default();
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+pub fn spawn_with_captured_files(
+    cmd: &mut Command,
+    dir: &Path,
+    label: &str,
+) -> std::io::Result<CapturedChild> {
+    let stdout_path = dir.join(format!("{label}.stdout"));
+    let stderr_path = dir.join(format!("{label}.stderr"));
+    let stdout_file = fs::File::create(&stdout_path)?;
+    let stderr_file = fs::File::create(&stderr_path)?;
+    let child = cmd
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()?;
+    Ok(CapturedChild {
+        guard: ChildGuard::new(child),
+        stdout_path,
+        stderr_path,
+    })
+}
+
+pub fn run_with_captured_files(
+    cmd: &mut Command,
+    dir: &Path,
+    label: &str,
+) -> std::io::Result<std::process::Output> {
+    spawn_with_captured_files(cmd, dir, label)?.wait_with_output()
+}
+
 pub struct DetachedPidFileGuard {
     pid_path: std::path::PathBuf,
 }

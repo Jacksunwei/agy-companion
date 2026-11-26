@@ -532,15 +532,20 @@ mod tests {
         assert!(!slow_msg.contains(&slow_port.to_string()));
         slow_handle.abort();
 
-        // (c) Closed loopback port returns sanitized Connect error with zero URL/port leak
+        // (c) Closed loopback port returns sanitized Connect error with zero URL/port leak.
+        // Use a 5s connect/request budget here because Windows retries loopback SYN for ~2s
+        // before returning WSAECONNREFUSED (Unix still returns ECONNREFUSED in < 1ms).
         let closed_listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind ephemeral port");
         let closed_port = closed_listener.local_addr().expect("closed addr").port();
         drop(closed_listener);
 
-        let conn_err = client
-            .probe_health(closed_port, Some(Duration::from_secs(1)))
+        let connect_client =
+            LoopbackProxyClient::new(Duration::from_secs(5), Duration::from_secs(5))
+                .expect("build connect probe client");
+        let conn_err = connect_client
+            .probe_health(closed_port, Some(Duration::from_secs(5)))
             .await
             .expect_err("closed port must fail");
         assert_eq!(

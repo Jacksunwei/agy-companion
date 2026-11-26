@@ -19,12 +19,12 @@ This repository uses **Antigravity customization conventions** as the default ag
 | `scripts/agent_check.sh` | Fast 7-gate local verification script | Run before every commit and PR (paired with strict Expat SVG validator `scripts/check_plugin_logo.py` + `scripts/test_check_plugin_logo.py`). |
 | `scripts/dev-install.sh` | Local dev build & plugin symlink helper | Supports `--no-build`, `--release`, `--dry-run`, `--uninstall`, `--plugins-dir <dir>`, `-h/--help`; physical `cd -P --` symlink safety; never modifies user Antigravity settings. |
 | `.github/PULL_REQUEST_TEMPLATE.md` | PR template | Every PR includes summary + pasted local verification evidence. |
-| `.github/workflows/ci.yml` | CI workflow (currently disabled at repo level) | Kept in sync with `scripts/agent_check.sh` so CI works immediately when enabled. |
+| `.github/workflows/ci.yml` | GitHub Actions CI workflow | Runs `scripts/agent_check.sh`, UI tests/bundle determinism, and opaque-box E2E on `ubuntu-latest` + `windows-latest` for PRs and pushes to `main`. |
 | `docs/` | Design specs (`docs/design/architecture.md`, `docs/design/dock-launcher-and-install.md`, `docs/design/testing-strategy.md`, etc.; index at `docs/README.md`) and reserved ADRs (`docs/decisions/`) | Update docs alongside behavior or architecture changes. |
 
 ## Verification Gates
 
-> **Local-only verification policy (for now):** `.github/workflows/ci.yml` is checked in and ready, but GitHub Actions is disabled at the repository level while this repo is private without Actions quota. Run all verification gates locally before opening or merging a PR.
+> **Verification policy:** GitHub Actions CI (`.github/workflows/ci.yml`) is enabled on PRs and pushes to `main`. Run all verification gates locally before pushing, and confirm CI checks are green before merging.
 
 ```bash
 # Gate 1 (Primary): Full 7-gate verification script

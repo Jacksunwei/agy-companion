@@ -107,7 +107,8 @@ fn decode_base64(input: &str) -> Vec<u8> {
         }
     };
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks_exact(4) {
+    let (chunks, _) = bytes.as_chunks::<4>();
+    for chunk in chunks {
         let a = val(chunk[0]);
         let b = val(chunk[1]);
         let pad_c = chunk[2] == b'=';
