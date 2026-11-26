@@ -10,6 +10,8 @@ Keep design intent and architectural decisions close to the code:
 - [Milestone 1 Implementation Plan](design/m1-implementation-plan.md) — Bite-sized TDD execution plan for Milestone 1.
 - [Usage & Cost Tracking (TODO)](design/usage-tracking-todo.md) — Post-M1 usage/cost aggregation & `ccusage`-style reporting design notes + day-1 `UsageSink` seam.
 - [User Version Upgrades (TODO)](design/upgrade-lifecycle-todo.md) — Post-M1 binary + plugin upgrade design notes + day-1 version/skew seams.
+- [Testing Strategy & CUJ Verification Guide](design/testing-strategy.md) — Enduring CUJ-first Testing Trophy, Single-Owner layer matrix, strict hermetic local-config/port isolation, fast latency SLOs, anti-slop rules, UI & Rust↔TS contract testing, and UX v2 testing standards.
+- [Testing Infrastructure Improvement Plan](design/testing-infra-improvement-plan.md) — Point-in-time `2026-11-25` audit, canonical metrics, 4-bucket anti-slop inventory, `ISO-1..ISO-11` hermeticity & speed bottleneck audits, S1–S8 red lines, and zero-conflict phased roadmap (`WS1–WS6`).
 
 ## Architecture Decision Records (`docs/decisions/`)
 
