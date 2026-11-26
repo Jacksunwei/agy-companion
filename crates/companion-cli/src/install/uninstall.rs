@@ -305,6 +305,7 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
     // NEVER touch ~/.gemini/config/config.json or /Applications/Antigravity.app.
     let mut purged_paths: Vec<PathBuf> = Vec::new();
     let mut preserved_paths: Vec<PathBuf> = Vec::new();
+    let auth_dir = companion_core::auth_dir_for_config_path(&norm_config_path)?;
 
     let mut usage_dirs: Vec<PathBuf> = Vec::new();
     if let Ok(u) = config.effective_usage_dir() {
@@ -320,6 +321,11 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
             && remove_regular_file_if_present(&config_path, opts.dry_run, &mut warnings)?
         {
             purged_paths.push(config_path.clone());
+        }
+        if config_dir_safety == ExistingDirSafety::SafeDir
+            && remove_dir_if_non_symlink(&auth_dir, opts.dry_run, &mut warnings)?
+        {
+            purged_paths.push(auth_dir.clone());
         }
         for usage_dir in &usage_dirs {
             if (runtime_data_dir_safety == ExistingDirSafety::Unsafe
@@ -389,6 +395,11 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
             && inspect_leaf_kind(&config_path).is_ok_and(|k| k != PathLeafKind::Missing)
         {
             preserved_paths.push(config_path.clone());
+        }
+        if config_dir_safety == ExistingDirSafety::SafeDir
+            && inspect_leaf_kind(&auth_dir).is_ok_and(|k| k != PathLeafKind::Missing)
+        {
+            preserved_paths.push(auth_dir.clone());
         }
         for usage_dir in &usage_dirs {
             if (runtime_data_dir_safety == ExistingDirSafety::Unsafe

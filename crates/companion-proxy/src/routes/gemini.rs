@@ -90,7 +90,7 @@ pub(super) async fn proxy_gemini_handler(
         Err(ProviderError::MissingApiKey) => {
             return json_error_response(
                 StatusCode::UNAUTHORIZED,
-                "missing Gemini API key: configure gemini.api_key or set GEMINI_API_KEY",
+                "missing Gemini API key: configure it in Antigravity Companion settings (auth/gemini.json) or set GEMINI_API_KEY",
             );
         }
         Err(ProviderError::InvalidConfig(_)) => {

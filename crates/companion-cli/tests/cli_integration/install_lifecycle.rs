@@ -2,6 +2,8 @@ use std::fs;
 #[cfg(unix)]
 use std::process::Command;
 
+#[cfg(unix)]
+use companion_core::AuthStore;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -29,6 +31,16 @@ fn install_and_uninstall_full_isolated_lifecycle_respects_symlink_guard_dry_run_
     fs::write(usage_dir.join("2026-11.jsonl"), "{}\n").expect("write legacy usage jsonl");
     let cfg = config_with_port(free_loopback_port());
     cfg.save_secure(&cfg_path).expect("save config");
+    let auth_store = companion_core::FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    companion_core::AuthStore::save_gemini(
+        &auth_store,
+        &companion_core::GeminiCredentials::new(
+            companion_core::ApiKey::parse_strict("AIzaSyLifecycleKey0001").unwrap(),
+        ),
+    )
+    .expect("save gemini auth");
+    let auth_dir = auth_store.auth_dir().unwrap().to_path_buf();
+    let auth_file = auth_store.gemini_path();
 
     // Protect user's ~/.gemini/config/config.json — must NEVER be modified even with --purge.
     let agy_cfg = home.join(".gemini").join("config").join("config.json");
@@ -118,8 +130,12 @@ fn install_and_uninstall_full_isolated_lifecycle_respects_symlink_guard_dry_run_
     assert_eq!(dry_json["dry_run"], true);
     assert!(plugin_link.join("plugin.json").is_file());
     assert!(home.join(".zlogin").is_file());
+    assert!(
+        auth_file.is_file(),
+        "auth/gemini.json preserved on --dry-run"
+    );
 
-    // 3. Standard uninstall removes plugin, binary, env.sh, empty .zlogin, and preserves config + usage.
+    // 3. Standard uninstall removes plugin, binary, env.sh, empty .zlogin, and preserves config + auth + usage.
     let uninst = isolated_cli_command(&home)
         .env("XDG_CONFIG_HOME", &xdg_config)
         .env("XDG_DATA_HOME", &xdg_data)
@@ -133,15 +149,27 @@ fn install_and_uninstall_full_isolated_lifecycle_respects_symlink_guard_dry_run_
         .output()
         .expect("run uninstall");
     assert_eq!(uninst.status.code(), Some(0));
+    let uninst_json: Value = serde_json::from_slice(&uninst.stdout).expect("parse uninst JSON");
+    let preserved = uninst_json["preserved_paths"].as_array().unwrap();
+    assert!(
+        preserved
+            .iter()
+            .any(|p| p.as_str() == Some(auth_dir.to_str().unwrap())),
+        "auth/ must be listed in preserved_paths: {preserved:?}"
+    );
     assert!(!plugin_link.exists());
     assert!(!xdg_data.join("agy-companion/bin/agy-companion").exists());
     assert!(!xdg_data.join("agy-companion/env.sh").exists());
     assert!(!home.join(".zlogin").exists());
     assert!(cfg_path.is_file(), "config.json preserved without --purge");
+    assert!(
+        auth_file.is_file(),
+        "auth/gemini.json preserved without --purge"
+    );
     assert!(usage_dir.is_dir(), "usage/ preserved without --purge");
     assert_eq!(fs::read_to_string(&agy_cfg).unwrap(), "{\"keep\":true}\n");
 
-    // 4. --purge removes config.json and usage/, still leaves ~/.gemini/config/config.json untouched.
+    // 4. --purge removes config.json, auth/, empty agy-companion config dir, and usage/, leaving ~/.gemini/config/config.json untouched.
     let purged = isolated_cli_command(&home)
         .env("XDG_CONFIG_HOME", &xdg_config)
         .env("XDG_DATA_HOME", &xdg_data)
@@ -156,7 +184,18 @@ fn install_and_uninstall_full_isolated_lifecycle_respects_symlink_guard_dry_run_
         .output()
         .expect("run purge uninstall");
     assert_eq!(purged.status.code(), Some(0));
+    let purged_json: Value = serde_json::from_slice(&purged.stdout).expect("parse purge JSON");
+    let purged_paths = purged_json["purged_paths"].as_array().unwrap();
+    assert!(
+        purged_paths
+            .iter()
+            .any(|p| p.as_str() == Some(auth_dir.to_str().unwrap())),
+        "auth/ must be listed in purged_paths: {purged_paths:?}"
+    );
     assert!(!cfg_path.exists());
+    assert!(!auth_file.exists());
+    assert!(!auth_dir.exists());
+    assert!(!xdg_config.join("agy-companion").exists());
     assert!(!usage_dir.exists());
     assert_eq!(fs::read_to_string(&agy_cfg).unwrap(), "{\"keep\":true}\n");
 }

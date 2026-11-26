@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 use ::url::Url;
-use companion_core::{GeminiConfig, api_key_hint};
+use companion_core::{ApiKey, GeminiConfig, api_key_hint};
 use futures_util::TryStreamExt;
 use http::header::{self, HeaderName, HeaderValue};
 
@@ -65,20 +65,25 @@ impl fmt::Debug for GeminiProvider {
 }
 
 impl GeminiProvider {
-    /// Constructs a validated `GeminiProvider` from `companion_core::GeminiConfig`.
-    pub fn from_config(config: &GeminiConfig) -> Result<Self, ProviderError> {
-        Self::from_config_with_timeout(config, Duration::from_secs(config.timeout_secs))
+    /// Constructs a validated `GeminiProvider` from `companion_core::GeminiConfig`
+    /// and an optional validated `ApiKey` loaded from `AuthStore`.
+    pub fn from_config(
+        config: &GeminiConfig,
+        api_key: Option<&ApiKey>,
+    ) -> Result<Self, ProviderError> {
+        Self::from_config_with_timeout(config, api_key, Duration::from_secs(config.timeout_secs))
     }
 
     /// Constructs a validated `GeminiProvider` from `companion_core::GeminiConfig`
-    /// using an explicit request timeout `Duration` (`!timeout.is_zero()`).
+    /// and an optional validated `ApiKey` using an explicit request timeout `Duration` (`!timeout.is_zero()`).
     pub fn from_config_with_timeout(
         config: &GeminiConfig,
+        api_key: Option<&ApiKey>,
         timeout: Duration,
     ) -> Result<Self, ProviderError> {
         Self::new_with_timeout(
             config.base_url.as_str(),
-            config.api_key.as_ref().map(|k| k.expose().to_string()),
+            api_key.map(|k| k.expose().to_string()),
             timeout,
         )
     }
@@ -115,11 +120,12 @@ impl GeminiProvider {
     #[cfg(test)]
     pub(crate) fn with_env_api_key(
         config: &GeminiConfig,
+        api_key: Option<&ApiKey>,
         env_key: Option<&str>,
     ) -> Result<Self, ProviderError> {
         Self::build(
             config.base_url.clone(),
-            config.api_key.as_ref().map(|k| k.expose().to_string()),
+            api_key.map(|k| k.expose().to_string()),
             Duration::from_secs(config.timeout_secs),
             EnvKeySource::Fixed(env_key.map(str::to_owned)),
         )

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod config;
 pub mod fs_safe;
 pub mod integration;
@@ -9,6 +10,11 @@ pub mod redaction;
 pub mod usage;
 pub mod validation;
 
+pub use auth::{
+    AUTH_DIR_NAME, AUTH_SCHEMA_VERSION, AuthStore, FileAuthStore, GEMINI_AUTH_FILENAME,
+    GeminiCredentials, MAX_AUTH_FILE_BYTES, MemoryAuthStore, SecretString,
+    auth_dir_for_config_path, inspect_auth_file_stamp, read_verified_auth_bytes_for_stamp,
+};
 pub use config::{
     ApiKeyPatch, CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CONFIG_PATH_ENV_VAR,
     CURRENT_SCHEMA_VERSION, CloudCodeConfig, CloudCodeConfigPatch, CloudCodeUpstream, Config,

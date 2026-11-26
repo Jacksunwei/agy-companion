@@ -156,10 +156,10 @@ class TestCujGeminiProxy(E2ETestCase):
         cfg = env.write_config(
             env.make_config_dict(
                 base_url=mock.base_url,
-                api_key=api_key,
                 default_model="gemini-4-hydrogen",
             )
         )
+        env.write_gemini_auth(api_key, config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg)
 
         # (a) Unary request with non-canonical whitespace & ?key=LEAKED.
@@ -298,7 +298,8 @@ class TestCujGeminiProxy(E2ETestCase):
         env = self.make_env()
         mock = self.start_mock_gemini()
         api_key = "AIzaSyCujFaultKey5678"
-        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key=api_key))
+        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url))
+        env.write_gemini_auth(api_key, config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg)
 
         mock.enqueue(
@@ -407,10 +408,10 @@ class TestCujGeminiProxy(E2ETestCase):
         cfg = env.write_config(
             env.make_config_dict(
                 base_url=mock.base_url,
-                api_key="AIzaSyCujModels1234",
                 default_model="gemini-3.8-flash",
             )
         )
+        env.write_gemini_auth("AIzaSyCujModels1234", config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg)
 
         mock.enqueue(
@@ -487,10 +488,10 @@ class TestCujUiMcpLifecycle(E2ETestCase):
             env.make_config_dict(
                 listen_port=port,
                 base_url=mock.base_url,
-                api_key=key_v1,
                 default_model="gemini-4-hydrogen",
             )
         )
+        env.write_gemini_auth(key_v1, config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg, port=port)
         mcp = self.start_mcp(
             env,
@@ -554,15 +555,22 @@ class TestCujUiMcpLifecycle(E2ETestCase):
             self.assertEqual(gem["api_key_hint"], "AIza...1111")
             self.assertNotIn(key_v1, json.dumps(res))
 
-        # (e) save_settings updates key_v1 -> key_v2 atomically at 0600, live proxy hot-reloads.
+        # (e) save_settings updates key_v1 -> key_v2 atomically in auth/gemini.json at 0700/0600, live proxy hot-reloads.
         save_res = mcp.save_settings_smart(api_key=key_v2, default_model="gemini-3.8-flash")
         mcp.assert_clean_stdout()
         self.assertEqual(save_res["structuredContent"]["config"]["providers"]["gemini"]["api_key_hint"], "AIza...2222")
+        auth_file = env.gemini_auth_path_for(cfg)
+        self.assertNotIn("api_key", cfg.read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(auth_file.read_text(encoding="utf-8"))["api_key"], key_v2)
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(os.lstat(cfg).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.lstat(auth_file.parent).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.lstat(auth_file).st_mode), 0o600)
         self.assertEqual(list(cfg.parent.glob("*.tmp")), [])
+        self.assertEqual(list(auth_file.parent.glob("*.tmp")), [])
 
         env.bump_mtime(cfg, delta=3.0)
+        env.bump_mtime(auth_file, delta=3.0)
         r_gen = http_raw_request(
             "127.0.0.1",
             proxy.port,
@@ -652,7 +660,13 @@ class TestCujUiMcpLifecycle(E2ETestCase):
         mcp.assert_clean_stdout()
 
         on_disk = json.loads(cfg.read_text(encoding="utf-8"))
-        self.assertEqual(on_disk["providers"]["gemini"]["api_key"], key_v1)
+        self.assertNotIn("api_key", on_disk["providers"]["gemini"])
+        auth_file = env.gemini_auth_path_for(cfg)
+        self.assertTrue(auth_file.is_file())
+        self.assertEqual(json.loads(auth_file.read_text(encoding="utf-8"))["api_key"], key_v1)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(os.lstat(auth_file.parent).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.lstat(auth_file).st_mode), 0o600)
         snap1 = mcp.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(snap1["config"]["providers"]["gemini"]["api_key_configured"], True)
         self.assertEqual(snap1["config"]["providers"]["gemini"]["default_model"], "gemini-3.8-flash")
@@ -660,7 +674,8 @@ class TestCujUiMcpLifecycle(E2ETestCase):
         mcp.save_settings_smart(clear_api_key=True)
         mcp.assert_clean_stdout()
         on_disk2 = json.loads(cfg.read_text(encoding="utf-8"))
-        self.assertIsNone(on_disk2["providers"]["gemini"].get("api_key"))
+        self.assertNotIn("api_key", on_disk2["providers"]["gemini"])
+        self.assertFalse(auth_file.exists())
         snap2 = mcp.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(snap2["config"]["providers"]["gemini"]["api_key_configured"], False)
         self.assertIsNone(snap2["config"]["providers"]["gemini"].get("api_key_hint"))
@@ -696,10 +711,10 @@ class TestCujCliSubcommands(E2ETestCase):
             env.make_config_dict(
                 listen_port=port,
                 base_url=mock.base_url,
-                api_key="AIzaSyCliDoctor1234",
             ),
             mode=0o600,
         )
+        env.write_gemini_auth("AIzaSyCliDoctor1234", config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg, port=port)
 
         r_models = run_cli([str(binary), "models", "--json", "--port", str(port)], env=base_env)
@@ -730,10 +745,11 @@ class TestCujCliSubcommands(E2ETestCase):
         # (d) Version skew against MockHealthServer(version="9.9.9") on both doctor and ui-mcp.
         skew_srv = self.start_mock_health(version="9.9.9")
         skew_cfg = env.write_config(
-            env.make_config_dict(listen_port=skew_srv.port, api_key="AIzaSyCliSkew123456"),
-            path=env.root / "skew.json",
+            env.make_config_dict(listen_port=skew_srv.port),
+            path=env.root / "skew" / "config.json",
             mode=0o600,
         )
+        env.write_gemini_auth("AIzaSyCliSkew123456", config_path=skew_cfg)
         r_skew = run_cli(
             [str(binary), "doctor", "--json", "--config", str(skew_cfg)],
             env=env.build_env(extra={"GOOGLE_GEMINI_BASE_URL": f"http://127.0.0.1:{skew_srv.port}"}),
@@ -749,10 +765,11 @@ class TestCujCliSubcommands(E2ETestCase):
         # (e) Unbound ephemeral port + 0644 config fails doctor.
         dead_port = find_free_port()
         bad_cfg = env.write_config(
-            env.make_config_dict(listen_port=dead_port, api_key="AIzaSyCliDead123456"),
-            path=env.root / "dead.json",
+            env.make_config_dict(listen_port=dead_port),
+            path=env.root / "dead" / "config.json",
             mode=0o644,
         )
+        env.write_gemini_auth("AIzaSyCliDead123456", config_path=bad_cfg)
         r_dead = run_cli([str(binary), "doctor", "--json", "--config", str(bad_cfg)], env=base_env)
         self.assertNotEqual(r_dead.returncode, 0)
         self.assertIs(r_dead.json_stdout()["ok"], False)
@@ -903,8 +920,9 @@ class TestCujDaemonAndCloudCode(E2ETestCase):
         mock = self.start_mock_gemini()
         port = find_free_port()
         cfg = env.write_config(
-            env.make_config_dict(listen_port=port, base_url=mock.base_url, api_key="AIzaSyDaemonKey1234")
+            env.make_config_dict(listen_port=port, base_url=mock.base_url)
         )
+        env.write_gemini_auth("AIzaSyDaemonKey1234", config_path=cfg)
 
         primary = self.start_proxy(
             env,
@@ -985,7 +1003,6 @@ class TestCujDaemonAndCloudCode(E2ETestCase):
 
         cfg = env.write_config(
             env.make_config_dict(
-                api_key=None,
                 cloudcode_upstream_url=mock_ccpa.base_url,
             )
         )
@@ -1067,15 +1084,10 @@ class TestCujDaemonAndCloudCode(E2ETestCase):
         self.assertEqual(len(mock_ccpa.requests), 1)
         self.assertEqual(mock_ccpa.requests[0].header("x-goog-user-project"), "ent-proj-2")
 
-        # (c) Hot-reload adds real Gemini key -> Day-1 merged catalog + Account A LRU preserved + stream 403 never retries.
-        env.write_config(
-            env.make_config_dict(
-                api_key="AIzaSyCloudCodeDay1Key",
-                cloudcode_upstream_url=mock_ccpa.base_url,
-            ),
-            path=cfg,
-        )
-        env.bump_mtime(cfg, delta=3.0)
+        # (c) Hot-reload adds real Gemini key in auth/gemini.json ONLY (without touching config.json) ->
+        # Day-1 merged catalog + Account A LRU preserved + stream 403 never retries.
+        auth_path = env.write_gemini_auth("AIzaSyCloudCodeDay1Key", config_path=cfg)
+        env.bump_mtime(auth_path, delta=3.0)
 
         mock_ccpa.clear_requests()
         r_day1 = http_raw_request(
@@ -1143,7 +1155,8 @@ class TestCujInstallUninstallLifecycle(E2ETestCase):
         env = self.make_env()
         self.register_pidfile_cleanup(env=env)
         port = find_free_port()
-        cfg = env.write_config(env.make_config_dict(listen_port=port, api_key="AIzaSyInstallKeep1234"))
+        cfg = env.write_config(env.make_config_dict(listen_port=port))
+        auth_keep = env.write_gemini_auth("AIzaSyInstallKeep1234", config_path=cfg)
         usage_canary = env.usage_dir / "usage.db"
         usage_canary.write_bytes(b"SQLite format 3\x00")
         gemini_cfg = env.home_dir / ".gemini" / "config" / "config.json"
@@ -1214,16 +1227,18 @@ class TestCujInstallUninstallLifecycle(E2ETestCase):
             self.fail(f"Proxy on port {port} still responded to /health after uninstall")
 
         self.assertTrue(cfg.is_file())
+        self.assertTrue(auth_keep.is_file())
         self.assertTrue(usage_canary.is_file())
         self.assertEqual(gemini_cfg.read_text(encoding="utf-8"), '{"keep":"user"}\n')
 
     def test_cuj_uninstall_purge_and_dry_run_safety(self) -> None:
-        """uninstall --dry-run --purge deletes nothing; --purge removes config & usage while preserving Antigravity config."""
+        """uninstall --dry-run --purge deletes nothing; --purge removes config, auth/ & usage while preserving Antigravity config."""
         binary = self.require_binary()
         env = self.make_env()
         self.register_pidfile_cleanup(env=env)
         port = find_free_port()
-        cfg = env.write_config(env.make_config_dict(listen_port=port, api_key="AIzaSyPurgeKey1234"))
+        cfg = env.write_config(env.make_config_dict(listen_port=port))
+        auth_purge = env.write_gemini_auth("AIzaSyPurgeKey1234", config_path=cfg)
         usage_db = env.usage_dir / "usage.db"
         usage_wal = env.usage_dir / "usage.db-wal"
         usage_db.write_bytes(b"SQLite format 3\x00")
@@ -1249,6 +1264,7 @@ class TestCujInstallUninstallLifecycle(E2ETestCase):
         self.assertIs(dry_json["dry_run"], True)
         self.assertIs(dry_json["purge"], True)
         self.assertTrue(cfg.is_file())
+        self.assertTrue(auth_purge.is_file())
         self.assertTrue(usage_db.is_file())
         self.assertTrue((plugins_dir / "agy-companion").is_dir())
 
@@ -1259,6 +1275,8 @@ class TestCujInstallUninstallLifecycle(E2ETestCase):
         self.assertEqual(purge.returncode, 0, purge.stderr)
         self.assertIs(purge.json_stdout()["purge"], True)
         self.assertFalse(cfg.exists())
+        self.assertFalse(auth_purge.exists())
+        self.assertFalse(auth_purge.parent.exists())
         self.assertFalse(usage_db.exists())
         self.assertFalse(usage_wal.exists())
         self.assertFalse((plugins_dir / "agy-companion").exists())

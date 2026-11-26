@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use companion_core::{ApiKey, Config};
+use companion_core::{ApiKey, AuthStore, Config, FileAuthStore, GeminiCredentials};
 use companion_proxy::{HealthResponse, PROTOCOL_VERSION};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -91,9 +91,14 @@ async fn serve_binds_loopback_serves_health_and_exits_cleanly_on_sigterm() {
     let usage_dir = temp.path().join("usage");
 
     let mut cfg = config_with_port(free_loopback_port());
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyServeLiveSecret8888").unwrap());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
+    FileAuthStore::for_config_path(&cfg_path)
+        .expect("auth store")
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSyServeLiveSecret8888").unwrap(),
+        ))
+        .expect("save gemini auth");
 
     let client = loopback_http_client();
 
@@ -162,10 +167,14 @@ async fn doctor_passes_against_healthy_server_under_hostile_proxy_and_never_leak
     let (port, handle) = spawn_mock_health("ok", env!("CARGO_PKG_VERSION"), PROTOCOL_VERSION).await;
     let temp = TempDir::new().expect("tempdir");
     let cfg_path = temp.path().join("config.json");
-    let mut cfg = Config::default();
-    cfg.providers.gemini.api_key =
-        Some(ApiKey::parse_strict("AIzaSyCfgSecretMustNotLeak1").unwrap());
+    let cfg = Config::default();
     cfg.save_secure(&cfg_path).expect("save_secure");
+    FileAuthStore::for_config_path(&cfg_path)
+        .expect("auth store")
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSyCfgSecretMustNotLeak1").unwrap(),
+        ))
+        .expect("save gemini auth");
 
     for extra_args in [&["--json"][..], &[][..]] {
         let mut cmd = isolated_tokio_cli_command(temp.path());
@@ -286,8 +295,13 @@ fn models_json_flag_emits_valid_custom_models_config_for_custom_port() {
     let cfg_path = temp.path().join("config.json");
     let mut cfg = Config::default();
     cfg.providers.gemini.default_model = "gemini-3.8-flash".to_string();
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyModelsSecret4444").unwrap());
     cfg.save_secure(&cfg_path).expect("save_secure");
+    FileAuthStore::for_config_path(&cfg_path)
+        .expect("auth store")
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSyModelsSecret4444").unwrap(),
+        ))
+        .expect("save gemini auth");
 
     let output = isolated_cli_command(temp.path())
         .args(["models", "--json", "--port", "5252", "--config"])
@@ -547,9 +561,14 @@ async fn serve_writes_0600_proxy_pid_and_proxy_log_in_isolated_dir_and_cleans_pi
     let usage_dir = temp.path().join("usage");
 
     let mut cfg = config_with_port(free_loopback_port());
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyPidLogSecret12345").unwrap());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
+    FileAuthStore::for_config_path(&cfg_path)
+        .expect("auth store")
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSyPidLogSecret12345").unwrap(),
+        ))
+        .expect("save gemini auth");
 
     let client = loopback_http_client();
     let (guard, port, _resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {

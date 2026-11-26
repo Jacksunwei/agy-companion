@@ -1,8 +1,8 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use companion_core::config::ConfigPatch;
 use companion_core::integration::IntegrationState;
-use companion_core::{Config, CoreError, UsageRange, UsageSummary};
+use companion_core::{ApiKey, Config, CoreError, GeminiCredentials, UsageRange, UsageSummary};
 use companion_providers::{GeminiProvider, ProviderAdapter};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::server::CompanionUiServer;
 use crate::types::{
-    GetUsageArgs, SaveSettingsArgs, SetLauncherIntegrationArgs, SettingsSnapshot,
+    ApiKeyPatch, GetUsageArgs, SaveSettingsArgs, SetLauncherIntegrationArgs, SettingsSnapshot,
     TestConnectionPayload,
 };
 use crate::ui_resource::{app_only_meta, companion_icons, open_settings_meta};
@@ -105,13 +105,13 @@ impl CompanionUiServer {
         &self,
         conversation_id: Option<&str>,
     ) -> Result<SettingsSnapshot, String> {
-        let cfg = self
-            .load_config_blocking()
+        let (cfg, gemini_creds) = self
+            .load_config_and_auth_blocking()
             .await
             .map_err(|err| err.message.to_string())?
             .map_err(|err| err.to_string())?;
         Ok(self
-            .build_snapshot_with_session(&cfg, None, conversation_id)
+            .build_snapshot_with_session(&cfg, gemini_creds.as_ref(), None, conversation_id)
             .await)
     }
 
@@ -120,29 +120,81 @@ impl CompanionUiServer {
         args: SaveSettingsArgs,
         conversation_id: Option<&str>,
     ) -> Result<SettingsSnapshot, String> {
-        let patch: ConfigPatch = args.try_into()?;
+        enum ValidatedKeyOp {
+            Clear,
+            Set(GeminiCredentials),
+        }
+
+        let (config_patch, api_key_patch, has_config_changes) =
+            args.into_config_and_auth_patches()?;
+        let key_op = match api_key_patch {
+            Some(ApiKeyPatch::Clear) => Some(ValidatedKeyOp::Clear),
+            Some(ApiKeyPatch::Set(raw)) => Some(ValidatedKeyOp::Set(GeminiCredentials::new(
+                ApiKey::parse_strict(&raw).map_err(|err| err.to_string())?,
+            ))),
+            None => None,
+        };
+
         let write_guard = self.config_write_lock.lock().await;
         let config_path = self.config_path.clone();
-        let save_outcome = tokio::task::spawn_blocking(move || -> Result<Config, String> {
-            let mut cfg = Config::load_or_default(&config_path).map_err(|err| err.to_string())?;
-            cfg.apply_patch(patch).map_err(|err| err.to_string())?;
-            cfg.save_secure(&config_path)
-                .map_err(|err| err.to_string())?;
-            Ok(cfg)
-        })
+        let auth_store = Arc::clone(&self.auth_store);
+        let save_outcome = tokio::task::spawn_blocking(
+            move || -> Result<(Config, Option<GeminiCredentials>), String> {
+                let mut cfg =
+                    Config::load_or_default(&config_path).map_err(|err| err.to_string())?;
+                cfg.apply_patch(config_patch)
+                    .map_err(|err| err.to_string())?;
+
+                let prev_creds: Option<Option<GeminiCredentials>> =
+                    if has_config_changes && key_op.is_some() {
+                        auth_store.load_gemini().ok()
+                    } else {
+                        None
+                    };
+
+                let gemini_creds = match key_op {
+                    Some(ValidatedKeyOp::Set(creds)) => {
+                        auth_store
+                            .save_gemini(&creds)
+                            .map_err(|err| err.to_string())?;
+                        Some(creds)
+                    }
+                    Some(ValidatedKeyOp::Clear) => {
+                        auth_store.clear_gemini().map_err(|err| err.to_string())?;
+                        None
+                    }
+                    None => auth_store.load_gemini().map_err(|err| err.to_string())?,
+                };
+
+                if has_config_changes && let Err(err) = cfg.save_secure(&config_path) {
+                    if let Some(prev) = prev_creds {
+                        match prev {
+                            Some(creds) => {
+                                let _ = auth_store.save_gemini(&creds);
+                            }
+                            None => {
+                                let _ = auth_store.clear_gemini();
+                            }
+                        }
+                    }
+                    return Err(err.to_string());
+                }
+                Ok((cfg, gemini_creds))
+            },
+        )
         .await
         .map_err(|err| format!("save_settings task failed: {err}"))?;
         drop(write_guard);
 
-        let cfg = save_outcome?;
+        let (cfg, gemini_creds) = save_outcome?;
         Ok(self
-            .build_snapshot_with_session(&cfg, None, conversation_id)
+            .build_snapshot_with_session(&cfg, gemini_creds.as_ref(), None, conversation_id)
             .await)
     }
 
     pub async fn test_connection_payload(&self) -> Result<TestConnectionPayload, String> {
-        let cfg = self
-            .load_config_blocking()
+        let (cfg, gemini_creds) = self
+            .load_config_and_auth_blocking()
             .await
             .map_err(|err| err.message.to_string())?
             .map_err(|err| err.to_string())?;
@@ -159,16 +211,19 @@ impl CompanionUiServer {
                 )
             });
 
-        let provider =
-            match GeminiProvider::from_config_with_timeout(&cfg.providers.gemini, timeout) {
-                Ok(provider) => provider.with_env_fallback(self.options.env_api_key_fallback),
-                Err(err) => {
-                    return Ok(TestConnectionPayload {
-                        ok: false,
-                        message: err.to_string(),
-                    });
-                }
-            };
+        let provider = match GeminiProvider::from_config_with_timeout(
+            &cfg.providers.gemini,
+            gemini_creds.as_ref().map(|c| &c.api_key),
+            timeout,
+        ) {
+            Ok(provider) => provider.with_env_fallback(self.options.env_api_key_fallback),
+            Err(err) => {
+                return Ok(TestConnectionPayload {
+                    ok: false,
+                    message: err.to_string(),
+                });
+            }
+        };
 
         let payload = match provider.health_check().await {
             Ok(()) => TestConnectionPayload {
@@ -195,36 +250,40 @@ impl CompanionUiServer {
         let integration_guard = self.integration_write_lock.lock().await;
         let config_guard = self.config_write_lock.lock().await;
         let config_path = self.config_path.clone();
+        let auth_store = Arc::clone(&self.auth_store);
         let mut opts = self.integration_options();
         // Hard invariant: UI/MCP NEVER follows RC symlinks.
         opts.follow_rc_symlink = false;
         let hybrid_override = self.options.hybrid_active_override;
-        let outcome = tokio::task::spawn_blocking(move || -> Result<(Config, _), CoreError> {
-            let _ = Config::load_or_default(&config_path)?;
-            let status = if enabled {
-                companion_core::integration::enable_and_persist_with_hybrid_active(
-                    &config_path,
-                    &opts,
-                    hybrid_override,
-                )?
-            } else {
-                companion_core::integration::disable_and_persist_with_hybrid_active(
-                    &config_path,
-                    &opts,
-                    hybrid_override,
-                )?
-            };
-            let updated_cfg = Config::load_or_default(&config_path)?;
-            Ok((updated_cfg, status))
-        })
+        let outcome = tokio::task::spawn_blocking(
+            move || -> Result<(Config, Option<GeminiCredentials>, _), CoreError> {
+                let _ = Config::load_or_default(&config_path)?;
+                let gemini_creds = auth_store.load_gemini()?;
+                let status = if enabled {
+                    companion_core::integration::enable_and_persist_with_hybrid_active(
+                        &config_path,
+                        &opts,
+                        hybrid_override,
+                    )?
+                } else {
+                    companion_core::integration::disable_and_persist_with_hybrid_active(
+                        &config_path,
+                        &opts,
+                        hybrid_override,
+                    )?
+                };
+                let updated_cfg = Config::load_or_default(&config_path)?;
+                Ok((updated_cfg, gemini_creds, status))
+            },
+        )
         .await
         .map_err(|err| format!("set_launcher_integration task failed: {err}"))?;
         drop(config_guard);
         drop(integration_guard);
 
-        let (cfg, status) = outcome.map_err(|err| err.to_string())?;
+        let (cfg, gemini_creds, status) = outcome.map_err(|err| err.to_string())?;
         Ok(self
-            .build_snapshot_with_session(&cfg, Some(status), conversation_id)
+            .build_snapshot_with_session(&cfg, gemini_creds.as_ref(), Some(status), conversation_id)
             .await)
     }
 
@@ -296,11 +355,11 @@ impl CompanionUiServer {
             }
         }
 
-        let cfg = match self.load_config_blocking().await? {
-            Ok(cfg) => cfg,
+        let (cfg, gemini_creds) = match self.load_config_and_auth_blocking().await? {
+            Ok(pair) => pair,
             Err(err) => return Ok(tool_error(err.to_string())),
         };
-        let snapshot = self.build_snapshot(&cfg).await;
+        let snapshot = self.build_snapshot(&cfg, gemini_creds.as_ref()).await;
         snapshot_tool_result(format_snapshot_summary(&snapshot), &snapshot)
     }
 

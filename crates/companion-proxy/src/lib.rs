@@ -11,6 +11,7 @@ pub mod stats;
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -18,8 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use companion_core::{
-    CloudCodeUpstream, Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_GEMINI_MODEL,
-    DEFAULT_TIMEOUT_SECS, FsError, UsageSink, default_enabled_gemini_models,
+    ApiKey, AuthStore, CloudCodeUpstream, Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL,
+    DEFAULT_GEMINI_MODEL, DEFAULT_TIMEOUT_SECS, FileAuthStore, FsError, MemoryAuthStore, UsageSink,
+    default_enabled_gemini_models,
 };
 use companion_providers::{GeminiProvider, ProviderAdapter, ProviderError};
 use thiserror::Error;
@@ -79,16 +81,31 @@ enum ProviderSource {
     HotReload(Box<HotReloadProvider>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ProxyStateOptions {
     pub config_path: Option<PathBuf>,
+    pub auth_store: Option<Arc<dyn AuthStore>>,
     pub env_fallback: bool,
+}
+
+impl fmt::Debug for ProxyStateOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyStateOptions")
+            .field("config_path", &self.config_path)
+            .field(
+                "auth_store_dir",
+                &self.auth_store.as_ref().and_then(|s| s.auth_dir()),
+            )
+            .field("env_fallback", &self.env_fallback)
+            .finish()
+    }
 }
 
 impl Default for ProxyStateOptions {
     fn default() -> Self {
         Self {
             config_path: None,
+            auth_store: None,
             env_fallback: true,
         }
     }
@@ -160,11 +177,27 @@ impl ProxyState {
         options: ProxyStateOptions,
     ) -> Result<Self, ProxyError> {
         config.validate()?;
-        let active = build_active_provider(&config, options.env_fallback, None)?;
+        let auth_store: Arc<dyn AuthStore> = match options.auth_store {
+            Some(store) => store,
+            None => match options.config_path.as_deref() {
+                Some(path) => Arc::new(FileAuthStore::for_config_path(path)?),
+                None => Arc::new(MemoryAuthStore::new()),
+            },
+        };
+        let initial_gemini_creds = auth_store.load_gemini()?;
+        let active = build_active_provider(
+            &config,
+            initial_gemini_creds.as_ref().map(|c| &c.api_key),
+            options.env_fallback,
+            None,
+        )?;
 
         let source = match options.config_path {
             Some(path) => ProviderSource::HotReload(Box::new(HotReloadProvider::new(
                 path,
+                auth_store,
+                config,
+                initial_gemini_creds,
                 active,
                 options.env_fallback,
             )?)),
@@ -216,11 +249,12 @@ impl ProxyState {
 
 pub(crate) fn build_active_provider(
     config: &Config,
+    gemini_api_key: Option<&ApiKey>,
     env_fallback: bool,
     previous_active: Option<&ActiveProvider>,
 ) -> Result<ActiveProvider, ProxyError> {
-    let provider =
-        GeminiProvider::from_config(&config.providers.gemini)?.with_env_fallback(env_fallback);
+    let provider = GeminiProvider::from_config(&config.providers.gemini, gemini_api_key)?
+        .with_env_fallback(env_fallback);
     let cloudcode = match previous_active {
         Some(prev)
             if prev.cloudcode_upstream == config.cloudcode.upstream

@@ -12,7 +12,10 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::get;
 use companion_core::integration::{IntegrationOptions, IntegrationState};
-use companion_core::{ApiKey, CloudCodeUpstream, Config, LoopbackHost, curated_model_presets};
+use companion_core::{
+    AUTH_DIR_NAME, ApiKey, AuthStore, CloudCodeUpstream, Config, FileAuthStore, GeminiCredentials,
+    LoopbackHost, MemoryAuthStore, curated_model_presets,
+};
 use companion_providers::MAX_PROBE_BODY_BYTES;
 use rmcp::ServiceExt;
 use rmcp::handler::server::wrapper::Parameters;
@@ -44,6 +47,7 @@ fn isolated_ui_server_options(tmp: &TempDir) -> UiServerOptions {
         hybrid_active_override: Some(false),
         probe_timeout: companion_providers::DEFAULT_PROBE_TIMEOUT,
         auto_enable_launcher: false,
+        auth_store_override: None,
     }
 }
 
@@ -376,9 +380,14 @@ async fn get_settings_never_returns_plaintext_api_key() {
     let cfg_path = tmp.path().join("config.json");
     let secret = "AIzaSySecret1234567890";
 
-    let mut cfg = config_with_port(free_closed_port().await);
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(secret).expect("valid api key"));
+    let cfg = config_with_port(free_closed_port().await);
     cfg.save_secure(&cfg_path).expect("save config");
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict(secret).expect("valid api key"),
+        ))
+        .expect("save gemini auth");
 
     let server = isolated_ui_server(&tmp, cfg_path);
 
@@ -464,10 +473,16 @@ async fn save_settings_persists_eagerly_and_validates_inputs() {
     assert!(serialized.contains("AIza...9876"));
 
     let saved = Config::load_or_default(&cfg_path).expect("reload config");
-    assert_eq!(
-        saved.providers.gemini.api_key.as_ref().map(ApiKey::expose),
-        Some(secret)
-    );
+    let raw_cfg = fs::read_to_string(&cfg_path).expect("read config.json");
+    assert!(!raw_cfg.contains(secret));
+    assert!(!raw_cfg.contains("api_key"));
+
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    let saved_creds = auth_store
+        .load_gemini()
+        .expect("load auth")
+        .expect("saved creds");
+    assert_eq!(saved_creds.api_key.expose(), secret);
     assert_eq!(saved.providers.gemini.default_model, "gemini-3.8-flash");
     assert_eq!(saved.proxy.port.get(), closed_port);
     assert_eq!(
@@ -483,6 +498,18 @@ async fn save_settings_persists_eagerly_and_validates_inputs() {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+        let auth_dir_mode = fs::metadata(auth_store.auth_dir().unwrap())
+            .expect("auth dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(auth_dir_mode, 0o700);
+        let auth_file_mode = fs::metadata(auth_store.gemini_path())
+            .expect("auth file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(auth_file_mode, 0o600);
     }
 }
 
@@ -494,9 +521,14 @@ async fn save_settings_preserves_existing_key_when_omitted_rejects_blank_set_and
     let closed_port = free_closed_port().await;
     let initial_key = "AIzaSyKeepThisSecretKey4321";
 
-    let mut cfg = config_with_port(closed_port);
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(initial_key).expect("valid key"));
+    let cfg = config_with_port(closed_port);
     cfg.save_secure(&cfg_path).expect("save initial");
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict(initial_key).expect("valid key"),
+        ))
+        .expect("seed auth");
 
     let server = isolated_ui_server(&tmp, cfg_path.clone());
 
@@ -520,16 +552,11 @@ async fn save_settings_preserves_existing_key_when_omitted_rejects_blank_set_and
     ] {
         let res = server.save_settings(Parameters(args)).await.expect("save");
         assert_eq!(res.is_error, Some(false));
-        let reloaded = Config::load_or_default(&cfg_path).expect("reload");
-        assert_eq!(
-            reloaded
-                .providers
-                .gemini
-                .api_key
-                .as_ref()
-                .map(ApiKey::expose),
-            Some(initial_key)
-        );
+        let reloaded_key = auth_store
+            .load_gemini()
+            .expect("reload auth")
+            .map(|c| c.api_key.expose().to_string());
+        assert_eq!(reloaded_key.as_deref(), Some(initial_key));
     }
 
     // ApiKeyPatch::Set("") and ApiKeyPatch::Set("   ") are strictly rejected without altering initial_key
@@ -547,16 +574,11 @@ async fn save_settings_preserves_existing_key_when_omitted_rejects_blank_set_and
             .await
             .expect("blank set");
         assert_eq!(rejected.is_error, Some(true));
-        let reloaded = Config::load_or_default(&cfg_path).expect("reload");
-        assert_eq!(
-            reloaded
-                .providers
-                .gemini
-                .api_key
-                .as_ref()
-                .map(ApiKey::expose),
-            Some(initial_key)
-        );
+        let reloaded_key = auth_store
+            .load_gemini()
+            .expect("reload auth")
+            .map(|c| c.api_key.expose().to_string());
+        assert_eq!(reloaded_key.as_deref(), Some(initial_key));
     }
 
     // Explicit ApiKeyPatch::Clear clears saved key
@@ -573,8 +595,8 @@ async fn save_settings_preserves_existing_key_when_omitted_rejects_blank_set_and
         .await
         .expect("clear");
     assert_eq!(cleared.is_error, Some(false));
-    let reloaded = Config::load_or_default(&cfg_path).expect("reload");
-    assert_eq!(reloaded.providers.gemini.api_key, None);
+    assert_eq!(auth_store.load_gemini().expect("reload auth"), None);
+    assert!(!auth_store.gemini_path().exists());
 }
 
 #[tokio::test]
@@ -914,8 +936,13 @@ async fn test_connection_handles_ok_invalid_key_missing_key_timeout_without_leak
     let (ok_port, ok_handle) = spawn_mock_http(ok_router).await;
     let mut cfg = Config::default();
     cfg.providers.gemini.base_url = format!("http://127.0.0.1:{ok_port}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(valid_secret).unwrap());
     cfg.save_secure(&cfg_path).expect("save ok");
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict(valid_secret).unwrap(),
+        ))
+        .expect("save ok auth");
 
     let server = isolated_ui_server(&tmp, cfg_path.clone());
     let res_ok = server.test_connection().await.expect("test ok");
@@ -949,8 +976,12 @@ async fn test_connection_handles_ok_invalid_key_missing_key_timeout_without_leak
     );
     let (bad_port, bad_handle) = spawn_mock_http(bad_router).await;
     cfg.providers.gemini.base_url = format!("http://127.0.0.1:{bad_port}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(bad_secret).unwrap());
     cfg.save_secure(&cfg_path).expect("save bad");
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict(bad_secret).unwrap(),
+        ))
+        .expect("save bad auth");
 
     let res_bad = server.test_connection().await.expect("test bad");
     assert_eq!(res_bad.is_error, Some(false));
@@ -963,8 +994,7 @@ async fn test_connection_handles_ok_invalid_key_missing_key_timeout_without_leak
     bad_handle.abort();
 
     // 3. Missing API key (deterministic with env fallback disabled)
-    cfg.providers.gemini.api_key = None;
-    cfg.save_secure(&cfg_path).expect("save missing");
+    auth_store.clear_gemini().expect("clear auth");
     let res_missing = server.test_connection().await.expect("test missing");
     assert_eq!(res_missing.is_error, Some(false));
     let payload_missing: TestConnectionPayload =
@@ -981,8 +1011,12 @@ async fn test_connection_handles_ok_invalid_key_missing_key_timeout_without_leak
     );
     let (slow_port, slow_handle) = spawn_mock_http(slow_router).await;
     cfg.providers.gemini.base_url = format!("http://127.0.0.1:{slow_port}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(valid_secret).unwrap());
     cfg.save_secure(&cfg_path).expect("save slow");
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict(valid_secret).unwrap(),
+        ))
+        .expect("save slow auth");
 
     let fast_timeout_server = isolated_ui_server_with(&tmp, cfg_path, |o| {
         o.test_connection_timeout_override = Some(Duration::from_millis(150));
@@ -1586,13 +1620,13 @@ async fn concurrent_save_settings_calls_preserve_disjoint_field_updates_and_clea
         assert_ne!(r3.expect("join 3").is_error, Some(true));
 
         let final_cfg = Config::load_or_default(&cfg_path).expect("load final config");
+        let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+        let final_key = auth_store
+            .load_gemini()
+            .expect("load final auth")
+            .map(|c| c.api_key.expose().to_string());
         assert_eq!(
-            final_cfg
-                .providers
-                .gemini
-                .api_key
-                .as_ref()
-                .map(ApiKey::expose),
+            final_key.as_deref(),
             Some(key_value.as_str()),
             "trial {trial}: lost api_key update"
         );
@@ -1611,11 +1645,15 @@ async fn concurrent_save_settings_calls_preserve_disjoint_field_updates_and_clea
     for trial in 0..10u16 {
         let tmp = TempDir::new().expect("tempdir");
         let cfg_path = tmp.path().join("config.json");
-        let mut initial = config_with_port(closed_port);
-        initial.providers.gemini.api_key = Some(
-            ApiKey::parse_strict(&format!("AIzaSyMustStayCleared{trial:02}")).expect("valid key"),
-        );
+        let initial = config_with_port(closed_port);
         initial.save_secure(&cfg_path).expect("seed config");
+        let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+        auth_store
+            .save_gemini(&GeminiCredentials::new(
+                ApiKey::parse_strict(&format!("AIzaSyMustStayCleared{trial:02}"))
+                    .expect("valid key"),
+            ))
+            .expect("seed auth");
 
         let server = isolated_ui_server(&tmp, cfg_path.clone());
 
@@ -1658,7 +1696,8 @@ async fn concurrent_save_settings_calls_preserve_disjoint_field_updates_and_clea
 
         let final_cfg = Config::load_or_default(&cfg_path).expect("load final config");
         assert_eq!(
-            final_cfg.providers.gemini.api_key, None,
+            auth_store.load_gemini().expect("load final auth"),
+            None,
             "trial {trial}: cleared API key was resurrected by concurrent non-key save"
         );
         assert_eq!(
@@ -1855,15 +1894,14 @@ async fn save_settings_rejects_placeholder_api_key_and_heals_legacy_disk_placeho
 
     let reloaded = Config::load_or_default(&cfg_path).expect("reload");
     assert_eq!(reloaded.providers.gemini.default_model, "gemini-4-neon");
-    assert_eq!(
-        reloaded.providers.gemini.api_key, None,
-        "legacy on-disk placeholder must be scrubbed on save"
-    );
     let raw_disk = fs::read_to_string(&cfg_path).expect("read healed config");
     assert!(
         !raw_disk.contains(companion_core::PROXY_PLACEHOLDER_API_KEY),
         "placeholder sentinel must be removed from disk file after save"
     );
+    assert!(!raw_disk.contains("api_key"));
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    assert_eq!(auth_store.load_gemini().expect("load auth"), None);
 }
 
 #[tokio::test]
@@ -3487,7 +3525,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
     const DAY0_FIXTURE: &str =
         include_str!("../../../ui/tests/fixtures/settings_snapshot_day0_offline.json");
     let day0_snapshot = SettingsSnapshot {
-        config: Config::default().redacted(),
+        config: Config::default().redacted_with_auth(None),
         binary_version: "0.1.0".to_string(),
         proxy: ProxyHealthSummary::unreachable("connection refused"),
         version_skew: false,
@@ -3664,4 +3702,333 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         serde_json::from_str::<TestConnectionPayload>(TEST_CONN_FIXTURE).expect("roundtrip conn"),
         test_conn
     );
+}
+
+#[tokio::test]
+async fn save_settings_atomic_rejection_and_key_only_write_without_creating_config_json() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    let server = isolated_ui_server(&tmp, cfg_path.clone());
+
+    // 1. Valid api_key + invalid base_url -> writes NEITHER config.json NOR auth/gemini.json
+    let bad_url_res = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    api_key: Some(ApiKeyPatch::Set("AIzaSyShouldNotWrite01".to_string())),
+                    base_url: Some("http://evil.example.com".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("bad url result");
+    assert_eq!(bad_url_res.is_error, Some(true));
+    assert!(
+        !cfg_path.exists(),
+        "config.json must not be created on error"
+    );
+    assert!(
+        !auth_store.gemini_path().exists(),
+        "auth/gemini.json must not be created on config patch error"
+    );
+
+    // 2. Invalid api_key (placeholder) + valid default_model -> writes NEITHER
+    let bad_key_res = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    api_key: Some(ApiKeyPatch::Set(
+                        companion_core::PROXY_PLACEHOLDER_API_KEY.to_string(),
+                    )),
+                    default_model: Some("gemini-4-neon".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("bad key result");
+    assert_eq!(bad_key_res.is_error, Some(true));
+    assert!(!cfg_path.exists());
+    assert!(!auth_store.gemini_path().exists());
+
+    // 3. Key-only save when config.json absent -> creates auth/gemini.json (0700/0600) WITHOUT creating config.json
+    let key_only_res = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    api_key: Some(ApiKeyPatch::Set("AIzaSyKeyOnlyNoCfg0001".to_string())),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("key-only save");
+    assert_eq!(key_only_res.is_error, Some(false));
+    assert!(
+        !cfg_path.exists(),
+        "key-only save must not needlessly create config.json"
+    );
+    assert!(auth_store.gemini_path().is_file());
+
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(auth_store.auth_dir().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(auth_store.gemini_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let get_res = server.get_settings().await.expect("get_settings");
+    assert_eq!(get_res.is_error, Some(false));
+    let snap: SettingsSnapshot =
+        serde_json::from_value(get_res.structured_content.expect("structured")).expect("parse");
+    assert!(snap.config.providers.gemini.api_key_configured);
+    assert_eq!(
+        snap.config.providers.gemini.api_key_hint.as_deref(),
+        Some("AIza...0001")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ui_mcp_tools_fail_closed_on_symlinked_auth_dir_and_gemini_file() {
+    use std::os::unix::fs::symlink;
+
+    use companion_core::GEMINI_AUTH_FILENAME;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let victim_dir = tmp.path().join("victim_dir");
+    fs::create_dir_all(&victim_dir).unwrap();
+    let victim_file = victim_dir.join(GEMINI_AUTH_FILENAME);
+    let victim_sentinel = r#"{"schema_version":1,"api_key":"AIzaSyVictimStayIntact"}"#;
+    fs::write(&victim_file, victim_sentinel).unwrap();
+
+    for case in ["symlink_auth_dir", "symlink_gemini_file"] {
+        let case_root = tmp.path().join(case);
+        fs::create_dir_all(&case_root).unwrap();
+        let cfg_path = case_root.join("config.json");
+        let auth_dir = case_root.join(AUTH_DIR_NAME);
+        if case == "symlink_auth_dir" {
+            symlink(&victim_dir, &auth_dir).unwrap();
+        } else {
+            fs::create_dir_all(&auth_dir).unwrap();
+            symlink(&victim_file, auth_dir.join(GEMINI_AUTH_FILENAME)).unwrap();
+        }
+
+        let server = isolated_ui_server(&tmp, cfg_path.clone());
+        assert_eq!(
+            server.get_settings().await.expect("get").is_error,
+            Some(true),
+            "{case}: get_settings must fail closed"
+        );
+        assert_eq!(
+            server.open_settings().await.expect("open").is_error,
+            Some(true),
+            "{case}: open_settings must fail closed"
+        );
+        assert_eq!(
+            server.test_connection().await.expect("test_conn").is_error,
+            Some(true),
+            "{case}: test_connection must fail closed"
+        );
+        let save_res = server
+            .save_settings(Parameters(SaveSettingsArgs {
+                providers: Some(ProvidersSettingsPatch {
+                    gemini: Some(GeminiSettingsPatch {
+                        api_key: Some(ApiKeyPatch::Set("AIzaSyShouldNotWrite02".to_string())),
+                        default_model: Some("gemini-4-neon".to_string()),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("save");
+        assert_eq!(
+            save_res.is_error,
+            Some(true),
+            "{case}: save_settings must fail closed"
+        );
+        assert!(
+            !cfg_path.exists(),
+            "{case}: failed save_settings must not create config.json"
+        );
+        assert_eq!(
+            fs::read_to_string(&victim_file).unwrap(),
+            victim_sentinel,
+            "{case}: symlink victim must remain untouched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ui_server_options_auth_store_override_uses_memory_store_without_disk_auth_dir() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let mem_store = Arc::new(MemoryAuthStore::with_gemini_key(
+        ApiKey::parse_strict("AIzaSyMemOverrideKey01").unwrap(),
+    ));
+    let mem_store_dyn: Arc<dyn AuthStore> = mem_store.clone();
+    let server = isolated_ui_server_with(&tmp, cfg_path.clone(), |o| {
+        o.auth_store_override = Some(mem_store_dyn);
+    });
+
+    let get_res = server.get_settings().await.expect("get_settings");
+    assert_eq!(get_res.is_error, Some(false));
+    let snap: SettingsSnapshot =
+        serde_json::from_value(get_res.structured_content.expect("structured")).expect("parse");
+    assert!(snap.config.providers.gemini.api_key_configured);
+    assert_eq!(
+        snap.config.providers.gemini.api_key_hint.as_deref(),
+        Some("AIza...ey01")
+    );
+    assert!(!tmp.path().join(AUTH_DIR_NAME).exists());
+
+    // Saving a rotated key updates MemoryAuthStore with zero disk auth/ creation
+    let save_res = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    api_key: Some(ApiKeyPatch::Set("AIzaSyMemOverrideKey02".to_string())),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("save rotated");
+    assert_eq!(save_res.is_error, Some(false));
+    assert_eq!(
+        mem_store.load_gemini().unwrap().unwrap().api_key.expose(),
+        "AIzaSyMemOverrideKey02"
+    );
+    assert!(!tmp.path().join(AUTH_DIR_NAME).exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn save_settings_rolls_back_gemini_auth_when_config_save_fails_on_read_only_dir() {
+    struct RestoreDirMode(PathBuf);
+    impl Drop for RestoreDirMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_dir = tmp.path().join("ro_cfg_dir");
+    fs::create_dir_all(&cfg_dir).expect("mkdir cfg_dir");
+    let cfg_path = cfg_dir.join("config.json");
+    Config::default()
+        .save_secure(&cfg_path)
+        .expect("seed config.json");
+
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    let original_key = "AIzaSyOrigBeforeFail01";
+    auth_store
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict(original_key).unwrap(),
+        ))
+        .expect("seed gemini auth");
+
+    // Make <config_dir> read-only (0500) while keeping <config_dir>/auth writable (0700).
+    let _restore_guard = RestoreDirMode(cfg_dir.clone());
+    fs::set_permissions(&cfg_dir, fs::Permissions::from_mode(0o500)).expect("chmod cfg_dir 0500");
+
+    let server = isolated_ui_server_with(&tmp, cfg_path.clone(), |_| {});
+
+    // 1. Combined Set(new_key) + default_model must fail and roll back auth/gemini.json to original_key.
+    let set_res = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    api_key: Some(ApiKeyPatch::Set("AIzaSyMutatedKey9999".to_string())),
+                    default_model: Some("gemini-3.8-flash".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("save_settings set response");
+    assert_eq!(set_res.is_error, Some(true));
+    assert_eq!(
+        auth_store
+            .load_gemini()
+            .expect("reload auth after set rollback")
+            .expect("original creds restored")
+            .api_key
+            .expose(),
+        original_key
+    );
+
+    // 2. Combined Clear + default_model must also fail and restore original_key.
+    let clear_res = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    api_key: Some(ApiKeyPatch::Clear),
+                    default_model: Some("gemini-3.8-flash".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("save_settings clear response");
+    assert_eq!(clear_res.is_error, Some(true));
+    assert_eq!(
+        auth_store
+            .load_gemini()
+            .expect("reload auth after clear rollback")
+            .expect("original creds restored after clear")
+            .api_key
+            .expose(),
+        original_key
+    );
+
+    // 3. When no prior key existed, combined Set + default_model failure must roll back by clearing.
+    auth_store.clear_gemini().expect("clear prior key");
+    assert!(auth_store.load_gemini().expect("verify cleared").is_none());
+    let day0_res = server
+        .save_settings(Parameters(SaveSettingsArgs {
+            providers: Some(ProvidersSettingsPatch {
+                gemini: Some(GeminiSettingsPatch {
+                    api_key: Some(ApiKeyPatch::Set("AIzaSyDay0Mutated9999".to_string())),
+                    default_model: Some("gemini-3.8-flash".to_string()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("save_settings day0 response");
+    assert_eq!(day0_res.is_error, Some(true));
+    assert!(
+        auth_store
+            .load_gemini()
+            .expect("reload auth after day0 rollback")
+            .is_none()
+    );
+    assert!(!auth_store.gemini_path().exists());
+
+    // Explicitly restore 0700 before TempDir drops (RestoreDirMode also handles panics).
+    drop(_restore_guard);
 }

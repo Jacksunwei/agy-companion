@@ -4,8 +4,8 @@ use std::sync::Arc;
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::protocol::PROTOCOL_VERSION;
 use companion_core::{
-    CloudCodeStatus, Config, CoreError, HostPlatform, ProxyHealthSummary, StatsSnapshot,
-    curated_model_presets,
+    AuthStore, CloudCodeStatus, Config, CoreError, FileAuthStore, GeminiCredentials, HostPlatform,
+    ProxyHealthSummary, StatsSnapshot, curated_model_presets,
 };
 use companion_providers::{DEFAULT_PROBE_TIMEOUT, LoopbackProxyClient, evaluate_health};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -29,6 +29,7 @@ pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = DEFAULT_PROBE_TIMEOUT.as_secs();
 #[derive(Clone)]
 pub struct CompanionUiServer {
     pub(crate) config_path: PathBuf,
+    pub(crate) auth_store: Arc<dyn AuthStore>,
     pub(crate) proxy_client: LoopbackProxyClient,
     pub(crate) config_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) integration_write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -45,11 +46,19 @@ impl CompanionUiServer {
         config_path: PathBuf,
         options: UiServerOptions,
     ) -> Result<Self, UiMcpError> {
+        let auth_store: Arc<dyn AuthStore> = match options.auth_store_override.clone() {
+            Some(store) => store,
+            None => Arc::new(
+                FileAuthStore::for_config_path(&config_path)
+                    .map_err(|err| UiMcpError::Initialize(err.to_string()))?,
+            ),
+        };
         let proxy_client = LoopbackProxyClient::new(options.probe_timeout, options.probe_timeout)
             .map_err(|err| UiMcpError::HttpClient(err.to_string()))?;
 
         Ok(Self {
             config_path,
+            auth_store,
             proxy_client,
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             integration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -113,6 +122,22 @@ impl CompanionUiServer {
             })
     }
 
+    pub(crate) async fn load_config_and_auth_blocking(
+        &self,
+    ) -> Result<Result<(Config, Option<GeminiCredentials>), CoreError>, ErrorData> {
+        let config_path = self.config_path.clone();
+        let auth_store = Arc::clone(&self.auth_store);
+        tokio::task::spawn_blocking(move || {
+            let cfg = Config::load_or_default(&config_path)?;
+            let gemini_creds = auth_store.load_gemini()?;
+            Ok((cfg, gemini_creds))
+        })
+        .await
+        .map_err(|err| {
+            ErrorData::internal_error(format!("config/auth load task failed: {err}"), None)
+        })
+    }
+
     async fn probe_proxy(
         &self,
         listen_port: u16,
@@ -167,13 +192,19 @@ impl CompanionUiServer {
             .unwrap_or_else(companion_core::integration::detect_hybrid_active)
     }
 
-    pub(crate) async fn build_snapshot(&self, cfg: &Config) -> SettingsSnapshot {
-        self.build_snapshot_with_session(cfg, None, None).await
+    pub(crate) async fn build_snapshot(
+        &self,
+        cfg: &Config,
+        gemini_creds: Option<&GeminiCredentials>,
+    ) -> SettingsSnapshot {
+        self.build_snapshot_with_session(cfg, gemini_creds, None, None)
+            .await
     }
 
     pub(crate) async fn build_snapshot_with_session(
         &self,
         cfg: &Config,
+        gemini_creds: Option<&GeminiCredentials>,
         integration_override: Option<IntegrationStatus>,
         conversation_id: Option<&str>,
     ) -> SettingsSnapshot {
@@ -231,7 +262,7 @@ impl CompanionUiServer {
         }
 
         SettingsSnapshot {
-            config: cfg.redacted(),
+            config: cfg.redacted_with_auth(gemini_creds),
             binary_version,
             proxy,
             version_skew,

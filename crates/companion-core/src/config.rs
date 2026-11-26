@@ -6,6 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::auth::GeminiCredentials;
 use crate::fs_safe::{self, FsError, SymlinkPolicy};
 use crate::models::{
     DEFAULT_GEMINI_MODEL, default_enabled_gemini_models, normalize_enabled_gemini_models,
@@ -14,9 +15,7 @@ use crate::models::{
 use crate::redaction::{
     RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig, api_key_hint,
 };
-use crate::validation::{
-    ApiKey, deserialize_optional_api_key, validate_trimmed_ascii_field, validate_upstream_url,
-};
+use crate::validation::{validate_trimmed_ascii_field, validate_upstream_url};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
@@ -37,6 +36,8 @@ pub(crate) const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
 pub enum CoreError {
     #[error("unsupported config schema version {found} (supported: {supported})")]
     UnsupportedSchemaVersion { found: u32, supported: u32 },
+    #[error("unsupported auth schema version {found} (supported: {supported})")]
+    UnsupportedAuthSchemaVersion { found: u32, supported: u32 },
     #[error("invalid listen host '{host}': only 127.0.0.1 and localhost are allowed")]
     InvalidListenHost { host: String },
     #[error("invalid listen port: port must be greater than 0")]
@@ -71,6 +72,14 @@ pub enum CoreError {
     },
     #[error("failed to serialize config: {reason}")]
     SerializeConfig { reason: String },
+    #[error("failed to parse auth file '{path}' at line {line}, column {column}")]
+    ParseAuth {
+        path: PathBuf,
+        line: usize,
+        column: usize,
+    },
+    #[error("failed to serialize auth credentials: {reason}")]
+    SerializeAuth { reason: String },
     #[error("usage database error at '{path}': {reason}")]
     UsageDatabase { path: PathBuf, reason: String },
     #[error("corrupted integration markers in '{path}': {reason}")]
@@ -229,8 +238,6 @@ pub struct CloudCodeConfig {
 #[serde(default)]
 pub struct GeminiConfig {
     pub base_url: String,
-    #[serde(default, deserialize_with = "deserialize_optional_api_key")]
-    pub api_key: Option<ApiKey>,
     pub default_model: String,
     #[serde(default = "default_enabled_gemini_models")]
     pub enabled_models: Vec<String>,
@@ -241,7 +248,6 @@ impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_GEMINI_BASE_URL.to_string(),
-            api_key: None,
             default_model: DEFAULT_GEMINI_MODEL.to_string(),
             enabled_models: default_enabled_gemini_models(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
@@ -312,7 +318,6 @@ pub struct CloudCodeConfigPatch {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeminiConfigPatch {
-    pub api_key: Option<ApiKeyPatch>,
     pub base_url: Option<String>,
     pub default_model: Option<String>,
     pub enabled_models: Option<Vec<String>>,
@@ -366,7 +371,6 @@ impl Default for RawCloudCodeConfig {
 #[serde(default)]
 struct RawGeminiConfig {
     base_url: String,
-    api_key: Option<String>,
     default_model: String,
     enabled_models: Vec<String>,
     timeout_secs: u64,
@@ -376,7 +380,6 @@ impl Default for RawGeminiConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_GEMINI_BASE_URL.to_string(),
-            api_key: None,
             default_model: DEFAULT_GEMINI_MODEL.to_string(),
             enabled_models: default_enabled_gemini_models(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
@@ -762,8 +765,8 @@ impl Config {
         }
     }
 
-    pub fn redacted(&self) -> RedactedConfig {
-        let hint = self.providers.gemini.api_key.as_ref().map(ApiKey::hint);
+    pub fn redacted_with_auth(&self, gemini_creds: Option<&GeminiCredentials>) -> RedactedConfig {
+        let hint = gemini_creds.map(|creds| creds.api_key.hint());
         RedactedConfig {
             schema_version: self.schema_version,
             proxy: self.proxy,
@@ -783,7 +786,7 @@ impl Config {
     }
 
     /// Parses and validates a JSON string from `path` using dual-layer raw deserialization so
-    /// domain errors (`InvalidListenHost`, `InvalidListenPort`, `InvalidBaseUrl`, `InvalidApiKey`)
+    /// domain errors (`InvalidListenHost`, `InvalidListenPort`, `InvalidBaseUrl`)
     /// preserve exact non-leaking `CoreError` variants instead of collapsing into `ParseConfig`.
     pub fn from_json_str(raw: &str, path: &Path) -> Result<Config, CoreError> {
         let raw_cfg: RawConfig =
@@ -803,10 +806,6 @@ impl Config {
         let host = raw_cfg.proxy.host.parse::<LoopbackHost>()?;
         let port = NonZeroU16::new(raw_cfg.proxy.port).ok_or(CoreError::InvalidListenPort)?;
         let upstream = CloudCodeUpstream::parse(&raw_cfg.cloudcode.upstream)?;
-        let api_key = match raw_cfg.providers.gemini.api_key {
-            Some(ref k) => ApiKey::parse_from_disk(k)?,
-            None => None,
-        };
         let enabled_models =
             normalize_enabled_gemini_models(raw_cfg.providers.gemini.enabled_models)?;
 
@@ -817,7 +816,6 @@ impl Config {
             providers: ProvidersConfig {
                 gemini: GeminiConfig {
                     base_url: raw_cfg.providers.gemini.base_url,
-                    api_key,
                     default_model: raw_cfg.providers.gemini.default_model,
                     enabled_models,
                     timeout_secs: raw_cfg.providers.gemini.timeout_secs,
@@ -872,16 +870,6 @@ impl Config {
         if let Some(providers) = patch.providers
             && let Some(gemini) = providers.gemini
         {
-            if let Some(api_key_patch) = gemini.api_key {
-                match api_key_patch {
-                    ApiKeyPatch::Clear => {
-                        next.providers.gemini.api_key = None;
-                    }
-                    ApiKeyPatch::Set(raw) => {
-                        next.providers.gemini.api_key = Some(ApiKey::parse_strict(&raw)?);
-                    }
-                }
-            }
             if let Some(raw_model) = gemini.default_model {
                 let trimmed = validate_trimmed_ascii_field(&raw_model, "default_model")?;
                 validate_gemini_model(&trimmed)?;
@@ -943,7 +931,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::validation::PROXY_PLACEHOLDER_API_KEY;
 
     #[test]
     fn defaults_to_schema_version_1_nested_layout() {
@@ -959,7 +946,6 @@ mod tests {
         );
         assert_eq!(cfg.providers.gemini.default_model, "gemini-4-hydrogen");
         assert_eq!(cfg.providers.gemini.timeout_secs, 900);
-        assert!(cfg.providers.gemini.api_key.is_none());
         assert!(cfg.usage_dir.is_none());
         assert!(cfg.validate().is_ok());
 
@@ -1080,7 +1066,7 @@ mod tests {
             },
             providers: ProvidersConfig {
                 gemini: GeminiConfig {
-                    api_key: Some(ApiKey::parse_strict("AIzaSyRoundTripSecretKey1234").unwrap()),
+                    default_model: "gemini-4-neon".to_string(),
                     ..Default::default()
                 },
             },
@@ -1092,17 +1078,22 @@ mod tests {
         let loaded = Config::load_or_default(&cfg_path).expect("load_or_default succeeds");
         assert_eq!(loaded, cfg);
 
-        // Verify exact nested JSON shape on disk
-        let raw_val: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        // Verify exact nested JSON shape on disk and zero api_key field in config.json
+        let raw_text = fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            !raw_text.contains("api_key"),
+            "config.json must never persist api_key: {raw_text}"
+        );
+        let raw_val: serde_json::Value = serde_json::from_str(&raw_text).unwrap();
         assert_eq!(raw_val["schema_version"], 1);
         assert_eq!(raw_val["proxy"]["host"], "localhost");
         assert_eq!(raw_val["proxy"]["port"], 4242);
         assert_eq!(raw_val["cloudcode"]["upstream"], "auto");
         assert_eq!(
             raw_val["providers"]["gemini"]["default_model"],
-            "gemini-4-hydrogen"
+            "gemini-4-neon"
         );
+        assert!(raw_val["providers"]["gemini"].get("api_key").is_none());
 
         let sibling_temps: Vec<_> = fs::read_dir(&nested_dir)
             .expect("read_dir")
@@ -1142,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn load_or_default_preserves_domain_errors_and_normalizes_placeholder() {
+    fn load_or_default_preserves_domain_errors_and_ignores_legacy_api_key_field() {
         let tmp = TempDir::new().expect("temp dir");
         let missing = tmp.path().join("does-not-exist.json");
         let loaded = Config::load_or_default(&missing).expect("missing returns default");
@@ -1158,55 +1149,26 @@ mod tests {
         let err = Config::load_or_default(&zero_port_path).expect_err("rejects port 0");
         assert!(matches!(err, CoreError::InvalidListenPort));
 
-        let bad_key_path = tmp.path().join("bad-key.json");
+        // Legacy config.json containing providers.gemini.api_key loads cleanly (field ignored)
+        // and omits api_key completely when re-saved.
+        let legacy_path = tmp.path().join("legacy-key.json");
         fs::write(
-            &bad_key_path,
-            r#"{"providers":{"gemini":{"api_key":"AIzaSySecret\r\n"}}}"#,
+            &legacy_path,
+            r#"{"schema_version":1,"providers":{"gemini":{"api_key":"AIzaSyLegacyIgnored01","default_model":"gemini-4-neon"}}}"#,
         )
-        .expect("write bad key");
-        let err = Config::load_or_default(&bad_key_path).expect_err("rejects CRLF api_key");
-        assert!(matches!(err, CoreError::InvalidApiKey));
-        assert!(!err.to_string().contains("AIzaSySecret"));
+        .expect("write legacy config");
+        let loaded = Config::load_or_default(&legacy_path).expect("legacy api_key field ignored");
+        assert_eq!(loaded.providers.gemini.default_model, "gemini-4-neon");
+        let redacted = loaded.redacted_with_auth(None);
+        assert!(!redacted.providers.gemini.api_key_configured);
+        assert_eq!(redacted.providers.gemini.api_key_hint, None);
 
-        for placeholder in [PROXY_PLACEHOLDER_API_KEY, "  agy-companion-local  "] {
-            let placeholder_path = tmp.path().join("placeholder.json");
-            fs::write(
-                &placeholder_path,
-                format!(r#"{{"providers":{{"gemini":{{"api_key":"{placeholder}"}}}}}}"#),
-            )
-            .expect("write placeholder");
-            let loaded =
-                Config::load_or_default(&placeholder_path).expect("placeholder normalizes");
-            assert_eq!(loaded.providers.gemini.api_key, None);
-            let redacted = loaded.redacted();
-            assert!(!redacted.providers.gemini.api_key_configured);
-            assert_eq!(redacted.providers.gemini.api_key_hint, None);
-            assert!(
-                format!("{:?}", loaded.providers.gemini).contains("api_key: None"),
-                "expected GeminiConfig Debug to show api_key: None"
-            );
-        }
-
-        // Control characters / non-ASCII variants of the placeholder still fail header validation.
-        for bad_placeholder in [
-            r"\tagy-companion-local\n",
-            r"agy-companion-local\r\n",
-            "agy-companion-local\u{00A0}",
-        ] {
-            let bad_placeholder_path = tmp.path().join("bad-placeholder.json");
-            fs::write(
-                &bad_placeholder_path,
-                format!(r#"{{"providers":{{"gemini":{{"api_key":"{bad_placeholder}"}}}}}}"#),
-            )
-            .expect("write bad placeholder");
-            assert!(
-                matches!(
-                    Config::load_or_default(&bad_placeholder_path),
-                    Err(CoreError::InvalidApiKey)
-                ),
-                "expected InvalidApiKey for '{bad_placeholder}'"
-            );
-        }
+        loaded
+            .save_secure(&legacy_path)
+            .expect("resave scrubs legacy field");
+        let resaved_raw = fs::read_to_string(&legacy_path).unwrap();
+        assert!(!resaved_raw.contains("api_key"));
+        assert!(!resaved_raw.contains("AIzaSyLegacyIgnored01"));
 
         let corrupt_path = tmp.path().join("corrupt.json");
         fs::write(&corrupt_path, "{ not valid json").expect("write corrupt");
@@ -1221,23 +1183,8 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_api_key_and_parse_error_leaks_nothing() {
+    fn debug_redacts_api_key_patch_and_parse_error_leaks_nothing() {
         let secret = "AIzaSyTopSecretKey9999";
-        let mut cfg = Config::default();
-        cfg.providers.gemini.api_key = Some(ApiKey::parse_strict(secret).unwrap());
-
-        let cfg_debug = format!("{cfg:?}");
-        let gemini_debug = format!("{:?}", cfg.providers.gemini);
-        assert!(
-            !cfg_debug.contains(secret),
-            "Config Debug leaked: {cfg_debug}"
-        );
-        assert!(
-            !gemini_debug.contains(secret),
-            "GeminiConfig Debug leaked: {gemini_debug}"
-        );
-        assert!(cfg_debug.contains("AIza...9999"));
-        assert!(gemini_debug.contains("AIza...9999"));
 
         let patch_debug = format!("{:?}", ApiKeyPatch::Set(secret.to_string()));
         assert!(!patch_debug.contains(secret));
@@ -1257,10 +1204,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_patch_is_transactional_trims_host_and_rejects_placeholder() {
+    fn apply_patch_is_transactional_trims_host_and_rolls_back_on_error() {
         let mut cfg = Config::default();
 
-        // Successful patch with padded host, model, base_url, upstream, and api_key
+        // Successful patch with padded host, model, base_url, upstream, and timeout
         cfg.apply_patch(ConfigPatch {
             proxy: Some(ProxyConfigPatch {
                 host: Some("  localhost  ".to_string()),
@@ -1271,7 +1218,6 @@ mod tests {
             }),
             providers: Some(ProvidersConfigPatch {
                 gemini: Some(GeminiConfigPatch {
-                    api_key: Some(ApiKeyPatch::Set("  AIzaSyPatchKey12345  ".to_string())),
                     base_url: Some(
                         "  https://generativelanguage.googleapis.com/v1beta  ".to_string(),
                     ),
@@ -1290,10 +1236,6 @@ mod tests {
             cfg.cloudcode.upstream,
             CloudCodeUpstream::Fixed("https://daily-cloudcode-pa.googleapis.com".to_string())
         );
-        assert_eq!(
-            cfg.providers.gemini.api_key.as_ref().map(ApiKey::expose),
-            Some("AIzaSyPatchKey12345")
-        );
         assert_eq!(cfg.providers.gemini.default_model, "gemini-5-pro");
         assert_eq!(cfg.providers.gemini.timeout_secs, 600);
 
@@ -1308,29 +1250,15 @@ mod tests {
                 cloudcode: None,
                 providers: Some(ProvidersConfigPatch {
                     gemini: Some(GeminiConfigPatch {
-                        api_key: Some(ApiKeyPatch::Set(PROXY_PLACEHOLDER_API_KEY.to_string())),
+                        timeout_secs: Some(0),
                         ..Default::default()
                     }),
                 }),
                 launcher_auto_start: None,
             })
-            .expect_err("placeholder must fail");
-        assert!(matches!(err, CoreError::PlaceholderApiKey));
-        assert!(err.to_string().to_lowercase().contains("placeholder"));
+            .expect_err("zero timeout must fail");
+        assert!(matches!(err, CoreError::InvalidTimeout));
         assert_eq!(cfg, before, "failed patch must not partially mutate Config");
-
-        // Clear API key works
-        cfg.apply_patch(ConfigPatch {
-            providers: Some(ProvidersConfigPatch {
-                gemini: Some(GeminiConfigPatch {
-                    api_key: Some(ApiKeyPatch::Clear),
-                    ..Default::default()
-                }),
-            }),
-            ..Default::default()
-        })
-        .expect("clear api_key succeeds");
-        assert_eq!(cfg.providers.gemini.api_key, None);
     }
 
     #[test]
@@ -1501,7 +1429,10 @@ mod tests {
             cfg.cloudcode.upstream.as_str(),
             DEFAULT_CLOUDCODE_UPSTREAM_URL
         );
-        assert_eq!(cfg.redacted().cloudcode.upstream, CloudCodeUpstream::Auto);
+        assert_eq!(
+            cfg.redacted_with_auth(None).cloudcode.upstream,
+            CloudCodeUpstream::Auto
+        );
 
         // Config JSON omitting cloudcode deserializes to Auto and validates cleanly.
         let omitted = Config::from_json_str(
@@ -2460,7 +2391,7 @@ mod tests {
             default_enabled_gemini_models()
         );
         assert_eq!(legacy.launcher_auto_start, None);
-        let redacted = legacy.redacted();
+        let redacted = legacy.redacted_with_auth(None);
         assert_eq!(
             redacted.providers.gemini.enabled_models,
             default_enabled_gemini_models()
@@ -2483,7 +2414,10 @@ mod tests {
             vec!["gemini-4-neon".to_string(), "gemini-4-carbon".to_string()]
         );
         assert_eq!(dedup_cfg.launcher_auto_start, Some(false));
-        assert_eq!(dedup_cfg.redacted().launcher_auto_start, Some(false));
+        assert_eq!(
+            dedup_cfg.redacted_with_auth(None).launcher_auto_start,
+            Some(false)
+        );
 
         // Empty enabled_models is allowed and round-trips through save_secure / load_or_default.
         let tmp = TempDir::new().unwrap();

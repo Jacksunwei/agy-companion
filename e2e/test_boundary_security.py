@@ -134,10 +134,10 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
                 listen_port=port,
                 base_url=mock.base_url,
                 cloudcode_upstream_url=mock.base_url,
-                api_key=sentinel_key,
             ),
             mode=0o644,
         )
+        env.write_gemini_auth(sentinel_key, config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg, port=port, extra_env={"RUST_LOG": "debug"})
         mcp = self.start_mcp(env, config_path=cfg, extra_env={"RUST_LOG": "debug"})
 
@@ -145,6 +145,9 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
         mcp.assert_clean_stdout()
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(os.lstat(cfg).st_mode), 0o600)
+        cfg_text = cfg.read_text(encoding="utf-8")
+        self.assertNotIn(sentinel_key, cfg_text)
+        self.assertNotIn("api_key", cfg_text)
 
         open_res = mcp.call_tool("open_settings", {})
         get_res = mcp.call_tool("get_settings", {})
@@ -224,16 +227,18 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
         mock = self.start_mock_gemini()
         real_key = "AIzaSyRealKeyStay1234"
         cfg = env.write_config(
-            env.make_config_dict(base_url=mock.base_url, cloudcode_upstream_url=mock.base_url, api_key=real_key)
+            env.make_config_dict(base_url=mock.base_url, cloudcode_upstream_url=mock.base_url)
         )
+        auth_file = env.write_gemini_auth(real_key, config_path=cfg)
 
-        # (a) ui-mcp rejects exact & whitespace-padded placeholder key, preserving real key on disk.
+        # (a) ui-mcp rejects exact & whitespace-padded placeholder key, preserving real key in auth/gemini.json.
         mcp = self.start_mcp(env, config_path=cfg)
         for bad_key in (_PLACEHOLDER_KEY, f"  {_PLACEHOLDER_KEY}  "):
             res = mcp.save_settings_smart(api_key=bad_key, raw=True)
             mcp.assert_clean_stdout()
             self.assertTrue(McpStdioClient.is_tool_error(res), f"Should reject placeholder {bad_key!r}: {res}")
-        self.assertEqual(json.loads(cfg.read_text(encoding="utf-8"))["providers"]["gemini"]["api_key"], real_key)
+        self.assertEqual(json.loads(auth_file.read_text(encoding="utf-8"))["api_key"], real_key)
+        self.assertNotIn("api_key", json.loads(cfg.read_text(encoding="utf-8"))["providers"]["gemini"])
 
         # (b) doctor --json ignores GEMINI_API_KEY=agy-companion-local.
         r_doc = run_cli(
@@ -242,15 +247,15 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
         )
         self.assertIs(r_doc.json_stdout()["env"]["gemini_api_key_set"], False)
 
-        # (c) Live proxy configured with placeholder key returns 401 on Gemini (0 upstream hits) and Day-0 on CloudCode.
+        # (c) Live proxy with placeholder key in auth/gemini.json returns 401 on Gemini (0 upstream hits) and Day-0 on CloudCode.
         ph_cfg = env.write_config(
             env.make_config_dict(
                 base_url=mock.base_url,
                 cloudcode_upstream_url=mock.base_url,
-                api_key=_PLACEHOLDER_KEY,
             ),
-            path=env.root / "ph_cfg.json",
+            path=env.root / "ph" / "config.json",
         )
+        env.write_gemini_auth(_PLACEHOLDER_KEY, config_path=ph_cfg)
         proxy = self.start_proxy(env, config_path=ph_cfg)
         mock.clear_requests()
 
@@ -282,7 +287,8 @@ class TestBoundaryS2SecretsAndSchema(E2ETestCase):
     def test_s2_mcp_deny_unknown_fields_and_tool_error_boundaries(self) -> None:
         """S2: MCP enforces deny_unknown_fields across all tools, mutually exclusive account_plan+cloudcode, and bad URI."""
         env = self.make_env()
-        cfg = env.write_config(env.make_config_dict(api_key="AIzaSySchemaKeep1234"))
+        cfg = env.write_config(env.make_config_dict())
+        env.write_gemini_auth("AIzaSySchemaKeep1234", config_path=cfg)
         before = cfg.read_text(encoding="utf-8")
         mcp = self.start_mcp(env, config_path=cfg)
 
@@ -350,7 +356,8 @@ class TestBoundaryS3UpstreamSsrfAndRedirects(E2ETestCase):
 
         # (b) ui-mcp save_settings rejects remote http:// without corrupting disk config.
         mock = self.start_mock_gemini()
-        good_cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSySsrfTest1234"))
+        good_cfg = env.write_config(env.make_config_dict(base_url=mock.base_url))
+        env.write_gemini_auth("AIzaSySsrfTest1234", config_path=good_cfg)
         before = good_cfg.read_text(encoding="utf-8")
         mcp = self.start_mcp(env, config_path=good_cfg)
         bad_res = mcp.save_settings_smart(base_url="http://example.com", raw=True)
@@ -392,8 +399,9 @@ class TestBoundaryS3UpstreamSsrfAndRedirects(E2ETestCase):
             )
         )
         cfg = env.write_config(
-            env.make_config_dict(base_url=primary.base_url, api_key="AIzaSyNoRedirect1234")
+            env.make_config_dict(base_url=primary.base_url)
         )
+        env.write_gemini_auth("AIzaSyNoRedirect1234", config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg)
 
         r_gen = http_raw_request(
@@ -452,7 +460,8 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
         r_mcp_sym = run_cli([str(binary), "ui-mcp", "--config", str(sym_cfg)], env=proc_env, stdin_bytes=b"", timeout=5.0)
         self.assertEqual(r_mcp_sym.stdout, "")
 
-        toctou_cfg = env.write_config(env.make_config_dict(api_key="AIzaSyToctouKey1234"), path=env.root / "toctou.json")
+        toctou_cfg = env.write_config(env.make_config_dict(), path=env.root / "toctou" / "config.json")
+        env.write_gemini_auth("AIzaSyToctouKey1234", config_path=toctou_cfg)
         mcp = self.start_mcp(env, config_path=toctou_cfg)
         os.unlink(toctou_cfg)
         os.symlink(victim, toctou_cfg)
@@ -461,15 +470,30 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
         self.assertEqual(victim.read_text(encoding="utf-8"), "DO_NOT_TOUCH")
         self.assertEqual(stat.S_IMODE(os.lstat(victim).st_mode), 0o644)
 
-        # (c) Eager serve prechecks reject symlink usage_dir, symlink/FIFO usage.db, symlink proxy.pid & proxy.log immediately.
-        for case in ("sym_usage_dir", "sym_usage_db", "fifo_usage_db", "sym_pid", "sym_log"):
+        # (c) Eager serve prechecks reject symlink auth/, auth/gemini.json, usage_dir, symlink/FIFO usage.db, symlink proxy.pid & proxy.log immediately.
+        for case in (
+            "sym_auth_dir",
+            "sym_auth_gemini",
+            "sym_usage_dir",
+            "sym_usage_db",
+            "fifo_usage_db",
+            "sym_pid",
+            "sym_log",
+        ):
             case_env = self.make_env()
             case_victim = case_env.root / "victim_target"
             case_victim.write_text("DO_NOT_TOUCH", encoding="utf-8")
             os.chmod(case_victim, 0o644)
             case_cfg = case_env.write_config(case_env.make_config_dict())
 
-            if case == "sym_usage_dir":
+            if case == "sym_auth_dir":
+                real_auth_target = case_env.root / "real_auth_target"
+                real_auth_target.mkdir()
+                os.symlink(real_auth_target, case_env.auth_dir)
+            elif case == "sym_auth_gemini":
+                case_env.auth_dir.mkdir(parents=True, exist_ok=True)
+                os.symlink(case_victim, case_env.gemini_auth_path)
+            elif case == "sym_usage_dir":
                 case_env.usage_dir.rmdir()
                 real_dir = case_env.root / "real_usage_target"
                 real_dir.mkdir()
@@ -493,22 +517,30 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             self.assertEqual(case_victim.read_text(encoding="utf-8"), "DO_NOT_TOUCH")
             self.assertEqual(stat.S_IMODE(os.lstat(case_victim).st_mode), 0o644)
 
-        # (d) Hot-reload symlink swap retains active key_v1 and keeps serving 200 without mutating victim.
+        # (d) Hot-reload symlink swap on BOTH config.json AND auth/gemini.json retains active key_v1 without mutating victims.
         mock = self.start_mock_gemini()
         key_v1 = "AIzaSyHotKeepV1_1111"
         key_v2 = "AIzaSyHotSwapV2_2222"
         hr_env = self.make_env()
-        hr_cfg = hr_env.write_config(hr_env.make_config_dict(base_url=mock.base_url, api_key=key_v1))
+        hr_cfg = hr_env.write_config(hr_env.make_config_dict(base_url=mock.base_url))
+        hr_auth = hr_env.write_gemini_auth(key_v1, config_path=hr_cfg)
         hr_victim = hr_env.write_config(
-            hr_env.make_config_dict(base_url=mock.base_url, api_key=key_v2),
+            hr_env.make_config_dict(base_url=mock.base_url),
             path=hr_env.root / "hr_victim.json",
             mode=0o644,
         )
+        hr_auth_victim = hr_env.root / "hr_auth_victim.json"
+        hr_auth_victim_text = json.dumps({"schema_version": 1, "api_key": key_v2})
+        hr_auth_victim.write_text(hr_auth_victim_text, encoding="utf-8")
+        os.chmod(hr_auth_victim, 0o644)
         proxy = self.start_proxy(hr_env, config_path=hr_cfg)
 
         os.unlink(hr_cfg)
         os.symlink(hr_victim, hr_cfg)
         hr_env.bump_mtime(hr_victim, delta=3.0)
+        os.unlink(hr_auth)
+        os.symlink(hr_auth_victim, hr_auth)
+        hr_env.bump_mtime(hr_auth_victim, delta=3.0)
 
         r_hr = http_raw_request(
             "127.0.0.1",
@@ -520,6 +552,7 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
         )
         self.assertEqual(r_hr.status, 200, r_hr.text)
         self.assertEqual(mock.requests[-1].header("x-goog-api-key"), key_v1)
+        self.assertEqual(hr_auth_victim.read_text(encoding="utf-8"), hr_auth_victim_text)
 
     def test_s6_xdg_precedence_traversal_and_symlink_rc_plugin_guards(self) -> None:
         """S6: Config precedence, relative/empty XDG fallback, .. traversal rejection, symlink RC & dev-plugin guards."""
@@ -666,9 +699,9 @@ class TestBoundaryS7HttpSurface(E2ETestCase):
             env.make_config_dict(
                 base_url=mock.base_url,
                 cloudcode_upstream_url=mock.base_url,
-                api_key="AIzaSyS7Surface1234",
             )
         )
+        env.write_gemini_auth("AIzaSyS7Surface1234", config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg)
 
         # (a) PUT/DELETE/PATCH -> 405 JSON with nosniff + no-store across all routes.
@@ -730,7 +763,8 @@ class TestBoundaryS7HttpSurface(E2ETestCase):
         """S7: Rejects malformed/conflicting Content-Length (400) & >64 MiB/u64-overflow (413) upfront; passes 3 MiB body."""
         env = self.make_env()
         mock = self.start_mock_gemini()
-        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url, api_key="AIzaSyS7Body1234"))
+        cfg = env.write_config(env.make_config_dict(base_url=mock.base_url))
+        env.write_gemini_auth("AIzaSyS7Body1234", config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg)
         mock.clear_requests()
 

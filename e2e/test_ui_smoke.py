@@ -529,9 +529,9 @@ class TestUiSmoke(E2ETestCase):
             env.make_config_dict(
                 listen_port=proxy_port,
                 base_url=mock.base_url,
-                api_key="test-sidecar-cdp-key-01",
             )
         )
+        env.write_gemini_auth("test-sidecar-cdp-key-01", config_path=cfg)
         token = "sidecar-cdp-token-42"
         self.start_proxy(
             env,

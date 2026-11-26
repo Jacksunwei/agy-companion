@@ -5,7 +5,7 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
 
-use companion_core::{ApiKey, Config};
+use companion_core::{ApiKey, AuthStore, Config, FileAuthStore, GeminiCredentials};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -21,9 +21,14 @@ fn ui_mcp_stdio_initialize_emits_strict_json_rpc_only_on_stdout() {
     let data_dir = temp.path().join("plugin-data");
     fs::create_dir(&data_dir).expect("mkdir data_dir");
 
-    let mut cfg = config_with_port(free_loopback_port());
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyUiMcpCfgSecret5555").unwrap());
+    let cfg = config_with_port(free_loopback_port());
     cfg.save_secure(&cfg_path).expect("save_secure");
+    FileAuthStore::for_config_path(&cfg_path)
+        .expect("auth store")
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSyUiMcpCfgSecret5555").unwrap(),
+        ))
+        .expect("save gemini auth");
 
     let mut guard = ChildGuard::new(
         isolated_cli_command(temp.path())
@@ -285,12 +290,19 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
             "missing save_settings response under RUST_LOG={rust_log}"
         );
 
-        // Verify persisted config on disk has 0600 permissions and saved API key.
-        let saved = Config::load_or_default(&cfg_path).expect("load saved config");
-        assert_eq!(
-            saved.providers.gemini.api_key.as_ref().map(ApiKey::expose),
-            Some(canary)
-        );
+        // Verify persisted config on disk has 0600 permissions, contains NO api_key,
+        // and auth/gemini.json holds the saved API key with 0700/0600 permissions.
+        let _saved = Config::load_or_default(&cfg_path).expect("load saved config");
+        let raw_cfg = fs::read_to_string(&cfg_path).expect("read saved config");
+        assert!(!raw_cfg.contains(canary));
+        assert!(!raw_cfg.contains("api_key"));
+
+        let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+        let saved_creds = auth_store
+            .load_gemini()
+            .expect("load saved auth")
+            .expect("saved gemini creds");
+        assert_eq!(saved_creds.api_key.expose(), canary);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -300,6 +312,21 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600, "saved config must have 0600 permissions");
+            let auth_dir_mode = fs::metadata(auth_store.auth_dir().unwrap())
+                .expect("metadata auth dir")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(auth_dir_mode, 0o700, "auth dir must have 0700 permissions");
+            let auth_file_mode = fs::metadata(auth_store.gemini_path())
+                .expect("metadata auth file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                auth_file_mode, 0o600,
+                "auth/gemini.json must have 0600 permissions"
+            );
         }
 
         assert!(

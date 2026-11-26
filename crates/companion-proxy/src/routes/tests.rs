@@ -1524,13 +1524,16 @@ async fn get_v1beta_models_returns_curated_fallback_and_live_filtered_catalog_wi
 
     let mut cfg = companion_core::Config::default();
     cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyGatewayDiscovery123").unwrap());
     cfg.providers.gemini.default_model = "gemini-3.8-flash".to_string();
+    let auth_store = Arc::new(companion_core::MemoryAuthStore::with_gemini_key(
+        ApiKey::parse_strict("AIzaSyGatewayDiscovery123").unwrap(),
+    ));
     let live_state = ProxyState::from_config_with_options(
         cfg,
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: Some(auth_store),
             env_fallback: false,
         },
     )
@@ -1658,13 +1661,16 @@ async fn cloudcode_fetch_available_models_merges_and_v1internal_streams_passthro
     let mut cfg = companion_core::Config::default();
     cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{ccpa_addr}"));
     cfg.providers.gemini.base_url = format!("http://{ccpa_addr}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyCloudCodeMergeKey1").unwrap());
     cfg.providers.gemini.default_model = "gemini-4-hydrogen".to_string();
+    let auth_store = Arc::new(companion_core::MemoryAuthStore::with_gemini_key(
+        ApiKey::parse_strict("AIzaSyCloudCodeMergeKey1").unwrap(),
+    ));
     let state = ProxyState::from_config_with_options(
         cfg,
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: Some(auth_store),
             env_fallback: false,
         },
     )
@@ -1852,7 +1858,16 @@ async fn cloudcode_fetch_available_models_day0_returns_upstream_untouched_preser
         let _ = axum::serve(ccpa_listener, mock_ccpa).await;
     });
 
-    for raw_api_key in [None, Some(companion_core::PROXY_PLACEHOLDER_API_KEY)] {
+    // Test Day-0 across: (1) missing auth, (2) legacy config.json with api_key ignored,
+    // and (3) auth/gemini.json containing quarantined PROXY_PLACEHOLDER_API_KEY.
+    let tmp = tempfile::TempDir::new().unwrap();
+    for (idx, raw_api_key) in [None, Some(companion_core::PROXY_PLACEHOLDER_API_KEY)]
+        .into_iter()
+        .enumerate()
+    {
+        let case_dir = tmp.path().join(format!("day0-{idx}"));
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let cfg_path = case_dir.join("config.json");
         let json = serde_json::json!({
             "schema_version": 1,
             "cloudcode": {
@@ -1866,17 +1881,23 @@ async fn cloudcode_fetch_available_models_day0_returns_upstream_untouched_preser
             }
         })
         .to_string();
-        let cfg = companion_core::Config::from_json_str(&json, std::path::Path::new("config.json"))
+        std::fs::write(&cfg_path, &json).unwrap();
+        if let Some(ph) = raw_api_key {
+            let auth_dir = companion_core::auth_dir_for_config_path(&cfg_path).unwrap();
+            std::fs::create_dir_all(&auth_dir).unwrap();
+            std::fs::write(
+                auth_dir.join(companion_core::GEMINI_AUTH_FILENAME),
+                serde_json::json!({ "schema_version": 1, "api_key": ph }).to_string(),
+            )
             .unwrap();
-        assert!(
-            cfg.providers.gemini.api_key.is_none(),
-            "placeholder/null API key must deserialize as None"
-        );
+        }
+        let cfg = companion_core::Config::from_json_str(&json, &cfg_path).unwrap();
         let state = ProxyState::from_config_with_options(
             cfg,
             Arc::new(NoopUsageSink),
             ProxyStateOptions {
-                config_path: None,
+                config_path: Some(cfg_path),
+                auth_store: None,
                 env_fallback: false,
             },
         )
@@ -1964,12 +1985,15 @@ async fn cloudcode_fetch_available_models_preserves_content_encoding_on_merge_er
     let mut cfg = companion_core::Config::default();
     cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{ccpa_addr}"));
     cfg.providers.gemini.base_url = format!("http://{ccpa_addr}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyMergeFallbackKey12").unwrap());
+    let auth_store = Arc::new(companion_core::MemoryAuthStore::with_gemini_key(
+        ApiKey::parse_strict("AIzaSyMergeFallbackKey12").unwrap(),
+    ));
     let state = ProxyState::from_config_with_options(
         cfg,
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: Some(auth_store),
             env_fallback: false,
         },
     )
@@ -2293,6 +2317,7 @@ async fn cloudcode_fallback_maps_client_disconnect_to_400_and_streaming_overflow
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: None,
             env_fallback: false,
         },
     )
@@ -2732,15 +2757,17 @@ async fn cloudcode_fetch_available_models_empty_enabled_models_returns_upstream_
     cfg.cloudcode.upstream =
         companion_core::CloudCodeUpstream::Fixed(format!("http://{ccpa_addr}"));
     cfg.providers.gemini.base_url = format!("http://{ccpa_addr}");
-    cfg.providers.gemini.api_key =
-        Some(companion_core::ApiKey::parse_strict("AIzaSyEmptyEnabledTest12").unwrap());
     cfg.providers.gemini.enabled_models = Vec::new();
+    let auth_store = Arc::new(companion_core::MemoryAuthStore::with_gemini_key(
+        companion_core::ApiKey::parse_strict("AIzaSyEmptyEnabledTest12").unwrap(),
+    ));
 
     let state = ProxyState::from_config_with_options(
         cfg,
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: Some(auth_store),
             env_fallback: false,
         },
     )
@@ -2838,16 +2865,18 @@ async fn cloudcode_fetch_available_models_injects_strictly_enabled_models_only()
     let mut cfg = companion_core::Config::default();
     cfg.cloudcode.upstream = companion_core::CloudCodeUpstream::Fixed(format!("http://{addr}"));
     cfg.providers.gemini.base_url = format!("http://{addr}");
-    cfg.providers.gemini.api_key =
-        Some(companion_core::ApiKey::parse_strict("AIzaSyStrictEnabledOnly1").unwrap());
     cfg.providers.gemini.default_model = "gemini-4-hydrogen".to_string();
     cfg.providers.gemini.enabled_models = vec!["gemini-4-argon".to_string()];
+    let auth_store = Arc::new(companion_core::MemoryAuthStore::with_gemini_key(
+        companion_core::ApiKey::parse_strict("AIzaSyStrictEnabledOnly1").unwrap(),
+    ));
 
     let state = ProxyState::from_config_with_options(
         cfg,
         Arc::new(NoopUsageSink),
         ProxyStateOptions {
             config_path: None,
+            auth_store: Some(auth_store),
             env_fallback: false,
         },
     )
@@ -2945,14 +2974,13 @@ async fn builtin_antigravity_passive_tee_tracks_sse_unary_path_fallback_and_rss(
     cfg.cloudcode.upstream = CloudCodeUpstream::Fixed(format!("http://{addr}"));
     cfg.providers.gemini.base_url = format!("http://{addr}");
     // Day-0: NO Google AI Studio API key configured — built-in tracking still works!
-    cfg.providers.gemini.api_key = None;
-
     let sink = Arc::new(RecordingSink::default());
     let state = ProxyState::from_config_with_options(
         cfg,
         sink.clone(),
         ProxyStateOptions {
             config_path: None,
+            auth_store: None,
             env_fallback: false,
         },
     )
@@ -3138,6 +3166,7 @@ async fn builtin_antigravity_passive_tee_skips_compressed_errors_and_non_generat
         sink.clone(),
         ProxyStateOptions {
             config_path: None,
+            auth_store: None,
             env_fallback: false,
         },
     )
@@ -3392,6 +3421,7 @@ async fn builtin_tee_preserves_split_content_encoding_and_fails_closed_on_non_as
         sink.clone(),
         ProxyStateOptions {
             config_path: None,
+            auth_store: None,
             env_fallback: false,
         },
     )

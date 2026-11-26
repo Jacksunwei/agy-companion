@@ -304,6 +304,54 @@ mod symlink_matrix {
             assert_victim_intact(&log_victim, "log");
         }
 
+        // Sub-case: real xdg_config/agy-companion dir containing symlinked auth -> v_auth_victim
+        let auth_temp = TempDir::new().expect("auth_temp");
+        let auth_home = auth_temp.path().join("home");
+        let auth_xdg_cfg = auth_temp.path().join("xdg_config");
+        let auth_xdg_data = auth_temp.path().join("xdg_data");
+        let auth_plugins = auth_temp.path().join("plugins");
+        let auth_victim_dir = auth_temp.path().join("v_auth_victim");
+        let auth_victim_file = auth_victim_dir.join("gemini.json");
+        fs::create_dir_all(&auth_home).expect("mkdir auth_home");
+        fs::create_dir_all(&auth_plugins).expect("mkdir auth_plugins");
+        fs::create_dir_all(auth_xdg_cfg.join("agy-companion")).expect("mkdir cfg");
+        write_victim(&auth_victim_file);
+        let auth_symlink = auth_xdg_cfg.join("agy-companion/auth");
+        symlink(&auth_victim_dir, &auth_symlink).expect("sym auth");
+
+        for dry_run in [true, false] {
+            let mut args = vec![
+                "uninstall",
+                "--plugins-dir",
+                auth_plugins.to_str().unwrap(),
+                "--purge",
+                "--json",
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = isolated_cli_command(&auth_home)
+                .env("XDG_CONFIG_HOME", &auth_xdg_cfg)
+                .env("XDG_DATA_HOME", &auth_xdg_data)
+                .env("ZDOTDIR", &auth_home)
+                .args(&args)
+                .output()
+                .expect("run uninstall auth symlink");
+            assert_eq!(out.status.code(), Some(0));
+            let rep: Value = serde_json::from_slice(&out.stdout).expect("parse json");
+            assert_eq!(rep["ok"], true);
+            assert!(!rep["warnings"].as_array().unwrap().is_empty());
+            assert!(
+                !rep["purged_paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.as_str() == Some(auth_symlink.to_str().unwrap())),
+                "symlinked auth/ must not be purged"
+            );
+            assert_victim_intact(&auth_victim_file, "uninstall --purge symlinked auth/");
+        }
+
         // Clean install removes its own ~/.local/bin/agy-companion symlink on uninstall.
         let clean_temp = TempDir::new().expect("tempdir");
         let clean_home = clean_temp.path().join("home");
@@ -452,6 +500,8 @@ mod symlink_matrix {
     fn matrix_serve_rejects_symlinked_config_usage_dir_pid_and_log() {
         for case in [
             "config",
+            "auth_dir",
+            "auth_gemini",
             "usage_dir",
             "proxy_pid",
             "proxy_log",
@@ -477,6 +527,19 @@ mod symlink_matrix {
                 cfg.save_secure(&cfg_path).expect("save config");
                 fs::create_dir_all(&runtime_dir).expect("mkdir runtime");
                 match case {
+                    "auth_dir" => {
+                        let victim_dir = temp.path().join("victim_auth_dir");
+                        let victim_dir_sentinel = victim_dir.join("DO_NOT_DELETE");
+                        write_victim(&victim_dir_sentinel);
+                        check_victim = victim_dir_sentinel;
+                        symlink(&victim_dir, temp.path().join("auth")).expect("symlink auth dir");
+                    }
+                    "auth_gemini" => {
+                        let auth_dir = temp.path().join("auth");
+                        fs::create_dir_all(&auth_dir).expect("mkdir auth");
+                        symlink(&victim, auth_dir.join("gemini.json"))
+                            .expect("symlink auth/gemini.json");
+                    }
                     "usage_dir" => {
                         let victim_dir = temp.path().join("victim_usage_dir");
                         let victim_dir_sentinel = victim_dir.join("DO_NOT_DELETE");
@@ -499,7 +562,10 @@ mod symlink_matrix {
                 .args(["--port", &port.to_string()]);
             run_serve_expect_fail_bounded(cmd, case);
             assert_victim_intact(&check_victim, case);
-            if matches!(case, "proxy_pid" | "proxy_log_rotated") {
+            if matches!(
+                case,
+                "auth_dir" | "auth_gemini" | "proxy_pid" | "proxy_log_rotated"
+            ) {
                 assert!(
                     !runtime_dir.join("proxy.log").exists(),
                     "{case}: serve must fail closed before creating proxy.log"
@@ -579,6 +645,28 @@ mod symlink_matrix {
         assert!(stdout.is_empty());
         assert_victim_intact(&victim, "ui-mcp symlinked config");
 
+        // (a2) Symlinked auth/gemini.json -> exit 1, 0 stdout, victim intact
+        let sym_auth_root = temp.path().join("sym_auth_ui");
+        let sym_auth_cfg = sym_auth_root.join("config.json");
+        config_with_port(free_loopback_port())
+            .save_secure(&sym_auth_cfg)
+            .expect("save sym auth cfg");
+        let sym_auth_dir = sym_auth_root.join("auth");
+        fs::create_dir_all(&sym_auth_dir).expect("mkdir auth");
+        symlink(&victim, sym_auth_dir.join("gemini.json")).expect("sym auth/gemini.json");
+        let (code, stdout, _stderr, timed_out) = run_ui_mcp_bounded_with_env(
+            &home,
+            &sym_auth_cfg,
+            &data_dir,
+            &[],
+            vec![],
+            Duration::from_secs(5),
+        );
+        assert!(!timed_out);
+        assert_eq!(code, Some(1));
+        assert!(stdout.is_empty());
+        assert_victim_intact(&victim, "ui-mcp symlinked auth/gemini.json");
+
         // (b) FIFO AGY_COMPANION_UI_HTML -> bounded non-hanging JSON-RPC error on resources/read
         let valid_cfg = temp.path().join("valid_cfg.json");
         config_with_port(free_loopback_port())
@@ -651,6 +739,42 @@ mod symlink_matrix {
             assert_eq!(perm["status"], "fail");
         }
         assert_victim_intact(&victim, "doctor symlinked config");
+
+        // Also verify symlinked auth/ and symlinked auth/gemini.json fail auth_permissions.
+        let victim_dir = temp.path().join("victim_doc_auth_dir");
+        fs::create_dir_all(&victim_dir).expect("mkdir victim_doc_auth_dir");
+        let victim_auth_file = victim_dir.join("gemini.json");
+        write_victim(&victim_auth_file);
+
+        for case in ["sym_auth_dir", "sym_auth_file"] {
+            let root = temp.path().join(case);
+            let cfg_path = root.join("config.json");
+            config_with_port(port).save_secure(&cfg_path).unwrap();
+            let auth_dir = root.join("auth");
+            if case == "sym_auth_dir" {
+                symlink(&victim_dir, &auth_dir).expect("sym auth dir");
+            } else {
+                fs::create_dir_all(&auth_dir).expect("mkdir auth");
+                symlink(&victim_auth_file, auth_dir.join("gemini.json")).expect("sym auth file");
+            }
+            let out = isolated_cli_command(&home)
+                .args(["doctor", "--config"])
+                .arg(&cfg_path)
+                .args(["--port", &port.to_string(), "--json"])
+                .output()
+                .expect("run doctor auth sym");
+            assert_eq!(out.status.code(), Some(1));
+            let parsed: Value = serde_json::from_slice(&out.stdout).expect("valid doctor JSON");
+            assert_eq!(parsed["ok"], false);
+            let auth_perm = parsed["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "auth_permissions")
+                .expect("auth_permissions check");
+            assert_eq!(auth_perm["status"], "fail");
+            assert_victim_intact(&victim_auth_file, case);
+        }
     }
 
     /// Cross-surface (Fish Stow): `uninstall --purge` reports Stow-symlinked `~/.config/fish`

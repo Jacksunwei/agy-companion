@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use companion_core::ApiKey;
+use companion_core::{ApiKey, AuthStore, FileAuthStore, GeminiCredentials};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -54,9 +54,14 @@ async fn serve_idle_shutdown_waits_for_in_flight_stream_then_exits_zero() {
 
     let mut cfg = config_with_port(free_loopback_port());
     cfg.providers.gemini.base_url = format!("http://127.0.0.1:{upstream_port}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyIdleStreamKey1234").unwrap());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
+    FileAuthStore::for_config_path(&cfg_path)
+        .expect("auth store")
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSyIdleStreamKey1234").unwrap(),
+        ))
+        .expect("save gemini auth");
 
     let client = loopback_http_client();
     let (guard, port, _resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {

@@ -42,6 +42,8 @@ pub enum CliError {
     InvalidPort(u16),
     #[error("invalid config file '{path}': {reason}")]
     InvalidConfigFile { path: PathBuf, reason: String },
+    #[error("invalid auth path '{path}': {reason}")]
+    InvalidAuthPath { path: PathBuf, reason: String },
     #[error("invalid data directory '{path}': {reason}")]
     InvalidDataDir { path: PathBuf, reason: String },
     #[error("failed to serialize output: {0}")]
@@ -110,6 +112,50 @@ pub fn precheck_existing_data_dir(path: &Path) -> Result<bool, CliError> {
     }
 }
 
+pub fn precheck_existing_auth_dir(config_path: &Path) -> Result<(), CliError> {
+    let auth_dir = companion_core::auth_dir_for_config_path(config_path)?;
+    match fs_safe::inspect_existing_dir(&auth_dir) {
+        Ok(None) => return Ok(()),
+        Ok(Some(_)) => {}
+        Err(FsError::SymlinkRejected { .. }) => {
+            return Err(CliError::InvalidAuthPath {
+                path: auth_dir,
+                reason: "symbolic links are not allowed for auth directories".to_string(),
+            });
+        }
+        Err(FsError::NotDirectory { .. }) => {
+            return Err(CliError::InvalidAuthPath {
+                path: auth_dir,
+                reason: "auth path must be a directory".to_string(),
+            });
+        }
+        Err(FsError::Io { source, .. }) => return Err(CliError::Io(source)),
+        Err(err) => return Err(CliError::from(err)),
+    }
+
+    let gemini_auth = auth_dir.join(companion_core::GEMINI_AUTH_FILENAME);
+    match fs_safe::inspect_regular_file_if_exists(
+        &gemini_auth,
+        Some(companion_core::MAX_AUTH_FILE_BYTES),
+    ) {
+        Ok(None) | Ok(Some(_)) => Ok(()),
+        Err(FsError::SymlinkRejected { .. }) => Err(CliError::InvalidAuthPath {
+            path: gemini_auth,
+            reason: "symbolic links are not allowed for auth files".to_string(),
+        }),
+        Err(FsError::NotRegularFile { .. }) => Err(CliError::InvalidAuthPath {
+            path: gemini_auth,
+            reason: "auth file path must be a regular file".to_string(),
+        }),
+        Err(FsError::SizeLimitExceeded { max_bytes, .. }) => Err(CliError::InvalidAuthPath {
+            path: gemini_auth,
+            reason: format!("auth file exceeds maximum allowed size of {max_bytes} bytes"),
+        }),
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
+    }
+}
+
 pub fn load_config_checked(path: &Path) -> Result<Config, CliError> {
     companion_core::validate_path(path)?;
     precheck_existing_config_file(path)?;
@@ -146,6 +192,7 @@ pub async fn run_ui_mcp_with_options(
     let (config_path, validated_data_dir) =
         validate_ui_mcp_paths(config_override.as_deref(), data_dir.as_deref())?;
     precheck_existing_config_file(&config_path)?;
+    precheck_existing_auth_dir(&config_path)?;
     if let Some(ref dir) = validated_data_dir {
         precheck_existing_data_dir(dir)?;
     }
