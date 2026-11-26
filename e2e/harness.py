@@ -780,13 +780,59 @@ def run_cli(
     if env is None:
         raise ValueError("run_cli requires an explicit isolated env= dict (ISO-10)")
     start = time.monotonic()
+    cwd_str = str(cwd) if cwd is not None else None
+    if os.name == "nt":
+        # On Windows, Rust's Command::spawn() passes bInheritHandles=TRUE, so a
+        # detached grandchild daemon (e.g., spawned by `install` or `hook-env`)
+        # inherits stdout/stderr pipe handles and blocks subprocess.run()'s
+        # communicate() forever. Capturing to TemporaryFile lets proc.wait()
+        # return as soon as the direct child exits without blocking on pipe EOF.
+        in_file = tempfile.TemporaryFile() if stdin_bytes is not None else None
+        out_file = tempfile.TemporaryFile()
+        err_file = tempfile.TemporaryFile()
+        try:
+            if in_file is not None and stdin_bytes is not None:
+                in_file.write(stdin_bytes)
+                in_file.seek(0)
+            proc = subprocess.Popen(
+                cmd,
+                stdin=in_file if in_file is not None else subprocess.DEVNULL,
+                stdout=out_file,
+                stderr=err_file,
+                env=env,
+                cwd=cwd_str,
+            )
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+                raise
+            out_file.seek(0)
+            err_file.seek(0)
+            out_bytes = out_file.read()
+            err_bytes = err_file.read()
+        finally:
+            if in_file is not None:
+                in_file.close()
+            out_file.close()
+            err_file.close()
+        duration = time.monotonic() - start
+        return CliResult(
+            returncode=rc,
+            stdout=out_bytes.decode("utf-8", errors="replace"),
+            stderr=err_bytes.decode("utf-8", errors="replace"),
+            duration_s=duration,
+            cmd=list(cmd),
+        )
+
     completed = subprocess.run(
         cmd,
         input=stdin_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
-        cwd=str(cwd) if cwd is not None else None,
+        cwd=cwd_str,
         timeout=timeout,
         check=False,
     )
