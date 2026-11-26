@@ -1,63 +1,78 @@
-# `e2e/` — Opaque-Box 4-Tier E2E Test Suite for `agy-companion`
+# `e2e/` — Opaque-Box Intent-Named Parallel E2E Suite
 
-Pure Python 3 standard-library opaque-box E2E test suite verifying all Milestone 1 user-facing features (**F1–F16**), the full CloudCode transparency, Dock/Launcher integration, and one-command install/uninstall rollout (**R01–R25**), and all 8 Security Invariants (**S1–S8**).
+Pure Python 3 standard-library opaque-box E2E suite for `agy-companion`. Exercises the compiled `agy-companion` binary, runtime packaging/launcher shims, and compiled `ui/dist/index.html` without reading repo source/docs or invoking `scripts/agent_check.sh`.
 
-- **Zero external dependencies**: Uses only Python 3 stdlib (`unittest`, `http.server`, `http.client`, `sqlite3`, `subprocess`, `socket`, `threading`, `tempfile`, `tomllib`, etc.).
-- **Strict test isolation**: Every test runs in a fresh `IsolatedEnv` (`tempfile.TemporaryDirectory`) with ambient secrets, shell hook vars, and proxy variables stripped (`STRIPPED_ENV_VARS` covers `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GEMINI_BASE_URL`, `CLOUD_CODE_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `ANTIGRAVITY_RESOLVING_ENVIRONMENT`, `AGY_COMPANION_*`, `JETSKI_MCP_ENV_RESTORE_*`, `SSH_CONNECTION`, `SSH_CLIENT`, `ZDOTDIR`, etc.). All child processes, mock servers, and detached daemons are torn down via `ExitStack` + 5-layer OS-cmdline-verified `reap_pidfile_daemon` + `atexit` PID guards.
+- **Zero external dependencies:** Uses only Python 3 stdlib (`unittest`, `concurrent.futures.ProcessPoolExecutor`, `http.server`, `http.client`, `sqlite3`, `subprocess`, `socket`, `threading`, `tempfile`, etc.). Always run with `python3 -B` so no `__pycache__` or `.pyc` files are created.
+- **Strict hermeticity:** Every test runs inside an `IsolatedEnv` (`HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `TMPDIR`, plus Windows profile vars), uses allowlist-scrubbed child envs with explicit `env=` on every `run_cli(...)` call, allocates ephemeral loopback ports outside the default companion port range, and tears down spawned processes/daemons via `ExitStack`, `reap_pidfile_daemon`, and `atexit` guards.
 
-## Layout (`15` files)
+## Layout
 
-| File | Purpose |
+| File | Role |
 | --- | --- |
-| `run_e2e.py` | CLI runner (`--tier`, `--binary`, `--repo-root`, `--self-test`, `--list`, `--filter`, `--json`, `--fail-fast`, `--timeout`, `--verbose`) supporting multi-module tier tuples and module-name filtering |
-| `harness.py` | `E2ETestCase`, `TestRuntimeConfig`, `IsolatedEnv`, `CompanionProcess`, `MockConnectProxy`, 5-layer `reap_pidfile_daemon` / `register_pidfile_cleanup`, `run_cli`, `http_raw_request`, `http_stream_request`, `poll_usage_events`, `poll_stats`, `find_key_recursive`, `resolve_binary` |
-| `mock_gemini.py` | Ephemeral HTTP/1.1 `MockGeminiServer` (exact request capture, chunked SSE, split UTF-8/CRLF, FIFO fault queues, `SO_LINGER` TCP RST, `EchoChecksumAction`) & `MockHealthServer` |
-| `mcp_client.py` | Strict newline-delimited JSON-RPC 2.0 `McpStdioClient` (stdout purity auditing, fast EOF detection, thread-safe stdin writes, `save_settings_smart` schema introspection) |
-| `test_tier1_features.py` | **Tier 1 (M1 + PR 1/2)** — Core happy-path feature coverage (`90` tests) |
-| `test_tier1_rollout.py` | **Tier 1 (Rollout)** — Happy-path coverage for `R01`–`R25` (`50` tests; combined Tier 1 = `140`) |
-| `test_tier2_boundaries.py` | **Tier 2 (M1)** — Boundaries, corner cases, negative inputs & S1–S8 security tests (`98` tests) |
-| `test_tier2_rollout.py` | **Tier 2 (Rollout)** — Boundary, negative & S1–S8 coverage for `R01`–`R25` (`51` tests; combined Tier 2 = `149`) |
-| `test_tier3_combinations.py` | **Tier 3 (M1)** — Pairwise cross-feature combinations (`16` tests) |
-| `test_tier3_rollout.py` | **Tier 3 (Rollout)** — Pairwise cross-PR combinations (`15` tests; combined Tier 3 = `31`) |
-| `test_tier4_scenarios.py` | **Tier 4 (M1)** — Multi-step real-world end-to-end application workloads (`7` tests) |
-| `test_tier4_rollout.py` | **Tier 4 (Rollout)** — End-to-end isolated-`$HOME` rollout lifecycles (`6` tests; combined Tier 4 = `13`) |
-| `test_self.py` | **Self-Tests** — `26` pure-Python harness self-tests (`SELF-01`..`SELF-26`), runnable without the Rust binary |
+| `run_e2e.py` | Parallel intent-named CLI runner (`--suite`, `--workers`, `--binary`, `--repo-root`, `--filter`, `--list`, `--json`, `-x/--fail-fast`, `--timeout`, `-v/--verbose`, `--self-test`, deprecated `--tier` alias) |
+| `harness.py` | `E2ETestCase`, `IsolatedEnv`, `CompanionProcess`, `MockConnectProxy`, `reap_pidfile_daemon`, `run_cli`, `http_raw_request`, `http_stream_request`, `poll_usage_events`, `poll_stats`, `find_free_port` |
+| `mock_gemini.py` | Ephemeral loopback HTTP/1.1 `MockGeminiServer` (request capture, chunked SSE, raw bytes, fault queues, TCP RST) & `MockHealthServer` |
+| `mcp_client.py` | Strict newline-delimited JSON-RPC 2.0 `McpStdioClient` (stdout purity auditing, `save_settings_smart` schema introspection) |
+| `cdp_smoke.py` | Pure-stdlib headless Chrome CDP harness (RFC 6455 WebSocket, WCAG 2.1 contrast math, hermetic `ChromeBrowser`, loopback mock MCP App host) |
+| `test_cuj_core.py` | `--suite cuj` — Core binary CUJs (proxy routing, SSE pass-through, `ui-mcp` lifecycle, SQLite usage, daemon adoption, install/uninstall, CloudCode catalog) |
+| `test_cuj_ux_v2.py` | `--suite cuj` — UX v2 cross-process CUJs (Day-0 passive built-in usage tee + S4 gzip skip + `proxy_rss_bytes`, `enabled_models` hot-reload & `[]` pause, concurrent `--auto-enable-launcher` lock, opt-out parity & symlink fail-closed, semantic `account_plan`) |
+| `test_boundary_security.py` | `--suite boundary` — Opaque-box S1–S7 security & error boundary canaries |
+| `test_shims_packaging.py` | `--suite shims` — Runtime launcher/dev-install/npm/Python packaging shims |
+| `test_ui_smoke.py` | `--suite ui-smoke` — Multi-viewport Dark/Light overflow, WCAG AA contrast, health-only `Live` footer popover, and RAM telemetry against compiled `ui/dist/index.html` |
+| `test_self.py` | `--self-test` — Dev-only harness safety guardrails (`IsolatedEnv`, `PidfileReaper`, `McpStdioClient`) |
 | `__init__.py` | Package marker |
 | `README.md` | This guide |
 
-Combined totals: **`333` E2E tests** (`T1=140, T2=149, T3=31, T4=13`) + **`26` harness self-tests**.
-
 ## Quick Usage
 
-Always invoke with `python3 -B` so no `__pycache__` or `*.pyc` files are created in the working tree:
+Always invoke with `python3 -B`:
 
 ```bash
-# 1. Verify harness integrity without needing a compiled agy-companion binary (26 self-tests)
-python3 -B e2e/run_e2e.py --self-test -v
-
-# 2. List all 333 tests (plain text or JSON) without needing a binary
-python3 -B e2e/run_e2e.py --list
-python3 -B e2e/run_e2e.py --list --json
-
-# 3. Run specific tier(s) or the entire 4-tier suite against a built binary
+# Build the binary once
 cargo build -p companion-cli
-python3 -B e2e/run_e2e.py --tier 1 --binary target/debug/agy-companion
+
+# Run default opaque-box suite (cuj + boundary + shims) in parallel or serial
+python3 -B e2e/run_e2e.py --suite all --workers 4 --binary target/debug/agy-companion --repo-root . -v
+python3 -B e2e/run_e2e.py --suite all --workers 1 --binary target/debug/agy-companion --repo-root . -v
+
+# Run a single intent suite
+python3 -B e2e/run_e2e.py --suite cuj --binary target/debug/agy-companion --repo-root . -v
+python3 -B e2e/run_e2e.py --suite boundary --binary target/debug/agy-companion --repo-root . -v
+python3 -B e2e/run_e2e.py --suite shims --binary target/debug/agy-companion --repo-root . -v
+
+# List tests, filter by substring, fail fast, or emit JSON
+python3 -B e2e/run_e2e.py --suite all --list
+python3 -B e2e/run_e2e.py --suite cuj --filter test_cuj_ux_ --binary target/debug/agy-companion -x -v
+python3 -B e2e/run_e2e.py --suite all --binary target/debug/agy-companion --json
+
+# Backwards-compatible --tier alias (1/3/4 -> cuj, 2 -> boundary, all -> all)
 python3 -B e2e/run_e2e.py --tier all --binary target/debug/agy-companion --repo-root . -v
 
-# 4. Filter by substring or module name (e.g. rollout-only), or emit JSON report
-python3 -B e2e/run_e2e.py --tier all --filter rollout --binary target/debug/agy-companion --repo-root . -v
-python3 -B e2e/run_e2e.py --tier 2 --filter f5 --binary target/debug/agy-companion -v
-python3 -B e2e/run_e2e.py --tier all --binary target/debug/agy-companion --json
+# Dev-only harness self-test guardrails (no Rust binary needed)
+python3 -B e2e/run_e2e.py --self-test -v
 ```
+
+## Headless Chrome CDP UI Smoke (`--suite ui-smoke`)
+
+`--suite ui-smoke` renders compiled `ui/dist/index.html` directly inside an isolated loopback mock MCP App host (no compiled Rust binary required) and is excluded from `--suite all`:
+
+```bash
+python3 -B e2e/run_e2e.py --suite ui-smoke --repo-root . -v
+```
+
+Environment controls:
+- `AGY_E2E_CHROME_BIN`: Authoritative Chrome/Chromium executable override. When set to a non-executable or empty path (e.g. `AGY_E2E_CHROME_BIN=/nonexistent`), discovery does **not** fall through to system Chrome and tests cleanly skip (exit `0`).
+- `CHROME_BIN`: Secondary executable hint used when `AGY_E2E_CHROME_BIN` is unset.
+- `AGY_E2E_REQUIRE_CHROME=1`: Fail instead of skipping when no Chrome binary is available.
 
 ## Binary Resolution & Exit Codes
 
-Binary lookup precedence for `--tier` runs:
+Binary lookup precedence (skipped for `--self-test` and `--suite ui-smoke`):
 1. `--binary <path>`
 2. `AGY_COMPANION_E2E_BIN` environment variable
 3. `<repo-root>/target/debug/agy-companion`
 
 Exit codes:
-- `0`: All selected tests passed (or `--list` succeeded).
+- `0`: All selected tests passed or cleanly skipped (or `--list` succeeded).
 - `1`: One or more tests failed or errored.
-- `2`: Invalid CLI arguments or missing/non-executable `agy-companion` binary.
+- `2`: Invalid CLI arguments, zero filter matches, or missing/non-executable binary.

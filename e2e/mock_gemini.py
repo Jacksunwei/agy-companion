@@ -474,7 +474,7 @@ class MockGeminiServer:
         self._httpd = httpd
         thread = threading.Thread(
             target=httpd.serve_forever,
-            kwargs={"poll_interval": 0.05},
+            kwargs={"poll_interval": 0.01},
             name=f"mock-gemini-{self._actual_port}",
             daemon=True,
         )
@@ -784,7 +784,7 @@ class MockHealthServer:
         self._httpd = httpd
         thread = threading.Thread(
             target=httpd.serve_forever,
-            kwargs={"poll_interval": 0.05},
+            kwargs={"poll_interval": 0.01},
             name=f"mock-health-{self._actual_port}",
             daemon=True,
         )
