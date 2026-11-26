@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+doctest = false
+
 [[bin]]
 name = "agy-companion"
 path = "src/main.rs"

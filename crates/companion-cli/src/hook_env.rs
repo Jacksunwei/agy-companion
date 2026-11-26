@@ -134,6 +134,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
+        tokio::task::yield_now().await;
         (port, handle)
     }
 

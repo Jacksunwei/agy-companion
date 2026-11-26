@@ -1,18 +1,16 @@
-#![forbid(unsafe_code)]
-
-mod common;
-
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Stdio;
 use std::time::Duration;
 
 use companion_core::{ApiKey, Config};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use common::{
-    BIN, config_with_port, free_loopback_port, isolated_cli_command, run_ui_mcp_bounded,
+use crate::common::{
+    ChildGuard, config_with_port, free_loopback_port, isolated_cli_command, run_ui_mcp_bounded,
     run_ui_mcp_bounded_with_calls,
 };
 
@@ -23,26 +21,28 @@ fn ui_mcp_stdio_initialize_emits_strict_json_rpc_only_on_stdout() {
     let data_dir = temp.path().join("plugin-data");
     fs::create_dir(&data_dir).expect("mkdir data_dir");
 
-    let mut cfg = Config::default();
+    let mut cfg = config_with_port(free_loopback_port());
     cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyUiMcpCfgSecret5555").unwrap());
     cfg.save_secure(&cfg_path).expect("save_secure");
 
-    let mut child = Command::new(BIN)
-        .arg("ui-mcp")
-        .arg(format!("--data-dir={}", data_dir.display()))
-        .arg("--config")
-        .arg(&cfg_path)
-        .env("RUST_LOG", "debug")
-        .env("GEMINI_API_KEY", "AIzaSyUiMcpEnvSecret6666")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ui-mcp");
+    let mut guard = ChildGuard::new(
+        isolated_cli_command(temp.path())
+            .arg("ui-mcp")
+            .arg(format!("--data-dir={}", data_dir.display()))
+            .arg("--config")
+            .arg(&cfg_path)
+            .env("RUST_LOG", "debug")
+            .env("GEMINI_API_KEY", "AIzaSyUiMcpEnvSecret6666")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ui-mcp"),
+    );
 
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let stderr = child.stderr.take().expect("stderr");
+    let mut stdin = guard.take_stdin().expect("stdin");
+    let stdout = guard.take_stdout().expect("stdout");
+    let stderr = guard.take_stderr().expect("stderr");
 
     let init_req = json!({
         "jsonrpc": "2.0",
@@ -111,7 +111,7 @@ fn ui_mcp_stdio_initialize_emits_strict_json_rpc_only_on_stdout() {
     let mut stderr_str = String::new();
     std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut stderr_str)
         .expect("read stderr");
-    let status = child.wait().expect("wait ui-mcp");
+    let status = guard.wait().expect("wait ui-mcp");
     assert_eq!(
         status.code(),
         Some(0),
@@ -164,21 +164,23 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
         let data_dir = temp.path().join("plugin-data");
         fs::create_dir(&data_dir).expect("mkdir data_dir");
 
-        let mut child = Command::new(BIN)
-            .arg("ui-mcp")
-            .arg(format!("--data-dir={}", data_dir.display()))
-            .arg("--config")
-            .arg(&cfg_path)
-            .env("RUST_LOG", rust_log)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn ui-mcp");
+        let mut guard = ChildGuard::new(
+            isolated_cli_command(temp.path())
+                .arg("ui-mcp")
+                .arg(format!("--data-dir={}", data_dir.display()))
+                .arg("--config")
+                .arg(&cfg_path)
+                .env("RUST_LOG", rust_log)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn ui-mcp"),
+        );
 
-        let mut stdin = child.stdin.take().expect("stdin");
-        let stdout = child.stdout.take().expect("stdout");
-        let stderr = child.stderr.take().expect("stderr");
+        let mut stdin = guard.take_stdin().expect("stdin");
+        let stdout = guard.take_stdout().expect("stdout");
+        let stderr = guard.take_stderr().expect("stderr");
 
         // Drain stderr concurrently to prevent pipe buffer deadlocks under trace logging.
         let stderr_thread = std::thread::spawn(move || {
@@ -249,7 +251,7 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
             }
         }
 
-        let status = child.wait().expect("wait ui-mcp");
+        let status = guard.wait().expect("wait ui-mcp");
         let stderr_str = stderr_thread.join().expect("join stderr reader");
         assert_eq!(
             status.code(),
@@ -320,11 +322,12 @@ fn ui_mcp_save_settings_never_leaks_api_key_under_trace_or_rmcp_trace_logging() 
 #[test]
 fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     let temp = TempDir::new().expect("tempdir");
+    let home = temp.path();
     let valid_data_dir = temp.path().join("valid-data-dir");
     fs::create_dir(&valid_data_dir).expect("mkdir valid_data_dir");
 
     let valid_cfg = temp.path().join("real_config.json");
-    Config::default()
+    config_with_port(free_loopback_port())
         .save_secure(&valid_cfg)
         .expect("save real_config");
 
@@ -332,7 +335,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     let cfg_dir = temp.path().join("cfg_dir");
     fs::create_dir(&cfg_dir).expect("mkdir cfg_dir");
     let (code, stdout, stderr, timed_out) =
-        run_ui_mcp_bounded(&cfg_dir, &valid_data_dir, Duration::from_secs(10));
+        run_ui_mcp_bounded(home, &cfg_dir, &valid_data_dir, Duration::from_secs(10));
     assert!(!timed_out, "ui-mcp --config <dir> must not hang");
     assert_eq!(code, Some(1), "ui-mcp --config <dir> must exit 1");
     assert!(
@@ -349,8 +352,12 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     let mut oversized_bytes = br#"{"schema_version":1}"#.to_vec();
     oversized_bytes.resize(1024 * 1024 + 1, b' ');
     fs::write(&oversized_cfg, oversized_bytes).expect("write oversized");
-    let (code, stdout, stderr, timed_out) =
-        run_ui_mcp_bounded(&oversized_cfg, &valid_data_dir, Duration::from_secs(10));
+    let (code, stdout, stderr, timed_out) = run_ui_mcp_bounded(
+        home,
+        &oversized_cfg,
+        &valid_data_dir,
+        Duration::from_secs(10),
+    );
     assert!(!timed_out, "ui-mcp --config <oversized> must not hang");
     assert_eq!(code, Some(1), "ui-mcp --config <oversized> must exit 1");
     assert!(
@@ -363,7 +370,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     let data_file = temp.path().join("data_as_file");
     fs::write(&data_file, "not a dir").expect("write data_file");
     let (code, stdout, stderr, timed_out) =
-        run_ui_mcp_bounded(&valid_cfg, &data_file, Duration::from_secs(10));
+        run_ui_mcp_bounded(home, &valid_cfg, &data_file, Duration::from_secs(10));
     assert!(!timed_out, "ui-mcp --data-dir <file> must not hang");
     assert_eq!(code, Some(1), "ui-mcp --data-dir <file> must exit 1");
     assert!(
@@ -384,7 +391,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
             .expect("run mkfifo");
         assert!(mkfifo_status.success(), "mkfifo failed");
         let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&fifo_cfg, &valid_data_dir, Duration::from_secs(10));
+            run_ui_mcp_bounded(home, &fifo_cfg, &valid_data_dir, Duration::from_secs(10));
         assert!(!timed_out, "ui-mcp --config <FIFO> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --config <FIFO> must exit 1");
         assert!(
@@ -397,7 +404,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
         let symlink_cfg = temp.path().join("symlink_config.json");
         symlink(&valid_cfg, &symlink_cfg).expect("symlink config");
         let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&symlink_cfg, &valid_data_dir, Duration::from_secs(10));
+            run_ui_mcp_bounded(home, &symlink_cfg, &valid_data_dir, Duration::from_secs(10));
         assert!(!timed_out, "ui-mcp --config <symlink> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --config <symlink> must exit 1");
         assert!(
@@ -410,8 +417,12 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
         let dangling_cfg = temp.path().join("dangling_config.json");
         symlink(temp.path().join("does_not_exist.json"), &dangling_cfg)
             .expect("dangling symlink config");
-        let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&dangling_cfg, &valid_data_dir, Duration::from_secs(10));
+        let (code, stdout, stderr, timed_out) = run_ui_mcp_bounded(
+            home,
+            &dangling_cfg,
+            &valid_data_dir,
+            Duration::from_secs(10),
+        );
         assert!(!timed_out, "ui-mcp --config <dangling> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --config <dangling> must exit 1");
         assert!(
@@ -424,7 +435,7 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
         let symlink_data_dir = temp.path().join("symlink_data_dir");
         symlink(&valid_data_dir, &symlink_data_dir).expect("symlink data_dir");
         let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&valid_cfg, &symlink_data_dir, Duration::from_secs(10));
+            run_ui_mcp_bounded(home, &valid_cfg, &symlink_data_dir, Duration::from_secs(10));
         assert!(!timed_out, "ui-mcp --data-dir <symlink> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --data-dir <symlink> must exit 1");
         assert!(
@@ -435,8 +446,12 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
 
         let symlink_data_dir_slash =
             std::path::PathBuf::from(format!("{}/", symlink_data_dir.display()));
-        let (code, stdout, stderr, timed_out) =
-            run_ui_mcp_bounded(&valid_cfg, &symlink_data_dir_slash, Duration::from_secs(10));
+        let (code, stdout, stderr, timed_out) = run_ui_mcp_bounded(
+            home,
+            &valid_cfg,
+            &symlink_data_dir_slash,
+            Duration::from_secs(10),
+        );
         assert!(!timed_out, "ui-mcp --data-dir <symlink/> must not hang");
         assert_eq!(code, Some(1), "ui-mcp --data-dir <symlink/> must exit 1");
         assert!(
@@ -447,11 +462,12 @@ fn ui_mcp_eagerly_rejects_fifo_symlink_dir_and_oversized_config() {
     }
 
     // (h) First-run UX: nonexistent --config and nonexistent --data-dir initialize cleanly
-    // without probing ambient host port 4141.
+    // without probing ambient host default port 24141.
     let nonexistent_cfg = temp.path().join("first_run_config.json");
     let nonexistent_data_dir = temp.path().join("first_run_data_dir");
     let closed_port = free_loopback_port();
     let (code, stdout, stderr, timed_out) = run_ui_mcp_bounded_with_calls(
+        home,
         &nonexistent_cfg,
         &nonexistent_data_dir,
         vec![json!({
@@ -532,22 +548,24 @@ fn ui_mcp_degrades_gracefully_and_preserves_rc_on_unsafe_leaf_env_sh() {
         );
         fs::write(&zlogin_path, &zlogin_before).expect("write zlogin");
 
-        let mut child = isolated_cli_command(&home)
-            .env("XDG_CONFIG_HOME", &xdg_config)
-            .env("XDG_DATA_HOME", &xdg_data)
-            .env("SHELL", "/bin/zsh")
-            .env("ZDOTDIR", &home)
-            .args(["ui-mcp", "--config"])
-            .arg(&cfg_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn ui-mcp");
+        let mut guard = ChildGuard::new(
+            isolated_cli_command(&home)
+                .env("XDG_CONFIG_HOME", &xdg_config)
+                .env("XDG_DATA_HOME", &xdg_data)
+                .env("SHELL", "/bin/zsh")
+                .env("ZDOTDIR", &home)
+                .args(["ui-mcp", "--config"])
+                .arg(&cfg_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn ui-mcp"),
+        );
 
-        let mut stdin = child.stdin.take().expect("stdin");
-        let stdout = child.stdout.take().expect("stdout");
-        let stderr = child.stderr.take().expect("stderr");
+        let mut stdin = guard.take_stdin().expect("stdin");
+        let stdout = guard.take_stdout().expect("stdout");
+        let stderr = guard.take_stderr().expect("stderr");
 
         let init_req = json!({
             "jsonrpc": "2.0",
@@ -608,7 +626,7 @@ fn ui_mcp_degrades_gracefully_and_preserves_rc_on_unsafe_leaf_env_sh() {
         let mut stderr_str = String::new();
         std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut stderr_str)
             .expect("read stderr");
-        let status = child.wait().expect("wait ui-mcp");
+        let status = guard.wait().expect("wait ui-mcp");
         assert_eq!(
             status.code(),
             Some(0),
@@ -679,7 +697,13 @@ fn ui_mcp_auto_enable_launcher_and_get_usage_sqlite_end_to_end() {
     fs::create_dir_all(&xdg_config).expect("mkdir xdg_config");
     fs::create_dir_all(&xdg_data).expect("mkdir xdg_data");
 
+    // Pre-write an isolated ephemeral-port config (launcher_auto_start = None) so open_settings
+    // probes a guaranteed-closed port instead of default 24141 while still triggering first-run auto-enable.
     let cfg_path = xdg_config.join("agy-companion").join("config.json");
+    config_with_port(free_loopback_port())
+        .save_secure(&cfg_path)
+        .expect("save isolated config");
+
     let sink = SqliteUsageSink::new(&usage_dir).expect("sink");
     sink.record_checked(&UsageEvent::from_gemini(
         "gemini-4-carbon",
@@ -705,22 +729,24 @@ fn ui_mcp_auto_enable_launcher_and_get_usage_sqlite_end_to_end() {
     .expect("seed builtin event");
     drop(sink);
 
-    let mut child = isolated_cli_command(&home)
-        .args([
-            "ui-mcp",
-            "--config",
-            cfg_path.to_str().unwrap(),
-            "--auto-enable-launcher",
-        ])
-        .env("SHELL", "/bin/zsh")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ui-mcp");
+    let mut guard = ChildGuard::new(
+        isolated_cli_command(&home)
+            .args([
+                "ui-mcp",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "--auto-enable-launcher",
+            ])
+            .env("SHELL", "/bin/zsh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ui-mcp"),
+    );
 
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stdin = guard.take_stdin().expect("stdin");
+    let mut stdout = BufReader::new(guard.take_stdout().expect("stdout"));
 
     let init_req = json!({
         "jsonrpc": "2.0",
@@ -766,7 +792,7 @@ fn ui_mcp_auto_enable_launcher_and_get_usage_sqlite_end_to_end() {
         }
         line.clear();
     }
-    let status = child.wait().expect("wait ui-mcp");
+    let status = guard.wait().expect("wait ui-mcp");
     assert!(status.success(), "ui-mcp should exit 0 cleanly");
 
     let open_resp = responses

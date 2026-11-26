@@ -53,8 +53,20 @@ pub fn ensure_first_run_launcher_enabled(
     config_path: &Path,
     opts: &IntegrationOptions,
 ) -> Result<AutoEnableOutcome, CoreError> {
+    ensure_first_run_launcher_enabled_with_hybrid_active(config_path, opts, None)
+}
+
+pub fn ensure_first_run_launcher_enabled_with_hybrid_active(
+    config_path: &Path,
+    opts: &IntegrationOptions,
+    hybrid_active_override: Option<bool>,
+) -> Result<AutoEnableOutcome, CoreError> {
     let inputs = read_process_env_inputs()?;
-    let env = LifecycleEnv::from_process(&inputs, detect_hybrid_active(), is_platform_supported());
+    let env = LifecycleEnv::from_process(
+        &inputs,
+        hybrid_active_override.unwrap_or_else(detect_hybrid_active),
+        is_platform_supported(),
+    );
     ensure_first_run_launcher_enabled_with_env(config_path, opts, &env)
 }
 
@@ -138,8 +150,20 @@ pub fn enable_and_persist(
     config_path: &Path,
     opts: &IntegrationOptions,
 ) -> Result<IntegrationStatus, CoreError> {
+    enable_and_persist_with_hybrid_active(config_path, opts, None)
+}
+
+pub fn enable_and_persist_with_hybrid_active(
+    config_path: &Path,
+    opts: &IntegrationOptions,
+    hybrid_active_override: Option<bool>,
+) -> Result<IntegrationStatus, CoreError> {
     let inputs = read_process_env_inputs()?;
-    let env = LifecycleEnv::from_process(&inputs, detect_hybrid_active(), is_platform_supported());
+    let env = LifecycleEnv::from_process(
+        &inputs,
+        hybrid_active_override.unwrap_or_else(detect_hybrid_active),
+        is_platform_supported(),
+    );
     enable_and_persist_with_env(config_path, opts, &env)
 }
 
@@ -175,8 +199,20 @@ pub fn disable_and_persist(
     config_path: &Path,
     opts: &IntegrationOptions,
 ) -> Result<IntegrationStatus, CoreError> {
+    disable_and_persist_with_hybrid_active(config_path, opts, None)
+}
+
+pub fn disable_and_persist_with_hybrid_active(
+    config_path: &Path,
+    opts: &IntegrationOptions,
+    hybrid_active_override: Option<bool>,
+) -> Result<IntegrationStatus, CoreError> {
     let inputs = read_process_env_inputs()?;
-    let env = LifecycleEnv::from_process(&inputs, detect_hybrid_active(), is_platform_supported());
+    let env = LifecycleEnv::from_process(
+        &inputs,
+        hybrid_active_override.unwrap_or_else(detect_hybrid_active),
+        is_platform_supported(),
+    );
     disable_and_persist_with_env(config_path, opts, &env)
 }
 

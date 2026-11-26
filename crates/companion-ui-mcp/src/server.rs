@@ -153,6 +153,12 @@ impl CompanionUiServer {
         }
     }
 
+    pub(crate) fn resolved_hybrid_active(&self) -> bool {
+        self.options
+            .hybrid_active_override
+            .unwrap_or_else(companion_core::integration::detect_hybrid_active)
+    }
+
     pub(crate) async fn build_snapshot(&self, cfg: &Config) -> SettingsSnapshot {
         self.build_snapshot_with_integration(cfg, None).await
     }
@@ -169,18 +175,22 @@ impl CompanionUiServer {
                 Some(status) => status,
                 None => {
                     let opts = self.integration_options();
+                    let hybrid_override = self.options.hybrid_active_override;
                     match tokio::task::spawn_blocking(move || {
-                        companion_core::integration::status(&opts)
+                        companion_core::integration::status_with_hybrid_active(
+                            &opts,
+                            hybrid_override,
+                        )
                     })
                     .await
                     {
                         Ok(Ok(status)) => status,
                         Ok(Err(err)) => IntegrationStatus::error_fallback(
-                            companion_core::integration::detect_hybrid_active(),
+                            self.resolved_hybrid_active(),
                             err.to_string(),
                         ),
                         Err(err) => IntegrationStatus::error_fallback(
-                            companion_core::integration::detect_hybrid_active(),
+                            self.resolved_hybrid_active(),
                             format!("launcher integration check failed: {err}"),
                         ),
                     }

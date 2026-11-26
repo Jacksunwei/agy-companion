@@ -1,7 +1,3 @@
-#![forbid(unsafe_code)]
-
-mod common;
-
 use std::fs;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -12,10 +8,11 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-use common::{
-    DetachedPidFileGuard, config_with_port, free_loopback_port, isolated_cli_command,
-    spawn_serve_and_wait_healthy,
+use crate::common::{
+    ChildGuard, DetachedPidFileGuard, config_with_port, free_loopback_port, isolated_cli_command,
 };
+#[cfg(unix)]
+use crate::common::{loopback_http_client, spawn_serve_and_wait_healthy};
 
 #[tokio::test]
 async fn hook_env_cold_starts_detached_daemon_and_fails_open_when_plugin_missing_or_port_occupied()
@@ -136,6 +133,7 @@ async fn hook_env_cold_starts_detached_daemon_and_fails_open_when_plugin_missing
         );
         let _ = axum::serve(listener, router).await;
     });
+    tokio::task::yield_now().await;
     let occupied = isolated_cli_command(&home)
         .args([
             "hook-env",
@@ -371,7 +369,7 @@ async fn launch_subcommand_spawns_detached_daemon_and_sets_restore_env_preservin
     // Wait briefly for the spawned script to finish writing app-env.txt
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline && !env_dump.is_file() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
     }
     let dumped = fs::read_to_string(&env_dump).expect("read dumped env");
     assert!(dumped.contains(&format!("CLOUD_CODE_URL=http://127.0.0.1:{port}")));
@@ -410,8 +408,8 @@ async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall
     let log_path = data_dir.join(companion_cli::daemon::PROXY_LOG_FILENAME);
     let _pid_guard = DetachedPidFileGuard::new(pid_path.clone());
 
-    // Launch 3 concurrent cold-start hook-env calls simultaneously.
-    let mut children = Vec::with_capacity(3);
+    // Launch 3 concurrent cold-start hook-env calls simultaneously, wrapped in ChildGuard.
+    let mut children: Vec<ChildGuard> = Vec::with_capacity(3);
     for _ in 0..3 {
         let child = isolated_cli_command(&home)
             .env("XDG_CONFIG_HOME", &xdg_config)
@@ -428,11 +426,11 @@ async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn hook-env");
-        children.push(child);
+        children.push(ChildGuard::new(child));
     }
 
-    for (idx, child) in children.into_iter().enumerate() {
-        let out = child.wait_with_output().expect("wait hook-env");
+    for (idx, guard) in children.into_iter().enumerate() {
+        let out = guard.wait_with_output().expect("wait hook-env");
         assert_eq!(
             out.status.code(),
             Some(0),
@@ -447,7 +445,7 @@ async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall
     }
 
     // Allow bind-race losers to exit cleanly on AddrInUse.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let uninst = isolated_cli_command(&home)
         .env("XDG_CONFIG_HOME", &xdg_config)
@@ -472,30 +470,33 @@ async fn concurrent_cold_start_hook_env_leaves_no_zombie_standby_after_uninstall
     assert_eq!(rep["ok"], true);
     assert_eq!(rep["proxy_stopped"], true);
 
-    // Wait 1.0s — if any losing daemon stayed parked via --adopt-running, it would
-    // reclaim the port within 500ms and resurrect proxy.pid/proxy.log.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Observe across > ADOPT_RUNNING_POLL_INTERVAL (500ms) in 20ms ticks so any
+    // wrongly parked standby fails fast if it rebinds or recreates pid/log files.
+    let observe_deadline = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < observe_deadline {
+        assert!(
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_err(),
+            "port {port} must not accept connections after uninstall --purge"
+        );
+        assert!(
+            !pid_path.exists(),
+            "proxy.pid must NOT resurrect in purged data dir"
+        );
+        assert!(
+            !log_path.exists(),
+            "proxy.log must NOT resurrect in purged data dir"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     assert!(
         companion_cli::launch::probe_running_companion_proxy_with_timeout(
             port,
-            Duration::from_millis(250),
+            Duration::from_millis(50),
         )
         .await
         .is_none(),
         "GET /health must fail (connection refused) after uninstall --purge"
-    );
-    assert!(
-        std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_err(),
-        "port {port} must not accept connections after uninstall --purge"
-    );
-    assert!(
-        !pid_path.exists(),
-        "proxy.pid must NOT resurrect in purged data dir"
-    );
-    assert!(
-        !log_path.exists(),
-        "proxy.log must NOT resurrect in purged data dir"
     );
 }
 
@@ -622,15 +623,11 @@ async fn cli_serve_auto_enable_launcher_runs_once_and_standalone_serve_never_mut
     cfg.usage_dir = Some(xdg_data.join("agy-companion").join("usage"));
     cfg.save_secure(&cfg_path).expect("save config");
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("build client");
+    let client = loopback_http_client();
 
     // 1. Standalone `serve` (WITHOUT --auto-enable-launcher) NEVER mutates RC or launcher_auto_start.
     {
-        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
             let mut cmd = isolated_cli_command(&home);
             cmd.env("XDG_DATA_HOME", &xdg_data)
                 .env("ZDOTDIR", &home)
@@ -660,7 +657,7 @@ async fn cli_serve_auto_enable_launcher_runs_once_and_standalone_serve_never_mut
 
     // 2. `serve --auto-enable-launcher` on None creates .zlogin + env.sh and persists Some(true).
     {
-        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
             let mut cmd = isolated_cli_command(&home);
             cmd.env("XDG_DATA_HOME", &xdg_data)
                 .env("ZDOTDIR", &home)
@@ -716,7 +713,7 @@ async fn cli_serve_auto_enable_launcher_runs_once_and_standalone_serve_never_mut
     );
 
     {
-        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
+        let (_guard, _port, _resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
             let mut cmd = isolated_cli_command(&home);
             cmd.env("XDG_DATA_HOME", &xdg_data)
                 .env("ZDOTDIR", &home)

@@ -3316,9 +3316,38 @@ async fn builtin_tee_preserves_split_content_encoding_and_fails_closed_on_non_as
     let raw_server = tokio::spawn(async move {
         for _ in 0..2 {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut req_buf = vec![0u8; 4096];
-            let n = socket.read(&mut req_buf).await.unwrap();
-            let req_text = String::from_utf8_lossy(&req_buf[..n]);
+            let mut req_buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 1024];
+            let mut expected_total: Option<usize> = None;
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                req_buf.extend_from_slice(&chunk[..n]);
+                if expected_total.is_none()
+                    && let Some(pos) = req_buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let header_end = pos + 4;
+                    let headers_str = String::from_utf8_lossy(&req_buf[..pos]);
+                    let content_len = headers_str
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_total = Some(header_end + content_len);
+                }
+                if let Some(total) = expected_total
+                    && req_buf.len() >= total
+                {
+                    break;
+                }
+            }
+            let req_text = String::from_utf8_lossy(&req_buf);
             let resp_bytes = if req_text.contains("mode=split") {
                 format!(
                     "HTTP/1.1 200 OK\r\n\

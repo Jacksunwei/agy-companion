@@ -1,11 +1,10 @@
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use companion_core::CoreError;
 use companion_core::fs_safe::{
     DirChainStatus, FsError, default_home_dir, ensure_dir_no_symlink, inspect_dir_chain,
-    inspect_existing_dir as core_inspect_existing_dir,
+    inspect_existing_dir as core_inspect_existing_dir, inspect_regular_file_if_exists,
 };
 
 use super::PLUGIN_DIR_NAME;
@@ -59,8 +58,8 @@ pub(crate) fn ensure_non_symlink_dir(dir: &Path, unix_mode: u32) -> Result<(), C
     }
 }
 
-/// Inspects an existing directory path using `fs::symlink_metadata` (with trailing slashes
-/// normalized) so callers never traverse a symlinked or non-directory intermediate component.
+/// Inspects an existing directory path via `companion_core::fs_safe::inspect_existing_dir`
+/// (with trailing slashes normalized) so callers never traverse a symlinked or non-directory component.
 pub(crate) fn inspect_existing_dir(
     dir: &Path,
     label: &str,
@@ -82,8 +81,8 @@ pub(crate) fn inspect_existing_dir(
 }
 
 /// Inspects every relative intermediate directory under `root` (`root/rel[0]`, `root/rel[0]/rel[1]`,
-/// ...) with `fs::symlink_metadata` so install/uninstall never traverses a symlinked intermediate
-/// component beneath a trusted base directory (such as `$HOME` or `%APPDATA%`).
+/// ...) via `companion_core::fs_safe::inspect_dir_chain` so install/uninstall never traverses a
+/// symlinked intermediate component beneath a trusted base directory (such as `$HOME` or `%APPDATA%`).
 pub(crate) fn inspect_non_symlink_rel_chain(
     root: &Path,
     rel_dirs: &[&str],
@@ -179,30 +178,30 @@ pub(crate) fn remove_regular_file_if_present(
     dry_run: bool,
     warnings: &mut Vec<String>,
 ) -> Result<bool, CliError> {
-    let check_path = normalized_metadata_path(path);
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                warnings.push(format!(
-                    "refusing to delete symlinked file '{}'",
-                    path.display()
-                ));
-                return Ok(false);
-            }
-            if !meta.file_type().is_file() {
-                warnings.push(format!(
-                    "refusing to delete non-regular path '{}'",
-                    path.display()
-                ));
-                return Ok(false);
-            }
+    match inspect_regular_file_if_exists(path, None) {
+        Ok(Some(_)) => {
             if !dry_run {
                 fs::remove_file(path)?;
             }
             Ok(true)
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(CliError::Io(err)),
+        Ok(None) => Ok(false),
+        Err(FsError::SymlinkRejected { .. }) => {
+            warnings.push(format!(
+                "refusing to delete symlinked file '{}'",
+                path.display()
+            ));
+            Ok(false)
+        }
+        Err(FsError::NotRegularFile { .. }) => {
+            warnings.push(format!(
+                "refusing to delete non-regular path '{}'",
+                path.display()
+            ));
+            Ok(false)
+        }
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
     }
 }
 
@@ -211,29 +210,29 @@ pub(crate) fn remove_dir_if_non_symlink(
     dry_run: bool,
     warnings: &mut Vec<String>,
 ) -> Result<bool, CliError> {
-    let check_path = normalized_metadata_path(path);
-    match fs::symlink_metadata(&check_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                warnings.push(format!(
-                    "refusing to recursively delete symlinked directory '{}'",
-                    path.display()
-                ));
-                return Ok(false);
-            }
-            if !meta.file_type().is_dir() {
-                warnings.push(format!(
-                    "refusing to delete non-directory path '{}'",
-                    path.display()
-                ));
-                return Ok(false);
-            }
+    match core_inspect_existing_dir(path) {
+        Ok(Some(_)) => {
             if !dry_run {
                 fs::remove_dir_all(path)?;
             }
             Ok(true)
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(CliError::Io(err)),
+        Ok(None) => Ok(false),
+        Err(FsError::SymlinkRejected { .. }) => {
+            warnings.push(format!(
+                "refusing to recursively delete symlinked directory '{}'",
+                path.display()
+            ));
+            Ok(false)
+        }
+        Err(FsError::NotDirectory { .. }) => {
+            warnings.push(format!(
+                "refusing to delete non-directory path '{}'",
+                path.display()
+            ));
+            Ok(false)
+        }
+        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
+        Err(err) => Err(CliError::from(err)),
     }
 }

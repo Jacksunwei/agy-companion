@@ -457,6 +457,42 @@ pub fn inspect_existing_dir(dir: &Path) -> Result<Option<fs::Metadata>, FsError>
     }
 }
 
+/// Classification of the final path component returned by [`inspect_leaf_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathLeafKind {
+    Missing,
+    RegularFile,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// Classifies the final path component via `lstat(2)` on a normalized path without
+/// dereferencing symlinks. Enforces `validate_path(path)` fail-closed.
+pub fn inspect_leaf_kind(path: &Path) -> Result<PathLeafKind, FsError> {
+    validate_path(path)?;
+    let check_path = normalize_path(path);
+    match fs::symlink_metadata(&check_path) {
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                Ok(PathLeafKind::Symlink)
+            } else if file_type.is_file() {
+                Ok(PathLeafKind::RegularFile)
+            } else if file_type.is_dir() {
+                Ok(PathLeafKind::Directory)
+            } else {
+                Ok(PathLeafKind::Other)
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(PathLeafKind::Missing),
+        Err(source) => Err(FsError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Ensures `dir` exists as a non-symlink directory, creating it recursively with `unix_mode` on Unix
 /// and post-create `lstat` verification.
 pub fn ensure_dir_no_symlink(dir: &Path, unix_mode: u32) -> Result<(), FsError> {
@@ -1476,6 +1512,20 @@ mod tests {
             0o600
         );
 
+        let new_append_log = tmp.path().join("new_proxy.log");
+        {
+            let (mut f, meta) =
+                open_verified_regular_file_0600(&new_append_log, OpenRegularMode::AppendCreate)
+                    .expect("create append 0600");
+            assert_eq!(meta.len(), 0);
+            f.write_all(b"first\n").expect("append new");
+        }
+        assert_eq!(fs::read(&new_append_log).unwrap(), b"first\n");
+        assert_eq!(
+            fs::metadata(&new_append_log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
         // tighten_regular_file_mode_0600
         let loose = tmp.path().join("loose.txt");
         fs::write(&loose, b"x").expect("write loose");
@@ -1499,6 +1549,10 @@ mod tests {
         ));
         assert!(matches!(
             open_verified_regular_file_0600(&link, OpenRegularMode::ReadWriteCreate),
+            Err(FsError::SymlinkRejected { .. })
+        ));
+        assert!(matches!(
+            open_verified_regular_file_0600(&link, OpenRegularMode::AppendCreate),
             Err(FsError::SymlinkRejected { .. })
         ));
         assert_eq!(
@@ -1791,5 +1845,83 @@ mod tests {
             ErrorKind::InvalidInput
         );
         assert!(victim.exists());
+    }
+
+    #[test]
+    fn inspect_leaf_kind_classifies_entries_and_rejects_invalid_paths() {
+        let tmp = TempDir::new().expect("temp dir");
+        let missing = tmp.path().join("does-not-exist");
+        let file = tmp.path().join("regular.txt");
+        let dir = tmp.path().join("dir");
+        fs::write(&file, b"hello").expect("write file");
+        fs::create_dir(&dir).expect("mkdir");
+
+        assert_eq!(inspect_leaf_kind(&missing).unwrap(), PathLeafKind::Missing);
+        assert_eq!(inspect_leaf_kind(&file).unwrap(), PathLeafKind::RegularFile);
+        assert_eq!(inspect_leaf_kind(&dir).unwrap(), PathLeafKind::Directory);
+
+        // Invalid paths fail closed before any lstat.
+        assert!(matches!(
+            inspect_leaf_kind(Path::new("")),
+            Err(FsError::EmptyPath)
+        ));
+        assert!(matches!(
+            inspect_leaf_kind(Path::new("   ")),
+            Err(FsError::EmptyPath)
+        ));
+        assert!(matches!(
+            inspect_leaf_kind(Path::new("/tmp/a\0b")),
+            Err(FsError::ContainsNul)
+        ));
+        assert!(matches!(
+            inspect_leaf_kind(&dir.join("..").join("regular.txt")),
+            Err(FsError::ParentDirTraversal)
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::process::Command;
+
+            let file_link = tmp.path().join("file_link");
+            let dir_link = tmp.path().join("dir_link");
+            let dangling_link = tmp.path().join("dangling_link");
+            symlink(&file, &file_link).expect("file symlink");
+            symlink(&dir, &dir_link).expect("dir symlink");
+            symlink(tmp.path().join("nowhere"), &dangling_link).expect("dangling symlink");
+
+            assert_eq!(
+                inspect_leaf_kind(&file_link).unwrap(),
+                PathLeafKind::Symlink
+            );
+            assert_eq!(inspect_leaf_kind(&dir_link).unwrap(), PathLeafKind::Symlink);
+            // Trailing slash on a directory symlink must normalize and still classify as Symlink.
+            let trailing_dir_link = PathBuf::from(format!("{}/", dir_link.display()));
+            assert_eq!(
+                inspect_leaf_kind(&trailing_dir_link).unwrap(),
+                PathLeafKind::Symlink
+            );
+            assert_eq!(
+                inspect_leaf_kind(&dangling_link).unwrap(),
+                PathLeafKind::Symlink
+            );
+
+            // FIFO classifies as Other without blocking.
+            let fifo = tmp.path().join("pipe.fifo");
+            assert!(
+                Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .expect("mkfifo")
+                    .success()
+            );
+            assert_eq!(inspect_leaf_kind(&fifo).unwrap(), PathLeafKind::Other);
+
+            // Child under regular file surfaces Io error (ENOTDIR), not Missing.
+            assert!(matches!(
+                inspect_leaf_kind(&file.join("child")),
+                Err(FsError::Io { .. })
+            ));
+        }
     }
 }

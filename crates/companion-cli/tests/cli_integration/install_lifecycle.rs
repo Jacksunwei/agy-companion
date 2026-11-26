@@ -1,14 +1,11 @@
-#![forbid(unsafe_code)]
-
-mod common;
-
 use std::fs;
+#[cfg(unix)]
 use std::process::Command;
 
 use serde_json::Value;
 use tempfile::TempDir;
 
-use common::{config_with_port, free_loopback_port, isolated_cli_command};
+use crate::common::{config_with_port, free_loopback_port, isolated_cli_command};
 
 #[cfg(unix)]
 #[test]
@@ -23,7 +20,7 @@ fn install_and_uninstall_full_isolated_lifecycle_respects_symlink_guard_dry_run_
     fs::create_dir_all(&home).expect("mkdir home");
     fs::create_dir_all(&plugins_dir).expect("mkdir plugins");
 
-    // Pre-write an isolated config with an ephemeral free port so we never collide with host 4141.
+    // Pre-write an isolated config with an ephemeral free port so we never touch default 24141.
     let cfg_path = xdg_config.join("agy-companion").join("config.json");
     let usage_dir = xdg_data.join("agy-companion").join("usage");
     fs::create_dir_all(&usage_dir).expect("mkdir usage");
@@ -431,7 +428,7 @@ fn install_and_uninstall_respect_explicit_config_flag_and_fail_closed_on_invalid
 
     // Seed default XDG config with a different port so we prove --config overrides XDG.
     let default_cfg_path = xdg_config.join("agy-companion").join("config.json");
-    config_with_port(24191)
+    config_with_port(free_loopback_port())
         .save_secure(&default_cfg_path)
         .expect("save default xdg config");
 
@@ -441,7 +438,7 @@ fn install_and_uninstall_respect_explicit_config_flag_and_fail_closed_on_invalid
     let keep_sibling = custom_dir.join("keep.txt");
     fs::write(&keep_sibling, "keep").expect("write sibling");
     let custom_cfg = custom_dir.join("my-companion.json");
-    let custom_port = 24149u16;
+    let custom_port = free_loopback_port();
     config_with_port(custom_port)
         .save_secure(&custom_cfg)
         .expect("save custom config");
@@ -576,7 +573,7 @@ fn install_and_uninstall_respect_explicit_config_flag_and_fail_closed_on_invalid
         let victim_dir = temp.path().join("victim_cfg_dir");
         fs::create_dir_all(&victim_dir).expect("mkdir victim");
         let victim_cfg = victim_dir.join("config.json");
-        config_with_port(24155)
+        config_with_port(free_loopback_port())
             .save_secure(&victim_cfg)
             .expect("save victim cfg");
         let sym_parent = temp.path().join("sym_cfg_parent");
@@ -649,7 +646,11 @@ fn install_persists_launcher_auto_start_and_uninstall_purge_removes_integration_
     fs::create_dir_all(&home).expect("mkdir home");
 
     // 1. `install --no-launcher-hook` persists launcher_auto_start = Some(false) and leaves RC untouched.
+    // Pre-write an ephemeral-port config (launcher_auto_start = None) so install never probes default 24141.
     let cfg_opt_out = temp.path().join("opt_out/config.json");
+    config_with_port(free_loopback_port())
+        .save_secure(&cfg_opt_out)
+        .expect("save opt_out config");
     let out_opt_out = isolated_cli_command(&home)
         .env("XDG_CONFIG_HOME", &xdg_config)
         .env("XDG_DATA_HOME", &xdg_data)
@@ -683,6 +684,9 @@ fn install_persists_launcher_auto_start_and_uninstall_purge_removes_integration_
 
     // 2. Default Unix `install` enables launcher hook and persists launcher_auto_start = Some(true).
     let cfg_default = temp.path().join("default_install/config.json");
+    config_with_port(free_loopback_port())
+        .save_secure(&cfg_default)
+        .expect("save default_install config");
     let out_default = isolated_cli_command(&home)
         .env("XDG_CONFIG_HOME", &xdg_config)
         .env("XDG_DATA_HOME", &xdg_data)

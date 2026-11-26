@@ -97,6 +97,11 @@ impl CloudCodeClient {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_prod_route_for_test(&self) {
+        self.inner.cache.record_without_key(true, true);
+    }
+
     pub fn base_url(&self) -> &str {
         match &self.inner.target {
             CloudCodeTarget::Fixed(url) => url,

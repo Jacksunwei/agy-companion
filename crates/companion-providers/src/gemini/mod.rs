@@ -67,10 +67,19 @@ impl fmt::Debug for GeminiProvider {
 impl GeminiProvider {
     /// Constructs a validated `GeminiProvider` from `companion_core::GeminiConfig`.
     pub fn from_config(config: &GeminiConfig) -> Result<Self, ProviderError> {
-        Self::new(
+        Self::from_config_with_timeout(config, Duration::from_secs(config.timeout_secs))
+    }
+
+    /// Constructs a validated `GeminiProvider` from `companion_core::GeminiConfig`
+    /// using an explicit request timeout `Duration` (`!timeout.is_zero()`).
+    pub fn from_config_with_timeout(
+        config: &GeminiConfig,
+        timeout: Duration,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_timeout(
             config.base_url.as_str(),
             config.api_key.as_ref().map(|k| k.expose().to_string()),
-            config.timeout_secs,
+            timeout,
         )
     }
 
@@ -80,12 +89,16 @@ impl GeminiProvider {
         api_key: Option<String>,
         timeout_secs: u64,
     ) -> Result<Self, ProviderError> {
-        Self::build(
-            base_url.into(),
-            api_key,
-            timeout_secs,
-            EnvKeySource::ProcessEnv,
-        )
+        Self::new_with_timeout(base_url, api_key, Duration::from_secs(timeout_secs))
+    }
+
+    /// Constructs a validated `GeminiProvider` from explicit parameters (`!timeout.is_zero()`).
+    pub fn new_with_timeout(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, ProviderError> {
+        Self::build(base_url.into(), api_key, timeout, EnvKeySource::ProcessEnv)
     }
 
     /// Controls whether `GEMINI_API_KEY` env fallback is consulted when neither
@@ -107,7 +120,7 @@ impl GeminiProvider {
         Self::build(
             config.base_url.clone(),
             config.api_key.as_ref().map(|k| k.expose().to_string()),
-            config.timeout_secs,
+            Duration::from_secs(config.timeout_secs),
             EnvKeySource::Fixed(env_key.map(str::to_owned)),
         )
     }
@@ -115,12 +128,12 @@ impl GeminiProvider {
     fn build(
         raw_base_url: String,
         api_key: Option<String>,
-        timeout_secs: u64,
+        timeout: Duration,
         env_key_source: EnvKeySource,
     ) -> Result<Self, ProviderError> {
-        if timeout_secs == 0 {
+        if timeout.is_zero() {
             return Err(ProviderError::InvalidConfig(
-                "timeout_secs must be greater than 0".to_string(),
+                "timeout must be greater than 0".to_string(),
             ));
         }
 
@@ -132,8 +145,7 @@ impl GeminiProvider {
             None => None,
         };
 
-        let timeout = Duration::from_secs(timeout_secs);
-        let connect_timeout = Duration::from_secs(timeout_secs.min(MAX_CONNECT_TIMEOUT_SECS));
+        let connect_timeout = timeout.min(Duration::from_secs(MAX_CONNECT_TIMEOUT_SECS));
 
         let mut builder = reqwest::Client::builder()
             .timeout(timeout)

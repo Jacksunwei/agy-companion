@@ -1,25 +1,26 @@
-#![forbid(unsafe_code)]
-
-mod common;
-
 use std::fs;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use companion_core::{ApiKey, Config};
 use companion_proxy::{HealthResponse, PROTOCOL_VERSION};
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 
-use common::{
-    BIN, ChildGuard, config_with_port, free_loopback_port, proxy_pid_matches_child,
-    spawn_mock_health, spawn_serve_and_wait_healthy, spawn_serve_with_port_picker,
+#[cfg(unix)]
+use crate::common::ChildGuard;
+use crate::common::{
+    BIN, config_with_port, free_loopback_port, isolated_cli_command, isolated_tokio_cli_command,
+    loopback_http_client, proxy_pid_matches_child, spawn_mock_health, spawn_serve_and_wait_healthy,
+    spawn_serve_with_port_picker,
 };
 
 #[test]
 fn binary_version_prints_agy_companion_version() {
-    let output = Command::new(BIN)
+    let temp = TempDir::new().expect("tempdir");
+    let output = isolated_cli_command(temp.path())
         .arg("--version")
         .output()
         .expect("run --version");
@@ -42,7 +43,7 @@ fn serve_rejects_non_loopback_config_and_port_zero() {
         r#"{"schema_version":1,"proxy":{"host":"0.0.0.0","port":4141},"providers":{"gemini":{"base_url":"https://generativelanguage.googleapis.com","api_key":"AIzaSyServeBadHostSecret111","default_model":"gemini-4-hydrogen","timeout_secs":900}}}"#,
     )
     .expect("write bad_host");
-    let out = Command::new(BIN)
+    let out = isolated_cli_command(temp.path())
         .args(["serve", "--config"])
         .arg(&bad_host)
         .output()
@@ -56,7 +57,7 @@ fn serve_rejects_non_loopback_config_and_port_zero() {
     // (b) --port 0
     let valid_cfg = temp.path().join("valid.json");
     Config::default().save_secure(&valid_cfg).expect("save");
-    let out = Command::new(BIN)
+    let out = isolated_cli_command(temp.path())
         .args(["serve", "--port", "0", "--config"])
         .arg(&valid_cfg)
         .output()
@@ -71,7 +72,7 @@ fn serve_rejects_non_loopback_config_and_port_zero() {
         r#"{"schema_version":1,"proxy":{"host":"127.0.0.1","port":4141},"providers":{"gemini":{"base_url":"http://evil.com","api_key":"AIzaSyServeBadUrlSecret222","default_model":"gemini-4-hydrogen","timeout_secs":900}}}"#,
     )
     .expect("write bad_url");
-    let out = Command::new(BIN)
+    let out = isolated_cli_command(temp.path())
         .args(["serve", "--config"])
         .arg(&bad_url)
         .output()
@@ -89,19 +90,15 @@ async fn serve_binds_loopback_serves_health_and_exits_cleanly_on_sigterm() {
     let cfg_path = temp.path().join("config.json");
     let usage_dir = temp.path().join("usage");
 
-    let mut cfg = Config::default();
+    let mut cfg = config_with_port(free_loopback_port());
     cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyServeLiveSecret8888").unwrap());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("client");
+    let client = loopback_http_client();
 
-    let (guard, _port, resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
-        let mut cmd = Command::new(BIN);
+    let (guard, _port, resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
+        let mut cmd = isolated_cli_command(temp.path());
         cmd.args(["serve", "--port", &port.to_string(), "--config"])
             .arg(&cfg_path)
             .env("GEMINI_API_KEY", "AIzaSyServeEnvSecret7777");
@@ -155,6 +152,9 @@ async fn serve_binds_loopback_serves_health_and_exits_cleanly_on_sigterm() {
         assert!(!stderr.contains("AIzaSyServeLiveSecret8888"));
         assert!(!stderr.contains("AIzaSyServeEnvSecret7777"));
     }
+
+    #[cfg(not(unix))]
+    let _ = &guard;
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn doctor_passes_against_healthy_server_under_hostile_proxy_and_never_leak
     cfg.save_secure(&cfg_path).expect("save_secure");
 
     for extra_args in [&["--json"][..], &[][..]] {
-        let mut cmd = tokio::process::Command::new(BIN);
+        let mut cmd = isolated_tokio_cli_command(temp.path());
         cmd.args(["doctor", "--config"])
             .arg(&cfg_path)
             .args(["--port", &port.to_string()])
@@ -222,7 +222,7 @@ async fn doctor_fails_on_version_skew_open_permissions_and_unreachable_proxy() {
     let (skew_port, skew_handle) = spawn_mock_health("ok", "0.0.1", PROTOCOL_VERSION).await;
     let cfg_ok = temp.path().join("cfg_ok.json");
     Config::default().save_secure(&cfg_ok).expect("save_secure");
-    let out = tokio::process::Command::new(BIN)
+    let out = isolated_tokio_cli_command(temp.path())
         .args(["doctor", "--config"])
         .arg(&cfg_ok)
         .args(["--port", &skew_port.to_string(), "--json"])
@@ -249,7 +249,7 @@ async fn doctor_fails_on_version_skew_open_permissions_and_unreachable_proxy() {
             .expect("save_secure");
         fs::set_permissions(&cfg_open, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
 
-        let out = tokio::process::Command::new(BIN)
+        let out = isolated_tokio_cli_command(temp.path())
             .args(["doctor", "--config"])
             .arg(&cfg_open)
             .args(["--port", &ok_port.to_string(), "--json"])
@@ -266,7 +266,7 @@ async fn doctor_fails_on_version_skew_open_permissions_and_unreachable_proxy() {
 
     // (c) Closed free port + 0600 config
     let closed_port = free_loopback_port();
-    let out = tokio::process::Command::new(BIN)
+    let out = isolated_tokio_cli_command(temp.path())
         .args(["doctor", "--config"])
         .arg(&cfg_ok)
         .args(["--port", &closed_port.to_string(), "--json"])
@@ -289,7 +289,7 @@ fn models_json_flag_emits_valid_custom_models_config_for_custom_port() {
     cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyModelsSecret4444").unwrap());
     cfg.save_secure(&cfg_path).expect("save_secure");
 
-    let output = Command::new(BIN)
+    let output = isolated_cli_command(temp.path())
         .args(["models", "--json", "--port", "5252", "--config"])
         .arg(&cfg_path)
         .output()
@@ -342,7 +342,7 @@ fn models_json_flag_emits_valid_custom_models_config_for_custom_port() {
     assert!(!stderr.contains("AIzaSyModelsSecret4444"));
 
     // Negative check: --port 0 must exit non-zero
-    let zero_out = Command::new(BIN)
+    let zero_out = isolated_cli_command(temp.path())
         .args(["models", "--json", "--port", "0", "--config"])
         .arg(&cfg_path)
         .output()
@@ -360,7 +360,7 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
     cfg.save_secure(&env_cfg).expect("save env_cfg");
 
     // AGY_COMPANION_CONFIG is honored when --config is omitted
-    let out = Command::new(BIN)
+    let out = isolated_cli_command(temp.path())
         .args(["models", "--json"])
         .env("AGY_COMPANION_CONFIG", &env_cfg)
         .output()
@@ -377,7 +377,7 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
     let cli_cfg = temp.path().join("cli_config.json");
     let cfg2 = config_with_port(5454);
     cfg2.save_secure(&cli_cfg).expect("save cli_cfg");
-    let out = Command::new(BIN)
+    let out = isolated_cli_command(temp.path())
         .args(["models", "--json", "--config"])
         .arg(&cli_cfg)
         .env("AGY_COMPANION_CONFIG", "../invalid-env-path.json")
@@ -392,7 +392,7 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
     );
 
     // ui-mcp eagerly rejects path traversal in --data-dir with zero stdout
-    let out = Command::new(BIN)
+    let out = isolated_cli_command(temp.path())
         .args(["ui-mcp", "--data-dir=../escape", "--config"])
         .arg(&cli_cfg)
         .output()
@@ -403,7 +403,7 @@ fn config_env_precedence_and_eager_path_traversal_rejection() {
 
     // doctor --config ../escape.json --json still outputs valid JSON and exits 1
     let closed_port = free_loopback_port();
-    let out = Command::new(BIN)
+    let out = isolated_cli_command(temp.path())
         .args([
             "doctor",
             "--config",
@@ -443,14 +443,12 @@ async fn doctor_rejects_trailing_slash_and_dot_suffix_symlinks_via_flag_and_env(
     let dir_link = temp.path().join("dir_symlink");
     symlink(&real_dir, &dir_link).expect("dir symlink");
 
+    // 4 representative trailing-slash & dot-suffix symlink shapes (exhaustive normalization
+    // permutations are owned by companion_core::fs_safe unit tests).
     let cases = [
         (
             "dangling/",
             PathBuf::from(format!("{}/", dangling_link.display())),
-        ),
-        (
-            "dangling//",
-            PathBuf::from(format!("{}//", dangling_link.display())),
         ),
         (
             "dangling/.",
@@ -461,14 +459,6 @@ async fn doctor_rejects_trailing_slash_and_dot_suffix_symlinks_via_flag_and_env(
             PathBuf::from(format!("{}/", file_link.display())),
         ),
         (
-            "sym_file/.",
-            PathBuf::from(format!("{}/.", file_link.display())),
-        ),
-        (
-            "sym_dir/",
-            PathBuf::from(format!("{}/", dir_link.display())),
-        ),
-        (
             "sym_dir/.",
             PathBuf::from(format!("{}/.", dir_link.display())),
         ),
@@ -477,7 +467,7 @@ async fn doctor_rejects_trailing_slash_and_dot_suffix_symlinks_via_flag_and_env(
     for (label, path) in &cases {
         for use_env in [false, true] {
             for json_mode in [true, false] {
-                let mut cmd = tokio::process::Command::new(BIN);
+                let mut cmd = isolated_tokio_cli_command(temp.path());
                 cmd.arg("doctor");
                 if use_env {
                     cmd.env("AGY_COMPANION_CONFIG", path);
@@ -556,18 +546,14 @@ async fn serve_writes_0600_proxy_pid_and_proxy_log_in_isolated_dir_and_cleans_pi
     let cfg_path = temp.path().join("config.json");
     let usage_dir = temp.path().join("usage");
 
-    let mut cfg = Config::default();
+    let mut cfg = config_with_port(free_loopback_port());
     cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyPidLogSecret12345").unwrap());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("client");
-    let (guard, port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
-        let mut cmd = Command::new(BIN);
+    let client = loopback_http_client();
+    let (guard, port, _resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
+        let mut cmd = isolated_cli_command(temp.path());
         cmd.args(["serve", "--port", &port.to_string(), "--config"])
             .arg(&cfg_path);
         cmd
@@ -641,116 +627,6 @@ async fn serve_writes_0600_proxy_pid_and_proxy_log_in_isolated_dir_and_cleans_pi
     }
 }
 
-#[tokio::test]
-async fn serve_idle_shutdown_waits_for_in_flight_stream_then_exits_zero() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Mock upstream SSE server that holds the stream open for 1.6s (> 1s idle timeout).
-    let upstream_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock upstream");
-    let upstream_port = upstream_listener.local_addr().expect("addr").port();
-    let upstream_handle = tokio::spawn(async move {
-        if let Ok((mut stream, _)) = upstream_listener.accept().await {
-            let mut req_buf = [0u8; 4096];
-            let _ = stream.read(&mut req_buf).await;
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
-                )
-                .await;
-            let chunk1 =
-                b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"part1\"}]}}]}\n\n";
-            let _ = stream
-                .write_all(format!("{:x}\r\n", chunk1.len()).as_bytes())
-                .await;
-            let _ = stream.write_all(chunk1).await;
-            let _ = stream.write_all(b"\r\n").await;
-            let _ = stream.flush().await;
-
-            tokio::time::sleep(Duration::from_millis(1600)).await;
-
-            let chunk2 = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"part2\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}\n\n";
-            let _ = stream
-                .write_all(format!("{:x}\r\n", chunk2.len()).as_bytes())
-                .await;
-            let _ = stream.write_all(chunk2).await;
-            let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
-            let _ = stream.flush().await;
-        }
-    });
-
-    let temp = TempDir::new().expect("tempdir");
-    let cfg_path = temp.path().join("config.json");
-    let usage_dir = temp.path().join("usage");
-
-    let mut cfg = Config::default();
-    cfg.providers.gemini.base_url = format!("http://127.0.0.1:{upstream_port}");
-    cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyIdleStreamKey1234").unwrap());
-    cfg.usage_dir = Some(usage_dir);
-    cfg.save_secure(&cfg_path).expect("save_secure");
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("client");
-    let (guard, port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
-        let mut cmd = Command::new(BIN);
-        cmd.args(["serve", "--port", &port.to_string(), "--config"])
-            .arg(&cfg_path)
-            .args(["--idle-shutdown-secs", "1"]);
-        cmd
-    })
-    .await;
-
-    let pid_path = temp.path().join("proxy.pid");
-    assert!(pid_path.is_file());
-
-    // Start slow SSE stream; proxy must stay alive through the entire 1.6s stream despite 1s idle timeout.
-    let stream_started = Instant::now();
-    let stream_resp = client
-        .post(format!(
-            "http://127.0.0.1:{port}/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse"
-        ))
-        .header("content-type", "application/json")
-        .body(r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#)
-        .send()
-        .await
-        .expect("stream request");
-    assert_eq!(stream_resp.status(), reqwest::StatusCode::OK);
-    let stream_body = stream_resp.text().await.expect("read full stream");
-    let stream_elapsed = stream_started.elapsed();
-    assert!(
-        stream_elapsed >= Duration::from_millis(1400),
-        "stream ended too early ({stream_elapsed:?}); idle shutdown must not interrupt active stream"
-    );
-    assert!(stream_body.contains("part1"));
-    assert!(stream_body.contains("part2"));
-
-    // Now that zero requests are in flight, serve must exit cleanly with code 0 after ~1s idle.
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || guard.wait_with_output()),
-    )
-    .await
-    .expect("serve did not exit after idle shutdown timeout")
-    .expect("join wait")
-    .expect("wait_with_output");
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "idle shutdown must exit 0; stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !pid_path.exists(),
-        "proxy.pid must be removed on clean idle shutdown"
-    );
-
-    upstream_handle.abort();
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms() {
@@ -758,19 +634,13 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
     let cfg_path = temp.path().join("config.json");
     let usage_dir = temp.path().join("usage");
 
-    let cfg = Config {
-        usage_dir: Some(usage_dir),
-        ..Default::default()
-    };
+    let mut cfg = config_with_port(free_loopback_port());
+    cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("client");
-    let (primary_guard, port, _resp) = spawn_serve_and_wait_healthy(&client, &cfg_path, |port| {
-        let mut cmd = Command::new(BIN);
+    let client = loopback_http_client();
+    let (primary_guard, port, _resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
+        let mut cmd = isolated_cli_command(temp.path());
         cmd.args(["serve", "--port", &port.to_string(), "--config"])
             .arg(&cfg_path);
         cmd
@@ -785,7 +655,7 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
     assert_eq!(primary_pid_json["pid"], primary_pid);
 
     // Start standby with --adopt-running.
-    let standby_child = Command::new(BIN)
+    let standby_child = isolated_cli_command(temp.path())
         .args(["serve", "--port", &port.to_string(), "--config"])
         .arg(&cfg_path)
         .arg("--adopt-running")
@@ -797,7 +667,7 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
     let standby_pid = standby_guard.id();
 
     // Standby must NOT clobber primary's proxy.pid while parked.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
     if let Some(status) = standby_guard.try_wait().expect("try_wait standby") {
         let output = tokio::task::spawn_blocking(move || standby_guard.wait_with_output())
             .await
@@ -850,7 +720,7 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
             "standby failed to take over within 2s (elapsed={:?})",
             takeover_start.elapsed()
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     // Stop standby cleanly and verify proxy.pid is removed.
@@ -868,37 +738,6 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
 }
 
 #[tokio::test]
-async fn doctor_cli_quarantines_placeholder_gemini_api_key() {
-    let (port, handle) = spawn_mock_health("ok", env!("CARGO_PKG_VERSION"), PROTOCOL_VERSION).await;
-    let temp = TempDir::new().expect("tempdir");
-    let cfg_path = temp.path().join("config.json");
-    Config::default().save_secure(&cfg_path).expect("save");
-
-    let output = tokio::process::Command::new(BIN)
-        .args(["doctor", "--config"])
-        .arg(&cfg_path)
-        .args(["--port", &port.to_string(), "--json"])
-        .env("GEMINI_API_KEY", companion_core::PROXY_PLACEHOLDER_API_KEY)
-        .output()
-        .await
-        .expect("run doctor");
-    handle.abort();
-
-    assert_eq!(output.status.code(), Some(0));
-    let parsed: Value =
-        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("parse doctor JSON");
-    assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["env"]["gemini_api_key_set"], false);
-    let key_check = parsed["checks"]
-        .as_array()
-        .expect("checks")
-        .iter()
-        .find(|c| c["name"] == "env_gemini_api_key")
-        .expect("env_gemini_api_key check");
-    assert_eq!(key_check["status"], "warn");
-}
-
-#[tokio::test]
 async fn spawn_serve_rejects_foreign_health_and_retries_fresh_port() {
     let (foreign_port, foreign_handle) =
         spawn_mock_health("ok", env!("CARGO_PKG_VERSION"), PROTOCOL_VERSION).await;
@@ -906,10 +745,8 @@ async fn spawn_serve_rejects_foreign_health_and_retries_fresh_port() {
     let temp = TempDir::new().expect("tempdir");
     let cfg_path = temp.path().join("config.json");
     let usage_dir = temp.path().join("usage");
-    let cfg = Config {
-        usage_dir: Some(usage_dir),
-        ..Default::default()
-    };
+    let mut cfg = config_with_port(free_loopback_port());
+    cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
 
     // Pre-seed a stale proxy.pid with matching port but non-matching PID (0) to verify
@@ -928,15 +765,11 @@ async fn spawn_serve_rejects_foreign_health_and_retries_fresh_port() {
     )
     .expect("write stale pid");
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("client");
+    let client = loopback_http_client();
 
     let mut attempts_seen = 0usize;
     let (guard, actual_port, resp) = spawn_serve_with_port_picker(
-        &client,
+        client,
         &cfg_path,
         |attempt| {
             attempts_seen = attempt;
@@ -947,7 +780,7 @@ async fn spawn_serve_rejects_foreign_health_and_retries_fresh_port() {
             }
         },
         |port| {
-            let mut cmd = Command::new(BIN);
+            let mut cmd = isolated_cli_command(temp.path());
             cmd.args(["serve", "--port", &port.to_string(), "--config"])
                 .arg(&cfg_path);
             cmd

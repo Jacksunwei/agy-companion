@@ -1,11 +1,13 @@
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use companion_core::Config;
-use companion_core::fs_safe::unlink_symlink;
+use companion_core::fs_safe::{FsError, PathLeafKind, inspect_leaf_kind, unlink_symlink};
 #[cfg(windows)]
-use companion_core::fs_safe::{rename_with_retry, unique_temp_suffix};
+use companion_core::fs_safe::{
+    inspect_regular_file_if_exists, rename_with_retry, unique_temp_suffix,
+};
 use companion_providers::LoopbackProxyClient;
 
 #[cfg(unix)]
@@ -38,8 +40,6 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
 
     let config_path = resolve_cli_config_path(opts.config.as_deref())?;
     let norm_config_path = normalized_metadata_path(&config_path);
-    let probe =
-        LoopbackProxyClient::new(INSTALL_HEALTH_PROBE_TIMEOUT, INSTALL_HEALTH_PROBE_TIMEOUT)?;
     let data_dir = companion_core::default_data_dir()?;
     let data_dir_safety = inspect_data_dir(&home, &data_dir, &mut warnings)?;
     let config_dir_safety = inspect_config_dir(&home, &norm_config_path, &mut warnings)?;
@@ -131,44 +131,43 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
             == ExistingDirSafety::SafeDir
     };
     if plugins_root_safe {
-        match fs::symlink_metadata(normalized_metadata_path(&plugin_target)) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+        match inspect_leaf_kind(&plugin_target) {
+            Ok(PathLeafKind::Symlink) => {
                 // Unlink symlink ONLY; never delete the symlink target directory.
                 if !opts.dry_run {
                     unlink_symlink(&plugin_target)?;
                 }
                 plugin_dir_removed = true;
             }
-            Ok(meta) if meta.file_type().is_dir() => {
-                match is_companion_plugin_dir(&plugin_target) {
-                    Ok(true) => {
-                        if !opts.dry_run {
-                            fs::remove_dir_all(&plugin_target)?;
-                        }
-                        plugin_dir_removed = true;
+            Ok(PathLeafKind::Directory) => match is_companion_plugin_dir(&plugin_target) {
+                Ok(true) => {
+                    if !opts.dry_run {
+                        fs::remove_dir_all(&plugin_target)?;
                     }
-                    Ok(false) => {
-                        warnings.push(format!(
-                            "refusing to remove plugin directory '{}': missing or non-companion plugin.json",
-                            plugin_target.display()
-                        ));
-                    }
-                    Err(err) => {
-                        warnings.push(format!(
-                            "refusing to remove plugin directory '{}': {err}",
-                            plugin_target.display()
-                        ));
-                    }
+                    plugin_dir_removed = true;
                 }
-            }
-            Ok(_) => {
+                Ok(false) => {
+                    warnings.push(format!(
+                        "refusing to remove plugin directory '{}': missing or non-companion plugin.json",
+                        plugin_target.display()
+                    ));
+                }
+                Err(err) => {
+                    warnings.push(format!(
+                        "refusing to remove plugin directory '{}': {err}",
+                        plugin_target.display()
+                    ));
+                }
+            },
+            Ok(PathLeafKind::RegularFile | PathLeafKind::Other) => {
                 warnings.push(format!(
                     "refusing to remove non-directory plugin path '{}'",
                     plugin_target.display()
                 ));
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => return Err(CliError::Io(err)),
+            Ok(PathLeafKind::Missing) => {}
+            Err(FsError::Io { source, .. }) => return Err(CliError::Io(source)),
+            Err(err) => return Err(CliError::from(err)),
         }
     }
 
@@ -181,8 +180,16 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
         pid_paths.push(data_dir.join(PROXY_PID_FILENAME));
     }
     let pid_candidates = deduplicate_paths(pid_paths);
-    let (proxy_stopped, proxy_pid) =
-        stop_proxy_from_pid_files(&probe, &pid_candidates, None, opts.dry_run, &mut warnings).await;
+    let (proxy_stopped, proxy_pid) = if pid_candidates
+        .iter()
+        .any(|p| !matches!(inspect_leaf_kind(p), Ok(PathLeafKind::Missing)))
+    {
+        let probe =
+            LoopbackProxyClient::new(INSTALL_HEALTH_PROBE_TIMEOUT, INSTALL_HEALTH_PROBE_TIMEOUT)?;
+        stop_proxy_from_pid_files(&probe, &pid_candidates, None, opts.dry_run, &mut warnings).await
+    } else {
+        (false, None)
+    };
 
     #[cfg(windows)]
     let windows_shortcut_removed = remove_windows_start_menu_shortcut(opts.dry_run, &mut warnings)?;
@@ -214,8 +221,8 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
     )? == ExistingDirSafety::SafeDir
     {
         let local_bin_link = home.join(".local").join("bin").join(BINARY_NAME);
-        match fs::symlink_metadata(normalized_metadata_path(&local_bin_link)) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+        match inspect_leaf_kind(&local_bin_link) {
+            Ok(PathLeafKind::Symlink) => {
                 if symlink_points_to_path(&local_bin_link, &stable_bin) {
                     if !opts.dry_run {
                         fs::remove_file(&local_bin_link)?;
@@ -229,14 +236,14 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
                     false
                 }
             }
-            Ok(_) => {
+            Ok(PathLeafKind::RegularFile | PathLeafKind::Directory | PathLeafKind::Other) => {
                 warnings.push(format!(
                     "preserving non-symlink file '{}'",
                     local_bin_link.display()
                 ));
                 false
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => false,
+            Ok(PathLeafKind::Missing) => false,
             Err(err) => {
                 warnings.push(format!(
                     "failed inspecting '{}': {err}",
@@ -258,8 +265,8 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
         }
         #[cfg(windows)]
         {
-            match fs::symlink_metadata(normalized_metadata_path(&stable_bin)) {
-                Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
+            match inspect_regular_file_if_exists(&stable_bin, None) {
+                Ok(Some(_)) => {
                     if opts.dry_run {
                         true
                     } else if let Err(rm_err) = fs::remove_file(&stable_bin) {
@@ -278,9 +285,10 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
                         true
                     }
                 }
-                Ok(_) => false,
-                Err(err) if err.kind() == ErrorKind::NotFound => false,
-                Err(err) => return Err(CliError::Io(err)),
+                Ok(None)
+                | Err(FsError::SymlinkRejected { .. } | FsError::NotRegularFile { .. }) => false,
+                Err(FsError::Io { source, .. }) => return Err(CliError::Io(source)),
+                Err(err) => return Err(CliError::from(err)),
             }
         }
     } else {
@@ -378,7 +386,7 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
         }
     } else {
         if config_dir_safety == ExistingDirSafety::SafeDir
-            && fs::symlink_metadata(&norm_config_path).is_ok()
+            && inspect_leaf_kind(&config_path).is_ok_and(|k| k != PathLeafKind::Missing)
         {
             preserved_paths.push(config_path.clone());
         }
@@ -390,7 +398,7 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
             {
                 continue;
             }
-            if fs::symlink_metadata(normalized_metadata_path(usage_dir)).is_ok() {
+            if inspect_leaf_kind(usage_dir).is_ok_and(|k| k != PathLeafKind::Missing) {
                 preserved_paths.push(usage_dir.clone());
             }
         }

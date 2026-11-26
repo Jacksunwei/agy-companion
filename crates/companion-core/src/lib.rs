@@ -20,14 +20,17 @@ pub use config::{
 };
 pub use fs_safe::{
     AtomicWriteOptions, BoundedReadResult, DirChainStatus, FileStamp, FsError, OpenRegularMode,
-    ParentDirPolicy, RejectedReason, SymlinkPolicy, TargetFilePolicy, TempPathGuard, validate_path,
-    write_atomic, write_atomic_secure,
+    ParentDirPolicy, PathLeafKind, RejectedReason, SymlinkPolicy, TargetFilePolicy, TempPathGuard,
+    inspect_leaf_kind, validate_path, write_atomic, write_atomic_secure,
 };
 pub use integration::{
     AutoEnableOutcome, DEFAULT_RESTORE_PREFIX, HOOK_BEGIN_MARKER, HOOK_END_MARKER,
     INTEGRATION_LOCK_FILENAME, IntegrationLock, IntegrationOptions, IntegrationPaths,
     IntegrationState, IntegrationStatus, ShellKind, StripReport, disable_and_persist,
-    enable_and_persist, ensure_first_run_launcher_enabled, set_launcher_auto_start_locked,
+    disable_and_persist_with_hybrid_active, enable_and_persist,
+    enable_and_persist_with_hybrid_active, ensure_first_run_launcher_enabled,
+    ensure_first_run_launcher_enabled_with_hybrid_active, set_launcher_auto_start_locked,
+    status_with_hybrid_active,
 };
 pub use models::{
     CURATED_GEMINI_MODELS, CuratedGeminiModel, DEFAULT_ENABLED_GEMINI_MODELS, DEFAULT_GEMINI_MODEL,

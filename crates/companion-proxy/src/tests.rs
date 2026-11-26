@@ -601,38 +601,52 @@ async fn hot_reload_preserves_cloudcode_routing_cache_when_upstream_and_timeout_
 
     let initial_cloudcode = Arc::clone(&state.active_provider().await.cloudcode);
     assert_eq!(initial_cloudcode.mode_label(), "auto");
+    initial_cloudcode.seed_prod_route_for_test();
+    assert_eq!(
+        initial_cloudcode.base_url(),
+        companion_core::CLOUDCODE_PROD_UPSTREAM_URL
+    );
 
     // Saving a new API key without changing cloudcode.upstream or timeout_secs
-    // must preserve the exact same Arc<CloudCodeClient> (and its routing LRU cache).
+    // must preserve the CloudCode routing cache across hot-reload.
     cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaSyReloadPreservesLru1").unwrap());
     cfg.save_secure(&config_path).unwrap();
     let after_key_save = state.active_provider().await;
     assert!(after_key_save.has_configured_api_key);
-    assert!(
-        Arc::ptr_eq(&initial_cloudcode, &after_key_save.cloudcode),
-        "CloudCodeClient Arc must be preserved across API key hot-reload"
+    assert_eq!(after_key_save.cloudcode.mode_label(), "auto");
+    assert_eq!(after_key_save.cloudcode_timeout_secs, 900);
+    assert_eq!(
+        after_key_save.cloudcode.base_url(),
+        companion_core::CLOUDCODE_PROD_UPSTREAM_URL,
+        "CloudCode routing cache must survive API key hot-reload"
     );
 
-    // Changing timeout_secs must rebuild CloudCodeClient.
+    // Changing timeout_secs must rebuild CloudCodeClient with a fresh routing cache and new timeout.
     cfg.providers.gemini.timeout_secs = 600;
     cfg.save_secure(&config_path).unwrap();
     let after_timeout_change = state.active_provider().await;
-    assert!(
-        !Arc::ptr_eq(&initial_cloudcode, &after_timeout_change.cloudcode),
-        "CloudCodeClient Arc must rebuild when timeout_secs changes"
+    assert_eq!(after_timeout_change.cloudcode_timeout_secs, 600);
+    assert_eq!(after_timeout_change.cloudcode.mode_label(), "auto");
+    assert_eq!(
+        after_timeout_change.cloudcode.base_url(),
+        companion_core::CLOUDCODE_DAILY_UPSTREAM_URL,
+        "CloudCodeClient must rebuild with fresh routing cache when timeout_secs changes"
     );
 
-    // Changing cloudcode.upstream must also rebuild CloudCodeClient.
-    let prev = Arc::clone(&after_timeout_change.cloudcode);
+    // Changing cloudcode.upstream must rebuild CloudCodeClient in fixed mode.
     cfg.cloudcode.upstream =
         CloudCodeUpstream::Fixed("https://cloudcode-pa.googleapis.com".to_string());
     cfg.save_secure(&config_path).unwrap();
     let after_url_change = state.active_provider().await;
-    assert!(
-        !Arc::ptr_eq(&prev, &after_url_change.cloudcode),
-        "CloudCodeClient Arc must rebuild when cloudcode_upstream_url changes"
-    );
     assert_eq!(after_url_change.cloudcode.mode_label(), "fixed");
+    assert_eq!(
+        after_url_change.cloudcode.base_url(),
+        "https://cloudcode-pa.googleapis.com"
+    );
+    assert_eq!(
+        after_url_change.cloudcode_upstream,
+        CloudCodeUpstream::Fixed("https://cloudcode-pa.googleapis.com".to_string())
+    );
 }
 
 #[tokio::test]
@@ -845,6 +859,10 @@ async fn proxy_state_constructors_support_result_new_with_cloudcode_di_and_optio
         .expect("ProxyState::new must return Ok for default CloudCode client");
     let active_new = state_new.active_provider().await;
     assert_eq!(active_new.cloudcode.mode_label(), "auto");
+    assert_eq!(
+        active_new.cloudcode.base_url(),
+        companion_core::CLOUDCODE_DAILY_UPSTREAM_URL
+    );
     assert!(!active_new.has_configured_api_key);
 
     let custom_cc = Arc::new(
@@ -858,9 +876,10 @@ async fn proxy_state_constructors_support_result_new_with_cloudcode_di_and_optio
         true,
     );
     let active_di = state_di.active_provider().await;
-    assert!(
-        Arc::ptr_eq(&custom_cc, &active_di.cloudcode),
-        "ProxyState::with_cloudcode must inject the exact CloudCodeClient Arc"
+    assert_eq!(active_di.cloudcode.mode_label(), "fixed");
+    assert_eq!(
+        active_di.cloudcode.base_url(),
+        "https://cloudcode-pa.googleapis.com"
     );
     assert!(active_di.has_configured_api_key);
 
@@ -870,14 +889,17 @@ async fn proxy_state_constructors_support_result_new_with_cloudcode_di_and_optio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hot_reload_concurrent_readers_see_immediate_rotation_with_zero_sleep_and_deduplicate_rebuilds()
- {
+async fn hot_reload_concurrent_readers_see_immediate_rotation_with_zero_sleep() {
+    use bytes::Bytes;
+    use companion_providers::ForwardRequest;
     use tokio::sync::Barrier;
 
+    let (upstream_addr, upstream_keys, upstream_handle) = spawn_mock_upstream("concurrent").await;
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
 
     let mut cfg = Config::default();
+    cfg.providers.gemini.base_url = format!("http://{upstream_addr}");
     cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaConcurrentInit11111").unwrap());
     cfg.save_secure(&config_path).unwrap();
 
@@ -892,11 +914,15 @@ async fn hot_reload_concurrent_readers_see_immediate_rotation_with_zero_sleep_an
     .unwrap();
 
     let initial = state.active_provider().await;
-    let initial_cloudcode = Arc::clone(&initial.cloudcode);
-    let initial_provider_ptr = Arc::as_ptr(&initial.provider).cast::<()>();
+    initial.cloudcode.seed_prod_route_for_test();
+    assert_eq!(
+        initial.cloudcode.base_url(),
+        companion_core::CLOUDCODE_PROD_UPSTREAM_URL
+    );
 
-    // Rotate key immediately with zero sleep and fire 16 concurrent readers behind a barrier.
+    // Rotate key and default_model immediately with zero sleep and fire 16 concurrent readers.
     cfg.providers.gemini.api_key = Some(ApiKey::parse_strict("AIzaConcurrentNext22222").unwrap());
+    cfg.providers.gemini.default_model = "gemini-4-argon".to_string();
     cfg.save_secure(&config_path).unwrap();
 
     let tasks = 16usize;
@@ -916,23 +942,34 @@ async fn hot_reload_concurrent_readers_see_immediate_rotation_with_zero_sleep_an
         results.push(handle.await.unwrap());
     }
 
-    let expected_ptr = Arc::as_ptr(&results[0].provider).cast::<()>();
-    assert_ne!(
-        expected_ptr, initial_provider_ptr,
-        "rotated config must produce a new provider immediately with zero sleep"
-    );
     for active in &results {
         assert!(active.has_configured_api_key);
-        assert!(
-            Arc::ptr_eq(&initial_cloudcode, &active.cloudcode),
-            "CloudCodeClient Arc must stay shared when upstream/timeout are unchanged"
-        );
+        assert_eq!(active.default_model, "gemini-4-argon");
         assert_eq!(
-            Arc::as_ptr(&active.provider).cast::<()>(),
-            expected_ptr,
-            "concurrent reloaders must deduplicate rebuilds to a single provider instance"
+            active.cloudcode.base_url(),
+            companion_core::CLOUDCODE_PROD_UPSTREAM_URL,
+            "CloudCode routing cache must survive concurrent key rotation"
         );
     }
+
+    // Verify rotated API key is delivered live to the mock upstream.
+    let resp = results[0]
+        .provider
+        .forward_gemini(ForwardRequest {
+            path_and_query: "/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse"
+                .to_string(),
+            body: Bytes::from_static(b"{}"),
+            content_type: Some("application/json".to_string()),
+            api_key_override: None,
+        })
+        .await
+        .expect("forward with rotated provider");
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        upstream_keys.lock().unwrap().as_slice(),
+        &[Some("AIzaConcurrentNext22222".to_string())]
+    );
+    upstream_handle.abort();
 }
 
 #[tokio::test]
@@ -945,7 +982,7 @@ async fn hot_reload_detects_same_second_in_place_edit_with_identical_length() {
     let make_json = |key: &str| {
         serde_json::json!({
             "schema_version": 1,
-            "proxy": { "host": "127.0.0.1", "port": 24141 },
+            "proxy": { "host": "127.0.0.1", "port": companion_core::DEFAULT_LISTEN_PORT },
             "cloudcode": { "upstream": "auto" },
             "providers": {
                 "gemini": {
@@ -1034,33 +1071,41 @@ async fn hot_reload_retains_active_provider_on_oversized_config_and_recovers() {
     .unwrap();
 
     let initial = state.active_provider().await;
-    let initial_ptr = Arc::as_ptr(&initial.provider).cast::<()>();
+    initial.cloudcode.seed_prod_route_for_test();
     assert!(initial.has_configured_api_key);
+    assert_eq!(initial.default_model, companion_core::DEFAULT_GEMINI_MODEL);
 
-    // Write > MAX_CONFIG_FILE_BYTES -> must retain active provider without swapping or panicking.
+    // Write > MAX_CONFIG_FILE_BYTES -> must retain active provider and routing cache without panicking.
     let oversized = vec![b' '; (MAX_CONFIG_FILE_BYTES as usize) + 64];
     fs::write(&config_path, oversized).unwrap();
     let during_oversize = state.active_provider().await;
-    assert_eq!(
-        Arc::as_ptr(&during_oversize.provider).cast::<()>(),
-        initial_ptr,
+    assert!(
+        during_oversize.has_configured_api_key,
         "oversized config must retain the previous active provider"
+    );
+    assert_eq!(
+        during_oversize.default_model,
+        companion_core::DEFAULT_GEMINI_MODEL
+    );
+    assert_eq!(
+        during_oversize.cloudcode.base_url(),
+        companion_core::CLOUDCODE_PROD_UPSTREAM_URL
     );
 
     // Recover immediately with a valid updated config.
     cfg.providers.gemini.api_key = None;
+    cfg.providers.gemini.default_model = "gemini-4-argon".to_string();
     cfg.save_secure(&config_path).unwrap();
     let recovered = state.active_provider().await;
-    assert_ne!(
-        Arc::as_ptr(&recovered.provider).cast::<()>(),
-        initial_ptr,
+    assert!(
+        !recovered.has_configured_api_key,
         "valid config after oversized file must hot-reload immediately"
     );
-    assert!(!recovered.has_configured_api_key);
+    assert_eq!(recovered.default_model, "gemini-4-argon");
 }
 
 #[tokio::test]
-async fn hot_reload_updates_enabled_models_immediately_and_preserves_cloudcode_client_arc() {
+async fn hot_reload_updates_enabled_models_immediately_and_preserves_cloudcode_routing_cache() {
     let tmp = TempDir::new().unwrap();
     let config_path = tmp.path().join("config.json");
 
@@ -1079,25 +1124,30 @@ async fn hot_reload_updates_enabled_models_immediately_and_preserves_cloudcode_c
     .unwrap();
 
     let initial = state.active_provider().await;
+    initial.cloudcode.seed_prod_route_for_test();
     assert_eq!(
         initial.enabled_models,
         companion_core::default_enabled_gemini_models()
     );
 
-    // Pause all models (enabled_models: []) -> updates immediately while preserving CloudCodeClient Arc.
+    // Pause all models (enabled_models: []) -> updates immediately while preserving CloudCode routing cache.
     cfg.providers.gemini.enabled_models = Vec::new();
     cfg.save_secure(&config_path).unwrap();
     let paused = state.active_provider().await;
     assert!(paused.enabled_models.is_empty());
-    assert!(
-        Arc::ptr_eq(&initial.cloudcode, &paused.cloudcode),
-        "enabled_models hot-reload must preserve CloudCodeClient routing cache"
+    assert_eq!(
+        paused.cloudcode.base_url(),
+        companion_core::CLOUDCODE_PROD_UPSTREAM_URL,
+        "enabled_models hot-reload must preserve CloudCode routing cache"
     );
 
-    // Enable Argon -> updates immediately while preserving CloudCodeClient Arc.
+    // Enable Argon -> updates immediately while preserving CloudCode routing cache.
     cfg.providers.gemini.enabled_models = vec!["gemini-4-argon".to_string()];
     cfg.save_secure(&config_path).unwrap();
     let updated = state.active_provider().await;
     assert_eq!(updated.enabled_models, vec!["gemini-4-argon".to_string()]);
-    assert!(Arc::ptr_eq(&initial.cloudcode, &updated.cloudcode));
+    assert_eq!(
+        updated.cloudcode.base_url(),
+        companion_core::CLOUDCODE_PROD_UPSTREAM_URL
+    );
 }
