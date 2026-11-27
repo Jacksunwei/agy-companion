@@ -60,8 +60,11 @@ pub use redaction::{
     api_key_hint, mask_account_id, mask_api_key,
 };
 pub use usage::{
-    GeminiUsageMetadata, NoopUsageSink, USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION,
-    UsageBreakdownRow, UsageBucket, UsageEvent, UsageRange, UsageSink, UsageSummary,
+    GeminiUsageMetadata, LsSyncWatermark, MAX_CONVERSATION_ID_LEN, MAX_MODEL_DISPLAY_NAME_LEN,
+    MAX_RESPONSE_ID_LEN, MIN_CONVERSATION_ID_LEN, NoopUsageSink, TelemetrySource,
+    USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION, UsageBreakdownRow, UsageBucket, UsageEvent,
+    UsageRange, UsageSink, UsageSummary, normalize_utc_timestamp, sanitize_conversation_id,
+    sanitize_model_display_name, sanitize_response_id,
 };
 #[cfg(feature = "sqlite")]
 pub use usage::{SqliteUsageSink, query_usage_summary, query_usage_summary_at};

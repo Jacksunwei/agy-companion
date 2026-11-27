@@ -117,7 +117,7 @@ class TestShimRunCompanion(E2ETestCase):
             timeout=10.0,
         )
         self.assertEqual(r_dev.returncode, 0, f"{r_dev.stdout}\n{r_dev.stderr}")
-        self.assertEqual(r_dev.stdout.strip(), "agy-companion 0.0.2")
+        self.assertEqual(r_dev.stdout.strip(), "agy-companion 0.0.3")
 
         # (b) Env scrubbing: placeholder GEMINI_API_KEY & proxy vars scrubbed; GOOGLE_API_KEY & real GEMINI_API_KEY kept.
         dumper = env.root / "env_dumper.sh"
