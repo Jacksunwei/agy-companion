@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod codex;
 pub mod gemini;
 pub mod probe_client;
 
@@ -17,6 +18,12 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use codex::auth::{
+    CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_ORIGINATOR,
+    CODEX_OAUTH_SCOPES, CodexAuth, CodexAuthManager, CodexAuthOptions, CodexLoginStart,
+    DEFAULT_CODEX_LOGIN_TTL, DEFAULT_CODEX_OAUTH_ISSUER, DEFAULT_CODEX_OAUTH_TIMEOUT,
+    DEFAULT_CODEX_REFRESH_MARGIN,
+};
 pub use gemini::{GEMINI_API_KEY_ENV_VAR, GeminiProvider};
 pub use probe_client::{
     DEFAULT_PROBE_TIMEOUT, HealthEvaluation, LoopbackProxyClient, MAX_PROBE_BODY_BYTES, ProbeError,
@@ -40,6 +47,14 @@ pub enum ProviderError {
         "missing Gemini API key: configure it in Antigravity Companion settings (auth/gemini.json) or set GEMINI_API_KEY"
     )]
     MissingApiKey,
+    #[error("{0}")]
+    NotAuthenticated(String),
+    #[error("{0}")]
+    AuthExpired(String),
+    #[error("OAuth error: {0}")]
+    OAuth(String),
+    #[error("credential store error: {0}")]
+    AuthStore(String),
     #[error("upstream provider request failed: {0}")]
     Upstream(String),
 }

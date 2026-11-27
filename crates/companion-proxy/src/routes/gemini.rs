@@ -93,6 +93,30 @@ pub(super) async fn proxy_gemini_handler(
                 "missing Gemini API key: configure it in Antigravity Companion settings (auth/gemini.json) or set GEMINI_API_KEY",
             );
         }
+        Err(ProviderError::NotAuthenticated(_)) => {
+            return json_error_response(
+                StatusCode::UNAUTHORIZED,
+                "OpenAI Codex is not signed in — sign in with ChatGPT in Antigravity Companion settings",
+            );
+        }
+        Err(ProviderError::AuthExpired(_)) => {
+            return json_error_response(
+                StatusCode::UNAUTHORIZED,
+                "OpenAI Codex session expired — sign in again",
+            );
+        }
+        Err(ProviderError::OAuth(_)) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream OAuth authentication failed",
+            );
+        }
+        Err(ProviderError::AuthStore(_)) => {
+            return json_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential store error",
+            );
+        }
         Err(ProviderError::InvalidConfig(_)) => {
             return json_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,

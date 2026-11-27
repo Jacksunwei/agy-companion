@@ -224,6 +224,82 @@ async fn doctor_passes_against_healthy_server_under_hostile_proxy_and_never_leak
 }
 
 #[tokio::test]
+async fn doctor_json_passes_with_codex_only_auth_and_never_leaks_tokens() {
+    use companion_core::{AUTH_SCHEMA_VERSION, CodexAuthMode, CodexCredentials, SecretString};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (port, handle) = spawn_mock_health("ok", env!("CARGO_PKG_VERSION"), PROTOCOL_VERSION).await;
+    let temp = TempDir::new().expect("tempdir");
+    let cfg_path = temp.path().join("config.json");
+    Config::default()
+        .save_secure(&cfg_path)
+        .expect("save_secure");
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    FileAuthStore::for_config_path(&cfg_path)
+        .expect("auth store")
+        .save_codex(&CodexCredentials {
+            schema_version: AUTH_SCHEMA_VERSION,
+            auth_mode: CodexAuthMode::ChatGptOAuth,
+            access_token: SecretString::new("eyJhbGciOiJSUzI1NiJ9.cli_codex_access_secret.sig"),
+            refresh_token: SecretString::new("rt_cli_codex_refresh_secret"),
+            id_token: Some(SecretString::new(
+                "eyJhbGciOiJSUzI1NiJ9.cli_codex_id_secret.sig",
+            )),
+            account_id: "acct_cli_99887766wxyz".to_string(),
+            expires_at_ms: now_ms + 3_600_000,
+            plan_type: Some("pro".to_string()),
+            email_hint: Some("j***@example.com".to_string()),
+            last_refresh_utc: "2026-11-26T22:00:00Z".to_string(),
+        })
+        .expect("save codex auth");
+
+    let output = isolated_tokio_cli_command(temp.path())
+        .args(["doctor", "--config"])
+        .arg(&cfg_path)
+        .args(["--port", &port.to_string(), "--json"])
+        .output()
+        .await
+        .expect("run doctor codex");
+    handle.abort();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "doctor should pass with Codex-only auth; stdout={stdout}, stderr={stderr}"
+    );
+    let parsed: Value = serde_json::from_str(&stdout).expect("valid doctor JSON");
+    assert_eq!(parsed["ok"], true);
+    let checks = parsed["checks"].as_array().expect("checks array");
+    assert_eq!(
+        checks.iter().find(|c| c["name"] == "auth_codex").unwrap()["status"],
+        "pass"
+    );
+    assert_eq!(
+        checks
+            .iter()
+            .find(|c| c["name"] == "provider_auth")
+            .unwrap()["status"],
+        "pass"
+    );
+
+    let combined = format!("{stdout}\n{stderr}");
+    for secret in [
+        "cli_codex_access_secret",
+        "rt_cli_codex_refresh_secret",
+        "cli_codex_id_secret",
+        "acct_cli_99887766wxyz",
+    ] {
+        assert!(!combined.contains(secret), "doctor leaked '{secret}'");
+    }
+}
+
+#[tokio::test]
 async fn doctor_fails_on_version_skew_open_permissions_and_unreachable_proxy() {
     let temp = TempDir::new().expect("tempdir");
 

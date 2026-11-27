@@ -746,6 +746,7 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
       config: {
         ...active.config,
         providers: {
+          ...active.config.providers,
           gemini: { ...active.config.providers.gemini, enabled_models: [] },
         },
       },

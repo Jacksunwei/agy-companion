@@ -337,13 +337,18 @@ name = "companion-providers"
 version = "0.0.2"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
+ "chrono",
  "companion-core",
  "futures-util",
+ "getrandom 0.4.3",
  "http",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

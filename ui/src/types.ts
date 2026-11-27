@@ -35,11 +35,23 @@ export interface RedactedGeminiConfig {
   api_key_hint: string | null;
 }
 
+export interface RedactedCodexConfig {
+  base_url: string;
+  default_model: string;
+  enabled_models: string[];
+  timeout_secs: number;
+  authenticated: boolean;
+  account_hint: string | null;
+  plan_type: string | null;
+  expires_at_ms: number | null;
+}
+
 export interface RedactedConfig {
   schema_version: number;
   proxy: ProxyConfig;
   providers: {
     gemini: RedactedGeminiConfig;
+    codex: RedactedCodexConfig;
   };
   launcher_auto_start: boolean | null;
 }
@@ -307,6 +319,22 @@ export const LIVE_PROVIDERS: ReadonlyArray<ProviderDescriptor> = [
   },
 ];
 
+export const DEFAULT_ENABLED_CODEX_MODELS: ReadonlyArray<string> = [
+  "gpt-6.2-astra",
+  "gpt-6.2-sol",
+];
+
+export const DEFAULT_CODEX_CONFIG: RedactedCodexConfig = {
+  base_url: "https://chatgpt.com/backend-api/codex",
+  default_model: "gpt-6.2-sol",
+  enabled_models: [...DEFAULT_ENABLED_CODEX_MODELS],
+  timeout_secs: 900,
+  authenticated: false,
+  account_hint: null,
+  plan_type: null,
+  expires_at_ms: null,
+};
+
 export const DEFAULT_CONFIG: RedactedConfig = {
   schema_version: 1,
   proxy: {
@@ -321,6 +349,10 @@ export const DEFAULT_CONFIG: RedactedConfig = {
       timeout_secs: 900,
       api_key_configured: false,
       api_key_hint: null,
+    },
+    codex: {
+      ...DEFAULT_CODEX_CONFIG,
+      enabled_models: [...DEFAULT_ENABLED_CODEX_MODELS],
     },
   },
   launcher_auto_start: null,
@@ -405,12 +437,68 @@ function parseAccountPlanStatus(raw: unknown): AccountPlanStatus {
   return { mode, resolved };
 }
 
+function parseRedactedCodexConfig(raw: unknown): RedactedCodexConfig | null {
+  if (raw === undefined) {
+    return {
+      ...DEFAULT_CODEX_CONFIG,
+      enabled_models: [...DEFAULT_ENABLED_CODEX_MODELS],
+    };
+  }
+  if (!isRecord(raw)) return null;
+
+  const baseUrl = asString(raw.base_url);
+  const defaultModel = asString(raw.default_model);
+  const timeoutSecs = asNumber(raw.timeout_secs);
+  const authenticated = asBoolean(raw.authenticated);
+  const accountHint = asNullableString(raw.account_hint);
+  const planType = asNullableString(raw.plan_type);
+  const expiresAtMs = asNullableNumber(raw.expires_at_ms);
+
+  if (
+    baseUrl === null ||
+    defaultModel === null ||
+    timeoutSecs === null ||
+    authenticated === null ||
+    accountHint === undefined ||
+    planType === undefined ||
+    expiresAtMs === undefined
+  ) {
+    return null;
+  }
+
+  let enabledModels: string[];
+  if (Array.isArray(raw.enabled_models)) {
+    enabledModels = raw.enabled_models
+      .filter((item): item is string => typeof item === "string")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  } else if (raw.enabled_models === undefined) {
+    enabledModels = [...DEFAULT_ENABLED_CODEX_MODELS];
+  } else {
+    return null;
+  }
+
+  return {
+    base_url: baseUrl,
+    default_model: defaultModel,
+    enabled_models: enabledModels,
+    timeout_secs: timeoutSecs,
+    authenticated,
+    account_hint: accountHint,
+    plan_type: planType,
+    expires_at_ms: expiresAtMs,
+  };
+}
+
 function parseRedactedConfig(raw: unknown): RedactedConfig | null {
   if (!isRecord(raw) || !isRecord(raw.proxy) || !isRecord(raw.providers)) {
     return null;
   }
   const geminiRaw = raw.providers.gemini;
   if (!isRecord(geminiRaw)) return null;
+
+  const codex = parseRedactedCodexConfig(raw.providers.codex);
+  if (codex === null) return null;
 
   const schemaVersion = asNumber(raw.schema_version) ?? 1;
   const host = asString(raw.proxy.host);
@@ -455,6 +543,7 @@ function parseRedactedConfig(raw: unknown): RedactedConfig | null {
         api_key_configured: apiKeyConfigured,
         api_key_hint: apiKeyHint,
       },
+      codex,
     },
     launcher_auto_start: asOptionalNullableBoolean(raw.launcher_auto_start),
   };

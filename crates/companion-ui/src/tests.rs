@@ -676,9 +676,9 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
     use companion_core::{
         CloudCodeConfig, CloudCodeStatsSnapshot, CloudCodeUpstream, Config,
         DEFAULT_LISTEN_PORT_NONZERO, IntegrationStatus, ModelSessionStats, ProxyConfig,
-        RecentCallSnapshot, RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig,
-        ShellKind, UsageBreakdownRow, UsageBucket, UsageRange, UsageStatsSnapshot, UsageSummary,
-        default_enabled_gemini_models,
+        RecentCallSnapshot, RedactedCodexConfig, RedactedConfig, RedactedGeminiConfig,
+        RedactedProvidersConfig, ShellKind, UsageBreakdownRow, UsageBucket, UsageRange,
+        UsageStatsSnapshot, UsageSummary, default_enabled_gemini_models,
     };
 
     // 1. settings_snapshot_active.json
@@ -703,6 +703,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
                     api_key_configured: true,
                     api_key_hint: Some("AIza...1234".to_string()),
                 },
+                codex: RedactedCodexConfig::default(),
             },
             launcher_auto_start: Some(true),
         },
@@ -828,7 +829,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
     const DAY0_FIXTURE: &str =
         include_str!("../../../ui/tests/fixtures/settings_snapshot_day0_offline.json");
     let day0_snapshot = SettingsSnapshot {
-        config: Config::default().redacted_with_auth(None),
+        config: Config::default().redacted_with_auth(None, None),
         binary_version: "0.1.0".to_string(),
         proxy: ProxyHealthSummary::unreachable("connection refused"),
         version_skew: false,
@@ -1363,4 +1364,117 @@ async fn save_settings_rolls_back_gemini_auth_when_config_save_fails_on_read_onl
 
     // Explicitly restore 0700 before TempDir drops (RestoreDirMode also handles panics).
     drop(_restore_guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_settings_reflects_redacted_codex_auth_and_fails_closed_on_corrupt_or_symlink() {
+    use companion_core::{
+        AUTH_SCHEMA_VERSION, AuthStore, CodexAuthMode, CodexCredentials, FileAuthStore,
+        SecretString,
+    };
+
+    let tmp = TempDir::new().expect("temp dir");
+    let cfg_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    let server = isolated_ui_server(&tmp, cfg_path.clone());
+
+    // 1. Authenticated auth/codex.json appears redacted in get_settings_snapshot with zero token leakage.
+    let creds = CodexCredentials {
+        schema_version: AUTH_SCHEMA_VERSION,
+        auth_mode: CodexAuthMode::ChatGptOAuth,
+        access_token: SecretString::new("eyJhbGciOiJSUzI1NiJ9.ui_codex_access_secret.sig"),
+        refresh_token: SecretString::new("rt_ui_codex_refresh_secret"),
+        id_token: Some(SecretString::new(
+            "eyJhbGciOiJSUzI1NiJ9.ui_codex_id_secret.sig",
+        )),
+        account_id: "acct_ui_99887766wxyz".to_string(),
+        expires_at_ms: 1_950_000_000_000,
+        plan_type: Some("pro".to_string()),
+        email_hint: Some("j***@example.com".to_string()),
+        last_refresh_utc: "2026-11-26T22:00:00Z".to_string(),
+    };
+    auth_store.save_codex(&creds).expect("save codex creds");
+
+    let snap = server
+        .get_settings_snapshot(None)
+        .await
+        .expect("get_settings_snapshot");
+    let raw = serde_json::to_string(&snap).expect("serialize snapshot");
+    for secret in [
+        "ui_codex_access_secret",
+        "rt_ui_codex_refresh_secret",
+        "ui_codex_id_secret",
+        "acct_ui_99887766wxyz",
+    ] {
+        assert!(!raw.contains(secret), "get_settings leaked '{secret}'");
+    }
+    assert!(snap.config.providers.codex.authenticated);
+    assert_eq!(
+        snap.config.providers.codex.account_hint.as_deref(),
+        Some("j***@example.com")
+    );
+    assert_eq!(
+        snap.config.providers.codex.plan_type.as_deref(),
+        Some("pro")
+    );
+    assert_eq!(
+        snap.config.providers.codex.expires_at_ms,
+        Some(1_950_000_000_000)
+    );
+
+    // 2. Corrupt auth/codex.json fails closed in get_settings, save_settings, test_connection,
+    // and set_launcher_integration without mutating disk.
+    fs::write(auth_store.codex_path(), "{corrupt_codex_json").expect("write corrupt");
+    assert!(server.get_settings_snapshot(None).await.is_err());
+    assert!(server.test_connection_payload().await.is_err());
+    assert!(
+        server
+            .save_settings_snapshot(
+                SaveSettingsArgs {
+                    providers: Some(ProvidersSettingsPatch {
+                        gemini: Some(GeminiSettingsPatch {
+                            default_model: Some("gemini-4-neon".to_string()),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        server
+            .set_launcher_integration_snapshot(true, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        !cfg_path.exists(),
+        "save_settings must not mutate config when auth/codex.json is corrupt"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        fs::remove_file(auth_store.codex_path()).expect("remove corrupt");
+        let victim = tmp.path().join("victim-codex.json");
+        fs::write(&victim, "victim-codex-sentinel").expect("write victim");
+        symlink(&victim, auth_store.codex_path()).expect("symlink codex");
+
+        assert!(server.get_settings_snapshot(None).await.is_err());
+        assert!(server.test_connection_payload().await.is_err());
+        assert!(
+            server
+                .set_launcher_integration_snapshot(true, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "victim-codex-sentinel"
+        );
+    }
 }

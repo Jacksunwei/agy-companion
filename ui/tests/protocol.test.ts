@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { describe, it } from "node:test";
 import {
+  DEFAULT_CODEX_CONFIG,
+  DEFAULT_ENABLED_CODEX_MODELS,
   DEFAULT_ENABLED_MODELS,
   DEFAULT_MODEL_PRESETS,
   PLACEHOLDER_API_KEY,
@@ -57,6 +59,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
       "gemini-4-neon",
       "gemini-4-hydrogen",
     ]);
+    assert.deepEqual(parsed.config.providers.codex, DEFAULT_CODEX_CONFIG);
 
     assert.equal(parsed.launcher_integration?.state, "active");
     assert.equal(parsed.launcher_integration?.enabled, true);
@@ -90,6 +93,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
 
     assert.equal(parsed.config.providers.gemini.api_key_configured, false);
     assert.equal(parsed.config.providers.gemini.api_key_hint, null);
+    assert.deepEqual(parsed.config.providers.codex, DEFAULT_CODEX_CONFIG);
     assert.equal(parsed.config.launcher_auto_start, null);
     assert.equal(parsed.proxy.reachable, false);
     assert.equal(parsed.proxy.status, null);
@@ -262,6 +266,72 @@ describe("parseSettingsSnapshot defensive invariants", () => {
       parseSettingsSnapshot(omitted)?.config.providers.gemini.enabled_models,
       DEFAULT_ENABLED_MODELS,
     );
+  });
+
+  it("parses authenticated, omitted, paused, and rejects malformed providers.codex", () => {
+    const authed = cloneJson(activeBase) as {
+      config: { providers: { codex?: Record<string, unknown> } };
+    };
+    authed.config.providers.codex = {
+      base_url: "https://chatgpt.com/backend-api/codex",
+      default_model: "gpt-6.2-astra",
+      enabled_models: [],
+      timeout_secs: 600,
+      authenticated: true,
+      account_hint: "j***@example.com",
+      plan_type: "pro",
+      expires_at_ms: 1_950_000_000_000,
+    };
+    const parsedAuthed = parseSettingsSnapshot(authed);
+    assert.deepEqual(parsedAuthed?.config.providers.codex, {
+      base_url: "https://chatgpt.com/backend-api/codex",
+      default_model: "gpt-6.2-astra",
+      enabled_models: [],
+      timeout_secs: 600,
+      authenticated: true,
+      account_hint: "j***@example.com",
+      plan_type: "pro",
+      expires_at_ms: 1_950_000_000_000,
+    });
+
+    // Omitted providers.codex defaults cleanly for backwards compatibility (e.g. legacy mock snapshots)
+    const omittedCodex = cloneJson(activeBase) as {
+      config: { providers: { codex?: Record<string, unknown> } };
+    };
+    delete omittedCodex.config.providers.codex;
+    const parsedOmitted = parseSettingsSnapshot(omittedCodex);
+    assert.deepEqual(parsedOmitted?.config.providers.codex, {
+      ...DEFAULT_CODEX_CONFIG,
+      enabled_models: [...DEFAULT_ENABLED_CODEX_MODELS],
+    });
+
+    // Present-but-malformed providers.codex fails closed (returns null)
+    const malformedCases: Array<(c: Record<string, unknown>) => void> = [
+      (c) => {
+        c.codex = "not-an-object";
+      },
+      (c) => {
+        c.codex = { ...(c.codex as Record<string, unknown>), authenticated: "true" };
+      },
+      (c) => {
+        const copy = { ...(c.codex as Record<string, unknown>) };
+        delete copy.account_hint;
+        c.codex = copy;
+      },
+      (c) => {
+        c.codex = { ...(c.codex as Record<string, unknown>), expires_at_ms: Number.NaN };
+      },
+      (c) => {
+        c.codex = { ...(c.codex as Record<string, unknown>), enabled_models: "gpt-6.2-sol" };
+      },
+    ];
+    for (const mutate of malformedCases) {
+      const sample = cloneJson(activeBase) as {
+        config: { providers: Record<string, unknown> };
+      };
+      mutate(sample.config.providers);
+      assert.equal(parseSettingsSnapshot(sample), null);
+    }
   });
 
   it("falls back to DEFAULT_MODEL_PRESETS when supported_models is empty or invalid", () => {
