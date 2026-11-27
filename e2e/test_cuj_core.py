@@ -652,9 +652,12 @@ class TestCujCliSubcommands(E2ETestCase):
         base_env = env.build_env()
 
         # (a) --version, --help, unknown subcommand.
+        expected_version = json.loads(
+            (self.repo_root / "plugin" / "plugin.json").read_text(encoding="utf-8")
+        )["version"]
         r_ver = run_cli([str(binary), "--version"], env=base_env)
         self.assertEqual(r_ver.returncode, 0, r_ver.stderr)
-        self.assertEqual(r_ver.stdout.strip(), "agy-companion 0.0.3")
+        self.assertEqual(r_ver.stdout.strip(), f"agy-companion {expected_version}")
 
         r_help = run_cli([str(binary), "--help"], env=base_env)
         self.assertEqual(r_help.returncode, 0, r_help.stderr)

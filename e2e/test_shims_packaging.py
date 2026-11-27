@@ -116,8 +116,11 @@ class TestShimRunCompanion(E2ETestCase):
             env=env.build_env(extra={"PATH": str(safe_bin)}),
             timeout=10.0,
         )
+        expected_version = json.loads(
+            (self.repo_root / "plugin" / "plugin.json").read_text(encoding="utf-8")
+        )["version"]
         self.assertEqual(r_dev.returncode, 0, f"{r_dev.stdout}\n{r_dev.stderr}")
-        self.assertEqual(r_dev.stdout.strip(), "agy-companion 0.0.3")
+        self.assertEqual(r_dev.stdout.strip(), f"agy-companion {expected_version}")
 
         # (b) Env scrubbing: placeholder GEMINI_API_KEY & proxy vars scrubbed; GOOGLE_API_KEY & real GEMINI_API_KEY kept.
         dumper = env.root / "env_dumper.sh"

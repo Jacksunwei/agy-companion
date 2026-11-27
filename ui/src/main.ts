@@ -128,7 +128,7 @@ async function main(): Promise<void> {
   const brand = el("div", "brand");
   const mark = el("span", "brand-mark");
   mark.append(createBrandMarkSvg());
-  const verEl = el("span", "hdr-ver", "0.0.3");
+  const verEl = el("span", "hdr-ver", "");
   brand.append(mark, el("h1", "brand-name", "Antigravity Companion"), verEl);
 
   const nav = el("nav", "hdr-tabs");
@@ -328,7 +328,7 @@ async function main(): Promise<void> {
   }
 
   function renderHeader(): void {
-    verEl.textContent = state.snapshot?.binary_version || "0.0.3";
+    verEl.textContent = state.snapshot?.binary_version || "";
     for (const [id, btn] of tabBtns.entries()) {
       btn.setAttribute("aria-selected", String(state.activeTab === id));
     }
