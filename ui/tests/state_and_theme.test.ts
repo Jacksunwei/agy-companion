@@ -637,12 +637,15 @@ describe("ui/src/style.css theme tokens & WCAG AA contrast", () => {
     }
   });
 
-  it("uses native :has(:checked), reduced-motion, contrast scrollbar, single-edge gutter, smooth details, and top-layer popover animations", () => {
+  it("uses native :has(:checked), reduced-motion, contrast scrollbar, symmetric side gaps, smooth details, and top-layer popover animations", () => {
     assert.ok(css.includes(".pr-row:has(.pr-inp:checked)"));
     assert.equal(css.includes(".pr-row.sel"), false, "Legacy JS .pr-row.sel class must be removed");
 
-    assert.ok(css.includes("scrollbar-gutter: stable;"));
-    assert.equal(css.includes("both-edges"), false, "Must use single-edge scrollbar-gutter: stable only");
+    assert.equal(
+      css.includes("scrollbar-gutter:"),
+      false,
+      "Must not reserve an asymmetric scrollbar-gutter on .pane-scroll",
+    );
 
     assert.ok(/@media\s*\(prefers-contrast:\s*more\)/.test(css));
     assert.ok(/@media\s*\(prefers-reduced-motion:\s*reduce\)/.test(css));

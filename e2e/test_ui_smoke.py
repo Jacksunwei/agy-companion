@@ -407,12 +407,16 @@ class TestUiSmoke(E2ETestCase):
                               const card = [...document.querySelectorAll('.card')].find(
                                 (c) => c.offsetParent !== null
                               );
+                              const cardRect = card ? card.getBoundingClientRect() : null;
                               return {{
                                 docOverflow: docEl.scrollWidth - docEl.clientWidth,
                                 scrollOverflow: scroll ? scroll.scrollWidth - scroll.clientWidth : 0,
                                 scrollClientWidth: scroll ? scroll.clientWidth : 0,
+                                scrollVerticalOverflow: scroll ? scroll.scrollHeight - scroll.clientHeight : 0,
+                                viewportWidth: window.innerWidth,
                                 wrapOverflow: wrap ? wrap.scrollWidth - wrap.clientWidth : 0,
                                 wrapRect: rect ? {{ left: rect.left, right: rect.right, width: rect.width }} : null,
+                                cardRect: cardRect ? {{ left: cardRect.left, right: cardRect.right }} : null,
                                 bodyText: document.body.innerText || '',
                                 brandFg: brand ? getComputedStyle(brand).color : null,
                                 brandBg: brand ? opaqueBg(brand) : null,
@@ -438,6 +442,14 @@ class TestUiSmoke(E2ETestCase):
                             1.5,
                             f".content-wrap not flush left ({ctx}): {rect}",
                         )
+                        if metrics["scrollVerticalOverflow"] <= 1 and metrics["cardRect"]:
+                            card_left = metrics["cardRect"]["left"]
+                            card_right = metrics["viewportWidth"] - metrics["cardRect"]["right"]
+                            self.assertLessEqual(
+                                abs(card_left - card_right),
+                                1.5,
+                                f"asymmetric panel side gaps ({ctx}): left={card_left} right={card_right}",
+                            )
 
                         for token in _FORBIDDEN_COPY_TOKENS:
                             self.assertNotIn(token, metrics["bodyText"], f"legacy copy {token!r} ({ctx})")
