@@ -4,8 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "agy-companion"
-version = "0.0.11"
+version = "0.0.12"
 description = "Bring your own models (BYOM) and track token usage and costs in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and native Sidecar Web UI."
+readme = "../../README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 keywords = [
@@ -31,17 +32,23 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Rust",
   "Topic :: Software Development :: Build Tools",
 ]
 
 [project.urls]
 Homepage = "https://github.com/Jacksunwei/agy-companion"
+Documentation = "https://github.com/Jacksunwei/agy-companion/blob/main/docs/README.md"
 Repository = "https://github.com/Jacksunwei/agy-companion"
+Changelog = "https://github.com/Jacksunwei/agy-companion/releases"
 Issues = "https://github.com/Jacksunwei/agy-companion/issues"
 
 [tool.maturin]
 bindings = "bin"
 manifest-path = "../../crates/companion-cli/Cargo.toml"
 python-source = "python"
+module-name = "agy_companion"
 strip = true

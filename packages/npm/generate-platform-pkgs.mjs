@@ -91,7 +91,7 @@ export function buildPlatformManifest(platform, version) {
     repository: {
       type: 'git',
       url: 'git+https://github.com/Jacksunwei/agy-companion.git',
-      directory: `packages/npm/platforms/${platform.dir}`,
+      directory: 'packages/npm',
     },
     homepage: 'https://github.com/Jacksunwei/agy-companion#readme',
     bugs: {
@@ -106,6 +106,25 @@ export function buildPlatformManifest(platform, version) {
       access: 'public',
     },
   };
+}
+
+export function buildPlatformReadme(platform) {
+  return [
+    `# ${platform.name}`,
+    '',
+    `Prebuilt \`agy-companion\` native binary package for **${platform.label}**.`,
+    '',
+    'This package is an internal platform-specific optional dependency of [`agy-companion`](https://www.npmjs.com/package/agy-companion) and is installed automatically for your OS and CPU architecture.',
+    '',
+    'Install the main CLI package instead:',
+    '',
+    '```bash',
+    'npx -y agy-companion@latest install',
+    '```',
+    '',
+    'See the [Antigravity Companion repository](https://github.com/Jacksunwei/agy-companion) for documentation and source code.',
+    '',
+  ].join('\n');
 }
 
 export function generatePlatformPackages({
@@ -125,7 +144,9 @@ export function generatePlatformPackages({
     const manifestPath = path.join(pkgDir, 'package.json');
     const manifest = buildPlatformManifest(platform, version);
     fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-    written.push({ platform: platform.dir, manifestPath, manifest });
+    const readmePath = path.join(pkgDir, 'README.md');
+    fs.writeFileSync(readmePath, buildPlatformReadme(platform), 'utf8');
+    written.push({ platform: platform.dir, manifestPath, readmePath, manifest });
   }
 
   return { version, outDir, written };

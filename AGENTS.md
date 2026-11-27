@@ -16,8 +16,8 @@ This repository uses **Antigravity customization conventions** (`AGENTS.md` + `.
 | `plugin/` | Antigravity plugin bundle | 6 files: `plugin.json`, `assets/logo.svg`, `sidecars/proxy/sidecar.json` (`has_web_ui: true`), `scripts/run-companion.sh`, `skills/companion/SKILL.md`, `README.md`; validated with `agy plugin validate --strict ./plugin` and embedded into `companion-cli`. |
 | `packages/` | Distribution shims | `packages/npm/agy-companion/` (`agy-companion` & `agyc`, 5 platform `optionalDependencies`), `packages/npm/generate-platform-pkgs.mjs`, and `packages/python/` (`maturin` `bindings = "bin"`). |
 | `e2e/` | Opaque-box Python 3 E2E suite | Pure stdlib parallel CUJ, boundary, shim, and Chrome CDP UI smoke (`e2e/run_e2e.py --suite all --workers 4`). Never grep repo source/docs inside `e2e/`; always run with `python3 -B`. |
-| `scripts/` | Verification & dev scripts | `check.py` (`--profile repo\|os\|all`, `--verify-ui-build`, `--with-e2e`), `bump_version.py`, `agent_check.sh` (POSIX shim), `check_plugin_logo.py`, `dev-install.sh`. |
-| `.github/` | PR template & CI | `PULL_REQUEST_TEMPLATE.md` and `workflows/ci.yml` (`repo-checks` on `ubuntu-latest` + `test` matrix on `[ubuntu, macos, windows]`). |
+| `scripts/` | Verification & dev scripts | `check.py` (`--profile repo\|os\|all`, `--verify-ui-build`, `--with-e2e`), `bump_version.py`, `agent_check.sh` (POSIX shim), `check_plugin_logo.py`, `package_release_asset.py`, `test_release_packaging.py`, `dev-install.sh`. |
+| `.github/` | PR template, CI & release | `PULL_REQUEST_TEMPLATE.md`, `release.yml`, `dependabot.yml`, `workflows/ci.yml` (`repo-checks` on `ubuntu-latest` + `test` matrix on `[ubuntu, macos, windows]`), and `workflows/release.yml` (5-target release pipeline for GitHub Releases, npm & PyPI). |
 | `docs/` | Design specs & ADRs | `docs/design/` (index at `docs/README.md`) and `docs/decisions/`. Update alongside behavior or architecture changes. |
 
 ## Verification Gates

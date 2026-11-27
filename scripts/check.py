@@ -512,10 +512,34 @@ class CheckRunner:
                 )
                 failed = True
 
+        # 5c. Release packaging helper script existence & executable bit
+        release_helper = self.repo_root / "scripts" / "package_release_asset.py"
+        if not release_helper.is_file():
+            self.fail(
+                f"{tag} Version sync & packaging: missing scripts/package_release_asset.py"
+            )
+            failed = True
+        elif not self.is_executable(release_helper):
+            self.fail(
+                f"{tag} Version sync & packaging: "
+                "scripts/package_release_asset.py is not executable (expected 0755)"
+            )
+            failed = True
+
+        # 5d. Registry-safe README.md links/images (no relative paths that break on PyPI/npmjs.com)
+        readme_errors = _validate_readme_absolute_urls(self.repo_root / "README.md")
+        if readme_errors:
+            self.fail(
+                f"{tag} Version sync & packaging: README.md contains relative links/images "
+                "(must use absolute https:// URLs or # anchors for PyPI/npmjs.com rendering)",
+                readme_errors,
+            )
+            failed = True
+
         if not failed:
             self.pass_(
                 f"{tag} Version sync & packaging: 4-way version {cargo_ver}, PR version bump, publishConfig, "
-                "5 platform manifests, node --check, execFileSync hygiene & py_compile passed"
+                "5 platform manifests, README absolute URLs, node --check, execFileSync hygiene & py_compile passed"
             )
 
     def _check_pr_version_bump(self, current_ver: str) -> str | None:
@@ -781,6 +805,7 @@ class CheckRunner:
         test_scripts = (
             self.repo_root / "scripts" / "test_check_plugin_logo.py",
             self.repo_root / "scripts" / "test_version_bump.py",
+            self.repo_root / "scripts" / "test_release_packaging.py",
         )
         failed = False
         for test_script in test_scripts:
@@ -944,8 +969,11 @@ def _validate_manifests_and_py_compile(root: pathlib.Path) -> tuple[str | None, 
         npm_data = json.loads(npm_pkg_json.read_text(encoding="utf-8"))
         npm_ver = npm_data.get("version")
         py_ver = _parse_toml_value(pyproject_toml, "project", "version")
+        py_requires_python = _parse_toml_value(pyproject_toml, "project", "requires-python")
+        py_readme = _parse_toml_value(pyproject_toml, "project", "readme")
         maturin_bindings = _parse_toml_value(pyproject_toml, "tool.maturin", "bindings")
         maturin_manifest = _parse_toml_value(pyproject_toml, "tool.maturin", "manifest-path")
+        maturin_module = _parse_toml_value(pyproject_toml, "tool.maturin", "module-name")
     except Exception as exc:
         return None, [str(exc)]
 
@@ -992,8 +1020,27 @@ def _validate_manifests_and_py_compile(root: pathlib.Path) -> tuple[str | None, 
             if dep_name.startswith("@agy-companion/") and dep_ver != cargo_ver:
                 errors.append(f"optionalDependencies[{dep_name!r}]={dep_ver!r} != {cargo_ver!r}")
 
+    if py_requires_python != ">=3.11":
+        errors.append(
+            f"[project].requires-python must be '>=3.11', got {py_requires_python!r}"
+        )
+
+    if py_readme != "../../README.md":
+        errors.append(
+            f"[project].readme must be '../../README.md', got {py_readme!r}"
+        )
+    else:
+        resolved_readme = (pyproject_toml.parent / py_readme).resolve()
+        if not resolved_readme.is_file():
+            errors.append(f"[project].readme target does not exist: {py_readme}")
+
     if maturin_bindings != "bin":
         errors.append(f"[tool.maturin].bindings must be 'bin', got {maturin_bindings!r}")
+
+    if maturin_module != "agy_companion":
+        errors.append(
+            f"[tool.maturin].module-name must be 'agy_companion', got {maturin_module!r}"
+        )
 
     resolved_manifest = (pyproject_toml.parent / maturin_manifest).resolve()
     if not resolved_manifest.is_file():
@@ -1054,6 +1101,47 @@ def _validate_generated_platform_pkgs(out_dir: pathlib.Path, expected_ver: str) 
             errors.append(f"{target}: preferUnplugged must be true")
         if "exports" in data:
             errors.append(f"{target}: must omit 'exports' field")
+        repo_dir = (
+            data.get("repository", {}).get("directory")
+            if isinstance(data.get("repository"), dict)
+            else None
+        )
+        if repo_dir != "packages/npm":
+            errors.append(f"{target}: repository.directory must be 'packages/npm', got {repo_dir!r}")
+        readme_path = out_dir / target / "README.md"
+        if not readme_path.is_file() or not readme_path.read_text(encoding="utf-8").strip():
+            errors.append(f"{target}: missing or empty generated README.md")
+    return errors
+
+
+_README_HTML_ATTR_RE = re.compile(r"""\b(?:src|href)\s*=\s*(?:"([^"]+)"|'([^']+)')""", re.IGNORECASE)
+_README_MD_LINK_RE = re.compile(r"""!?\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)""")
+
+
+def _validate_readme_absolute_urls(readme_path: pathlib.Path) -> list[str]:
+    if not readme_path.is_file():
+        return [f"missing {readme_path.name}"]
+
+    errors: list[str] = []
+    in_fence = False
+    for idx, line in enumerate(readme_path.read_text(encoding="utf-8").splitlines(), start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+
+        for match in _README_HTML_ATTR_RE.finditer(line):
+            url = (match.group(1) or match.group(2) or "").strip()
+            if url and not url.startswith(("https://", "http://", "#", "mailto:")):
+                errors.append(f"README.md:{idx}: relative HTML src/href {url!r}")
+
+        for match in _README_MD_LINK_RE.finditer(line):
+            url = match.group(1).strip()
+            if url and not url.startswith(("https://", "http://", "#", "mailto:")):
+                errors.append(f"README.md:{idx}: relative Markdown link {url!r}")
+
     return errors
 
 

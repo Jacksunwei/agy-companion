@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="plugin/assets/logo.svg" width="88" height="88" alt="Antigravity Companion logo" />
+  <img src="https://raw.githubusercontent.com/Jacksunwei/agy-companion/main/plugin/assets/logo.svg" width="88" height="88" alt="Antigravity Companion logo" />
 </p>
 
 <h1 align="center">❤️ Antigravity Companion ❤️</h1>
@@ -10,11 +10,12 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0" /></a>
-  <img src="https://img.shields.io/badge/version-0.0.7-informational.svg" alt="Version 0.0.7" />
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-2024%20%7C%20forbid%28unsafe__code%29-orange.svg" alt="Rust 2024 forbid(unsafe_code)" /></a>
+  <a href="https://github.com/Jacksunwei/agy-companion/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0" /></a>
+  <a href="https://www.npmjs.com/package/agy-companion"><img src="https://img.shields.io/npm/v/agy-companion.svg" alt="npm version" /></a>
+  <a href="https://pypi.org/project/agy-companion/"><img src="https://img.shields.io/pypi/v/agy-companion.svg" alt="PyPI version" /></a>
+  <a href="https://github.com/Jacksunwei/agy-companion/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust-2024%20%7C%20forbid%28unsafe__code%29-orange.svg" alt="Rust 2024 forbid(unsafe_code)" /></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platforms: macOS, Linux, Windows" />
-  <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
+  <a href="https://github.com/Jacksunwei/agy-companion/blob/main/CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
 <p align="center">
@@ -62,7 +63,7 @@ npm i -g agy-companion && agy-companion install
 uvx --refresh agy-companion install
 ```
 
-> **Pre-release status:** `v0.0.7` packaging is staged in-repo awaiting the first tagged release (`0.0.1` placeholder packages are currently reserved on npm and PyPI). To run `agy-companion` from a checkout right now, see [Build from Source](CONTRIBUTING.md#build-from-source).
+> **Release channels:** Prebuilt binaries for macOS (`arm64`/`x64`), Linux (`x64`/`arm64`), and Windows (`x64`) are published via [GitHub Releases](https://github.com/Jacksunwei/agy-companion/releases), [npm](https://www.npmjs.com/package/agy-companion), and [PyPI](https://pypi.org/project/agy-companion/) on each `v*.*.*` tag (see [`docs/design/release-pipeline.md`](https://github.com/Jacksunwei/agy-companion/blob/main/docs/design/release-pipeline.md)). To run from a local checkout instead, see [Build from Source](https://github.com/Jacksunwei/agy-companion/blob/main/CONTRIBUTING.md#build-from-source).
 
 <details>
 <summary>Upgrade, Uninstall, Full Purge &amp; Troubleshooting</summary>
@@ -81,7 +82,7 @@ uvx --refresh agy-companion install
 - **One-shot launch (without shell hook):** `agy-companion launch`
 - **Diagnostics:** `agy-companion doctor`
 
-See [`docs/design/dock-launcher-and-install.md`](docs/design/dock-launcher-and-install.md) and [`plugin/README.md`](plugin/README.md) for lifecycle details and troubleshooting.
+See [`docs/design/dock-launcher-and-install.md`](https://github.com/Jacksunwei/agy-companion/blob/main/docs/design/dock-launcher-and-install.md) and [`plugin/README.md`](https://github.com/Jacksunwei/agy-companion/blob/main/plugin/README.md) for lifecycle details and troubleshooting.
 
 </details>
 
@@ -98,17 +99,17 @@ See [`docs/design/dock-launcher-and-install.md`](docs/design/dock-launcher-and-i
 <table>
   <tr>
     <td align="center" width="33%">
-      <img src="docs/assets/settings.png" alt="Settings tab — connect Gemini API and OpenAI Codex and choose enabled models" />
+      <img src="https://raw.githubusercontent.com/Jacksunwei/agy-companion/main/docs/assets/settings.png" alt="Settings tab — connect Gemini API and OpenAI Codex and choose enabled models" />
       <br />
       <sub><strong>Settings</strong> — Connect ChatGPT &amp; Gemini, toggle models</sub>
     </td>
     <td align="center" width="33%">
-      <img src="docs/assets/monitor.png" alt="Monitor tab — live context fill, cache hit rate, call health, and per-model breakdown" />
+      <img src="https://raw.githubusercontent.com/Jacksunwei/agy-companion/main/docs/assets/monitor.png" alt="Monitor tab — live context fill, cache hit rate, call health, and per-model breakdown" />
       <br />
       <sub><strong>Monitor</strong> — Live context, cache hits &amp; session cost</sub>
     </td>
     <td align="center" width="33%">
-      <img src="docs/assets/usage.png" alt="Usage tab — 7-day token and cost chart with model and provider breakdown" />
+      <img src="https://raw.githubusercontent.com/Jacksunwei/agy-companion/main/docs/assets/usage.png" alt="Usage tab — 7-day token and cost chart with model and provider breakdown" />
       <br />
       <sub><strong>Usage</strong> — Multi-day spend, cache savings &amp; trends</sub>
     </td>
@@ -119,16 +120,16 @@ See [`docs/design/dock-launcher-and-install.md`](docs/design/dock-launcher-and-i
 
 ## Privacy & Security
 
-Antigravity Companion runs strictly locally (`127.0.0.1`) — your prompts, code, and credentials stay on your machine, and local usage tracking records token counts and latency only. See [`SECURITY.md`](SECURITY.md) for vulnerability reporting and security details.
+Antigravity Companion runs strictly locally (`127.0.0.1`) — your prompts, code, and credentials stay on your machine, and local usage tracking records token counts and latency only. See [`SECURITY.md`](https://github.com/Jacksunwei/agy-companion/blob/main/SECURITY.md) for vulnerability reporting and security details.
 
 ---
 
 ## Contributing
 
-Contributions are welcome — especially new provider adapters (Ollama Cloud, OpenAI-compatible endpoints, Claude), UX improvements, and platform polish. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, architecture, and development guidelines, or open a [Provider Adapter proposal](https://github.com/Jacksunwei/agy-companion/issues/new?template=provider_adapter.yml).
+Contributions are welcome — especially new provider adapters (Ollama Cloud, OpenAI-compatible endpoints, Claude), UX improvements, and platform polish. See [`CONTRIBUTING.md`](https://github.com/Jacksunwei/agy-companion/blob/main/CONTRIBUTING.md) for setup, architecture, and development guidelines, or open a [Provider Adapter proposal](https://github.com/Jacksunwei/agy-companion/issues/new?template=provider_adapter.yml).
 
 ---
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](https://github.com/Jacksunwei/agy-companion/blob/main/LICENSE).
