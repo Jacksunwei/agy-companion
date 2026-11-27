@@ -18,7 +18,7 @@ use url::{Origin, Url};
 use crate::codex::auth::CodexAuth;
 use crate::codex::translate::{
     CodexSseTranslator, UnaryGeminiAggregator, sanitize_codex_error_json,
-    translate_gemini_to_codex_request,
+    translate_gemini_to_codex_request_with_cache_key,
 };
 use crate::gemini::url::is_loopback_url;
 use crate::{
@@ -38,6 +38,7 @@ const CHATGPT_ACCOUNT_ID_HEADER: HeaderName = HeaderName::from_static("chatgpt-a
 const OPENAI_BETA_HEADER: HeaderName = HeaderName::from_static("openai-beta");
 const ORIGINATOR_HEADER: HeaderName = HeaderName::from_static("originator");
 const VERSION_HEADER: HeaderName = HeaderName::from_static("version");
+const SESSION_ID_HEADER: HeaderName = HeaderName::from_static("session_id");
 
 const MAX_CONNECT_TIMEOUT_SECS: u64 = 30;
 const HEALTH_CHECK_TIMEOUT_SECS: u64 = 15;
@@ -153,6 +154,7 @@ impl CodexProvider {
         &self,
         body: Bytes,
         creds: &CodexCredentials,
+        session_id: Option<&str>,
         timeout_override: Option<Duration>,
     ) -> Result<reqwest::Response, ProviderError> {
         let auth_header = build_bearer_header(creds.access_token.expose())?;
@@ -185,6 +187,10 @@ impl CodexProvider {
             )
             .body(body);
 
+        if let Some(sid) = session_id {
+            req = req.header(SESSION_ID_HEADER, build_session_id_header(sid)?);
+        }
+
         if let Some(timeout) = timeout_override {
             req = req.timeout(timeout);
         }
@@ -195,11 +201,12 @@ impl CodexProvider {
     async fn send_with_single_401_retry(
         &self,
         body: Bytes,
+        session_id: Option<&str>,
         timeout_override: Option<Duration>,
     ) -> Result<reqwest::Response, ProviderError> {
         let creds = self.auth.valid_credentials(false).await?;
         let response = self
-            .send_responses_request(body.clone(), &creds, timeout_override)
+            .send_responses_request(body.clone(), &creds, session_id, timeout_override)
             .await?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -209,7 +216,7 @@ impl CodexProvider {
             );
             let refreshed = self.auth.valid_credentials(true).await?;
             return self
-                .send_responses_request(body, &refreshed, timeout_override)
+                .send_responses_request(body, &refreshed, session_id, timeout_override)
                 .await;
         }
 
@@ -228,7 +235,14 @@ impl ProviderAdapter for CodexProvider {
     ) -> BoxFuture<'_, Result<ForwardResponse, ProviderError>> {
         Box::pin(async move {
             let (model, is_streaming) = parse_gemini_codex_path(&req.path_and_query)?;
-            let translated = translate_gemini_to_codex_request(&model, &req.body)?;
+            let translated = translate_gemini_to_codex_request_with_cache_key(
+                &model,
+                &req.body,
+                req.conversation_id.as_deref(),
+            )?;
+            let session_id = translated
+                .get("prompt_cache_key")
+                .and_then(serde_json::Value::as_str);
             let codex_body = Bytes::from(serde_json::to_vec(&translated).map_err(|_| {
                 ProviderError::InvalidRequest(
                     "failed to serialize translated Codex request".to_string(),
@@ -243,7 +257,9 @@ impl ProviderAdapter for CodexProvider {
                 "forwarding Gemini request to OpenAI Codex Responses API"
             );
 
-            let response = self.send_with_single_401_retry(codex_body, None).await?;
+            let response = self
+                .send_with_single_401_retry(codex_body, session_id, None)
+                .await?;
             let status = response.status();
 
             if !status.is_success() {
@@ -330,7 +346,7 @@ impl ProviderAdapter for CodexProvider {
                 .timeout
                 .min(Duration::from_secs(HEALTH_CHECK_TIMEOUT_SECS));
             let response = self
-                .send_with_single_401_retry(probe_body, Some(timeout))
+                .send_with_single_401_retry(probe_body, None, Some(timeout))
                 .await?;
 
             if response.status().is_success() {
@@ -611,6 +627,23 @@ fn build_account_id_header(account_id: &str) -> Result<HeaderValue, ProviderErro
     Ok(hv)
 }
 
+fn build_session_id_header(session_id: &str) -> Result<HeaderValue, ProviderError> {
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(ProviderError::InvalidRequest(
+            "Codex session_id contains invalid header characters".to_string(),
+        ));
+    }
+    HeaderValue::from_str(session_id).map_err(|_| {
+        ProviderError::InvalidRequest(
+            "Codex session_id contains invalid header characters".to_string(),
+        )
+    })
+}
+
 fn sanitize_reqwest_error(err: reqwest::Error) -> ProviderError {
     let sanitized = err.without_url();
     if sanitized.is_timeout() {
@@ -886,12 +919,13 @@ mod tests {
         let auth = Arc::new(StubCodexAuth::with_tokens("access_tok_1", "access_tok_2"));
         let provider = CodexProvider::new(&base_url, auth, 30).expect("provider");
 
-        // 1. Streaming SSE
+        // 1. Streaming SSE with explicit conversation_id + systemInstruction
         let req = ForwardRequest {
             path_and_query: "/v1beta/models/gpt-6.2-astra:streamGenerateContent?alt=sse"
                 .to_string(),
             body: Bytes::from(
                 json!({
+                    "systemInstruction": { "parts": [{ "text": "Follow workspace rules." }] },
                     "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
                     "generationConfig": { "thinkingConfig": { "thinkingLevel": "HIGH" } }
                 })
@@ -899,6 +933,7 @@ mod tests {
             ),
             content_type: Some("application/json".to_string()),
             api_key_override: None,
+            conversation_id: Some("conv-cache-test-1234".to_string()),
         };
         let resp = provider.forward_gemini(req).await.expect("forward sse");
         assert_eq!(resp.status, 200);
@@ -911,7 +946,7 @@ mod tests {
         assert!(raw.contains("\"cachedContentTokenCount\":300"));
         assert!(raw.contains("\"thoughtsTokenCount\":15"));
 
-        // Verify required Codex headers were sent accurately.
+        // Verify required Codex headers + session_id + prompt_cache_key + developer SI placement.
         let hdrs = mock.captured_headers.lock().unwrap()[0].clone();
         assert_eq!(
             hdrs.get("authorization").map(String::as_str),
@@ -933,8 +968,21 @@ mod tests {
             hdrs.get("version").map(String::as_str),
             Some(CODEX_CLIENT_VERSION)
         );
+        assert_eq!(
+            hdrs.get("session_id").map(String::as_str),
+            Some("conv-cache-test-1234")
+        );
+        let body0 = mock.captured_bodies.lock().unwrap()[0].clone();
+        assert_eq!(body0["instructions"], crate::DEFAULT_CODEX_INSTRUCTIONS);
+        assert_eq!(body0["prompt_cache_key"], "conv-cache-test-1234");
+        assert_eq!(body0["input"][0]["role"], "developer");
+        assert_eq!(
+            body0["input"][0]["content"][0]["text"],
+            "Follow workspace rules."
+        );
+        assert_eq!(body0["input"][1]["role"], "user");
 
-        // 2. Unary :generateContent aggregates translated stream into single Gemini JSON.
+        // 2. Unary :generateContent without conversation_id derives matching fallback session_id & prompt_cache_key.
         let unary_req = ForwardRequest {
             path_and_query: "/v1beta/models/gpt-6.2-sol:generateContent".to_string(),
             body: Bytes::from(
@@ -943,6 +991,7 @@ mod tests {
             ),
             content_type: Some("application/json".to_string()),
             api_key_override: None,
+            conversation_id: None,
         };
         let unary_resp = provider
             .forward_gemini(unary_req)
@@ -950,6 +999,16 @@ mod tests {
             .expect("forward unary");
         assert_eq!(unary_resp.status, 200);
         assert_eq!(unary_resp.content_type.as_deref(), Some("application/json"));
+        let hdrs1 = mock.captured_headers.lock().unwrap()[1].clone();
+        let body1 = mock.captured_bodies.lock().unwrap()[1].clone();
+        let fallback_key = body1["prompt_cache_key"]
+            .as_str()
+            .expect("fallback prompt_cache_key");
+        assert!(fallback_key.starts_with("agyc-"));
+        assert_eq!(
+            hdrs1.get("session_id").map(String::as_str),
+            Some(fallback_key)
+        );
         let unary_bytes = collect_stream(unary_resp.stream).await;
         let unary_json: serde_json::Value =
             serde_json::from_slice(&unary_bytes).expect("valid unary json");
@@ -977,6 +1036,7 @@ mod tests {
             body: Bytes::from(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#),
             content_type: None,
             api_key_override: None,
+            conversation_id: None,
         };
         let resp = provider.forward_gemini(req).await.expect("retry succeeds");
         assert_eq!(resp.status, 200);
@@ -1002,6 +1062,7 @@ mod tests {
                 body: Bytes::from(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect("persistent 401 sanitized");
@@ -1023,6 +1084,7 @@ mod tests {
                 body: Bytes::from(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect("429 sanitized");
@@ -1041,6 +1103,7 @@ mod tests {
                 body: Bytes::from(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect_err("unauth fails");
@@ -1049,7 +1112,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn health_check_list_models_and_no_redirect_policy() {
-        let (base_url, _) = spawn_mock_codex(MockMode::UnauthorizedOnceThenSuccess).await;
+        let (base_url, mock) = spawn_mock_codex(MockMode::UnauthorizedOnceThenSuccess).await;
         let auth = Arc::new(StubCodexAuth::with_tokens("stale", "fresh"));
         let provider = CodexProvider::new(&base_url, auth.clone(), 30).expect("provider");
         provider
@@ -1057,6 +1120,16 @@ mod tests {
             .await
             .expect("health_check succeeds after 401 refresh");
         assert_eq!(auth.force_refresh_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !mock.captured_headers.lock().unwrap()[0].contains_key("session_id"),
+            "health_check probe must not send session_id"
+        );
+        assert!(
+            mock.captured_bodies.lock().unwrap()[0]
+                .get("prompt_cache_key")
+                .is_none(),
+            "health_check probe must not send prompt_cache_key"
+        );
 
         let models = provider.list_models(None).await.expect("list_models");
         assert_eq!(models.models.len(), CURATED_CODEX_MODELS.len());

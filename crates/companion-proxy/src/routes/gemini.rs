@@ -100,6 +100,7 @@ pub(super) async fn proxy_gemini_handler(
         body: body.clone(),
         content_type: content_type.clone(),
         api_key_override: api_key_override.clone(),
+        conversation_id: conversation_id.clone(),
     };
 
     let mut upstream = match target_provider.forward_gemini(forward_req).await {
@@ -177,6 +178,7 @@ pub(super) async fn proxy_gemini_handler(
                 body: stripped_body,
                 content_type,
                 api_key_override,
+                conversation_id: conversation_id.clone(),
             };
             match target_provider.forward_gemini(retry_req).await {
                 Ok(retry_resp) => {
