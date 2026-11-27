@@ -25,6 +25,16 @@ pub use codex::auth::{
     DEFAULT_CODEX_LOGIN_TTL, DEFAULT_CODEX_OAUTH_ISSUER, DEFAULT_CODEX_OAUTH_TIMEOUT,
     DEFAULT_CODEX_REFRESH_MARGIN,
 };
+pub use codex::provider::{
+    CODEX_CLIENT_VERSION, CODEX_OPENAI_BETA_HEADER, CODEX_ORIGINATOR_HEADER, CodexProvider,
+};
+pub use codex::translate::{
+    CodexSseTranslator, DEFAULT_CODEX_INSTRUCTIONS, DEFAULT_MAX_CODEX_SSE_EVENT_BYTES,
+    DEFAULT_MAX_TOOL_CALL_ARGS_BYTES, DEFAULT_MAX_TOTAL_TOOL_CALL_ARGS_BYTES,
+    DEFAULT_MAX_UNARY_RESPONSE_BYTES, MAX_CODEX_CALL_ID_LEN, MAX_CONCURRENT_TOOL_CALLS,
+    UnaryGeminiAggregator, normalize_gemini_schema, sanitize_codex_error_json,
+    translate_gemini_to_codex_request,
+};
 pub use gemini::{GEMINI_API_KEY_ENV_VAR, GeminiProvider};
 pub use ls_client::{
     ANTIGRAVITY_CSRF_TOKEN_ENV_VAR, ANTIGRAVITY_LS_ADDRESS_ENV_VAR, DEFAULT_LS_CONNECT_TIMEOUT,
@@ -50,6 +60,8 @@ pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + 
 pub enum ProviderError {
     #[error("invalid request path: {0}")]
     InvalidPath(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("invalid provider configuration: {0}")]
     InvalidConfig(String),
     #[error(

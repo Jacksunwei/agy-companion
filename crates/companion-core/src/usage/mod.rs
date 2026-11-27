@@ -292,6 +292,14 @@ impl UsageEvent {
         Self::from_parts("gemini", "proxy", model, usage, latency_ms)
     }
 
+    pub fn from_codex(
+        model: impl Into<String>,
+        usage: &GeminiUsageMetadata,
+        latency_ms: u64,
+    ) -> Self {
+        Self::from_parts("openai-codex", "proxy", model, usage, latency_ms)
+    }
+
     pub fn from_antigravity_builtin(
         model: impl Into<String>,
         usage: &GeminiUsageMetadata,
@@ -511,7 +519,17 @@ mod tests {
         assert_eq!(builtin.cached_tokens, 2);
         assert_eq!(builtin.reasoning_tokens, 1);
         assert_eq!(builtin.latency_ms, 456);
+        let codex = UsageEvent::from_codex("gpt-6.2-sol", &usage, 789);
+        assert_eq!(codex.provider, "openai-codex");
+        assert_eq!(codex.source, "proxy");
+        assert_eq!(codex.model, "gpt-6.2-sol");
+        assert_eq!(codex.input_tokens, 10);
+        assert_eq!(codex.output_tokens, 5);
+        assert_eq!(codex.cached_tokens, 2);
+        assert_eq!(codex.reasoning_tokens, 1);
+        assert_eq!(codex.latency_ms, 789);
         sink.record(event);
+        sink.record(codex);
         sink.record(builtin);
     }
 

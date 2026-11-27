@@ -10,8 +10,8 @@ use http::{HeaderMap, Method, StatusCode, header};
 
 use crate::ProxyState;
 use crate::cloudcode::{
-    CloudCodeError, is_cloudcode_path, is_uncompressed_content_encoding, merge_available_models,
-    validate_cloudcode_path,
+    CloudCodeError, is_cloudcode_path, is_uncompressed_content_encoding,
+    merge_available_models_multi_provider, validate_cloudcode_path,
 };
 
 use super::middleware::{
@@ -144,8 +144,11 @@ pub(super) async fn fetch_available_models_handler(
         });
     }
 
+    let gemini_ready = active.has_configured_api_key && !active.enabled_models.is_empty();
+    let codex_ready = active.codex_authenticated && !active.codex_enabled_models.is_empty();
+
     let refresh_ts_ms = unix_timestamp_ms();
-    if !active.has_configured_api_key || active.enabled_models.is_empty() {
+    if !gemini_ready && !codex_ready {
         state.stats().record_catalog_refresh(refresh_ts_ms, false);
         let mut builder = Response::builder()
             .status(StatusCode::OK)
@@ -162,10 +165,24 @@ pub(super) async fn fetch_available_models_handler(
         });
     }
 
-    let (final_body, was_merged) = match merge_available_models(
+    let empty_models: &[String] = &[];
+    let gemini_models = if gemini_ready {
+        active.enabled_models.as_slice()
+    } else {
+        empty_models
+    };
+    let codex_models = if codex_ready {
+        active.codex_enabled_models.as_slice()
+    } else {
+        empty_models
+    };
+
+    let (final_body, was_merged) = match merge_available_models_multi_provider(
         &upstream.body,
-        &active.enabled_models,
+        gemini_models,
         &active.default_model,
+        codex_models,
+        &active.codex_default_model,
     ) {
         Ok(merged) => (Bytes::from(merged), true),
         Err(err) => {

@@ -77,7 +77,7 @@ pub fn build_router(state: ProxyState) -> Router {
         .with_state(state)
 }
 
-pub(super) fn json_error_response(status: StatusCode, message: &'static str) -> Response {
+pub(super) fn json_error_response(status: StatusCode, message: &str) -> Response {
     let payload = serde_json::json!({
         "error": {
             "message": message,

@@ -45,8 +45,10 @@ pub(super) async fn proxy_gemini_handler(
     }
 
     let model = extract_model_name(path_and_query);
+    let max_model_len =
+        companion_core::MAX_GEMINI_MODEL_LEN.max(companion_core::MAX_CODEX_MODEL_LEN);
     if model == "unknown"
-        || model.len() > companion_core::MAX_GEMINI_MODEL_LEN
+        || model.len() > max_model_len
         || model == "."
         || model.contains("..")
         || model.contains(['?', '#', '/', '\\', '%', ';'])
@@ -54,10 +56,12 @@ pub(super) async fn proxy_gemini_handler(
     {
         return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
     }
-    if !companion_core::is_supported_gemini_model(&model) {
+    let is_gemini = companion_core::is_supported_gemini_model(&model);
+    let is_codex = !is_gemini && companion_core::is_codex_model(&model);
+    if !is_gemini && !is_codex {
         return json_error_response(
             StatusCode::BAD_REQUEST,
-            "unsupported model: only Gemini 3.8+ and Gemini 4+ models are supported (unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly)",
+            "unsupported model: only Gemini 3.8+ and Gemini 4+ or supported OpenAI Codex models are supported (unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly)",
         );
     }
 
@@ -67,13 +71,29 @@ pub(super) async fn proxy_gemini_handler(
     };
 
     let active = state.active_provider().await;
-    let api_key_override = match validate_inbound_api_key(&headers, active.has_configured_api_key) {
-        Ok(key) => key,
-        Err(msg) => return json_error_response(StatusCode::BAD_REQUEST, msg),
+    let api_key_override = if is_gemini {
+        match validate_inbound_api_key(&headers, active.has_configured_api_key) {
+            Ok(key) => key,
+            Err(msg) => return json_error_response(StatusCode::BAD_REQUEST, msg),
+        }
+    } else {
+        None
+    };
+
+    let (target_provider, origin) = if is_gemini {
+        (Arc::clone(&active.provider), UsageOrigin::GeminiProxy)
+    } else {
+        let Some(codex) = active.codex_provider.as_ref() else {
+            return json_error_response(
+                StatusCode::UNAUTHORIZED,
+                "OpenAI Codex is not signed in — sign in with ChatGPT in Antigravity Companion settings",
+            );
+        };
+        (Arc::clone(codex), UsageOrigin::CodexProxy)
     };
 
     let started_at = Instant::now();
-    let has_thought_sig = body_contains_thought_signature(&body);
+    let has_thought_sig = is_gemini && body_contains_thought_signature(&body);
     let conversation_id = crate::session::extract_conversation_id(&body);
     let forward_req = ForwardRequest {
         path_and_query: path_and_query.to_string(),
@@ -82,10 +102,13 @@ pub(super) async fn proxy_gemini_handler(
         api_key_override: api_key_override.clone(),
     };
 
-    let mut upstream = match active.provider.forward_gemini(forward_req).await {
+    let mut upstream = match target_provider.forward_gemini(forward_req).await {
         Ok(resp) => resp,
         Err(ProviderError::InvalidPath(_)) => {
             return json_error_response(StatusCode::BAD_REQUEST, "invalid request path");
+        }
+        Err(ProviderError::InvalidRequest(msg)) => {
+            return json_error_response(StatusCode::BAD_REQUEST, &msg);
         }
         Err(ProviderError::MissingApiKey) => {
             return json_error_response(
@@ -135,7 +158,7 @@ pub(super) async fn proxy_gemini_handler(
     // foreign thoughtSignature tokens that generativelanguage.googleapis.com rejects with
     // 400 INVALID_THOUGHT_SIGNATURE. Keep byte-for-byte pass-through on the normal path (S4),
     // and only strip foreign thoughtSignature keys on an explicit 400 INVALID_THOUGHT_SIGNATURE.
-    if upstream.status == StatusCode::BAD_REQUEST.as_u16() && has_thought_sig {
+    if is_gemini && upstream.status == StatusCode::BAD_REQUEST.as_u16() && has_thought_sig {
         let SniffedErrorPrefix {
             sniffed,
             leftover,
@@ -155,7 +178,7 @@ pub(super) async fn proxy_gemini_handler(
                 content_type,
                 api_key_override,
             };
-            match active.provider.forward_gemini(retry_req).await {
+            match target_provider.forward_gemini(retry_req).await {
                 Ok(retry_resp) => {
                     upstream = retry_resp;
                 }
@@ -189,7 +212,7 @@ pub(super) async fn proxy_gemini_handler(
             collector,
             stats: Arc::clone(state.stats()),
             usage_sink: Arc::clone(state.usage_sink()),
-            origin: UsageOrigin::GeminiProxy,
+            origin,
             model,
             conversation_id,
             started_at,

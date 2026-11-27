@@ -17,6 +17,7 @@ pub const DEFAULT_MAX_JSON_TEE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UsageOrigin {
     GeminiProxy,
+    CodexProxy,
     AntigravityBuiltin,
 }
 
@@ -24,13 +25,14 @@ impl UsageOrigin {
     pub(super) const fn provider(self) -> &'static str {
         match self {
             Self::GeminiProxy => "gemini",
+            Self::CodexProxy => "openai-codex",
             Self::AntigravityBuiltin => "antigravity",
         }
     }
 
     pub(super) const fn source(self) -> &'static str {
         match self {
-            Self::GeminiProxy => "proxy",
+            Self::GeminiProxy | Self::CodexProxy => "proxy",
             Self::AntigravityBuiltin => "builtin",
         }
     }
@@ -225,6 +227,9 @@ impl Stream for UsageTeeStream {
                         let event = match this.origin {
                             UsageOrigin::GeminiProxy => {
                                 UsageEvent::from_gemini(&this.model, &usage, latency_ms)
+                            }
+                            UsageOrigin::CodexProxy => {
+                                UsageEvent::from_codex(&this.model, &usage, latency_ms)
                             }
                             UsageOrigin::AntigravityBuiltin => {
                                 UsageEvent::from_antigravity_builtin(
