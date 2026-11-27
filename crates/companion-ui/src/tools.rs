@@ -154,10 +154,7 @@ impl CompanionUiServer {
                 let payload = match provider.health_check().await {
                     Ok(()) => TestConnectionPayload {
                         ok: true,
-                        message: format!(
-                            "Connected to Gemini upstream ({}) successfully.",
-                            cfg.providers.gemini.base_url
-                        ),
+                        message: "Connected \u{00b7} Google AI Studio".to_string(),
                     },
                     Err(err) => TestConnectionPayload {
                         ok: false,
@@ -198,10 +195,7 @@ impl CompanionUiServer {
                 let payload = match provider.health_check().await {
                     Ok(()) => TestConnectionPayload {
                         ok: true,
-                        message: format!(
-                            "Connected to OpenAI Codex upstream ({}) successfully.",
-                            cfg.providers.codex.base_url
-                        ),
+                        message: "Connected \u{00b7} OpenAI Codex".to_string(),
                     },
                     Err(err) => TestConnectionPayload {
                         ok: false,

@@ -18,6 +18,8 @@ import {
 export interface SettingsViewActions {
   onOpenExternalUrl: (url: string, displayUrl: string) => void;
   onDraftChange: (draft: string) => void;
+  onOpenGeminiKeyEdit: () => void;
+  onCancelGeminiKeyEdit: () => void;
   onSaveKey: () => void;
   onTestConnection: () => void;
   onToggleClearConfirm: () => void;
@@ -51,6 +53,7 @@ export interface SettingsViewController {
   root: HTMLElement;
   update: (state: AppState) => void;
   clearKeyInputDom: () => void;
+  focusKeyInput: () => void;
   clearCodexManualInputDom: () => void;
 }
 
@@ -104,19 +107,20 @@ export function createSettingsView(
   // Render live providers from typed registry (Google AI Studio today)
   const geminiProvider = LIVE_PROVIDERS[0];
 
-  const card = el("section", "card");
+  const card = el("section", "card prov-card");
   card.setAttribute("aria-label", `${geminiProvider.title} provider`);
 
-  const hdr = el("div", "sec-h");
-  hdr.append(el("span", "prov-title", geminiProvider.title));
+  const hdr = el("div", "prov-hdr");
+  const provId = el("div", "prov-id");
+  provId.append(el("span", "prov-title", geminiProvider.title));
 
   const statusTag = el("span", "tag");
   const statusDot = el("span", "sdot ok");
   const statusText = el("span", null, "Not set");
   statusTag.append(statusDot, statusText);
-  hdr.append(statusTag);
+  provId.append(statusTag);
 
-  const right = el("span", "sec-right");
+  const geminiActions = el("div", "prov-actions");
   const getKeyBtn = el("button", "lnk", "Get API key \u2197");
   getKeyBtn.type = "button";
   getKeyBtn.title = geminiProvider.keyPortalUrl;
@@ -126,11 +130,26 @@ export function createSettingsView(
       geminiProvider.keyPortalDisplay,
     );
   });
-  right.append(getKeyBtn);
-  hdr.append(right);
+
+  const testBtn = el("button", "btn btn-sm", "Test");
+  testBtn.type = "button";
+  testBtn.hidden = true;
+  testBtn.disabled = true;
+
+  const replaceBtn = el("button", "lnk", "Replace");
+  replaceBtn.type = "button";
+  replaceBtn.hidden = true;
+
+  const clearBtn = el("button", "lnk-danger", "Clear");
+  clearBtn.type = "button";
+  clearBtn.hidden = true;
+
+  geminiActions.append(getKeyBtn, testBtn, replaceBtn, clearBtn);
+  hdr.append(provId, geminiActions);
   card.append(hdr);
 
-  // Write-only API key input
+  // Compact write-only API key row (shown when unconfigured or when Replace is open)
+  const keyRow = el("div", "key-row");
   const keyInput = el("input", "inp mono");
   keyInput.id = "gemini-api-key";
   keyInput.type = "password";
@@ -139,18 +158,14 @@ export function createSettingsView(
   keyInput.placeholder = "Paste Google AI Studio API key";
   keyInput.setAttribute("aria-label", "Google AI Studio API key");
 
-  const actRow = el("div", "act-row");
-  const saveBtn = el("button", "btn btn-primary", "Save");
+  const keyActRow = el("div", "act-row key-act-row");
+  const saveBtn = el("button", "btn btn-primary btn-sm", "Save");
   saveBtn.type = "button";
   saveBtn.disabled = true;
 
-  const testBtn = el("button", "btn", "Test");
-  testBtn.type = "button";
-  testBtn.disabled = true;
-
-  const clearBtn = el("button", "lnk-danger", "Clear");
-  clearBtn.type = "button";
-  clearBtn.hidden = true;
+  const cancelKeyEditBtn = el("button", "btn btn-sm", "Cancel");
+  cancelKeyEditBtn.type = "button";
+  cancelKeyEditBtn.hidden = true;
 
   keyInput.addEventListener("input", () => {
     actions.onDraftChange(keyInput.value);
@@ -161,14 +176,21 @@ export function createSettingsView(
       if (!saveBtn.disabled) {
         actions.onSaveKey();
       }
+    } else if (event.key === "Escape" && !cancelKeyEditBtn.hidden) {
+      event.preventDefault();
+      event.stopPropagation();
+      actions.onCancelGeminiKeyEdit();
     }
   });
   saveBtn.addEventListener("click", () => actions.onSaveKey());
+  cancelKeyEditBtn.addEventListener("click", () => actions.onCancelGeminiKeyEdit());
   testBtn.addEventListener("click", () => actions.onTestConnection());
+  replaceBtn.addEventListener("click", () => actions.onOpenGeminiKeyEdit());
   clearBtn.addEventListener("click", () => actions.onToggleClearConfirm());
 
-  actRow.append(saveBtn, testBtn, clearBtn);
-  card.append(keyInput, actRow);
+  keyActRow.append(saveBtn, cancelKeyEditBtn);
+  keyRow.append(keyInput, keyActRow);
+  card.append(keyRow);
 
   // Inline 2-click Clear confirm row
   const clearConfirmRow = el("div", "confirm-row");
@@ -248,29 +270,38 @@ export function createSettingsView(
   providerStack.append(card);
 
   // Provider 2: OpenAI Codex (ChatGPT OAuth)
-  const codexCard = el("section", "card");
+  const codexCard = el("section", "card prov-card");
   codexCard.setAttribute("aria-label", "OpenAI Codex provider");
 
-  const codexHdr = el("div", "sec-h");
-  codexHdr.append(el("span", "prov-title", "OpenAI Codex"));
+  const codexHdr = el("div", "prov-hdr");
+  const codexProvId = el("div", "prov-id");
+  codexProvId.append(el("span", "prov-title", "OpenAI Codex"));
 
   const codexStatusTag = el("span", "tag codex-status-tag");
   const codexStatusDot = el("span", "sdot ok");
   codexStatusDot.hidden = true;
   const codexStatusText = el("span", "codex-status-text", "Not signed in");
   codexStatusTag.append(codexStatusDot, codexStatusText);
-  codexHdr.append(codexStatusTag);
-  codexCard.append(codexHdr);
+  codexProvId.append(codexStatusTag);
 
-  // State 1: Signed-out action row
-  const codexSignedOutWrap = el("div", "codex-signed-out");
-  const codexSignInRow = el("div", "act-row codex-act-row");
-  const codexSignInBtn = el("button", "btn btn-primary", "Sign in with ChatGPT \u2197");
+  const codexActions = el("div", "prov-actions");
+  const codexSignInBtn = el("button", "btn btn-primary btn-sm", "Sign in with ChatGPT \u2197");
   codexSignInBtn.type = "button";
   codexSignInBtn.addEventListener("click", () => actions.onStartCodexLogin());
-  codexSignInRow.append(codexSignInBtn);
-  codexSignedOutWrap.append(codexSignInRow);
-  codexCard.append(codexSignedOutWrap);
+
+  const codexTestBtn = el("button", "btn btn-sm", "Test");
+  codexTestBtn.type = "button";
+  codexTestBtn.hidden = true;
+  codexTestBtn.addEventListener("click", () => actions.onTestCodexConnection());
+
+  const codexSignOutBtn = el("button", "lnk-danger", "Sign out");
+  codexSignOutBtn.type = "button";
+  codexSignOutBtn.hidden = true;
+  codexSignOutBtn.addEventListener("click", () => actions.onToggleCodexSignOutConfirm());
+
+  codexActions.append(codexSignInBtn, codexTestBtn, codexSignOutBtn);
+  codexHdr.append(codexProvId, codexActions);
+  codexCard.append(codexHdr);
 
   // State 2: Pending sign-in panel (2s poll + sync open + copy + cancel + inline paste fallback)
   const codexPendingWrap = el("div", "codex-pending");
@@ -303,7 +334,7 @@ export function createSettingsView(
   const codexFallbackSum = el("summary", "codex-fallback-sum", "Having trouble? Paste callback URL");
   codexFallbackDetails.append(codexFallbackSum);
 
-  const codexFallbackBody = el("div", "codex-fallback-body");
+  const codexFallbackBody = el("div", "codex-fallback-body key-row");
   const codexManualInput = el("input", "inp mono");
   codexManualInput.id = "codex-callback-input";
   codexManualInput.type = "text";
@@ -323,7 +354,7 @@ export function createSettingsView(
     }
   });
 
-  const codexFallbackActRow = el("div", "act-row");
+  const codexFallbackActRow = el("div", "act-row key-act-row");
   const codexCompleteBtn = el("button", "btn btn-primary btn-sm", "Complete sign-in");
   codexCompleteBtn.type = "button";
   codexCompleteBtn.disabled = true;
@@ -334,21 +365,7 @@ export function createSettingsView(
   codexPendingWrap.append(codexFallbackDetails);
   codexCard.append(codexPendingWrap);
 
-  // State 3: Signed-in action row + 2-click Sign out confirm
-  const codexSignedInWrap = el("div", "codex-signed-in");
-  codexSignedInWrap.hidden = true;
-
-  const codexSignedInActRow = el("div", "act-row codex-act-row");
-  const codexTestBtn = el("button", "btn", "Test");
-  codexTestBtn.type = "button";
-  codexTestBtn.addEventListener("click", () => actions.onTestCodexConnection());
-
-  const codexSignOutBtn = el("button", "lnk-danger", "Sign out");
-  codexSignOutBtn.type = "button";
-  codexSignOutBtn.addEventListener("click", () => actions.onToggleCodexSignOutConfirm());
-  codexSignedInActRow.append(codexTestBtn, codexSignOutBtn);
-  codexSignedInWrap.append(codexSignedInActRow);
-
+  // Inline 2-click Sign out confirm row
   const codexSignOutConfirmRow = el("div", "confirm-row");
   codexSignOutConfirmRow.hidden = true;
   codexSignOutConfirmRow.append(el("span", null, "Sign out of OpenAI Codex?"));
@@ -359,8 +376,7 @@ export function createSettingsView(
   codexCancelSignOutBtn.type = "button";
   codexCancelSignOutBtn.addEventListener("click", () => actions.onCancelCodexSignOut());
   codexSignOutConfirmRow.append(codexConfirmSignOutBtn, codexCancelSignOutBtn);
-  codexSignedInWrap.append(codexSignOutConfirmRow);
-  codexCard.append(codexSignedInWrap);
+  codexCard.append(codexSignOutConfirmRow);
 
   // Codex status feedback line (shared across signed-out, pending, signed-in)
   const codexFeedbackEl = el("div", "status-line");
@@ -566,7 +582,8 @@ export function createSettingsView(
       state.saving || state.clearing || state.updatingIntegration || state.codexBusy;
     const hasDraft = state.apiKeyDraft.trim().length > 0;
 
-    // Status pill
+    // Status pill & symmetric header actions
+    const geminiKeyEditVisible = !apiKeyConfigured || state.geminiKeyEditOpen;
     if (apiKeyConfigured) {
       statusTag.className = "tag tag-ok mono";
       statusDot.hidden = false;
@@ -577,7 +594,13 @@ export function createSettingsView(
       statusText.textContent = "Not set";
     }
 
-    // Input placeholder (never clobber active typing)
+    getKeyBtn.hidden = !geminiKeyEditVisible;
+    testBtn.hidden = geminiKeyEditVisible;
+    replaceBtn.hidden = geminiKeyEditVisible;
+    clearBtn.hidden = geminiKeyEditVisible;
+
+    // Compact inline key row (visible when unconfigured or replacing key)
+    keyRow.hidden = !geminiKeyEditVisible;
     keyInput.placeholder = apiKeyConfigured
       ? "Paste new key to replace"
       : "Paste Google AI Studio API key";
@@ -586,17 +609,22 @@ export function createSettingsView(
       keyInput.value = state.apiKeyDraft;
     }
 
-    // Buttons: Test disabled on unsaved draft, unconfigured, or busy
     saveBtn.textContent = state.saving ? "Saving\u2026" : "Save";
     saveBtn.disabled = !canCall || !hasDraft || writeBusy;
+    cancelKeyEditBtn.hidden = !(apiKeyConfigured && state.geminiKeyEditOpen);
+    cancelKeyEditBtn.disabled = writeBusy;
 
     testBtn.textContent = state.testing ? "Testing\u2026" : "Test";
     testBtn.disabled = !canCall || !apiKeyConfigured || hasDraft || writeBusy || state.testing;
 
-    clearBtn.hidden = !apiKeyConfigured;
+    replaceBtn.disabled = !canCall || writeBusy;
     clearBtn.disabled = !canCall || writeBusy;
 
-    clearConfirmRow.hidden = !(state.clearConfirmOpen && apiKeyConfigured);
+    clearConfirmRow.hidden = !(
+      state.clearConfirmOpen &&
+      apiKeyConfigured &&
+      !state.geminiKeyEditOpen
+    );
     confirmClearBtn.textContent = state.clearing ? "Clearing\u2026" : "Confirm clear";
     confirmClearBtn.disabled = !canCall || writeBusy;
     cancelClearBtn.disabled = writeBusy;
@@ -609,7 +637,8 @@ export function createSettingsView(
       keyFeedbackEl.hidden = true;
     }
 
-    // Enabled models chips
+    // Enabled models chips (hidden until configured, symmetric with OpenAI Codex)
+    modSec.hidden = !apiKeyConfigured;
     const enabledCount = enabledSet.size;
     modelCountEl.textContent = `${enabledCount} enabled`;
     for (const [id, entry] of chipMap.entries()) {
@@ -641,25 +670,34 @@ export function createSettingsView(
       codexStatusDot.className = "sdot warn";
       codexStatusDot.hidden = false;
       codexStatusText.textContent = "Signing in\u2026";
+      codexStatusTag.removeAttribute("title");
     } else if (codexAuthenticated) {
+      const badgeText = formatCodexStatusBadge(codex?.plan_type, codex?.account_hint);
       codexStatusTag.className = "tag tag-ok codex-status-tag";
       codexStatusDot.className = "sdot ok";
       codexStatusDot.hidden = false;
-      codexStatusText.textContent = formatCodexStatusBadge(
-        codex?.plan_type,
-        codex?.account_hint,
-      );
+      codexStatusText.textContent = badgeText;
+      codexStatusTag.title = badgeText;
     } else {
       codexStatusTag.className = "tag codex-status-tag";
       codexStatusDot.hidden = true;
       codexStatusText.textContent = "Not signed in";
+      codexStatusTag.removeAttribute("title");
     }
 
-    codexSignedOutWrap.hidden = codexAuthenticated || codexPending;
+    codexActions.hidden = codexPending;
+    codexSignInBtn.hidden = codexAuthenticated || codexPending;
     codexSignInBtn.textContent = state.codexBusy
       ? "Starting sign-in\u2026"
       : "Sign in with ChatGPT \u2197";
     codexSignInBtn.disabled = !canCall || writeBusy;
+
+    codexTestBtn.hidden = !codexAuthenticated || codexPending;
+    codexTestBtn.textContent = state.codexTesting ? "Testing\u2026" : "Test";
+    codexTestBtn.disabled = !canCall || !codexAuthenticated || writeBusy || state.codexTesting;
+
+    codexSignOutBtn.hidden = !codexAuthenticated || codexPending;
+    codexSignOutBtn.disabled = !canCall || writeBusy;
 
     codexPendingWrap.hidden = !codexPending;
     const hasPendingUrl = state.codexAuthorizeUrl !== null;
@@ -682,11 +720,6 @@ export function createSettingsView(
     codexCompleteBtn.textContent = state.codexBusy ? "Completing\u2026" : "Complete sign-in";
     codexCompleteBtn.disabled =
       !canCall || writeBusy || state.codexManualInputDraft.trim().length === 0;
-
-    codexSignedInWrap.hidden = !codexAuthenticated || codexPending;
-    codexTestBtn.textContent = state.codexTesting ? "Testing\u2026" : "Test";
-    codexTestBtn.disabled = !canCall || !codexAuthenticated || writeBusy || state.codexTesting;
-    codexSignOutBtn.disabled = !canCall || writeBusy;
 
     codexSignOutConfirmRow.hidden = !(
       state.codexSignOutConfirmOpen &&
@@ -816,9 +849,13 @@ export function createSettingsView(
     keyInput.value = "";
   };
 
+  const focusKeyInput = () => {
+    keyInput.focus();
+  };
+
   const clearCodexManualInputDom = () => {
     codexManualInput.value = "";
   };
 
-  return { root, update, clearKeyInputDom, clearCodexManualInputDom };
+  return { root, update, clearKeyInputDom, focusKeyInput, clearCodexManualInputDom };
 }

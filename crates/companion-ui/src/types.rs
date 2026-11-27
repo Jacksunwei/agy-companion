@@ -221,6 +221,8 @@ pub struct SettingsSnapshot {
     pub proxy_rss_bytes: Option<u64>,
     #[serde(default)]
     pub ls_telemetry_active: bool,
+    #[serde(default)]
+    pub last_catalog_refresh_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -52,6 +52,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
     });
     assert.equal(parsed.platform, "macos");
     assert.equal(parsed.ls_telemetry_active, false);
+    assert.equal(parsed.last_catalog_refresh_at_ms, 1_747_299_990_000);
 
     assert.equal(parsed.config.schema_version, 1);
     assert.deepEqual(parsed.config.proxy, { host: "127.0.0.1", port: 24141 });
@@ -140,6 +141,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
     assert.ok(parsed.launcher_integration?.manual_snippet?.includes("env.sh"));
     assert.equal(parsed.platform, "macos");
     assert.equal(parsed.ls_telemetry_active, false);
+    assert.equal(parsed.last_catalog_refresh_at_ms, null);
     assert.deepEqual(parsed.account_plan, { mode: "auto", resolved: null });
   });
 
@@ -178,8 +180,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
     const parsed = parseTestConnectionPayload(raw);
     assert.deepEqual(parsed, {
       ok: true,
-      message:
-        "Connected to Gemini upstream (https://generativelanguage.googleapis.com) successfully.",
+      message: "Connected \u00b7 Google AI Studio",
     });
 
     const startRaw = loadFixture("start_codex_login.json");
@@ -490,6 +491,28 @@ describe("parseSettingsSnapshot defensive invariants", () => {
     const nonBoolLs = cloneJson(activeBase);
     nonBoolLs.ls_telemetry_active = "true";
     assert.equal(parseSettingsSnapshot(nonBoolLs)?.ls_telemetry_active, false);
+  });
+
+  it("parses top-level last_catalog_refresh_at_ms safely across number, null, omitted, and invalid inputs", () => {
+    const withTs = cloneJson(activeBase);
+    withTs.last_catalog_refresh_at_ms = 1_750_000_000_000;
+    assert.equal(parseSettingsSnapshot(withTs)?.last_catalog_refresh_at_ms, 1_750_000_000_000);
+
+    const nullTs = cloneJson(activeBase);
+    nullTs.last_catalog_refresh_at_ms = null;
+    assert.equal(parseSettingsSnapshot(nullTs)?.last_catalog_refresh_at_ms, null);
+
+    const omittedTs = cloneJson(activeBase);
+    delete omittedTs.last_catalog_refresh_at_ms;
+    assert.equal(parseSettingsSnapshot(omittedTs)?.last_catalog_refresh_at_ms, null);
+
+    const nonFiniteTs = cloneJson(activeBase);
+    nonFiniteTs.last_catalog_refresh_at_ms = Number.NaN;
+    assert.equal(parseSettingsSnapshot(nonFiniteTs)?.last_catalog_refresh_at_ms, null);
+
+    const stringTs = cloneJson(activeBase);
+    stringTs.last_catalog_refresh_at_ms = "1750000000000";
+    assert.equal(parseSettingsSnapshot(stringTs)?.last_catalog_refresh_at_ms, null);
   });
 });
 

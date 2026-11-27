@@ -59,12 +59,14 @@ function makeState(overrides: Partial<AppState> = {}): AppState {
     unhealthyStreak: 0,
 
     apiKeyDraft: "",
+    geminiKeyEditOpen: false,
     clearConfirmOpen: false,
     disableProxyConfirmOpen: false,
     advOpen: false,
     keyFeedback: null,
     modelFeedback: null,
     advFeedback: null,
+    catalogRefreshReminder: null,
 
     codexBusy: false,
     codexTesting: false,
@@ -100,7 +102,7 @@ afterEach(() => {
 
 describe("buildBannerNode priority queue & interactions", () => {
   const noopActions = () => {
-    const calls = { recheck: 0, enableProxy: 0, toasts: [] as string[] };
+    const calls = { recheck: 0, enableProxy: 0, dismissCatalog: 0, toasts: [] as string[] };
     return {
       calls,
       actions: {
@@ -109,6 +111,9 @@ describe("buildBannerNode priority queue & interactions", () => {
         },
         onEnableProxy: () => {
           calls.enableProxy += 1;
+        },
+        onDismissCatalogReminder: () => {
+          calls.dismissCatalog += 1;
         },
         onToast: (msg: string) => {
           calls.toasts.push(msg);
@@ -353,6 +358,109 @@ describe("buildBannerNode priority queue & interactions", () => {
       actions,
     ) as unknown as FakeElement;
     assert.ok(lsWithKeyNotHybrid.textContent.includes("Quit (\u2318Q) and reopen Antigravity"));
+  });
+
+  it("renders Priority 5 catalog refresh reminder with platform copy, wait hint, Dismiss button, and P1-P4 preemption", () => {
+    const { actions, calls } = noopActions();
+    const base = loadActiveSnapshot(); // last_catalog_refresh_at_ms = 1_747_299_990_000
+    const reminder = {
+      baselineCatalogRefreshAtMs: base.last_catalog_refresh_at_ms,
+      changedAtMs: 1_747_300_100_000,
+    };
+
+    // macOS with live countdown (~3m when 120s elapsed -> 180s remaining)
+    const macNode = buildBannerNode(
+      makeState({ snapshot: base, catalogRefreshReminder: reminder }),
+      actions,
+      1_747_299_990_000 + 120_000,
+    ) as unknown as FakeElement;
+    assert.ok(macNode);
+    assert.equal(macNode.className, "banner info banner-dismissible");
+    assert.equal(macNode.getAttribute("role"), "status");
+    assert.ok(macNode.textContent.includes("Model list updated"));
+    assert.ok(
+      macNode.textContent.includes(
+        "Quit (\u2318Q) & reopen Antigravity, or wait ~3m for the model list to update.",
+      ),
+    );
+    const dismissBtn = macNode.querySelector("button.banner-dismiss")!;
+    assert.ok(dismissBtn);
+    assert.equal(dismissBtn.getAttribute("aria-label"), "Dismiss");
+    assert.equal(/refresh/i.test(dismissBtn.getAttribute("aria-label") ?? ""), false);
+    dismissBtn.click();
+    assert.equal(calls.dismissCatalog, 1);
+
+    // Linux & Windows omit ⌘Q and fall back to "up to ~5m" when timestamp is null
+    for (const platform of ["linux", "windows"] as const) {
+      const node = buildBannerNode(
+        makeState({
+          snapshot: { ...base, platform, last_catalog_refresh_at_ms: null },
+          catalogRefreshReminder: { baselineCatalogRefreshAtMs: null, changedAtMs: 1_747_300_100_000 },
+        }),
+        actions,
+        1_747_300_100_000,
+      ) as unknown as FakeElement;
+      assert.ok(node);
+      assert.ok(
+        node.textContent.includes(
+          "Quit & reopen Antigravity, or wait up to ~5m for the model list to update.",
+        ),
+      );
+      assert.equal(node.textContent.includes("\u2318Q"), false);
+    }
+
+    // Still renders after clearing last BYOM key when ls_telemetry_active && hybrid_active
+    const lsClearedLastProvider = buildBannerNode(
+      makeState({
+        snapshot: {
+          ...base,
+          ls_telemetry_active: true,
+          config: {
+            ...base.config,
+            providers: {
+              ...base.config.providers,
+              gemini: { ...base.config.providers.gemini, api_key_configured: false, api_key_hint: null },
+              codex: { ...base.config.providers.codex, authenticated: false },
+            },
+          },
+        },
+        catalogRefreshReminder: reminder,
+      }),
+      actions,
+      1_747_299_990_000 + 250_000,
+    ) as unknown as FakeElement;
+    assert.ok(lsClearedLastProvider);
+    assert.ok(lsClearedLastProvider.textContent.includes("wait <1m"));
+
+    // Preempted by Priority 4 (!hybrid_active) — zero duplicate banners
+    const p4Wins = buildBannerNode(
+      makeState({
+        snapshot: {
+          ...base,
+          launcher_integration: base.launcher_integration
+            ? { ...base.launcher_integration, hybrid_active: false }
+            : null,
+        },
+        catalogRefreshReminder: reminder,
+      }),
+      actions,
+      1_747_300_100_000,
+    ) as unknown as FakeElement;
+    assert.ok(p4Wins);
+    assert.ok(p4Wins.textContent.includes("Quit (\u2318Q) and reopen Antigravity"));
+    assert.equal(p4Wins.textContent.includes("Model list updated"), false);
+
+    // Preempted by Priority 2 (!reachable)
+    const p2Wins = buildBannerNode(
+      makeState({
+        snapshot: { ...base, proxy: { ...base.proxy, reachable: false } },
+        catalogRefreshReminder: reminder,
+      }),
+      actions,
+      1_747_300_100_000,
+    ) as unknown as FakeElement;
+    assert.ok(p2Wins.textContent.includes("Local proxy offline"));
+    assert.equal(p2Wins.textContent.includes("Model list updated"), false);
   });
 });
 
@@ -919,6 +1027,8 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
       {
         onOpenExternalUrl: (url) => calls.push(`open:${url}`),
         onDraftChange: (d) => calls.push(`draft:${d}`),
+        onOpenGeminiKeyEdit: () => calls.push("openGeminiKeyEdit"),
+        onCancelGeminiKeyEdit: () => calls.push("cancelGeminiKeyEdit"),
         onSaveKey: () => calls.push("saveKey"),
         onTestConnection: () => calls.push("testConn"),
         onToggleClearConfirm: () => calls.push("toggleClear"),
@@ -953,28 +1063,40 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     return { view, root: view.root as unknown as FakeElement, calls, tooltip };
   };
 
-  it("drives write-only API key lifecycle, Enter save, 2-click Clear/Cancel, focus guard, and Get API key link", () => {
+  it("drives symmetric compact Google AI Studio lifecycle: unconfigured key-row, configured header Test/Replace/Clear, Escape cancel, focus guard, and 2-click Clear", () => {
     const { view, root, calls, tooltip } = makeHarness();
     const offline = loadOfflineSnapshot();
 
-    // Unconfigured: "Not set", Clear hidden, Save & Test disabled
+    // Unconfigured: "Not set", Get API key visible, Test/Replace/Clear hidden, inline key-row open, Enabled models hidden
     view.update(makeState({ snapshot: offline }));
     const geminiCard = root.querySelector('[aria-label="Google AI Studio provider"]')!;
+    const keyRow = geminiCard.querySelector(".key-row")!;
     const keyInput = geminiCard.querySelector("#gemini-api-key")!;
-    const actButtons = geminiCard.querySelectorAll(".act-row button");
-    const [saveBtn, testBtn, clearBtn] = actButtons;
+    const headerBtns = geminiCard.querySelectorAll(".prov-actions button");
+    const getKeyBtn = headerBtns.find((b) => b.textContent === "Get API key \u2197")!;
+    const testBtn = headerBtns.find((b) => b.textContent === "Test")!;
+    const replaceBtn = headerBtns.find((b) => b.textContent === "Replace")!;
+    const clearBtn = headerBtns.find((b) => b.textContent === "Clear")!;
+    const keyBtns = keyRow.querySelectorAll("button");
+    const saveBtn = keyBtns.find((b) => b.textContent === "Save")!;
+    const cancelEditBtn = keyBtns.find((b) => b.textContent === "Cancel")!;
+    const modSec = geminiCard.querySelector(".divider")!;
+
     assert.ok(geminiCard.textContent.includes("Not set"));
-    assert.equal(saveBtn.disabled, true);
-    assert.equal(testBtn.disabled, true);
+    assert.equal(getKeyBtn.hidden, false);
+    assert.equal(testBtn.hidden, true);
+    assert.equal(replaceBtn.hidden, true);
     assert.equal(clearBtn.hidden, true);
+    assert.equal(keyRow.hidden, false);
+    assert.equal(saveBtn.disabled, true);
+    assert.equal(cancelEditBtn.hidden, true);
+    assert.equal(modSec.hidden, true);
 
     // Get API key external link
-    const getKeyBtn = geminiCard.querySelector(".lnk")!;
-    assert.equal(getKeyBtn.textContent, "Get API key \u2197");
     getKeyBtn.click();
     assert.equal(calls.at(-1), "open:https://aistudio.google.com/api-keys");
 
-    // Draft typing fires onDraftChange, enables Save, keeps Test disabled, Enter fires onSaveKey
+    // Draft typing fires onDraftChange, enables Save, Enter fires onSaveKey
     keyInput.focus();
     keyInput.value = "synthetic-draft-key";
     keyInput.dispatchEvent(new FakeEvent("input", { bubbles: true }));
@@ -982,7 +1104,6 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
 
     view.update(makeState({ snapshot: offline, apiKeyDraft: "synthetic-draft-key" }));
     assert.equal(saveBtn.disabled, false);
-    assert.equal(testBtn.disabled, true);
     keyInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Enter" }));
     assert.equal(calls.at(-1), "saveKey");
 
@@ -994,14 +1115,39 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     view.clearKeyInputDom();
     assert.equal(keyInput.value, "");
 
-    // Configured with empty draft: masked hint shown, Test enabled, Clear visible + 2-click confirm
+    // Configured steady state: masked hint shown, key-row collapsed, header shows Test/Replace/Clear, Enabled models visible
     view.update(makeState({ snapshot: loadActiveSnapshot(), apiKeyDraft: "" }));
     assert.ok(geminiCard.textContent.includes("AIza...1234"));
+    assert.equal(keyRow.hidden, true);
+    assert.equal(getKeyBtn.hidden, true);
+    assert.equal(testBtn.hidden, false);
     assert.equal(testBtn.disabled, false);
+    assert.equal(replaceBtn.hidden, false);
     assert.equal(clearBtn.hidden, false);
+    assert.equal(modSec.hidden, false);
+
     testBtn.click();
     assert.equal(calls.at(-1), "testConn");
 
+    // Replace opens inline key-row with Cancel + swaps header to Get API key; Escape or Cancel closes
+    replaceBtn.click();
+    assert.equal(calls.at(-1), "openGeminiKeyEdit");
+    view.update(
+      makeState({ snapshot: loadActiveSnapshot(), geminiKeyEditOpen: true, apiKeyDraft: "" }),
+    );
+    assert.equal(keyRow.hidden, false);
+    assert.equal(getKeyBtn.hidden, false);
+    assert.equal(testBtn.hidden, true);
+    assert.equal(replaceBtn.hidden, true);
+    assert.equal(clearBtn.hidden, true);
+    assert.equal(cancelEditBtn.hidden, false);
+    keyInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Escape" }));
+    assert.equal(calls.at(-1), "cancelGeminiKeyEdit");
+    cancelEditBtn.click();
+    assert.equal(calls.at(-1), "cancelGeminiKeyEdit");
+
+    // 2-click Clear confirm
+    view.update(makeState({ snapshot: loadActiveSnapshot(), geminiKeyEditOpen: false }));
     clearBtn.click();
     assert.equal(calls.at(-1), "toggleClear");
     view.update(makeState({ snapshot: loadActiveSnapshot(), clearConfirmOpen: true }));
@@ -1170,17 +1316,20 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     const codexCard = root.querySelector('[aria-label="OpenAI Codex provider"]')!;
     assert.ok(codexCard, "OpenAI Codex card must be stacked inside .provider-stack");
 
-    // 1. Signed-out state
+    // 1. Signed-out state: header has Sign in with ChatGPT button, Test & Sign out hidden
     view.update(makeState({ snapshot: base }));
     assert.ok(codexCard.textContent.includes("Not signed in"));
-    const signedOutWrap = codexCard.querySelector(".codex-signed-out")!;
+    const codexActions = codexCard.querySelector(".prov-actions")!;
     const pendingWrap = codexCard.querySelector(".codex-pending")!;
-    const signedInWrap = codexCard.querySelector(".codex-signed-in")!;
-    assert.equal(signedOutWrap.hidden, false);
+    const headerBtns = codexActions.querySelectorAll("button");
+    const signInBtn = headerBtns.find((b) => b.textContent === "Sign in with ChatGPT \u2197")!;
+    const codexTestBtn = headerBtns.find((b) => b.textContent === "Test")!;
+    const codexSignOutBtn = headerBtns.find((b) => b.textContent === "Sign out")!;
+    assert.equal(codexActions.hidden, false);
+    assert.equal(signInBtn.hidden, false);
+    assert.equal(codexTestBtn.hidden, true);
+    assert.equal(codexSignOutBtn.hidden, true);
     assert.equal(pendingWrap.hidden, true);
-    assert.equal(signedInWrap.hidden, true);
-    const signInBtn = signedOutWrap.querySelector("button")!;
-    assert.equal(signInBtn.textContent, "Sign in with ChatGPT \u2197");
     signInBtn.click();
     assert.equal(calls.at(-1), "codexStart");
 
@@ -1193,9 +1342,8 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
         codexManualInputDraft: "",
       }),
     );
-    assert.equal(signedOutWrap.hidden, true);
+    assert.equal(codexActions.hidden, true);
     assert.equal(pendingWrap.hidden, false);
-    assert.equal(signedInWrap.hidden, true);
     assert.ok(codexCard.textContent.includes("Signing in\u2026"));
     assert.ok(pendingWrap.textContent.includes("Complete sign-in in your browser\u2026"));
 
@@ -1233,7 +1381,7 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     view.clearCodexManualInputDom();
     assert.equal(manualInput.value, "");
 
-    // 3. Signed-in state: status badge, Test, inline 2-click Sign out, 4 GPT-6.x chips, 0-models Restore defaults
+    // 3. Signed-in state: status badge + title tooltip, header Test + Sign out, inline 2-click Sign out, 4 GPT-6.x chips, 0-models Restore defaults
     const codexSignedInSnap: SettingsSnapshot = {
       ...base,
       codex_login_pending: false,
@@ -1252,12 +1400,15 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
       },
     };
     view.update(makeState({ snapshot: codexSignedInSnap }));
-    assert.equal(signedOutWrap.hidden, true);
+    assert.equal(codexActions.hidden, false);
+    assert.equal(signInBtn.hidden, true);
+    assert.equal(codexTestBtn.hidden, false);
+    assert.equal(codexSignOutBtn.hidden, false);
     assert.equal(pendingWrap.hidden, true);
-    assert.equal(signedInWrap.hidden, false);
     assert.ok(codexCard.textContent.includes("Pro \u00b7 j***@example.com"));
+    const codexTag = codexCard.querySelector(".codex-status-tag")!;
+    assert.equal(codexTag.title, "Pro \u00b7 j***@example.com");
 
-    const [codexTestBtn, codexSignOutBtn] = signedInWrap.querySelectorAll(".act-row button");
     assert.equal(codexTestBtn.disabled, false);
     codexTestBtn.click();
     assert.equal(calls.at(-1), "codexTest");
@@ -1265,7 +1416,7 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     codexSignOutBtn.click();
     assert.equal(calls.at(-1), "codexToggleSignOut");
     view.update(makeState({ snapshot: codexSignedInSnap, codexSignOutConfirmOpen: true }));
-    const signOutRow = signedInWrap.querySelector(".confirm-row")!;
+    const signOutRow = codexCard.querySelector(".confirm-row")!;
     assert.equal(signOutRow.hidden, false);
     const [confirmSignOutBtn, cancelSignOutBtn] = signOutRow.querySelectorAll("button");
     confirmSignOutBtn.click();

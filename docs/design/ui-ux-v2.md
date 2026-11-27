@@ -79,9 +79,9 @@ Every viewport renders the exact same full-width single-column DOM structure —
 - **CUJ-adaptive landing:** Opens on **Monitor** whenever `hybrid_active` is true (even without a Google AI Studio API key configured) or `api_key_configured` is true; opens on **Settings** on Day-0 before Hybrid Mode is active and no API key is configured (`!hybrid_active && !api_key_configured`).
 
 ### Responsive Padding (Full-Width Single Column)
-- **Narrow aux pane (`320px–400px`):** `padding: 12px 12px 18px`; chips wrap naturally (`gap: 6px`); tooltips clamp within `[10px, width - tipWidth - 10px]`.
-- **Standard aux pane (`401px–600px`):** `padding: 14px 14px 20px`.
-- **Wide aux pane (`> 600px`):** `width: 100%; padding: 16px 14px 24px` (aligned with the `14px` header insets).
+- **Narrow aux pane (`320px–400px`):** `padding: 10px 10px 14px`; chips wrap naturally (`gap: 5px`); tooltips clamp within `[10px, width - tipWidth - 10px]`.
+- **Standard aux pane (`401px–600px`):** `padding: 10px 14px 14px`.
+- **Wide aux pane (`> 600px`):** `width: 100%; padding: 14px 14px 18px` (aligned with the `14px` header insets).
 
 ---
 
@@ -98,6 +98,7 @@ Rendered above the active tab's content whenever attention is needed, in strict 
 | 3 | `!launcher.enabled` (Unix explicit opt-out) | **Local proxy is disabled** | `Your enabled models won't appear in Antigravity. Re-enable the proxy, then quit and reopen Antigravity.` + inline **`Re-enable proxy`** button (one click re-enables and transitions to Priority 4). |
 | 4 | `launcher.enabled && !hybrid_active` (first run or just re-enabled) | **macOS:** `Quit (⌘Q) and reopen Antigravity` / **Linux:** `Quit and reopen Antigravity` | `The local proxy is enabled. Quit and reopen Antigravity to use your enabled models.` *(macOS includes `(⌘Q)`.)* |
 | 4 (Win) | `platform === "windows" && !hybrid_active` | **Reopen Antigravity via Companion shortcut** | `Close Antigravity and launch it from the "Antigravity (Companion)" Start Menu shortcut to use your enabled models.` |
+| 5 | `hybrid_active && catalogRefreshReminder` (after saving/clearing a provider credential or changing enabled models) | **Model list updated** *(calm dismissible `.banner.info`, `role="status"`, does not trigger Settings attention dot)* | **macOS:** `Quit (⌘Q) & reopen Antigravity, or wait <hint> for the model list to update.` / **Linux & Windows:** `Quit & reopen Antigravity, or wait <hint> for the model list to update.` Live `<hint>` (`~Xm`, `<1m`, or `up to ~5m`) uses top-level `last_catalog_refresh_at_ms` and auto-dismisses once a newer catalog poll arrives (or via `Dismiss`). |
 
 ### 4.2 Tab 1 — Monitor (Live Session)
 
@@ -134,10 +135,14 @@ Backed directly by `crates/companion-core/src/usage/sqlite.rs` (`usage_events` t
 ### 4.4 Tab 3 — Settings
 
 #### Section A — `Model providers` (`.provider-stack`)
+Both **Google AI Studio** and **OpenAI Codex** share a symmetric compact `.prov-card` anatomy (`.prov-hdr` with `.prov-id` + right-aligned `.prov-actions` that fit on one row at `460px`/`760px` and wrap cleanly onto two rows at `360px`, compact `25px` `.m-chip` toggles, concise connection-test status `Connected · Google AI Studio` / `Connected · OpenAI Codex` with no raw upstream URLs, and `Enabled models` hidden until the provider is configured):
 - **`Google AI Studio` Card:**
-  - Header: **`Google AI Studio`** + masked status pill (`● AQ.A…_J5w` green when configured, muted `Not set` when unset) + right-aligned **`Get API key ↗`** button.
-  - **`Get API key ↗` link handling (S5 CSP-safe):** Calls `@modelcontextprotocol/ext-apps` `app.openLink({ url: "https://aistudio.google.com/api-keys" })`; falls back to clipboard copy + inline `"Copied aistudio.google.com/api-keys"` toast if the host lacks `openLinks`.
-  - **Write-only API key row (S2):** Password input (`Paste Google AI Studio API key` / `Paste new key to replace`), **`Save`** (enabled when non-empty), **`Test`** (enabled when saved & no unsaved draft), and right-aligned **`Clear`** text action (when configured; opens inline 2-click `Confirm clear` / `Cancel` — never `window.confirm()`).
+  - **Unconfigured:** Header shows **`Google AI Studio`** + `Not set` + **`Get API key ↗`** (CSP-safe external link with clipboard fallback), plus a single-line write-only `.key-row` (`#gemini-api-key` + **`Save`**); `Enabled models` stays hidden until configured.
+  - **Configured steady state:** Header folds **`Test`**, **`Replace`**, and **`Clear`** next to the masked key pill (`● AIza…1234`), collapsing `#gemini-api-key` until **`Replace`** is clicked (revealing inline `.key-row` with **`Save`** + **`Cancel`**/`Escape` and swapping the header action to **`Get API key ↗`**). **`Clear`** opens inline 2-click `Confirm clear` / `Cancel` (never `window.confirm()`).
+- **`OpenAI Codex` Card:**
+  - **Signed out:** Single compact header row with **`OpenAI Codex`** + `Not signed in` + **`Sign in with ChatGPT ↗`**.
+  - **OAuth pending:** Browser sign-in actions (`Open sign-in page ↗`, `Copy link`, `Cancel`) plus a collapsed callback-URL fallback using the same compact `.key-row`.
+  - **Signed in:** Header folds **`Test`** and **`Sign out`** (2-click inline confirm) next to the truncated status pill (`● Plus · j***@gmail.com` with full `title` tooltip), followed by `Enabled models` chips.
   - **Divider + `Enabled models` multi-select chips:**
     - Interactive `<button type="button" role="checkbox" aria-checked>` chips with instant persistence (`save_settings({ enabled_models })`) and viewport-clamped accessible tooltips (`mouseenter` / `focus`, dismissed on `mouseleave` / `blur` / `Escape`):
 

@@ -2,21 +2,27 @@ import {
   copyTextWithFallback,
   createIcon,
   el,
+  formatCatalogRefreshCopy,
   quitReopenCapitalized,
   quitReopenSentence,
 } from "./dom.ts";
-import { hasConfiguredByomProvider } from "./state.ts";
+import {
+  formatCatalogRefreshWaitHint,
+  hasConfiguredByomProvider,
+} from "./state.ts";
 import type { AppState } from "./types.ts";
 
 export interface BannerActions {
   onRecheck: () => void;
   onEnableProxy: () => void;
+  onDismissCatalogReminder: () => void;
   onToast: (message: string) => void;
 }
 
 export function buildBannerNode(
   state: AppState,
   actions: BannerActions,
+  nowMs = Date.now(),
 ): HTMLElement | null {
   if (state.standalone) {
     const b = el("div", "banner info");
@@ -140,12 +146,11 @@ export function buildBannerNode(
   // built-in monitoring works without proxy injection — avoid nagging about proxy
   // opt-out or reopening Antigravity for custom models the user hasn't configured.
   const byomConfigured = hasConfiguredByomProvider(snap);
-  if (snap.ls_telemetry_active && !byomConfigured) {
-    return null;
-  }
+  const suppressProxySetupNags = snap.ls_telemetry_active && !byomConfigured;
 
   // Priority 3: Explicit Unix opt-out (local proxy hook disabled)
   if (
+    !suppressProxySetupNags &&
     platform !== "windows" &&
     li &&
     !li.enabled &&
@@ -182,7 +187,7 @@ export function buildBannerNode(
 
   // Priority 4: Enabled (or Windows) but Antigravity has not reconnected yet
   const hybridActive = li?.hybrid_active === true;
-  if (platform === "windows" && !hybridActive) {
+  if (!suppressProxySetupNags && platform === "windows" && !hybridActive) {
     const b = el("div", "banner warn");
     b.setAttribute("role", "alert");
     const ic = el("span", "ic");
@@ -200,7 +205,7 @@ export function buildBannerNode(
     return b;
   }
 
-  if (platform !== "windows" && li && li.enabled && !hybridActive) {
+  if (!suppressProxySetupNags && platform !== "windows" && li && li.enabled && !hybridActive) {
     const b = el("div", "banner warn");
     b.setAttribute("role", "alert");
     const ic = el("span", "ic");
@@ -215,6 +220,28 @@ export function buildBannerNode(
       ),
     );
     b.append(ic, txt);
+    return b;
+  }
+
+  // Priority 5: Post-change model-selector update reminder (only when proxy is wired in)
+  if (hybridActive && state.catalogRefreshReminder) {
+    const b = el("div", "banner info banner-dismissible");
+    b.setAttribute("role", "status");
+    const ic = el("span", "ic");
+    ic.append(createIcon("info"));
+    const waitHint = formatCatalogRefreshWaitHint(snap.last_catalog_refresh_at_ms, nowMs);
+    const txt = el("div", "txt");
+    txt.append(
+      el("b", null, "Model list updated"),
+      el("span", "sub", formatCatalogRefreshCopy(platform, waitHint)),
+    );
+    const dismissBtn = el("button", "banner-dismiss");
+    dismissBtn.type = "button";
+    dismissBtn.setAttribute("aria-label", "Dismiss");
+    dismissBtn.title = "Dismiss";
+    dismissBtn.append(createIcon("close"));
+    dismissBtn.addEventListener("click", () => actions.onDismissCatalogReminder());
+    b.append(ic, txt, dismissBtn);
     return b;
   }
 

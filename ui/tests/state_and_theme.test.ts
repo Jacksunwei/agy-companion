@@ -4,15 +4,20 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  CATALOG_POLL_INTERVAL_MS,
   CODEX_PENDING_POLL_MS,
   HEALTHY_POLL_MS,
   UNHEALTHY_BACKOFF_MS,
   chooseInitialTab,
+  createCatalogRefreshReminder,
+  formatCatalogRefreshWaitHint,
   needsSettingsAttention,
   nextPollDelayMs,
+  reconcileCatalogRefreshReminder,
   shouldApplyRefresh,
   toggleEnabledModel,
 } from "../src/state.ts";
+import { formatCatalogRefreshCopy } from "../src/dom.ts";
 import {
   CURATED_MODEL_CATALOG,
   parseSettingsSnapshot,
@@ -337,6 +342,149 @@ describe("ui/src/state.ts pure state helpers", () => {
         ls_telemetry_active: true,
       }),
       false,
+    );
+  });
+
+  it("manages catalogRefreshReminder lifecycle, auto-clear reconciliation, wait hints, and platform copy", () => {
+    assert.equal(CATALOG_POLL_INTERVAL_MS, 300_000);
+    const active = loadSnapshot("settings_snapshot_active.json");
+    const offline = loadSnapshot("settings_snapshot_day0_offline.json");
+
+    // Only activates when proxy is reachable AND hybrid_active === true
+    assert.equal(createCatalogRefreshReminder(null, offline, 1_747_300_000_000), null);
+    assert.equal(
+      createCatalogRefreshReminder(
+        active,
+        {
+          ...active,
+          proxy: { ...active.proxy, reachable: false },
+        },
+        1_747_300_000_000,
+      ),
+      null,
+    );
+    assert.equal(
+      createCatalogRefreshReminder(
+        active,
+        {
+          ...active,
+          launcher_integration: active.launcher_integration
+            ? { ...active.launcher_integration, hybrid_active: false }
+            : null,
+        },
+        1_747_300_000_000,
+      ),
+      null,
+    );
+
+    const rem = createCatalogRefreshReminder(null, active, 1_747_300_050_000);
+    assert.deepEqual(rem, {
+      baselineCatalogRefreshAtMs: 1_747_299_990_000,
+      changedAtMs: 1_747_300_050_000,
+    });
+
+    // Falls back to prevSnap timestamp when nextSnap omits it
+    const remFromPrev = createCatalogRefreshReminder(
+      active,
+      { ...active, last_catalog_refresh_at_ms: null },
+      1_747_300_050_000,
+    );
+    assert.deepEqual(remFromPrev, {
+      baselineCatalogRefreshAtMs: 1_747_299_990_000,
+      changedAtMs: 1_747_300_050_000,
+    });
+
+    // Reconcile preserves reminder when timestamp is unchanged or older
+    assert.equal(reconcileCatalogRefreshReminder(null, active), null);
+    assert.deepEqual(reconcileCatalogRefreshReminder(rem, active), rem);
+    assert.deepEqual(
+      reconcileCatalogRefreshReminder(rem, {
+        ...active,
+        last_catalog_refresh_at_ms: 1_747_299_980_000,
+      }),
+      rem,
+    );
+
+    // Auto-clears as soon as a newer last_catalog_refresh_at_ms arrives
+    assert.equal(
+      reconcileCatalogRefreshReminder(rem, {
+        ...active,
+        last_catalog_refresh_at_ms: 1_747_299_990_001,
+      }),
+      null,
+    );
+
+    // Null baseline auto-clears on any non-null timestamp (clock-skew safe)
+    const nullBaselineRem = createCatalogRefreshReminder(
+      null,
+      { ...active, last_catalog_refresh_at_ms: null },
+      1_747_300_050_000,
+    );
+    assert.deepEqual(nullBaselineRem, {
+      baselineCatalogRefreshAtMs: null,
+      changedAtMs: 1_747_300_050_000,
+    });
+    assert.deepEqual(
+      reconcileCatalogRefreshReminder(nullBaselineRem, {
+        ...active,
+        last_catalog_refresh_at_ms: null,
+      }),
+      nullBaselineRem,
+    );
+    assert.equal(
+      reconcileCatalogRefreshReminder(nullBaselineRem, {
+        ...active,
+        last_catalog_refresh_at_ms: 1_747_300_000_000,
+      }),
+      null,
+    );
+
+    // Clears if proxy becomes unreachable or hybrid_active drops
+    assert.equal(
+      reconcileCatalogRefreshReminder(rem, {
+        ...active,
+        proxy: { ...active.proxy, reachable: false },
+      }),
+      null,
+    );
+    assert.equal(
+      reconcileCatalogRefreshReminder(rem, {
+        ...active,
+        launcher_integration: active.launcher_integration
+          ? { ...active.launcher_integration, hybrid_active: false }
+          : null,
+      }),
+      null,
+    );
+
+    // Wait hint formatting across all ranges
+    const t0 = 1_750_000_000_000;
+    assert.equal(formatCatalogRefreshWaitHint(null, t0), "up to ~5m");
+    assert.equal(formatCatalogRefreshWaitHint(0, t0), "up to ~5m");
+    assert.equal(formatCatalogRefreshWaitHint(Number.NaN, t0), "up to ~5m");
+    assert.equal(formatCatalogRefreshWaitHint(t0 + 1_000, t0), "up to ~5m"); // clock skew
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0), "~5m"); // 300s left
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0 + 10_000), "~5m"); // 290s left
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0 + 175_000), "~2m"); // 125s left
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0 + 239_999), "~1m"); // 60.001s left
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0 + 240_000), "<1m"); // 60s left
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0 + 299_000), "<1m"); // 1s left
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0 + 300_000), "<1m"); // overdue grace start
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0 + 360_000), "<1m"); // overdue grace end
+    assert.equal(formatCatalogRefreshWaitHint(t0, t0 + 360_001), "up to ~5m"); // stale > 6m
+
+    // Platform copy
+    assert.equal(
+      formatCatalogRefreshCopy("macos", "~2m"),
+      "Quit (\u2318Q) & reopen Antigravity, or wait ~2m for the model list to update.",
+    );
+    assert.equal(
+      formatCatalogRefreshCopy("linux", "<1m"),
+      "Quit & reopen Antigravity, or wait <1m for the model list to update.",
+    );
+    assert.equal(
+      formatCatalogRefreshCopy("windows", "up to ~5m"),
+      "Quit & reopen Antigravity, or wait up to ~5m for the model list to update.",
     );
   });
 });
