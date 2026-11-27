@@ -61,6 +61,7 @@ Expected positive signal:
      git log "$(git describe --tags --abbrev=0)..HEAD" --oneline
      ```
    - Move `## [Unreleased]` items into a new `## [X.Y.Z] - YYYY-MM-DD` section (Keep a Changelog categories: `Added`, `Changed`, `Fixed`, `Security`, `Removed`), leaving `## [Unreleased]` empty above it.
+   - Keep entries concise and user-facing (describe what changed for users, not internal CI/versioning rules, crate names, or implementation details).
    - Update the bottom compare/release links:
      - `[Unreleased]: https://github.com/Jacksunwei/agy-companion/compare/vX.Y.Z...HEAD`
      - `[X.Y.Z]: https://github.com/Jacksunwei/agy-companion/compare/vPREV...vX.Y.Z`
