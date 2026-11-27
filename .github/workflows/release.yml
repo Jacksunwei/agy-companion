@@ -1,0 +1,583 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and verify all 5 targets without publishing to GitHub Releases, npm, or PyPI'
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify manifests, UI bundle, and tag parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Resolve version and validate release trigger
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          FULL_REF: ${{ github.ref }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python -B - <<'PY'
+          import os, pathlib, re, tomllib
+
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          version = cargo["workspace"]["package"]["version"]
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise SystemExit(f"Invalid workspace version: {version!r}")
+
+          event = os.environ["EVENT_NAME"]
+          ref_name = os.environ["REF_NAME"]
+          full_ref = os.environ["FULL_REF"]
+          is_tag = full_ref.startswith("refs/tags/v")
+
+          if is_tag and ref_name != f"v{version}":
+              raise SystemExit(
+                  f"Tag {ref_name!r} does not match Cargo.toml workspace version 'v{version}'"
+              )
+
+          if event == "push":
+              publish = is_tag
+          else:
+              publish = os.environ.get("DRY_RUN", "true").lower() == "false"
+              if publish and not is_tag:
+                  raise SystemExit(
+                      "Refusing live publish from a non-tag ref. Push tag 'v"
+                      + version
+                      + "' or run workflow_dispatch on that tag."
+                  )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+              out.write(f"publish={'true' if publish else 'false'}\n")
+          print(f"Resolved version={version} publish={publish} ref={full_ref}")
+          PY
+
+      - name: Run OS-independent repo checks and verify deterministic UI bundle
+        run: python -B scripts/check.py --profile repo --verify-ui-build
+
+      - name: Run UI tests and script unit tests
+        run: |
+          npm --prefix ui test
+          python -B scripts/test_check_plugin_logo.py
+          python -B scripts/test_version_bump.py
+          python -B scripts/test_release_packaging.py
+
+  build:
+    name: Build (${{ matrix.npm_target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - npm_target: darwin-arm64
+            rust_target: aarch64-apple-darwin
+            os: macos-latest
+            manylinux: ''
+          - npm_target: darwin-x64
+            rust_target: x86_64-apple-darwin
+            os: macos-15-intel
+            manylinux: ''
+          - npm_target: linux-x64
+            rust_target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            manylinux: '2_28'
+          - npm_target: linux-arm64
+            rust_target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            manylinux: '2_28'
+          - npm_target: win32-x64
+            rust_target: x86_64-pc-windows-msvc
+            os: windows-latest
+            manylinux: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain (host builds)
+        if: matrix.manylinux == ''
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Pre-create wheel output directory
+        shell: bash
+        run: mkdir -p dist/wheels
+
+      - name: Build Python wheel and native binary via maturin
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        with:
+          working-directory: packages/python
+          target: ${{ matrix.rust_target }}
+          manylinux: ${{ matrix.manylinux }}
+          rust-toolchain: stable
+          args: --release --locked --out ../../dist/wheels
+
+      - name: Extract binary, smoke-test --version, and package release archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.npm_target }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          python -B scripts/package_release_asset.py package-wheel \
+            --wheels-dir dist/wheels \
+            --target "${TARGET}" \
+            --version "${VERSION}" \
+            --bin-out-dir dist/bin \
+            --release-out-dir dist/release
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-${{ matrix.npm_target }}
+          path: dist/wheels/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload native binary artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.npm_target }}
+          path: dist/bin/${{ matrix.npm_target }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload GitHub Release archive artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-archive-${{ matrix.npm_target }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  package-verify:
+    name: Verify checksums, launcher extraction, npm packs, and PyPI wheels
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Download release archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-archive-*
+          merge-multiple: true
+          path: dist/release
+
+      - name: Download native binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          path: dist/bin
+
+      - name: Download Python wheels
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist/wheels
+
+      - name: Assemble and validate checksums.txt
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          python -B scripts/package_release_asset.py checksums \
+            --release-dir dist/release \
+            --version "${VERSION}" \
+            --out-file dist/release/checksums.txt
+          cat dist/release/checksums.txt
+
+      - name: Verify Unix tarballs with plugin/scripts/run-companion.sh
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          source plugin/scripts/run-companion.sh
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            archive="agy-companion-v${VERSION}-${target}.tar.gz"
+            verify_sha256 "dist/release/${archive}" "dist/release/checksums.txt" "${archive}"
+            extract_dir="$(mktemp -d)"
+            extracted="$(extract_verified_binary "dist/release/${archive}" "${extract_dir}")"
+            test -s "${extracted}"
+            rm -rf "${extract_dir}"
+            echo "Verified launcher extraction for ${archive}"
+          done
+
+      - name: Verify Windows zip archive structure and payload
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          python -B - <<'PY'
+          import os, pathlib, zipfile
+
+          version = os.environ["VERSION"]
+          zip_path = pathlib.Path("dist/release") / f"agy-companion-v{version}-win32-x64.zip"
+          if not zip_path.is_file():
+              raise SystemExit(f"Missing Windows archive: {zip_path}")
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              names = zf.namelist()
+              if names != ["agy-companion.exe"]:
+                  raise SystemExit(f"Unexpected win32-x64 zip entries: {names!r}")
+              payload = zf.read("agy-companion.exe")
+              if not payload:
+                  raise SystemExit("win32-x64 zip payload agy-companion.exe is empty")
+              print(f"Verified Windows archive {zip_path.name} ({len(payload)} bytes)")
+          PY
+
+      - name: Verify npm packages (pack + local linux-x64 install smoke test)
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          node packages/npm/generate-platform-pkgs.mjs --out-dir dist/npm/platforms
+
+          assert_pack_includes() {
+            local pkg_dir="$1"
+            shift
+            local pack_json
+            pack_json="$(npm pack --dry-run --json "${pkg_dir}")"
+            node -e '
+              const data = JSON.parse(process.argv[1]);
+              const expected = process.argv.slice(2);
+              const files = new Set((data[0]?.files ?? []).map((f) => f.path));
+              const missing = expected.filter((p) => !files.has(p));
+              if (missing.length > 0) {
+                console.error(`Missing expected files in ${data[0]?.id}: ${missing.join(", ")}`);
+                console.error(`Packed files: ${[...files].sort().join(", ")}`);
+                process.exit(1);
+              }
+              console.log(`Verified npm pack for ${data[0]?.id}: ${[...files].sort().join(", ")}`);
+            ' "${pack_json}" "$@"
+          }
+
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            exe="agy-companion"
+            if [[ "${target}" == "win32-x64" ]]; then
+              exe="agy-companion.exe"
+            fi
+            mkdir -p "dist/npm/platforms/${target}/bin"
+            cp "dist/bin/binary-${target}/${exe}" "dist/npm/platforms/${target}/bin/${exe}"
+            chmod 0755 "dist/npm/platforms/${target}/bin/${exe}"
+            cp LICENSE "dist/npm/platforms/${target}/LICENSE"
+            assert_pack_includes "dist/npm/platforms/${target}" "LICENSE" "README.md" "bin/${exe}"
+          done
+
+          mkdir -p dist/npm/meta
+          cp -R packages/npm/agy-companion/. dist/npm/meta/
+          chmod 0755 dist/npm/meta/bin/agy-companion.js
+          cp README.md LICENSE dist/npm/meta/
+          assert_pack_includes dist/npm/meta "LICENSE" "README.md" "bin/agy-companion.js"
+
+          # End-to-end smoke test installing packed linux-x64 + meta tarballs offline.
+          smoke_dir="$(mktemp -d)"
+          mkdir -p "${smoke_dir}/app"
+          plat_tgz="$(npm pack dist/npm/platforms/linux-x64 --pack-destination "${smoke_dir}" | tail -n 1)"
+          meta_tgz="$(npm pack dist/npm/meta --pack-destination "${smoke_dir}" | tail -n 1)"
+          npm --prefix "${smoke_dir}/app" install --no-audit --no-fund --omit=optional \
+            "${smoke_dir}/${plat_tgz}" "${smoke_dir}/${meta_tgz}"
+          actual_ver="$("${smoke_dir}/app/node_modules/.bin/agy-companion" --version)"
+          actual_alias="$("${smoke_dir}/app/node_modules/.bin/agyc" --version)"
+          test "${actual_ver}" = "agy-companion ${VERSION}"
+          test "${actual_alias}" = "agy-companion ${VERSION}"
+          echo "Verified npm install smoke test: ${actual_ver} (agyc: ${actual_alias})"
+          rm -rf "${smoke_dir}"
+
+      - name: Verify Python wheels (twine check + local linux-x64 venv install smoke test)
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip twine
+          twine check --strict dist/wheels/*.whl
+          wheel_count="$(ls -1 dist/wheels/*.whl | wc -l | tr -d '[:space:]')"
+          test "${wheel_count}" = "5"
+
+          venv_dir="$(mktemp -d)"
+          python -m venv "${venv_dir}"
+          "${venv_dir}/bin/pip" install --quiet --no-deps dist/wheels/*linux*x86_64*.whl
+          actual_ver="$("${venv_dir}/bin/agy-companion" --version)"
+          test "${actual_ver}" = "agy-companion ${VERSION}"
+          "${venv_dir}/bin/python" -c "import agy_companion; p = agy_companion.find_binary(); assert p and p.is_file(), p; print('find_binary:', p)"
+          echo "Verified PyPI wheel smoke test: ${actual_ver}"
+          rm -rf "${venv_dir}"
+
+      - name: Upload verified checksums.txt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-checksums
+          path: dist/release/checksums.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  github-release:
+    name: Publish GitHub Release
+    needs: [verify, package-verify]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-archive-*
+          merge-multiple: true
+          path: dist/release
+
+      - name: Download verified checksums.txt
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-checksums
+          path: dist/release
+
+      - name: Prepare and validate exact release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          rm -f dist/release/*.sha256
+          assets=(dist/release/*.tar.gz dist/release/*.zip dist/release/checksums.txt)
+          if [[ "${#assets[@]}" -ne 6 ]]; then
+            echo "Expected exactly 6 release assets (5 archives + checksums.txt), found ${#assets[@]}: ${assets[*]}" >&2
+            exit 1
+          fi
+          ls -la "${assets[@]}"
+
+      - name: Attest SLSA build provenance for release archives and checksums
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/release/*.tar.gz
+            dist/release/*.zip
+            dist/release/checksums.txt
+
+      - name: Create or update GitHub Release atomically
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/release/*.tar.gz dist/release/*.zip dist/release/checksums.txt)
+          if [[ "${#assets[@]}" -ne 6 ]]; then
+            echo "Expected exactly 6 release assets (5 archives + checksums.txt), found ${#assets[@]}" >&2
+            exit 1
+          fi
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${assets[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
+          else
+            gh release create "${TAG}" "${assets[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${TAG}" \
+              --verify-tag \
+              --draft \
+              --generate-notes
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
+          fi
+
+  publish-npm:
+    name: Publish to npm
+    needs: [verify, package-verify, github-release]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js (without registry-url so OIDC Trusted Publishing works)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Verify bundled npm >= 11.5.1 for OIDC Trusted Publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const cur = require("node:child_process").execFileSync("npm", ["--version"], { encoding: "utf8" }).trim();
+            const [maj, min, pat] = cur.split(".").map(Number);
+            const ok = maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)));
+            console.log(`Detected npm ${cur} (OIDC-ready: ${ok})`);
+            if (!ok) {
+              console.error("Bundled npm is older than 11.5.1; failing closed.");
+              process.exit(1);
+            }
+          '
+
+      - name: Download native binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          path: dist/bin
+
+      - name: Stage npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          node packages/npm/generate-platform-pkgs.mjs --out-dir dist/npm/platforms
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            exe="agy-companion"
+            if [[ "${target}" == "win32-x64" ]]; then
+              exe="agy-companion.exe"
+            fi
+            mkdir -p "dist/npm/platforms/${target}/bin"
+            cp "dist/bin/binary-${target}/${exe}" "dist/npm/platforms/${target}/bin/${exe}"
+            chmod 0755 "dist/npm/platforms/${target}/bin/${exe}"
+            cp LICENSE "dist/npm/platforms/${target}/LICENSE"
+          done
+          mkdir -p dist/npm/meta
+          cp -R packages/npm/agy-companion/. dist/npm/meta/
+          chmod 0755 dist/npm/meta/bin/agy-companion.js
+          cp README.md LICENSE dist/npm/meta/
+
+      - name: Publish platform packages and meta-package to npm
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Support both npm Trusted Publishing (OIDC, zero secrets) and optional
+          # NPM_TOKEN bootstrap for first-time publishing of new @agy-companion/* packages.
+          if [[ -n "${NPM_TOKEN:-}" ]]; then
+            tmp_npmrc="$(mktemp)"
+            trap 'rm -f "${tmp_npmrc}"' EXIT
+            chmod 0600 "${tmp_npmrc}"
+            printf '//registry.npmjs.org/:_authToken=%s\n' "${NPM_TOKEN}" > "${tmp_npmrc}"
+            unset NPM_TOKEN
+            export NPM_CONFIG_USERCONFIG="${tmp_npmrc}"
+            echo "Authenticating npm publish with NPM_TOKEN + OIDC provenance"
+          else
+            echo "Authenticating npm publish with OIDC Trusted Publishing (no NPM_TOKEN set)"
+          fi
+
+          publish_if_missing() {
+            local pkg_name="$1"
+            local pkg_dir="$2"
+            local published_ver
+            published_ver="$(npm view "${pkg_name}@${VERSION}" version --registry=https://registry.npmjs.org/ 2>/dev/null || true)"
+            if [[ "${published_ver}" == "${VERSION}" ]]; then
+              echo "Skipping ${pkg_name}@${VERSION} (already published)"
+              return 0
+            fi
+            echo "Publishing ${pkg_name}@${VERSION} from ${pkg_dir}..."
+            npm publish "${pkg_dir}" --provenance --access public
+          }
+
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            publish_if_missing "@agy-companion/${target}" "dist/npm/platforms/${target}"
+          done
+          publish_if_missing "agy-companion" "dist/npm/meta"
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [verify, package-verify, github-release]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download Python wheels
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist/wheels
+
+      - name: Publish wheels to PyPI via OIDC Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/wheels/
+          attestations: true
+          verify-metadata: true
+          skip-existing: true
+          print-hash: true
