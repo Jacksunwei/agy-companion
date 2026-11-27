@@ -603,12 +603,65 @@ class CheckRunner:
             )
 
         if cur_parsed <= base_parsed:
+            if cur_parsed == base_parsed and self._is_github_meta_only_change(git, base_ref):
+                return None
             return (
                 f"PR version bump required: workspace version {current_ver} is not greater than "
                 f"{base_ref} ({base_ver}); run 'python3 -B scripts/bump_version.py' to bump the dev "
                 "version (or '--release' for a release-prep PR)"
             )
         return None
+
+    def _is_github_meta_only_change(self, git: str, base_ref: str) -> bool:
+        """Return True iff every changed/untracked path relative to base_ref is under .github/."""
+        diff_proc = self.run_capture(
+            [git, "diff", "-z", "--name-only", f"{base_ref}...HEAD"],
+            c_locale=True,
+        )
+        if diff_proc.returncode != 0:
+            diff_proc = self.run_capture(
+                [git, "diff", "-z", "--name-only", base_ref, "HEAD"],
+                c_locale=True,
+            )
+            if diff_proc.returncode != 0:
+                return False
+
+        changed: set[str] = {p for p in diff_proc.stdout.split("\0") if p}
+
+        status_proc = self.run_capture(
+            [git, "status", "--porcelain=v1", "-z", "-uall"],
+            c_locale=True,
+        )
+        if status_proc.returncode != 0:
+            return False
+
+        tokens = status_proc.stdout.split("\0")
+        idx = 0
+        while idx < len(tokens):
+            entry = tokens[idx]
+            idx += 1
+            if not entry:
+                continue
+            if len(entry) < 4:
+                return False
+            xy = entry[:2]
+            path = entry[3:]
+            changed.add(path)
+            if "R" in xy or "C" in xy:
+                if idx < len(tokens) and tokens[idx]:
+                    changed.add(tokens[idx])
+                    idx += 1
+
+        if not changed:
+            return False
+
+        for raw_path in changed:
+            norm = raw_path.replace("\\", "/")
+            if not norm.startswith(".github/"):
+                return False
+            if ".." in norm.split("/"):
+                return False
+        return True
 
     def check_fmt_ui_static_and_hermeticity(self, tag: str) -> None:
         failed = False
