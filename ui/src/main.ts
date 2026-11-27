@@ -20,8 +20,11 @@ import {
 } from "./state.ts";
 import "./style.css";
 import {
+  CURATED_CODEX_MODEL_CATALOG,
+  DEFAULT_ENABLED_CODEX_MODELS,
   DEFAULT_ENABLED_MODELS,
   parseSettingsSnapshot,
+  parseStartCodexLoginPayload,
   parseTestConnectionPayload,
   parseUsageSummary,
   validateApiKey,
@@ -79,6 +82,15 @@ async function main(): Promise<void> {
     modelFeedback: null,
     advFeedback: null,
 
+    codexBusy: false,
+    codexTesting: false,
+    codexAuthorizeUrl: null,
+    codexManualFallbackOpen: false,
+    codexManualInputDraft: "",
+    codexSignOutConfirmOpen: false,
+    codexFeedback: null,
+    codexModelFeedback: null,
+
     usageRange: "7d",
     usageUnit: "usd",
     usageGroup: "model",
@@ -95,7 +107,12 @@ async function main(): Promise<void> {
   let lastPollCompletedAt = 0;
 
   function isWriteInFlight(): boolean {
-    return state.saving || state.clearing || state.updatingIntegration;
+    return (
+      state.saving ||
+      state.clearing ||
+      state.updatingIntegration ||
+      state.codexBusy
+    );
   }
 
   /* =========================================================================
@@ -194,6 +211,48 @@ async function main(): Promise<void> {
       },
       onRestoreDefaultModels: () => {
         void handleRestoreDefaultModels();
+      },
+      onStartCodexLogin: () => {
+        void handleStartCodexLogin();
+      },
+      onOpenPendingCodexUrl: () => {
+        handleOpenPendingCodexUrlSync();
+      },
+      onCopyPendingCodexUrl: () => {
+        void handleCopyPendingCodexUrl();
+      },
+      onCancelCodexLogin: () => {
+        void handleCancelCodexLogin();
+      },
+      onToggleCodexFallbackOpen: (open) => {
+        state.codexManualFallbackOpen = open;
+      },
+      onCodexManualInputChange: (draft) => {
+        state.codexManualInputDraft = draft;
+        settingsView.update(state);
+      },
+      onCompleteCodexLogin: () => {
+        void handleCompleteCodexLogin();
+      },
+      onTestCodexConnection: () => {
+        void handleTestCodexConnection();
+      },
+      onToggleCodexSignOutConfirm: () => {
+        state.codexSignOutConfirmOpen = !state.codexSignOutConfirmOpen;
+        settingsView.update(state);
+      },
+      onCancelCodexSignOut: () => {
+        state.codexSignOutConfirmOpen = false;
+        settingsView.update(state);
+      },
+      onDisconnectCodex: () => {
+        void handleDisconnectCodex();
+      },
+      onToggleCodexModel: (modelId) => {
+        void handleToggleCodexModel(modelId);
+      },
+      onRestoreDefaultCodexModels: () => {
+        void handleRestoreDefaultCodexModels();
       },
       onSelectAccountPlan: (plan) => {
         void handleSelectAccountPlan(plan);
@@ -331,12 +390,28 @@ async function main(): Promise<void> {
   }
 
   function applySnapshot(snap: SettingsSnapshot): void {
+    const wasCodexAuthed = state.snapshot?.config.providers.codex.authenticated === true;
+    const wasCodexPending =
+      state.snapshot?.codex_login_pending === true || state.codexAuthorizeUrl !== null;
+
     state.snapshot = snap;
     state.loadError = null;
     if (snap.proxy.reachable) {
       state.unhealthyStreak = 0;
     } else {
       state.unhealthyStreak = Math.min(state.unhealthyStreak + 1, UNHEALTHY_BACKOFF_MS.length);
+    }
+
+    if (!snap.codex_login_pending) {
+      if (state.codexAuthorizeUrl !== null) {
+        state.codexAuthorizeUrl = null;
+        state.codexManualFallbackOpen = false;
+        state.codexManualInputDraft = "";
+        settingsView.clearCodexManualInputDom();
+      }
+      if (!wasCodexAuthed && snap.config.providers.codex.authenticated && wasCodexPending) {
+        state.codexFeedback = { tone: "ok", text: "Signed in to OpenAI Codex" };
+      }
     }
 
     if (!state.initialTabApplied && !state.tabPinnedByUser) {
@@ -604,6 +679,250 @@ async function main(): Promise<void> {
     );
   }
 
+  function openExternalUrlSync(url: string): boolean {
+    if (!state.connected || state.standalone) return false;
+    try {
+      const popup = window.open(url, "_blank", "noopener,noreferrer");
+      return popup !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  function handleOpenPendingCodexUrlSync(): void {
+    const url = state.codexAuthorizeUrl;
+    if (!url) return;
+    if (!openExternalUrlSync(url)) {
+      void copyTextWithFallback(url).then((copied) => {
+        showToast(
+          copied
+            ? "Browser blocked pop-up \u2014 sign-in link copied"
+            : "Copy the sign-in link and open it in your browser",
+        );
+      });
+    }
+  }
+
+  async function handleCopyPendingCodexUrl(): Promise<void> {
+    const url = state.codexAuthorizeUrl;
+    if (!url) return;
+    const copied = await copyTextWithFallback(url);
+    showToast(copied ? "Copied OpenAI sign-in link" : "Unable to copy sign-in link");
+  }
+
+  async function handleStartCodexLogin(): Promise<void> {
+    if (!state.connected || state.standalone || isWriteInFlight()) return;
+    state.snapshotEpoch += 1;
+    state.codexBusy = true;
+    state.codexFeedback = null;
+    state.codexSignOutConfirmOpen = false;
+    settingsView.update(state);
+
+    const outcome = await callTool("start_codex_login", {}, parseStartCodexLoginPayload);
+    state.codexBusy = false;
+
+    if (outcome.ok) {
+      state.snapshotEpoch += 1;
+      state.codexAuthorizeUrl = outcome.data.authorize_url;
+      state.codexManualFallbackOpen = outcome.data.manual_fallback;
+      state.codexManualInputDraft = "";
+      settingsView.clearCodexManualInputDom();
+      if (state.snapshot) {
+        state.snapshot = { ...state.snapshot, codex_login_pending: true };
+      }
+
+      const opened = openExternalUrlSync(outcome.data.authorize_url);
+      if (outcome.data.manual_fallback) {
+        state.codexFeedback = {
+          tone: "warn",
+          text: "Local callback port busy \u2014 paste the redirect URL below after signing in.",
+        };
+      } else if (!opened) {
+        const copied = await copyTextWithFallback(outcome.data.authorize_url);
+        state.codexFeedback = {
+          tone: "info",
+          text: copied
+            ? "Pop-up blocked \u2014 sign-in link copied, or click Open sign-in page."
+            : "Click Open sign-in page to continue in your browser.",
+        };
+      }
+      renderAll();
+      scheduleNextPoll();
+    } else {
+      state.codexFeedback = { tone: "err", text: outcome.error };
+      renderAll();
+    }
+  }
+
+  async function handleCancelCodexLogin(): Promise<void> {
+    if (!state.connected || state.standalone || isWriteInFlight()) return;
+    state.snapshotEpoch += 1;
+    state.codexBusy = true;
+    state.codexFeedback = null;
+    settingsView.update(state);
+
+    const outcome = await callTool("cancel_codex_login", {}, parseSettingsSnapshot);
+    state.codexBusy = false;
+
+    if (outcome.ok) {
+      state.snapshotEpoch += 1;
+      state.codexAuthorizeUrl = null;
+      state.codexManualFallbackOpen = false;
+      state.codexManualInputDraft = "";
+      settingsView.clearCodexManualInputDom();
+      state.codexFeedback = { tone: "info", text: "Sign-in canceled" };
+      applySnapshot(outcome.data);
+      scheduleNextPoll();
+    } else {
+      state.codexFeedback = { tone: "err", text: outcome.error };
+      renderAll();
+    }
+  }
+
+  async function handleCompleteCodexLogin(): Promise<void> {
+    if (!state.connected || state.standalone || isWriteInFlight()) return;
+    const trimmed = state.codexManualInputDraft.trim();
+    if (!trimmed) {
+      state.codexFeedback = { tone: "err", text: "Paste the callback URL or authorization code first." };
+      settingsView.update(state);
+      return;
+    }
+
+    state.snapshotEpoch += 1;
+    state.codexBusy = true;
+    state.codexFeedback = { tone: "info", text: "Completing OpenAI Codex sign-in\u2026" };
+    settingsView.update(state);
+
+    const outcome = await callTool(
+      "complete_codex_login",
+      { callback_input: trimmed },
+      parseSettingsSnapshot,
+    );
+    state.codexBusy = false;
+
+    if (outcome.ok) {
+      state.snapshotEpoch += 1;
+      state.codexAuthorizeUrl = null;
+      state.codexManualFallbackOpen = false;
+      state.codexManualInputDraft = "";
+      settingsView.clearCodexManualInputDom();
+      state.codexFeedback = { tone: "ok", text: "Signed in to OpenAI Codex" };
+      applySnapshot(outcome.data);
+      scheduleNextPoll();
+    } else {
+      state.codexFeedback = { tone: "err", text: outcome.error };
+      renderAll();
+    }
+  }
+
+  async function handleTestCodexConnection(): Promise<void> {
+    if (!state.connected || state.standalone || state.codexTesting || isWriteInFlight()) return;
+    state.codexTesting = true;
+    state.codexFeedback = { tone: "info", text: "Testing OpenAI Codex connection\u2026" };
+    settingsView.update(state);
+
+    const outcome = await callTool(
+      "test_connection",
+      { provider: "codex" },
+      parseTestConnectionPayload,
+    );
+    state.codexTesting = false;
+
+    if (outcome.ok) {
+      state.codexFeedback = {
+        tone: outcome.data.ok ? "ok" : "err",
+        text: outcome.data.message,
+      };
+    } else {
+      state.codexFeedback = { tone: "err", text: outcome.error };
+    }
+    settingsView.update(state);
+  }
+
+  async function handleDisconnectCodex(): Promise<void> {
+    if (!state.connected || state.standalone || isWriteInFlight()) return;
+    state.snapshotEpoch += 1;
+    state.codexBusy = true;
+    state.codexFeedback = null;
+    settingsView.update(state);
+
+    const outcome = await callTool("disconnect_codex", {}, parseSettingsSnapshot);
+    state.codexBusy = false;
+
+    if (outcome.ok) {
+      state.snapshotEpoch += 1;
+      state.codexSignOutConfirmOpen = false;
+      state.codexAuthorizeUrl = null;
+      state.codexManualFallbackOpen = false;
+      state.codexManualInputDraft = "";
+      settingsView.clearCodexManualInputDom();
+      state.codexFeedback = { tone: "warn", text: "Signed out of OpenAI Codex" };
+      applySnapshot(outcome.data);
+      scheduleNextPoll();
+    } else {
+      state.codexFeedback = { tone: "err", text: outcome.error };
+      renderAll();
+    }
+  }
+
+  async function saveEnabledCodexModels(
+    nextModels: string[],
+    successText: string | null,
+  ): Promise<void> {
+    if (!state.connected || state.standalone || isWriteInFlight()) return;
+    state.snapshotEpoch += 1;
+    state.codexBusy = true;
+    settingsView.update(state);
+
+    const args: SaveSettingsArgs = {
+      providers: {
+        codex: {
+          enabled_models: nextModels,
+        },
+      },
+    };
+    const outcome = await callTool(
+      "save_settings",
+      args as unknown as Record<string, unknown>,
+      parseSettingsSnapshot,
+    );
+    state.codexBusy = false;
+
+    if (outcome.ok) {
+      state.snapshotEpoch += 1;
+      const count = outcome.data.config.providers.codex.enabled_models.length;
+      state.codexModelFeedback =
+        count > 0
+          ? {
+              tone: "ok",
+              text:
+                successText ??
+                `Saved \u00b7 ${count} ${count === 1 ? "model" : "models"} active`,
+            }
+          : null;
+      applySnapshot(outcome.data);
+    } else {
+      state.codexModelFeedback = { tone: "err", text: outcome.error };
+      renderAll();
+    }
+  }
+
+  async function handleToggleCodexModel(modelId: string): Promise<void> {
+    const current =
+      state.snapshot?.config.providers.codex.enabled_models ?? [...DEFAULT_ENABLED_CODEX_MODELS];
+    await saveEnabledCodexModels(
+      toggleEnabledModel(current, modelId, CURATED_CODEX_MODEL_CATALOG),
+      null,
+    );
+  }
+
+  async function handleRestoreDefaultCodexModels(): Promise<void> {
+    await saveEnabledCodexModels(
+      [...DEFAULT_ENABLED_CODEX_MODELS],
+      `Restored default Codex models (${DEFAULT_ENABLED_CODEX_MODELS.length} enabled)`,
+    );
+  }
+
   async function handleSelectAccountPlan(plan: AccountPlanChoice): Promise<void> {
     if (!state.connected || state.standalone || isWriteInFlight()) return;
     state.snapshotEpoch += 1;
@@ -682,12 +1001,16 @@ async function main(): Promise<void> {
     clearPollTimer();
     if (!state.connected || state.standalone || document.hidden) return;
     const reachable = state.snapshot?.proxy.reachable ?? true;
+    const codexPending =
+      state.snapshot?.codex_login_pending === true ||
+      (state.codexAuthorizeUrl !== null &&
+        state.snapshot?.config.providers.codex.authenticated !== true);
     pollTimer = window.setTimeout(() => {
       pollTimer = null;
       if (!document.hidden) {
         void refreshSettings(true);
       }
-    }, nextPollDelayMs(reachable, state.unhealthyStreak));
+    }, nextPollDelayMs(reachable, state.unhealthyStreak, codexPending));
   }
 
   function triggerThrottledRecheck(): void {

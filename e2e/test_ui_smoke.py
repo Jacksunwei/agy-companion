@@ -44,6 +44,12 @@ _SUPPORTED_MODELS: list[dict[str, str]] = [
     {"id": "gemini-4-argon", "display_name": "Gemini 4 Argon", "short_label": "4 Argon"},
     {"id": "gemini-3.8-flash", "display_name": "Gemini 3.8 Flash", "short_label": "3.8 Flash"},
 ]
+_SUPPORTED_CODEX_MODELS: list[dict[str, str]] = [
+    {"id": "gpt-6.2-astra", "display_name": "GPT-6.2 Astra", "short_label": "6.2 Astra"},
+    {"id": "gpt-6.2-sol", "display_name": "GPT-6.2 Sol", "short_label": "6.2 Sol"},
+    {"id": "gpt-6.1-terra", "display_name": "GPT-6.1 Terra", "short_label": "6.1 Terra"},
+    {"id": "gpt-6-luna", "display_name": "GPT-6 Luna", "short_label": "6 Luna"},
+]
 
 
 def _make_snapshot(
@@ -136,7 +142,17 @@ def _make_snapshot(
                     "timeout_secs": 900,
                     "api_key_configured": True,
                     "api_key_hint": "test...1234",
-                }
+                },
+                "codex": {
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "default_model": "gpt-6.2-sol",
+                    "enabled_models": ["gpt-6.2-astra", "gpt-6.2-sol"],
+                    "timeout_secs": 900,
+                    "authenticated": False,
+                    "account_hint": None,
+                    "plan_type": None,
+                    "expires_at_ms": None,
+                },
             },
             "launcher_auto_start": True,
         },
@@ -168,6 +184,8 @@ def _make_snapshot(
             "resolved_upstream": "https://cloudcode-pa.googleapis.com",
         },
         "supported_models": _SUPPORTED_MODELS,
+        "supported_codex_models": _SUPPORTED_CODEX_MODELS,
+        "codex_login_pending": False,
         "platform": "macos",
         "account_plan": {"mode": "auto", "resolved": "organization"},
         "proxy_rss_bytes": rss_bytes,
@@ -328,6 +346,10 @@ class TestUiSmoke(E2ETestCase):
 
                         for token in _FORBIDDEN_COPY_TOKENS:
                             self.assertNotIn(token, metrics["bodyText"], f"legacy copy {token!r} ({ctx})")
+
+                        if tab_label == "Settings":
+                            self.assertIn("OpenAI Codex", metrics["bodyText"], f"OpenAI Codex card missing ({ctx})")
+                            self.assertIn("Sign in with ChatGPT", metrics["bodyText"], f"Codex sign-in CTA missing ({ctx})")
 
                         # Primary text WCAG AA >= 4.5:1 in both Dark and Light.
                         brand_ratio = wcag_contrast_ratio(

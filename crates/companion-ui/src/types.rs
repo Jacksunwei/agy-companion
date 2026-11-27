@@ -4,16 +4,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use companion_core::config::{
-    CloudCodeConfigPatch, ConfigPatch, GeminiConfigPatch, ProvidersConfigPatch, ProxyConfigPatch,
+    CloudCodeConfigPatch, CodexConfigPatch, ConfigPatch, GeminiConfigPatch, ProvidersConfigPatch,
+    ProxyConfigPatch,
 };
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::{
     AuthStore, CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CloudCodeStatsSnapshot,
     CloudCodeStatus, CloudCodeUpstream, DEFAULT_CLOUDCODE_UPSTREAM_URL, HostPlatform, ModelPreset,
     ProxyHealthSummary, RedactedConfig, StatsSnapshot, UsageRange, api_key_hint,
-    curated_model_presets,
+    curated_codex_model_presets, curated_model_presets,
 };
-use companion_providers::DEFAULT_PROBE_TIMEOUT;
+use companion_providers::{CodexAuthManager, DEFAULT_PROBE_TIMEOUT};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -41,6 +42,7 @@ pub struct UiServerOptions {
     pub hybrid_active_override: Option<bool>,
     pub probe_timeout: Duration,
     pub auth_store_override: Option<Arc<dyn AuthStore>>,
+    pub codex_auth_override: Option<Arc<CodexAuthManager>>,
 }
 
 impl fmt::Debug for UiServerOptions {
@@ -62,6 +64,13 @@ impl fmt::Debug for UiServerOptions {
                 "auth_store_override",
                 &self.auth_store_override.as_ref().map(|_| "<AuthStore>"),
             )
+            .field(
+                "codex_auth_override",
+                &self
+                    .codex_auth_override
+                    .as_ref()
+                    .map(|_| "<CodexAuthManager>"),
+            )
             .finish()
     }
 }
@@ -76,6 +85,7 @@ impl Default for UiServerOptions {
             hybrid_active_override: None,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             auth_store_override: None,
+            codex_auth_override: None,
         }
     }
 }
@@ -93,6 +103,11 @@ impl UiServerOptions {
 
     pub fn with_auth_store_override(mut self, store: Arc<dyn AuthStore>) -> Self {
         self.auth_store_override = Some(store);
+        self
+    }
+
+    pub fn with_codex_auth_override(mut self, codex_auth: Arc<CodexAuthManager>) -> Self {
+        self.codex_auth_override = Some(codex_auth);
         self
     }
 }
@@ -194,6 +209,10 @@ pub struct SettingsSnapshot {
     pub cloudcode: CloudCodeStatus,
     #[serde(default = "curated_model_presets")]
     pub supported_models: Vec<ModelPreset>,
+    #[serde(default = "curated_codex_model_presets")]
+    pub supported_codex_models: Vec<ModelPreset>,
+    #[serde(default)]
+    pub codex_login_pending: bool,
     #[serde(default)]
     pub platform: HostPlatform,
     #[serde(default)]
@@ -273,8 +292,17 @@ pub struct GeminiSettingsPatch {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct CodexSettingsPatch {
+    pub base_url: Option<String>,
+    pub default_model: Option<String>,
+    pub enabled_models: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProvidersSettingsPatch {
     pub gemini: Option<GeminiSettingsPatch>,
+    pub codex: Option<CodexSettingsPatch>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -314,6 +342,17 @@ impl From<GeminiSettingsPatch> for GeminiConfigPatch {
     }
 }
 
+impl From<CodexSettingsPatch> for CodexConfigPatch {
+    fn from(patch: CodexSettingsPatch) -> Self {
+        Self {
+            base_url: patch.base_url,
+            default_model: patch.default_model,
+            enabled_models: patch.enabled_models,
+            timeout_secs: None,
+        }
+    }
+}
+
 impl SaveSettingsArgs {
     pub(crate) fn into_config_and_auth_patches(
         mut self,
@@ -339,6 +378,13 @@ impl SaveSettingsArgs {
                 .and_then(|p| p.gemini.as_ref())
                 .is_some_and(|g| {
                     g.base_url.is_some() || g.default_model.is_some() || g.enabled_models.is_some()
+                })
+            || self
+                .providers
+                .as_ref()
+                .and_then(|p| p.codex.as_ref())
+                .is_some_and(|c| {
+                    c.base_url.is_some() || c.default_model.is_some() || c.enabled_models.is_some()
                 });
 
         let config_patch = ConfigPatch::try_from(self)?;
@@ -350,7 +396,7 @@ impl From<ProvidersSettingsPatch> for ProvidersConfigPatch {
     fn from(patch: ProvidersSettingsPatch) -> Self {
         Self {
             gemini: patch.gemini.map(Into::into),
-            codex: None,
+            codex: patch.codex.map(Into::into),
         }
     }
 }
@@ -384,8 +430,35 @@ impl TryFrom<SaveSettingsArgs> for ConfigPatch {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestConnectionProvider {
+    #[default]
+    Gemini,
+    Codex,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestConnectionArgs {
+    pub provider: TestConnectionProvider,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestConnectionPayload {
     pub ok: bool,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartCodexLoginPayload {
+    pub authorize_url: String,
+    pub callback_listening: bool,
+    pub manual_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteCodexLoginArgs {
+    pub callback_input: String,
 }

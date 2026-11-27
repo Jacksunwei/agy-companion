@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use companion_core::integration::{IntegrationOptions, IntegrationState};
 use companion_core::{
     AUTH_DIR_NAME, ApiKey, AuthStore, Config, FileAuthStore, GeminiCredentials, LoopbackHost,
-    MemoryAuthStore, curated_model_presets,
+    MemoryAuthStore, curated_codex_model_presets, curated_model_presets,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -41,6 +41,7 @@ fn isolated_ui_server_options(tmp: &TempDir) -> UiServerOptions {
         hybrid_active_override: Some(false),
         probe_timeout: companion_providers::DEFAULT_PROBE_TIMEOUT,
         auth_store_override: None,
+        codex_auth_override: None,
     }
 }
 
@@ -139,6 +140,7 @@ async fn save_settings_persists_preserves_clears_and_rejects_invalid_or_placehol
                         enabled_models: Some(vec!["gemini-4-neon".to_string()]),
                         base_url: None,
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -203,6 +205,7 @@ async fn save_settings_persists_preserves_clears_and_rejects_invalid_or_placehol
                         default_model: Some("gemini-5-pro".to_string()),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -234,6 +237,7 @@ async fn save_settings_persists_preserves_clears_and_rejects_invalid_or_placehol
                         api_key: Some(ApiKeyPatch::Set("agy-companion-local".to_string())),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -253,6 +257,7 @@ async fn save_settings_persists_preserves_clears_and_rejects_invalid_or_placehol
                                 api_key: Some(ApiKeyPatch::Set(blank.to_string())),
                                 ..Default::default()
                             }),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     },
@@ -312,6 +317,7 @@ async fn save_settings_persists_preserves_clears_and_rejects_invalid_or_placehol
                         api_key: Some(ApiKeyPatch::Clear),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -338,6 +344,7 @@ fn save_settings_args_denies_unknown_fields_at_every_nesting_level() {
         r#"{"cloudcode": {"unknown_cc": 1}}"#,
         r#"{"providers": {"unknown_provider": {}}}"#,
         r#"{"providers": {"gemini": {"unknown_gemini": 1}}}"#,
+        r#"{"providers": {"codex": {"unknown_codex": 1}}}"#,
     ] {
         assert!(
             serde_json::from_str::<SaveSettingsArgs>(bad).is_err(),
@@ -345,6 +352,26 @@ fn save_settings_args_denies_unknown_fields_at_every_nesting_level() {
         );
     }
     assert!(serde_json::from_str::<GetUsageArgs>(r#"{"range":"7d","extra":1}"#).is_err());
+    assert!(
+        serde_json::from_str::<TestConnectionArgs>(r#"{"provider":"gemini","extra":1}"#).is_err()
+    );
+    assert!(serde_json::from_str::<TestConnectionArgs>(r#"{"provider":"unknown"}"#).is_err());
+    assert_eq!(
+        serde_json::from_str::<TestConnectionArgs>(r#"{}"#).expect("default provider"),
+        TestConnectionArgs {
+            provider: TestConnectionProvider::Gemini
+        }
+    );
+    assert_eq!(
+        serde_json::from_str::<TestConnectionArgs>(r#"{"provider":"codex"}"#).expect("codex"),
+        TestConnectionArgs {
+            provider: TestConnectionProvider::Codex
+        }
+    );
+    assert!(
+        serde_json::from_str::<CompleteCodexLoginArgs>(r#"{"callback_input":"code","extra":1}"#)
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -366,6 +393,7 @@ async fn concurrent_save_settings_calls_preserve_disjoint_updates() {
                         api_key: Some(ApiKeyPatch::Set("test-concurrent-key-1111".to_string())),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -378,6 +406,7 @@ async fn concurrent_save_settings_calls_preserve_disjoint_updates() {
                         default_model: Some("gemini-4-carbon".to_string()),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -499,7 +528,10 @@ async fn test_connection_handles_ok_invalid_key_missing_key_and_corrupt_config()
         .expect("save gemini auth");
 
     let server = isolated_ui_server(&tmp, cfg_path.clone());
-    let ok = server.test_connection_payload().await.expect("ok payload");
+    let ok = server
+        .test_connection_payload(TestConnectionProvider::Gemini)
+        .await
+        .expect("ok payload");
     assert!(ok.ok);
     assert!(!ok.message.contains(secret));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -507,14 +539,19 @@ async fn test_connection_handles_ok_invalid_key_missing_key_and_corrupt_config()
     // Missing key returns ok=false without contacting upstream.
     auth_store.clear_gemini().expect("clear key");
     let missing = server
-        .test_connection_payload()
+        .test_connection_payload(TestConnectionProvider::Gemini)
         .await
         .expect("missing key payload");
     assert!(!missing.ok);
 
     // Corrupt config returns Err(String).
     write_raw_secure(&cfg_path, "{corrupt json");
-    assert!(server.test_connection_payload().await.is_err());
+    assert!(
+        server
+            .test_connection_payload(TestConnectionProvider::Gemini)
+            .await
+            .is_err()
+    );
 
     handle.abort();
 }
@@ -807,6 +844,8 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
             resolved_upstream: Some("https://cloudcode-pa.googleapis.com".to_string()),
         },
         supported_models: curated_model_presets(),
+        supported_codex_models: curated_codex_model_presets(),
+        codex_login_pending: false,
         platform: HostPlatform::Macos,
         account_plan: AccountPlanStatus {
             mode: AccountPlanMode::Auto,
@@ -859,6 +898,8 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         },
         cloudcode: CloudCodeStatus::from_config_and_stats(&CloudCodeUpstream::Auto, None),
         supported_models: curated_model_presets(),
+        supported_codex_models: curated_codex_model_presets(),
+        codex_login_pending: false,
         platform: HostPlatform::Macos,
         account_plan: AccountPlanStatus::from_config_and_stats(&CloudCodeUpstream::Auto, None),
         proxy_rss_bytes: None,
@@ -1008,6 +1049,26 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         serde_json::from_str::<TestConnectionPayload>(TEST_CONN_FIXTURE).expect("roundtrip conn"),
         test_conn
     );
+
+    // 5. start_codex_login.json
+    const START_CODEX_FIXTURE: &str =
+        include_str!("../../../ui/tests/fixtures/start_codex_login.json");
+    let start_codex = StartCodexLoginPayload {
+        authorize_url: "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
+        callback_listening: true,
+        manual_fallback: false,
+    };
+    let expected_start_codex: Value =
+        serde_json::from_str(START_CODEX_FIXTURE).expect("parse start_codex_login fixture");
+    assert_eq!(
+        serde_json::to_value(&start_codex).expect("serialize start_codex_login"),
+        expected_start_codex
+    );
+    assert_eq!(
+        serde_json::from_str::<StartCodexLoginPayload>(START_CODEX_FIXTURE)
+            .expect("roundtrip start_codex_login"),
+        start_codex
+    );
 }
 
 #[tokio::test]
@@ -1028,6 +1089,7 @@ async fn save_settings_atomic_rejection_and_key_only_write_without_creating_conf
                             base_url: Some("http://evil.example.com".to_string()),
                             ..Default::default()
                         }),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1058,6 +1120,7 @@ async fn save_settings_atomic_rejection_and_key_only_write_without_creating_conf
                             default_model: Some("gemini-4-neon".to_string()),
                             ..Default::default()
                         }),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1078,6 +1141,7 @@ async fn save_settings_atomic_rejection_and_key_only_write_without_creating_conf
                         api_key: Some(ApiKeyPatch::Set("AIzaSyKeyOnlyNoCfg0001".to_string())),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1155,7 +1219,10 @@ async fn ui_service_fails_closed_on_symlinked_auth_dir_and_gemini_file() {
             "{case}: get_settings_snapshot must fail closed"
         );
         assert!(
-            server.test_connection_payload().await.is_err(),
+            server
+                .test_connection_payload(TestConnectionProvider::Gemini)
+                .await
+                .is_err(),
             "{case}: test_connection_payload must fail closed"
         );
         assert!(
@@ -1170,6 +1237,7 @@ async fn ui_service_fails_closed_on_symlinked_auth_dir_and_gemini_file() {
                                 default_model: Some("gemini-4-neon".to_string()),
                                 ..Default::default()
                             }),
+                            ..Default::default()
                         }),
                         ..Default::default()
                     },
@@ -1230,6 +1298,7 @@ async fn ui_server_options_auth_store_override_uses_memory_store_without_disk_au
                         api_key: Some(ApiKeyPatch::Set("AIzaSyMemOverrideKey02".to_string())),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1288,6 +1357,7 @@ async fn save_settings_rolls_back_gemini_auth_when_config_save_fails_on_read_onl
                             default_model: Some("gemini-3.8-flash".to_string()),
                             ..Default::default()
                         }),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1317,6 +1387,7 @@ async fn save_settings_rolls_back_gemini_auth_when_config_save_fails_on_read_onl
                             default_model: Some("gemini-3.8-flash".to_string()),
                             ..Default::default()
                         }),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1348,6 +1419,7 @@ async fn save_settings_rolls_back_gemini_auth_when_config_save_fails_on_read_onl
                             default_model: Some("gemini-3.8-flash".to_string()),
                             ..Default::default()
                         }),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1428,7 +1500,18 @@ async fn get_settings_reflects_redacted_codex_auth_and_fails_closed_on_corrupt_o
     // and set_launcher_integration without mutating disk.
     fs::write(auth_store.codex_path(), "{corrupt_codex_json").expect("write corrupt");
     assert!(server.get_settings_snapshot(None).await.is_err());
-    assert!(server.test_connection_payload().await.is_err());
+    assert!(
+        server
+            .test_connection_payload(TestConnectionProvider::Gemini)
+            .await
+            .is_err()
+    );
+    assert!(
+        server
+            .test_connection_payload(TestConnectionProvider::Codex)
+            .await
+            .is_err()
+    );
     assert!(
         server
             .save_settings_snapshot(
@@ -1438,6 +1521,7 @@ async fn get_settings_reflects_redacted_codex_auth_and_fails_closed_on_corrupt_o
                             default_model: Some("gemini-4-neon".to_string()),
                             ..Default::default()
                         }),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1467,7 +1551,18 @@ async fn get_settings_reflects_redacted_codex_auth_and_fails_closed_on_corrupt_o
         symlink(&victim, auth_store.codex_path()).expect("symlink codex");
 
         assert!(server.get_settings_snapshot(None).await.is_err());
-        assert!(server.test_connection_payload().await.is_err());
+        assert!(
+            server
+                .test_connection_payload(TestConnectionProvider::Gemini)
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .test_connection_payload(TestConnectionProvider::Codex)
+                .await
+                .is_err()
+        );
         assert!(
             server
                 .set_launcher_integration_snapshot(true, None)
@@ -1479,4 +1574,307 @@ async fn get_settings_reflects_redacted_codex_auth_and_fails_closed_on_corrupt_o
             "victim-codex-sentinel"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_settings_codex_patch_persists_and_rejects_invalid_atomically() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+    let server = isolated_ui_server(&tmp, cfg_path.clone());
+
+    let initial = server
+        .get_settings_snapshot(None)
+        .await
+        .expect("initial snapshot");
+    assert_eq!(initial.supported_codex_models.len(), 4);
+    assert_eq!(initial.supported_codex_models[0].id, "gpt-6.2-astra");
+    assert!(!initial.codex_login_pending);
+
+    // 1. Atomic rejection: valid Gemini API key + invalid Codex base_url writes neither disk file.
+    assert!(
+        server
+            .save_settings_snapshot(
+                SaveSettingsArgs {
+                    providers: Some(ProvidersSettingsPatch {
+                        gemini: Some(GeminiSettingsPatch {
+                            api_key: Some(ApiKeyPatch::Set("test-codex-atomic-key".to_string())),
+                            ..Default::default()
+                        }),
+                        codex: Some(CodexSettingsPatch {
+                            base_url: Some("http://evil.example.com".to_string()),
+                            ..Default::default()
+                        }),
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!cfg_path.exists());
+    assert!(!auth_store.gemini_path().exists());
+
+    // 2. Atomic rejection: invalid Codex model ID writes nothing.
+    assert!(
+        server
+            .save_settings_snapshot(
+                SaveSettingsArgs {
+                    providers: Some(ProvidersSettingsPatch {
+                        codex: Some(CodexSettingsPatch {
+                            enabled_models: Some(vec!["gemini-4-carbon".to_string()]),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!cfg_path.exists());
+
+    // 3. Valid Codex patch persists cleanly (including empty enabled_models pause) without touching Gemini.
+    let saved = server
+        .save_settings_snapshot(
+            SaveSettingsArgs {
+                providers: Some(ProvidersSettingsPatch {
+                    codex: Some(CodexSettingsPatch {
+                        default_model: Some("gpt-6.2-astra".to_string()),
+                        enabled_models: Some(vec![
+                            "gpt-6.2-astra".to_string(),
+                            "gpt-6.1-terra".to_string(),
+                        ]),
+                        base_url: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("save codex settings");
+    assert_eq!(saved.config.providers.codex.default_model, "gpt-6.2-astra");
+    assert_eq!(
+        saved.config.providers.codex.enabled_models,
+        vec!["gpt-6.2-astra", "gpt-6.1-terra"]
+    );
+
+    let paused = server
+        .save_settings_snapshot(
+            SaveSettingsArgs {
+                providers: Some(ProvidersSettingsPatch {
+                    codex: Some(CodexSettingsPatch {
+                        enabled_models: Some(vec![]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("pause codex models");
+    assert!(paused.config.providers.codex.enabled_models.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_oauth_lifecycle_and_test_connection_via_ui_server() {
+    use companion_providers::{CodexAuthManager, CodexAuthOptions};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg_path = tmp.path().join("config.json");
+
+    // Helper: minimal unsigned JWT encoding account_id, plan_type, email, and future exp.
+    fn make_test_jwt(payload_json: &str) -> String {
+        fn b64url(input: &[u8]) -> String {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in input.chunks(3) {
+                let b0 = chunk[0] as u32;
+                let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+                let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+                let triple = (b0 << 16) | (b1 << 8) | b2;
+                out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+                out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+                if chunk.len() > 1 {
+                    out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+                }
+                if chunk.len() > 2 {
+                    out.push(TABLE[(triple & 0x3f) as usize] as char);
+                }
+            }
+            out
+        }
+        format!(
+            "{}.{}.sig",
+            b64url(br#"{"alg":"RS256","typ":"JWT"}"#),
+            b64url(payload_json.as_bytes())
+        )
+    }
+
+    let access_jwt = make_test_jwt(
+        r#"{"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acct_ui_test_12345","chatgpt_plan_type":"pro"},"https://api.openai.com/profile":{"email":"jack@example.com"}}"#,
+    );
+    let access_jwt_for_oauth = access_jwt.clone();
+    let access_jwt_for_codex = access_jwt.clone();
+    let refresh_secret = "rt_ui_secret_should_never_leak";
+    let codex_hits = Arc::new(AtomicUsize::new(0));
+    let codex_hits_clone = Arc::clone(&codex_hits);
+
+    let mock_router = Router::new()
+        .route(
+            "/oauth/token",
+            post(move || {
+                let access = access_jwt_for_oauth.clone();
+                async move {
+                    axum::Json(json!({
+                        "access_token": access,
+                        "refresh_token": refresh_secret,
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/responses",
+            post(move |headers: axum::http::HeaderMap| {
+                let expected_auth = format!("Bearer {access_jwt_for_codex}");
+                let hits = Arc::clone(&codex_hits_clone);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let acct = headers
+                        .get("chatgpt-account-id")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if auth == expected_auth && acct == "acct_ui_test_12345" {
+                        let sse = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n";
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            sse.to_string(),
+                        )
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [("content-type", "application/json")],
+                            r#"{"error":{"message":"unauthorized"}}"#.to_string(),
+                        )
+                    }
+                }
+            }),
+        );
+    let (mock_port, mock_handle) = spawn_mock_http(mock_router).await;
+    tokio::task::yield_now().await;
+
+    let mut cfg = config_with_port(free_closed_port().await);
+    cfg.providers.codex.base_url = format!("http://127.0.0.1:{mock_port}");
+    cfg.save_secure(&cfg_path).expect("save config");
+
+    let auth_store: Arc<dyn AuthStore> =
+        Arc::new(FileAuthStore::for_config_path(&cfg_path).expect("file auth store"));
+    let codex_auth = Arc::new(
+        CodexAuthManager::with_options(
+            Arc::clone(&auth_store),
+            CodexAuthOptions {
+                oauth_issuer: format!("http://127.0.0.1:{mock_port}"),
+                callback_bind_port: 0,
+                ..CodexAuthOptions::default()
+            },
+        )
+        .expect("codex auth manager"),
+    );
+
+    let server = isolated_ui_server_with(&tmp, cfg_path.clone(), |o| {
+        o.auth_store_override = Some(Arc::clone(&auth_store));
+        o.codex_auth_override = Some(Arc::clone(&codex_auth));
+    });
+
+    // 1. Unauthenticated Codex test_connection fails cleanly without contacting upstream.
+    let unauth = server
+        .test_connection_payload(TestConnectionProvider::Codex)
+        .await
+        .expect("unauth codex test");
+    assert!(!unauth.ok);
+    assert_eq!(codex_hits.load(Ordering::SeqCst), 0);
+
+    // 2. start_codex_login -> pending == true -> cancel_codex_login_snapshot -> pending == false.
+    let started1 = server.start_codex_login().await.expect("start login 1");
+    assert!(started1.authorize_url.contains("/oauth/authorize?"));
+    assert!(started1.callback_listening);
+    assert!(!started1.manual_fallback);
+    assert!(
+        server
+            .get_settings_snapshot(None)
+            .await
+            .expect("pending snap")
+            .codex_login_pending
+    );
+
+    let canceled = server
+        .cancel_codex_login_snapshot(None)
+        .await
+        .expect("cancel login");
+    assert!(!canceled.codex_login_pending);
+    assert!(!canceled.config.providers.codex.authenticated);
+
+    // 3. start_codex_login + complete_codex_login_snapshot via manual callback URL.
+    let started2 = server.start_codex_login().await.expect("start login 2");
+    let state_param = started2
+        .authorize_url
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("state="))
+        .expect("state query param")
+        .to_string();
+    let completed = server
+        .complete_codex_login_snapshot(
+            &format!("http://localhost:1455/auth/callback?code=authcode-123&state={state_param}"),
+            None,
+        )
+        .await
+        .expect("complete codex login");
+    assert!(!completed.codex_login_pending);
+    assert!(completed.config.providers.codex.authenticated);
+    assert_eq!(
+        completed.config.providers.codex.plan_type.as_deref(),
+        Some("pro")
+    );
+    assert_eq!(
+        completed.config.providers.codex.account_hint.as_deref(),
+        Some("j***@example.com")
+    );
+    let completed_raw = serde_json::to_string(&completed).expect("serialize completed");
+    assert!(!completed_raw.contains(&access_jwt));
+    assert!(!completed_raw.contains(refresh_secret));
+
+    // 4. Authenticated Codex test_connection succeeds against mock Responses server.
+    let ok = server
+        .test_connection_payload(TestConnectionProvider::Codex)
+        .await
+        .expect("authed codex test");
+    assert!(ok.ok, "expected ok, got: {}", ok.message);
+    assert!(!ok.message.contains(&access_jwt));
+    assert!(!ok.message.contains(refresh_secret));
+    assert_eq!(codex_hits.load(Ordering::SeqCst), 1);
+
+    // 5. disconnect_codex_snapshot clears auth/codex.json and resets authenticated.
+    let disconnected = server
+        .disconnect_codex_snapshot(None)
+        .await
+        .expect("disconnect codex");
+    assert!(!disconnected.config.providers.codex.authenticated);
+    assert!(!disconnected.codex_login_pending);
+    assert!(auth_store.load_codex().expect("load codex").is_none());
+
+    mock_handle.abort();
 }

@@ -46,7 +46,7 @@ import harness  # noqa: E402
 
 
 SUITE_MODULES: dict[str, tuple[str, ...]] = {
-    "cuj": ("test_cuj_core", "test_cuj_ux_v2", "test_cuj_ls_telemetry"),
+    "cuj": ("test_cuj_core", "test_cuj_ux_v2", "test_cuj_ls_telemetry", "test_cuj_codex"),
     "boundary": ("test_boundary_security",),
     "shims": ("test_shims_packaging",),
     "ui-smoke": ("test_ui_smoke",),

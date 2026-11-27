@@ -62,7 +62,8 @@ export function buildBannerNode(
 
   const platform = snap.platform;
   const li = snap.launcher_integration;
-  const writeBusy = state.saving || state.clearing || state.updatingIntegration;
+  const writeBusy =
+    state.saving || state.clearing || state.updatingIntegration || state.codexBusy;
 
   // Priority 1: Symlinked or read-only shell profile requiring one manual line
   if (li && li.state === "manual_required") {

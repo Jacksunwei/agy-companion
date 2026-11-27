@@ -1,4 +1,5 @@
 import {
+  CURATED_CODEX_MODEL_CATALOG,
   CURATED_MODEL_CATALOG,
   type ModelPreset,
   type ModelSessionStats,
@@ -88,6 +89,13 @@ export const MODEL_LIST_PRICES: Readonly<Record<string, ModelListPrice>> = {
   },
 };
 
+export const CODEX_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
+  "gpt-6.2-astra": 272_000,
+  "gpt-6.2-sol": 500_000,
+  "gpt-6.1-terra": 500_000,
+  "gpt-6-luna": 272_000,
+};
+
 function normalizeModelId(modelId: string): string {
   return modelId.trim().replace(/^models\//i, "").toLowerCase();
 }
@@ -98,7 +106,8 @@ export function getModelListPrice(modelId: string): ModelListPrice | null {
 }
 
 export function getModelContextWindow(modelId: string): number {
-  return getModelListPrice(modelId)?.contextWindow ?? 1_000_000;
+  const norm = normalizeModelId(modelId);
+  return MODEL_LIST_PRICES[norm]?.contextWindow ?? CODEX_CONTEXT_WINDOWS[norm] ?? 1_000_000;
 }
 
 export function estimateTokensCost(
@@ -267,6 +276,9 @@ export function formatModelLabel(
   const curated = CURATED_MODEL_CATALOG.find((m) => m.id === norm);
   if (curated) return curated.displayName;
 
+  const curatedCodex = CURATED_CODEX_MODEL_CATALOG.find((m) => m.id === norm);
+  if (curatedCodex) return curatedCodex.displayName;
+
   if (norm === "antigravity-builtin") return "Antigravity Built-in";
   return modelId.trim() || "Unknown model";
 }
@@ -276,6 +288,7 @@ export function formatProviderBadge(provider: string, source: string | null): st
   const s = (source ?? "").trim().toLowerCase();
   if (p === "antigravity" || s === "builtin") return "Antigravity";
   if (p === "gemini") return "Gemini";
+  if (p === "openai-codex" || p === "codex") return "Codex";
   if (!p) return "Antigravity";
   return p.charAt(0).toUpperCase() + p.slice(1);
 }
@@ -290,6 +303,7 @@ export function formatProviderFullName(provider: string): string {
   const p = provider.trim().toLowerCase();
   if (p === "antigravity") return "Antigravity";
   if (p === "gemini") return "Google AI Studio";
+  if (p === "openai-codex" || p === "codex") return "OpenAI Codex";
   if (!p) return "Antigravity";
   return p.charAt(0).toUpperCase() + p.slice(1);
 }

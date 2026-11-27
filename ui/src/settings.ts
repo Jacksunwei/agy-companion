@@ -6,6 +6,8 @@ import {
   type TooltipController,
 } from "./dom.ts";
 import {
+  CURATED_CODEX_MODEL_CATALOG,
+  DEFAULT_ENABLED_CODEX_MODELS,
   DEFAULT_ENABLED_MODELS,
   LIVE_PROVIDERS,
   type AccountPlanChoice,
@@ -23,6 +25,19 @@ export interface SettingsViewActions {
   onClearKey: () => void;
   onToggleModel: (modelId: string) => void;
   onRestoreDefaultModels: () => void;
+  onStartCodexLogin: () => void;
+  onOpenPendingCodexUrl: () => void;
+  onCopyPendingCodexUrl: () => void;
+  onCancelCodexLogin: () => void;
+  onToggleCodexFallbackOpen: (open: boolean) => void;
+  onCodexManualInputChange: (draft: string) => void;
+  onCompleteCodexLogin: () => void;
+  onTestCodexConnection: () => void;
+  onToggleCodexSignOutConfirm: () => void;
+  onCancelCodexSignOut: () => void;
+  onDisconnectCodex: () => void;
+  onToggleCodexModel: (modelId: string) => void;
+  onRestoreDefaultCodexModels: () => void;
   onSelectAccountPlan: (plan: AccountPlanChoice) => void;
   onToggleAdvOpen: (open: boolean) => void;
   onRecheckIntegration: () => void;
@@ -36,6 +51,22 @@ export interface SettingsViewController {
   root: HTMLElement;
   update: (state: AppState) => void;
   clearKeyInputDom: () => void;
+  clearCodexManualInputDom: () => void;
+}
+
+export function formatCodexStatusBadge(
+  planType: string | null | undefined,
+  accountHint: string | null | undefined,
+): string {
+  const rawPlan = (planType ?? "").trim();
+  const plan = rawPlan
+    ? rawPlan.charAt(0).toUpperCase() + rawPlan.slice(1).toLowerCase()
+    : "";
+  const hint = (accountHint ?? "").trim();
+  if (plan && hint) return `${plan} \u00b7 ${hint}`;
+  if (plan) return plan;
+  if (hint) return hint;
+  return "Signed in";
 }
 
 const PLAN_OPTIONS: ReadonlyArray<{
@@ -215,6 +246,189 @@ export function createSettingsView(
 
   card.append(modSec);
   providerStack.append(card);
+
+  // Provider 2: OpenAI Codex (ChatGPT OAuth)
+  const codexCard = el("section", "card");
+  codexCard.setAttribute("aria-label", "OpenAI Codex provider");
+
+  const codexHdr = el("div", "sec-h");
+  codexHdr.append(el("span", "prov-title", "OpenAI Codex"));
+
+  const codexStatusTag = el("span", "tag codex-status-tag");
+  const codexStatusDot = el("span", "sdot ok");
+  codexStatusDot.hidden = true;
+  const codexStatusText = el("span", "codex-status-text", "Not signed in");
+  codexStatusTag.append(codexStatusDot, codexStatusText);
+  codexHdr.append(codexStatusTag);
+  codexCard.append(codexHdr);
+
+  // State 1: Signed-out action row
+  const codexSignedOutWrap = el("div", "codex-signed-out");
+  const codexSignInRow = el("div", "act-row codex-act-row");
+  const codexSignInBtn = el("button", "btn btn-primary", "Sign in with ChatGPT \u2197");
+  codexSignInBtn.type = "button";
+  codexSignInBtn.addEventListener("click", () => actions.onStartCodexLogin());
+  codexSignInRow.append(codexSignInBtn);
+  codexSignedOutWrap.append(codexSignInRow);
+  codexCard.append(codexSignedOutWrap);
+
+  // State 2: Pending sign-in panel (2s poll + sync open + copy + cancel + inline paste fallback)
+  const codexPendingWrap = el("div", "codex-pending");
+  codexPendingWrap.hidden = true;
+  codexPendingWrap.append(
+    el("div", "opt-sub codex-pending-msg", "Complete sign-in in your browser\u2026"),
+  );
+
+  const codexPendingActRow = el("div", "act-row");
+  const codexOpenPageBtn = el("button", "btn btn-primary btn-sm", "Open sign-in page \u2197");
+  codexOpenPageBtn.type = "button";
+  codexOpenPageBtn.addEventListener("click", () => actions.onOpenPendingCodexUrl());
+
+  const codexCopyLinkBtn = el("button", "btn btn-sm", "Copy link");
+  codexCopyLinkBtn.type = "button";
+  codexCopyLinkBtn.addEventListener("click", () => actions.onCopyPendingCodexUrl());
+
+  const codexCancelLoginBtn = el("button", "btn btn-sm", "Cancel");
+  codexCancelLoginBtn.type = "button";
+  codexCancelLoginBtn.addEventListener("click", () => actions.onCancelCodexLogin());
+
+  codexPendingActRow.append(codexOpenPageBtn, codexCopyLinkBtn, codexCancelLoginBtn);
+  codexPendingWrap.append(codexPendingActRow);
+
+  const codexFallbackDetails = el("details", "codex-fallback");
+  codexFallbackDetails.open = false;
+  codexFallbackDetails.addEventListener("toggle", () => {
+    actions.onToggleCodexFallbackOpen(codexFallbackDetails.open);
+  });
+  const codexFallbackSum = el("summary", "codex-fallback-sum", "Having trouble? Paste callback URL");
+  codexFallbackDetails.append(codexFallbackSum);
+
+  const codexFallbackBody = el("div", "codex-fallback-body");
+  const codexManualInput = el("input", "inp mono");
+  codexManualInput.id = "codex-callback-input";
+  codexManualInput.type = "text";
+  codexManualInput.autocomplete = "off";
+  codexManualInput.spellcheck = false;
+  codexManualInput.placeholder = "Paste http://localhost:1455/auth/callback?code=...";
+  codexManualInput.setAttribute("aria-label", "OpenAI Codex callback URL or authorization code");
+  codexManualInput.addEventListener("input", () => {
+    actions.onCodexManualInputChange(codexManualInput.value);
+  });
+  codexManualInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (!codexCompleteBtn.disabled) {
+        actions.onCompleteCodexLogin();
+      }
+    }
+  });
+
+  const codexFallbackActRow = el("div", "act-row");
+  const codexCompleteBtn = el("button", "btn btn-primary btn-sm", "Complete sign-in");
+  codexCompleteBtn.type = "button";
+  codexCompleteBtn.disabled = true;
+  codexCompleteBtn.addEventListener("click", () => actions.onCompleteCodexLogin());
+  codexFallbackActRow.append(codexCompleteBtn);
+  codexFallbackBody.append(codexManualInput, codexFallbackActRow);
+  codexFallbackDetails.append(codexFallbackBody);
+  codexPendingWrap.append(codexFallbackDetails);
+  codexCard.append(codexPendingWrap);
+
+  // State 3: Signed-in action row + 2-click Sign out confirm
+  const codexSignedInWrap = el("div", "codex-signed-in");
+  codexSignedInWrap.hidden = true;
+
+  const codexSignedInActRow = el("div", "act-row codex-act-row");
+  const codexTestBtn = el("button", "btn", "Test");
+  codexTestBtn.type = "button";
+  codexTestBtn.addEventListener("click", () => actions.onTestCodexConnection());
+
+  const codexSignOutBtn = el("button", "lnk-danger", "Sign out");
+  codexSignOutBtn.type = "button";
+  codexSignOutBtn.addEventListener("click", () => actions.onToggleCodexSignOutConfirm());
+  codexSignedInActRow.append(codexTestBtn, codexSignOutBtn);
+  codexSignedInWrap.append(codexSignedInActRow);
+
+  const codexSignOutConfirmRow = el("div", "confirm-row");
+  codexSignOutConfirmRow.hidden = true;
+  codexSignOutConfirmRow.append(el("span", null, "Sign out of OpenAI Codex?"));
+  const codexConfirmSignOutBtn = el("button", "btn btn-sm btn-danger-solid", "Confirm sign out");
+  codexConfirmSignOutBtn.type = "button";
+  codexConfirmSignOutBtn.addEventListener("click", () => actions.onDisconnectCodex());
+  const codexCancelSignOutBtn = el("button", "btn btn-sm", "Cancel");
+  codexCancelSignOutBtn.type = "button";
+  codexCancelSignOutBtn.addEventListener("click", () => actions.onCancelCodexSignOut());
+  codexSignOutConfirmRow.append(codexConfirmSignOutBtn, codexCancelSignOutBtn);
+  codexSignedInWrap.append(codexSignOutConfirmRow);
+  codexCard.append(codexSignedInWrap);
+
+  // Codex status feedback line (shared across signed-out, pending, signed-in)
+  const codexFeedbackEl = el("div", "status-line");
+  codexFeedbackEl.setAttribute("role", "status");
+  codexFeedbackEl.hidden = true;
+  codexCard.append(codexFeedbackEl);
+
+  // Codex Enabled models (visible when signed in)
+  const codexModSec = el("div", "divider");
+  codexModSec.hidden = true;
+  const cmh = el("div", "sec-h");
+  cmh.append(el("span", "sec-t", "Enabled models"));
+  const codexModelCountEl = el(
+    "span",
+    "sec-right sec-count num",
+    `${DEFAULT_ENABLED_CODEX_MODELS.length} enabled`,
+  );
+  cmh.append(codexModelCountEl);
+  codexModSec.append(cmh);
+
+  const codexChipStrip = el("div", "chip-strip");
+  codexChipStrip.setAttribute("role", "group");
+  codexChipStrip.setAttribute("aria-label", "Enabled OpenAI Codex models");
+
+  const codexChipMap = new Map<string, { btn: HTMLButtonElement; info: CuratedModelInfo }>();
+  for (const model of CURATED_CODEX_MODEL_CATALOG) {
+    const chip = el("button", "m-chip");
+    chip.type = "button";
+    chip.setAttribute("role", "checkbox");
+    chip.setAttribute("aria-checked", String(model.defaultOn));
+    chip.setAttribute("aria-describedby", "model-tooltip");
+
+    const chk = el("span", "chk");
+    chk.append(createIcon("check"));
+    chip.append(chk, el("span", null, model.label));
+
+    chip.addEventListener("mouseenter", () => tooltip.show(chip, model));
+    chip.addEventListener("mouseleave", () => tooltip.scheduleHide());
+    chip.addEventListener("focus", () => tooltip.show(chip, model));
+    chip.addEventListener("blur", () => tooltip.hideNow());
+    chip.addEventListener("click", () => {
+      tooltip.hideNow();
+      actions.onToggleCodexModel(model.id);
+    });
+
+    codexChipMap.set(model.id, { btn: chip, info: model });
+    codexChipStrip.append(chip);
+  }
+  codexModSec.append(codexChipStrip);
+
+  const codexZeroModelsBox = el("div", "zero-models-note");
+  codexZeroModelsBox.hidden = true;
+  codexZeroModelsBox.append(
+    el("span", null, "No models enabled \u2014 none will appear in Antigravity's selector."),
+  );
+  const codexRestoreDefaultsBtn = el("button", "lnk", "Restore defaults");
+  codexRestoreDefaultsBtn.type = "button";
+  codexRestoreDefaultsBtn.addEventListener("click", () => actions.onRestoreDefaultCodexModels());
+  codexZeroModelsBox.append(codexRestoreDefaultsBtn);
+  codexModSec.append(codexZeroModelsBox);
+
+  const codexModelFeedbackEl = el("div", "status-line");
+  codexModelFeedbackEl.setAttribute("role", "status");
+  codexModelFeedbackEl.hidden = true;
+  codexModSec.append(codexModelFeedbackEl);
+
+  codexCard.append(codexModSec);
+  providerStack.append(codexCard);
   root.append(providerStack);
 
   // Section B: Collapsed Advanced Disclosure (ONLY Antigravity plan + Unix-only Local proxy)
@@ -348,7 +562,8 @@ export function createSettingsView(
     const enabledSet = new Set(gemini?.enabled_models ?? DEFAULT_ENABLED_MODELS);
     const platform = snap?.platform ?? "macos";
     const canCall = state.connected && !state.standalone;
-    const writeBusy = state.saving || state.clearing || state.updatingIntegration;
+    const writeBusy =
+      state.saving || state.clearing || state.updatingIntegration || state.codexBusy;
     const hasDraft = state.apiKeyDraft.trim().length > 0;
 
     // Status pill
@@ -411,6 +626,101 @@ export function createSettingsView(
       modelFeedbackEl.hidden = false;
     } else {
       modelFeedbackEl.hidden = true;
+    }
+
+    // OpenAI Codex card
+    const codex = snap?.config.providers.codex;
+    const codexAuthenticated = codex?.authenticated === true;
+    const codexPending =
+      snap?.codex_login_pending === true ||
+      (!codexAuthenticated && state.codexAuthorizeUrl !== null);
+    const codexEnabledSet = new Set(codex?.enabled_models ?? DEFAULT_ENABLED_CODEX_MODELS);
+
+    if (codexPending) {
+      codexStatusTag.className = "tag tag-warn codex-status-tag";
+      codexStatusDot.className = "sdot warn";
+      codexStatusDot.hidden = false;
+      codexStatusText.textContent = "Signing in\u2026";
+    } else if (codexAuthenticated) {
+      codexStatusTag.className = "tag tag-ok codex-status-tag";
+      codexStatusDot.className = "sdot ok";
+      codexStatusDot.hidden = false;
+      codexStatusText.textContent = formatCodexStatusBadge(
+        codex?.plan_type,
+        codex?.account_hint,
+      );
+    } else {
+      codexStatusTag.className = "tag codex-status-tag";
+      codexStatusDot.hidden = true;
+      codexStatusText.textContent = "Not signed in";
+    }
+
+    codexSignedOutWrap.hidden = codexAuthenticated || codexPending;
+    codexSignInBtn.textContent = state.codexBusy
+      ? "Starting sign-in\u2026"
+      : "Sign in with ChatGPT \u2197";
+    codexSignInBtn.disabled = !canCall || writeBusy;
+
+    codexPendingWrap.hidden = !codexPending;
+    const hasPendingUrl = state.codexAuthorizeUrl !== null;
+    codexOpenPageBtn.hidden = !hasPendingUrl;
+    codexOpenPageBtn.disabled = !hasPendingUrl;
+    codexCopyLinkBtn.hidden = !hasPendingUrl;
+    codexCopyLinkBtn.disabled = !hasPendingUrl;
+    codexCancelLoginBtn.disabled = !canCall || writeBusy;
+
+    if (codexFallbackDetails.open !== state.codexManualFallbackOpen) {
+      codexFallbackDetails.open = state.codexManualFallbackOpen;
+    }
+    codexManualInput.disabled = !canCall || state.codexBusy;
+    if (
+      document.activeElement !== codexManualInput &&
+      codexManualInput.value !== state.codexManualInputDraft
+    ) {
+      codexManualInput.value = state.codexManualInputDraft;
+    }
+    codexCompleteBtn.textContent = state.codexBusy ? "Completing\u2026" : "Complete sign-in";
+    codexCompleteBtn.disabled =
+      !canCall || writeBusy || state.codexManualInputDraft.trim().length === 0;
+
+    codexSignedInWrap.hidden = !codexAuthenticated || codexPending;
+    codexTestBtn.textContent = state.codexTesting ? "Testing\u2026" : "Test";
+    codexTestBtn.disabled = !canCall || !codexAuthenticated || writeBusy || state.codexTesting;
+    codexSignOutBtn.disabled = !canCall || writeBusy;
+
+    codexSignOutConfirmRow.hidden = !(
+      state.codexSignOutConfirmOpen &&
+      codexAuthenticated &&
+      !codexPending
+    );
+    codexConfirmSignOutBtn.textContent = state.codexBusy ? "Signing out\u2026" : "Confirm sign out";
+    codexConfirmSignOutBtn.disabled = !canCall || writeBusy;
+    codexCancelSignOutBtn.disabled = writeBusy;
+
+    if (state.codexFeedback) {
+      codexFeedbackEl.className = `status-line ${state.codexFeedback.tone}`;
+      codexFeedbackEl.textContent = state.codexFeedback.text;
+      codexFeedbackEl.hidden = false;
+    } else {
+      codexFeedbackEl.hidden = true;
+    }
+
+    codexModSec.hidden = !codexAuthenticated || codexPending;
+    const codexEnabledCount = codexEnabledSet.size;
+    codexModelCountEl.textContent = `${codexEnabledCount} enabled`;
+    for (const [id, entry] of codexChipMap.entries()) {
+      entry.btn.setAttribute("aria-checked", String(codexEnabledSet.has(id)));
+      entry.btn.disabled = !canCall || writeBusy;
+    }
+    codexZeroModelsBox.hidden = codexEnabledCount > 0;
+    codexRestoreDefaultsBtn.disabled = !canCall || writeBusy;
+
+    if (codexEnabledCount > 0 && state.codexModelFeedback) {
+      codexModelFeedbackEl.className = `status-line ${state.codexModelFeedback.tone}`;
+      codexModelFeedbackEl.textContent = state.codexModelFeedback.text;
+      codexModelFeedbackEl.hidden = false;
+    } else {
+      codexModelFeedbackEl.hidden = true;
     }
 
     // Advanced disclosure
@@ -506,5 +816,9 @@ export function createSettingsView(
     keyInput.value = "";
   };
 
-  return { root, update, clearKeyInputDom };
+  const clearCodexManualInputDom = () => {
+    codexManualInput.value = "";
+  };
+
+  return { root, update, clearKeyInputDom, clearCodexManualInputDom };
 }

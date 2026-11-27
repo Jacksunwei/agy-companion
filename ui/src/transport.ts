@@ -10,7 +10,11 @@ export type AllowedSidecarTool =
   | "get_usage"
   | "save_settings"
   | "test_connection"
-  | "set_launcher_integration";
+  | "set_launcher_integration"
+  | "start_codex_login"
+  | "cancel_codex_login"
+  | "complete_codex_login"
+  | "disconnect_codex";
 
 const ALLOWED_SIDECAR_TOOLS: ReadonlySet<string> = new Set<AllowedSidecarTool>([
   "get_settings",
@@ -18,6 +22,19 @@ const ALLOWED_SIDECAR_TOOLS: ReadonlySet<string> = new Set<AllowedSidecarTool>([
   "save_settings",
   "test_connection",
   "set_launcher_integration",
+  "start_codex_login",
+  "cancel_codex_login",
+  "complete_codex_login",
+  "disconnect_codex",
+]);
+
+const CONVERSATION_SCOPED_TOOLS: ReadonlySet<string> = new Set<AllowedSidecarTool>([
+  "get_settings",
+  "save_settings",
+  "set_launcher_integration",
+  "cancel_codex_login",
+  "complete_codex_login",
+  "disconnect_codex",
 ]);
 
 const CONVERSATION_ID_RE = /^[0-9A-Za-z_-]{6,64}$/;
@@ -104,12 +121,7 @@ export async function callSidecarApi<T>(
     return { ok: false, error: `Unsupported sidecar action: ${toolName}` };
   }
   const bodyObj: Record<string, unknown> = { ...args };
-  if (
-    ctx.conversationId &&
-    (toolName === "get_settings" ||
-      toolName === "save_settings" ||
-      toolName === "set_launcher_integration")
-  ) {
+  if (ctx.conversationId && CONVERSATION_SCOPED_TOOLS.has(toolName)) {
     bodyObj.conversation_id = ctx.conversationId;
   }
 

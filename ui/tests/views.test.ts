@@ -5,7 +5,7 @@ import { buildBannerNode } from "../src/banners.ts";
 import { createTooltipController } from "../src/dom.ts";
 import { createFooterController } from "../src/footer.ts";
 import { buildMonitorView } from "../src/monitor.ts";
-import { createSettingsView } from "../src/settings.ts";
+import { createSettingsView, formatCodexStatusBadge } from "../src/settings.ts";
 import {
   parseSettingsSnapshot,
   parseUsageSummary,
@@ -65,6 +65,15 @@ function makeState(overrides: Partial<AppState> = {}): AppState {
     keyFeedback: null,
     modelFeedback: null,
     advFeedback: null,
+
+    codexBusy: false,
+    codexTesting: false,
+    codexAuthorizeUrl: null,
+    codexManualFallbackOpen: false,
+    codexManualInputDraft: "",
+    codexSignOutConfirmOpen: false,
+    codexFeedback: null,
+    codexModelFeedback: null,
 
     usageRange: "7d",
     usageUnit: "usd",
@@ -644,6 +653,19 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
         onClearKey: () => calls.push("clearKey"),
         onToggleModel: (id) => calls.push(`toggleModel:${id}`),
         onRestoreDefaultModels: () => calls.push("restoreDefaults"),
+        onStartCodexLogin: () => calls.push("codexStart"),
+        onOpenPendingCodexUrl: () => calls.push("codexOpenPending"),
+        onCopyPendingCodexUrl: () => calls.push("codexCopyPending"),
+        onCancelCodexLogin: () => calls.push("codexCancel"),
+        onToggleCodexFallbackOpen: (o) => calls.push(`codexFallbackOpen:${o}`),
+        onCodexManualInputChange: (d) => calls.push(`codexDraft:${d}`),
+        onCompleteCodexLogin: () => calls.push("codexComplete"),
+        onTestCodexConnection: () => calls.push("codexTest"),
+        onToggleCodexSignOutConfirm: () => calls.push("codexToggleSignOut"),
+        onCancelCodexSignOut: () => calls.push("codexCancelSignOut"),
+        onDisconnectCodex: () => calls.push("codexDisconnect"),
+        onToggleCodexModel: (id) => calls.push(`codexToggleModel:${id}`),
+        onRestoreDefaultCodexModels: () => calls.push("codexRestoreDefaults"),
         onSelectAccountPlan: (p) => calls.push(`plan:${p}`),
         onToggleAdvOpen: (o) => calls.push(`advOpen:${o}`),
         onRecheckIntegration: () => calls.push("recheck"),
@@ -664,16 +686,17 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
 
     // Unconfigured: "Not set", Clear hidden, Save & Test disabled
     view.update(makeState({ snapshot: offline }));
-    const keyInput = root.querySelector("#gemini-api-key")!;
-    const actButtons = root.querySelectorAll(".act-row button");
+    const geminiCard = root.querySelector('[aria-label="Google AI Studio provider"]')!;
+    const keyInput = geminiCard.querySelector("#gemini-api-key")!;
+    const actButtons = geminiCard.querySelectorAll(".act-row button");
     const [saveBtn, testBtn, clearBtn] = actButtons;
-    assert.ok(root.textContent.includes("Not set"));
+    assert.ok(geminiCard.textContent.includes("Not set"));
     assert.equal(saveBtn.disabled, true);
     assert.equal(testBtn.disabled, true);
     assert.equal(clearBtn.hidden, true);
 
     // Get API key external link
-    const getKeyBtn = root.querySelector(".lnk")!;
+    const getKeyBtn = geminiCard.querySelector(".lnk")!;
     assert.equal(getKeyBtn.textContent, "Get API key \u2197");
     getKeyBtn.click();
     assert.equal(calls.at(-1), "open:https://aistudio.google.com/api-keys");
@@ -700,7 +723,7 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
 
     // Configured with empty draft: masked hint shown, Test enabled, Clear visible + 2-click confirm
     view.update(makeState({ snapshot: loadActiveSnapshot(), apiKeyDraft: "" }));
-    assert.ok(root.textContent.includes("AIza...1234"));
+    assert.ok(geminiCard.textContent.includes("AIza...1234"));
     assert.equal(testBtn.disabled, false);
     assert.equal(clearBtn.hidden, false);
     testBtn.click();
@@ -709,7 +732,7 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     clearBtn.click();
     assert.equal(calls.at(-1), "toggleClear");
     view.update(makeState({ snapshot: loadActiveSnapshot(), clearConfirmOpen: true }));
-    const clearRow = root.querySelector(".confirm-row")!;
+    const clearRow = geminiCard.querySelector(".confirm-row")!;
     assert.equal(clearRow.hidden, false);
     const [confirmClearBtn, cancelClearBtn] = clearRow.querySelectorAll("button");
     confirmClearBtn.click();
@@ -729,7 +752,8 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
         modelFeedback: { tone: "ok", text: "Saved" },
       }),
     );
-    const chips = root.querySelectorAll(".m-chip");
+    const geminiCard = root.querySelector('[aria-label="Google AI Studio provider"]')!;
+    const chips = geminiCard.querySelectorAll(".m-chip");
     assert.equal(chips.length, 5);
     assert.equal(chips[0].getAttribute("role"), "checkbox");
     assert.equal(chips[0].getAttribute("aria-checked"), "true");
@@ -737,7 +761,7 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     chips[3].click();
     assert.equal(calls.at(-1), "toggleModel:gemini-4-argon");
 
-    const zeroBox = root.querySelector(".zero-models-note")!;
+    const zeroBox = geminiCard.querySelector(".zero-models-note")!;
     assert.equal(zeroBox.hidden, true);
 
     // 0-models pause state
@@ -757,9 +781,9 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
         modelFeedback: { tone: "ok", text: "Should be hidden when 0 enabled" },
       }),
     );
-    assert.ok(root.textContent.includes("0 enabled"));
+    assert.ok(geminiCard.textContent.includes("0 enabled"));
     assert.equal(zeroBox.hidden, false);
-    const statusLines = root.querySelectorAll(".status-line");
+    const statusLines = geminiCard.querySelectorAll(".status-line");
     assert.equal(statusLines[1].hidden, true);
 
     zeroBox.querySelector("button")!.click();
@@ -858,6 +882,148 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     view.update(makeState({ snapshot: { ...active, platform: "windows" } }));
     assert.equal(proxyWrap.hidden, true);
     assert.equal(root.querySelector(".adv-hint")?.textContent, "Plan");
+
+    tooltip.destroy();
+  });
+
+  it("drives OpenAI Codex card across signed-out, pending (sync open + copy + cancel + manual paste), and signed-in (Test, 2-click Sign out, 4 GPT-6.x chips, 0-models restore)", () => {
+    assert.equal(formatCodexStatusBadge("pro", "j***@example.com"), "Pro \u00b7 j***@example.com");
+    assert.equal(formatCodexStatusBadge("plus", null), "Plus");
+    assert.equal(formatCodexStatusBadge(null, "acct...9999"), "acct...9999");
+    assert.equal(formatCodexStatusBadge(null, null), "Signed in");
+
+    const { view, root, calls, tooltip } = makeHarness();
+    const base = loadActiveSnapshot();
+    const codexCard = root.querySelector('[aria-label="OpenAI Codex provider"]')!;
+    assert.ok(codexCard, "OpenAI Codex card must be stacked inside .provider-stack");
+
+    // 1. Signed-out state
+    view.update(makeState({ snapshot: base }));
+    assert.ok(codexCard.textContent.includes("Not signed in"));
+    const signedOutWrap = codexCard.querySelector(".codex-signed-out")!;
+    const pendingWrap = codexCard.querySelector(".codex-pending")!;
+    const signedInWrap = codexCard.querySelector(".codex-signed-in")!;
+    assert.equal(signedOutWrap.hidden, false);
+    assert.equal(pendingWrap.hidden, true);
+    assert.equal(signedInWrap.hidden, true);
+    const signInBtn = signedOutWrap.querySelector("button")!;
+    assert.equal(signInBtn.textContent, "Sign in with ChatGPT \u2197");
+    signInBtn.click();
+    assert.equal(calls.at(-1), "codexStart");
+
+    // 2. Pending state with authorize_url (sync Open, Copy link, Cancel, and manual fallback)
+    view.update(
+      makeState({
+        snapshot: { ...base, codex_login_pending: true },
+        codexAuthorizeUrl: "https://auth.openai.com/oauth/authorize?state=abc",
+        codexManualFallbackOpen: true,
+        codexManualInputDraft: "",
+      }),
+    );
+    assert.equal(signedOutWrap.hidden, true);
+    assert.equal(pendingWrap.hidden, false);
+    assert.equal(signedInWrap.hidden, true);
+    assert.ok(codexCard.textContent.includes("Signing in\u2026"));
+    assert.ok(pendingWrap.textContent.includes("Complete sign-in in your browser\u2026"));
+
+    const pendingBtns = pendingWrap.querySelectorAll(".act-row button");
+    const openPageBtn = pendingBtns.find((b) => b.textContent === "Open sign-in page \u2197")!;
+    const copyLinkBtn = pendingBtns.find((b) => b.textContent === "Copy link")!;
+    const cancelLoginBtn = pendingBtns.find((b) => b.textContent === "Cancel")!;
+    const completeBtn = pendingBtns.find((b) => b.textContent === "Complete sign-in")!;
+    assert.equal(openPageBtn.hidden, false);
+    assert.equal(copyLinkBtn.hidden, false);
+    assert.equal(completeBtn.disabled, true);
+
+    openPageBtn.click();
+    copyLinkBtn.click();
+    cancelLoginBtn.click();
+    assert.deepEqual(calls.slice(-3), ["codexOpenPending", "codexCopyPending", "codexCancel"]);
+
+    const manualInput = codexCard.querySelector("#codex-callback-input")!;
+    manualInput.focus();
+    manualInput.value = "http://localhost:1455/auth/callback?code=c1&state=s1";
+    manualInput.dispatchEvent(new FakeEvent("input", { bubbles: true }));
+    assert.equal(calls.at(-1), "codexDraft:http://localhost:1455/auth/callback?code=c1&state=s1");
+
+    view.update(
+      makeState({
+        snapshot: { ...base, codex_login_pending: true },
+        codexAuthorizeUrl: "https://auth.openai.com/oauth/authorize?state=abc",
+        codexManualFallbackOpen: true,
+        codexManualInputDraft: "http://localhost:1455/auth/callback?code=c1&state=s1",
+      }),
+    );
+    assert.equal(completeBtn.disabled, false);
+    manualInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Enter" }));
+    assert.equal(calls.at(-1), "codexComplete");
+    view.clearCodexManualInputDom();
+    assert.equal(manualInput.value, "");
+
+    // 3. Signed-in state: status badge, Test, inline 2-click Sign out, 4 GPT-6.x chips, 0-models Restore defaults
+    const codexSignedInSnap: SettingsSnapshot = {
+      ...base,
+      codex_login_pending: false,
+      config: {
+        ...base.config,
+        providers: {
+          ...base.config.providers,
+          codex: {
+            ...base.config.providers.codex,
+            authenticated: true,
+            plan_type: "pro",
+            account_hint: "j***@example.com",
+            enabled_models: ["gpt-6.2-astra", "gpt-6.2-sol"],
+          },
+        },
+      },
+    };
+    view.update(makeState({ snapshot: codexSignedInSnap }));
+    assert.equal(signedOutWrap.hidden, true);
+    assert.equal(pendingWrap.hidden, true);
+    assert.equal(signedInWrap.hidden, false);
+    assert.ok(codexCard.textContent.includes("Pro \u00b7 j***@example.com"));
+
+    const [codexTestBtn, codexSignOutBtn] = signedInWrap.querySelectorAll(".act-row button");
+    assert.equal(codexTestBtn.disabled, false);
+    codexTestBtn.click();
+    assert.equal(calls.at(-1), "codexTest");
+
+    codexSignOutBtn.click();
+    assert.equal(calls.at(-1), "codexToggleSignOut");
+    view.update(makeState({ snapshot: codexSignedInSnap, codexSignOutConfirmOpen: true }));
+    const signOutRow = signedInWrap.querySelector(".confirm-row")!;
+    assert.equal(signOutRow.hidden, false);
+    const [confirmSignOutBtn, cancelSignOutBtn] = signOutRow.querySelectorAll("button");
+    confirmSignOutBtn.click();
+    cancelSignOutBtn.click();
+    assert.deepEqual(calls.slice(-2), ["codexDisconnect", "codexCancelSignOut"]);
+
+    const codexChips = codexCard.querySelectorAll(".m-chip");
+    assert.equal(codexChips.length, 4);
+    assert.equal(codexChips[0].getAttribute("aria-checked"), "true");
+    assert.equal(codexChips[1].getAttribute("aria-checked"), "true");
+    assert.equal(codexChips[2].getAttribute("aria-checked"), "false");
+    assert.equal(codexChips[3].getAttribute("aria-checked"), "false");
+    codexChips[2].click();
+    assert.equal(calls.at(-1), "codexToggleModel:gpt-6.1-terra");
+
+    // 0-models state reveals Restore defaults
+    const codexPausedSnap: SettingsSnapshot = {
+      ...codexSignedInSnap,
+      config: {
+        ...codexSignedInSnap.config,
+        providers: {
+          ...codexSignedInSnap.config.providers,
+          codex: { ...codexSignedInSnap.config.providers.codex, enabled_models: [] },
+        },
+      },
+    };
+    view.update(makeState({ snapshot: codexPausedSnap }));
+    const codexZeroBox = codexCard.querySelector(".zero-models-note")!;
+    assert.equal(codexZeroBox.hidden, false);
+    codexZeroBox.querySelector("button")!.click();
+    assert.equal(calls.at(-1), "codexRestoreDefaults");
 
     tooltip.destroy();
   });

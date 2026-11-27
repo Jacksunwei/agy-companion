@@ -8,9 +8,11 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::Response;
 use axum::routing::{get, post};
-use companion_core::UsageRange;
+use companion_core::{AuthStore, UsageRange};
+use companion_providers::CodexAuthManager;
 use companion_ui::{
-    CompanionUiServer, GetUsageArgs, SaveSettingsArgs, SettingsSnapshot, UiServerOptions,
+    CompanionUiServer, GetUsageArgs, SaveSettingsArgs, SettingsSnapshot, TestConnectionArgs,
+    UiServerOptions,
 };
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::Deserialize;
@@ -74,7 +76,19 @@ async fn apply_ls_telemetry_overlay(
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EmptyHttpArgs {}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GetSettingsHttpArgs {
+    #[serde(default)]
+    conversation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompleteCodexLoginHttpArgs {
+    callback_input: String,
     #[serde(default)]
     conversation_id: Option<String>,
 }
@@ -285,12 +299,132 @@ async fn save_settings_handler(
 async fn test_connection_handler(
     State(state): State<SidecarUiState>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(resp) = reject_invalid_api_request(&state, &headers) {
         return resp;
     }
-    match state.ui.test_connection_payload().await {
+    let args: TestConnectionArgs = if body.is_empty() {
+        TestConnectionArgs::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return api_error(StatusCode::BAD_REQUEST, format!("invalid request: {err}"));
+            }
+        }
+    };
+    match state.ui.test_connection_payload(args.provider).await {
         Ok(payload) => api_ok(&payload),
+        Err(msg) => api_error(StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+async fn start_codex_login_handler(
+    State(state): State<SidecarUiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = reject_invalid_api_request(&state, &headers) {
+        return resp;
+    }
+    if !body.is_empty()
+        && let Err(err) = serde_json::from_slice::<EmptyHttpArgs>(&body)
+    {
+        return api_error(StatusCode::BAD_REQUEST, format!("invalid request: {err}"));
+    }
+    match state.ui.start_codex_login().await {
+        Ok(payload) => api_ok(&payload),
+        Err(msg) => api_error(StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+async fn cancel_codex_login_handler(
+    State(state): State<SidecarUiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = reject_invalid_api_request(&state, &headers) {
+        return resp;
+    }
+    let args: GetSettingsHttpArgs = if body.is_empty() {
+        GetSettingsHttpArgs::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return api_error(StatusCode::BAD_REQUEST, format!("invalid request: {err}"));
+            }
+        }
+    };
+    match state
+        .ui
+        .cancel_codex_login_snapshot(args.conversation_id.as_deref())
+        .await
+    {
+        Ok(snapshot) => {
+            let overlaid =
+                apply_ls_telemetry_overlay(&state, snapshot, args.conversation_id.as_deref()).await;
+            api_ok(&overlaid)
+        }
+        Err(msg) => api_error(StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+async fn complete_codex_login_handler(
+    State(state): State<SidecarUiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = reject_invalid_api_request(&state, &headers) {
+        return resp;
+    }
+    let args: CompleteCodexLoginHttpArgs = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, format!("invalid request: {err}")),
+    };
+    match state
+        .ui
+        .complete_codex_login_snapshot(&args.callback_input, args.conversation_id.as_deref())
+        .await
+    {
+        Ok(snapshot) => {
+            let overlaid =
+                apply_ls_telemetry_overlay(&state, snapshot, args.conversation_id.as_deref()).await;
+            api_ok(&overlaid)
+        }
+        Err(msg) => api_error(StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+async fn disconnect_codex_handler(
+    State(state): State<SidecarUiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = reject_invalid_api_request(&state, &headers) {
+        return resp;
+    }
+    let args: GetSettingsHttpArgs = if body.is_empty() {
+        GetSettingsHttpArgs::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return api_error(StatusCode::BAD_REQUEST, format!("invalid request: {err}"));
+            }
+        }
+    };
+    match state
+        .ui
+        .disconnect_codex_snapshot(args.conversation_id.as_deref())
+        .await
+    {
+        Ok(snapshot) => {
+            let overlaid =
+                apply_ls_telemetry_overlay(&state, snapshot, args.conversation_id.as_deref()).await;
+            api_ok(&overlaid)
+        }
         Err(msg) => api_error(StatusCode::BAD_REQUEST, msg),
     }
 }
@@ -345,6 +479,13 @@ pub fn build_sidecar_ui_router_with_ls(
             "/_api/set_launcher_integration",
             post(set_launcher_integration_handler),
         )
+        .route("/_api/start_codex_login", post(start_codex_login_handler))
+        .route("/_api/cancel_codex_login", post(cancel_codex_login_handler))
+        .route(
+            "/_api/complete_codex_login",
+            post(complete_codex_login_handler),
+        )
+        .route("/_api/disconnect_codex", post(disconnect_codex_handler))
         .layer(DefaultBodyLimit::max(MAX_SIDECAR_API_BODY_BYTES))
         .with_state(state)
 }
@@ -357,7 +498,8 @@ pub async fn bind_and_spawn_sidecar_ui<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    bind_and_spawn_sidecar_ui_with_ls(config_path, sidecar_cfg, None, shutdown).await
+    bind_and_spawn_sidecar_ui_with_auth_and_ls(config_path, sidecar_cfg, None, None, None, shutdown)
+        .await
 }
 
 pub async fn bind_and_spawn_sidecar_ui_with_ls<F>(
@@ -369,10 +511,36 @@ pub async fn bind_and_spawn_sidecar_ui_with_ls<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let ui = Arc::new(CompanionUiServer::with_options(
+    bind_and_spawn_sidecar_ui_with_auth_and_ls(
         config_path,
-        UiServerOptions::default(),
-    )?);
+        sidecar_cfg,
+        None,
+        None,
+        ls_collector,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn bind_and_spawn_sidecar_ui_with_auth_and_ls<F>(
+    config_path: PathBuf,
+    sidecar_cfg: SidecarUiConfig,
+    auth_store: Option<Arc<dyn AuthStore>>,
+    codex_auth: Option<Arc<CodexAuthManager>>,
+    ls_collector: Option<LsCollectorHandle>,
+    shutdown: F,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), CliError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let mut ui_options = UiServerOptions::default();
+    if let Some(store) = auth_store {
+        ui_options = ui_options.with_auth_store_override(store);
+    }
+    if let Some(manager) = codex_auth {
+        ui_options = ui_options.with_codex_auth_override(manager);
+    }
+    let ui = Arc::new(CompanionUiServer::with_options(config_path, ui_options)?);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), sidecar_cfg.port);
     let listener = TcpListener::bind(addr).await?;
     let bound_addr = listener.local_addr()?;
@@ -704,5 +872,377 @@ mod tests {
         ui_srv.abort();
         ls_srv.abort();
         proxy_srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_ui_codex_oauth_endpoints_and_provider_test_connection() {
+        use std::num::NonZeroU16;
+
+        use companion_core::{Config, FileAuthStore};
+        use companion_providers::CodexAuthOptions;
+
+        let tmp = TempDir::new().expect("tmp");
+        let cfg_path = tmp.path().join("config.json");
+
+        fn make_jwt(payload_json: &str) -> String {
+            fn b64url(input: &[u8]) -> String {
+                const TABLE: &[u8; 64] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                let mut out = String::new();
+                for chunk in input.chunks(3) {
+                    let b0 = chunk[0] as u32;
+                    let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+                    let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+                    let triple = (b0 << 16) | (b1 << 8) | b2;
+                    out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+                    out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+                    if chunk.len() > 1 {
+                        out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+                    }
+                    if chunk.len() > 2 {
+                        out.push(TABLE[(triple & 0x3f) as usize] as char);
+                    }
+                }
+                out
+            }
+            format!(
+                "{}.{}.sig",
+                b64url(br#"{"alg":"RS256","typ":"JWT"}"#),
+                b64url(payload_json.as_bytes())
+            )
+        }
+
+        let access_jwt = make_jwt(
+            r#"{"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acct_sidecar_999","chatgpt_plan_type":"plus"},"https://api.openai.com/profile":{"email":"dev@example.com"}}"#,
+        );
+        let refresh_secret = "rt_sidecar_secret_token";
+        let captured_conv_ids: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_conv_ids_clone = Arc::clone(&captured_conv_ids);
+        let access_for_oauth = access_jwt.clone();
+        let access_for_responses = access_jwt.clone();
+
+        let mock_router = Router::new()
+            .route(
+                "/health",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "protocol_version": 1
+                    }))
+                }),
+            )
+            .route(
+                "/api/stats",
+                get(move |query: axum::extract::RawQuery| {
+                    let convs = Arc::clone(&captured_conv_ids_clone);
+                    async move {
+                        if let Some(q) = query.0 {
+                            convs.lock().await.push(q);
+                        }
+                        axum::Json(serde_json::json!({
+                            "usage": {
+                                "requests": 0,
+                                "prompt_tokens": 0,
+                                "cached_tokens": 0,
+                                "output_tokens": 0,
+                                "reasoning_tokens": 0,
+                                "cache_hit_ratio": 0.0
+                            },
+                            "cloudcode": {
+                                "mode": "auto",
+                                "resolved_upstream": null,
+                                "last_catalog_refresh_at_ms": null,
+                                "last_catalog_included_proxy_models": null
+                            },
+                            "proxy_rss_bytes": null,
+                            "recent_calls": [],
+                            "by_model": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/oauth/token",
+                post(move || {
+                    let access = access_for_oauth.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "access_token": access,
+                            "refresh_token": refresh_secret,
+                            "expires_in": 3600
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/responses",
+                post(move |headers: HeaderMap| {
+                    let expected = format!("Bearer {access_for_responses}");
+                    async move {
+                        let ok = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            == Some(expected.as_str());
+                        if ok {
+                            let sse = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n";
+                            (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                sse.to_string(),
+                            )
+                        } else {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                r#"{"error":{"message":"unauthorized"}}"#.to_string(),
+                            )
+                        }
+                    }
+                }),
+            );
+
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let mock_port = mock_listener.local_addr().expect("mock addr").port();
+        let mock_server = tokio::spawn(async move {
+            let _ = axum::serve(mock_listener, mock_router).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.proxy.port = NonZeroU16::new(mock_port).expect("non-zero");
+        cfg.providers.codex.base_url = format!("http://127.0.0.1:{mock_port}");
+        cfg.save_secure(&cfg_path).expect("save config");
+
+        let auth_store: Arc<dyn AuthStore> =
+            Arc::new(FileAuthStore::for_config_path(&cfg_path).expect("auth store"));
+        let codex_auth = Arc::new(
+            CodexAuthManager::with_options(
+                Arc::clone(&auth_store),
+                CodexAuthOptions {
+                    oauth_issuer: format!("http://127.0.0.1:{mock_port}"),
+                    callback_bind_port: 0,
+                    ..CodexAuthOptions::default()
+                },
+            )
+            .expect("codex auth"),
+        );
+
+        let opts = UiServerOptions {
+            ui_html_source: UiHtmlSource::Fixed(None),
+            env_api_key_fallback: false,
+            integration_options_override: Some(IntegrationOptions {
+                shell: None,
+                rc_file: Some(tmp.path().join(".zlogin")),
+                binary_path: Some(tmp.path().join("agy-companion")),
+                data_dir: Some(tmp.path().join("data")),
+                follow_rc_symlink: false,
+            }),
+            hybrid_active_override: Some(true),
+            auth_store_override: Some(Arc::clone(&auth_store)),
+            codex_auth_override: Some(Arc::clone(&codex_auth)),
+            ..UiServerOptions::default()
+        };
+        let ui = Arc::new(CompanionUiServer::with_options(cfg_path, opts).expect("ui server"));
+        let token = "codex-sidecar-token-456";
+        let router = build_sidecar_ui_router(ui, Some(token.to_string()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ui");
+        let addr = listener.local_addr().expect("ui addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+
+        // 1. Auth (401), Content-Type (415), and deny_unknown_fields (400) across all 5 endpoints.
+        for path in [
+            "/_api/start_codex_login",
+            "/_api/cancel_codex_login",
+            "/_api/complete_codex_login",
+            "/_api/disconnect_codex",
+            "/_api/test_connection",
+        ] {
+            let no_tok = client
+                .post(format!("http://{addr}{path}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body("{}")
+                .send()
+                .await
+                .expect("no_tok");
+            assert_eq!(no_tok.status(), StatusCode::UNAUTHORIZED, "{path} 401");
+
+            let bad_ct = client
+                .post(format!("http://{addr}{path}"))
+                .header(SIDECAR_TOKEN_HEADER, token)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body("{}")
+                .send()
+                .await
+                .expect("bad_ct");
+            assert_eq!(
+                bad_ct.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{path} 415"
+            );
+
+            let unknown = client
+                .post(format!("http://{addr}{path}"))
+                .header(SIDECAR_TOKEN_HEADER, token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(r#"{"unknown_field":1}"#)
+                .send()
+                .await
+                .expect("unknown");
+            assert_eq!(unknown.status(), StatusCode::BAD_REQUEST, "{path} 400");
+        }
+
+        // 2. Empty body and explicit provider on /_api/test_connection work; unauth codex returns ok=false.
+        let default_conn = client
+            .post(format!("http://{addr}/_api/test_connection"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("")
+            .send()
+            .await
+            .expect("default test_connection");
+        assert_eq!(default_conn.status(), StatusCode::OK);
+        let default_json: serde_json::Value = default_conn.json().await.expect("default json");
+        assert_eq!(default_json["ok"].as_bool(), Some(false));
+
+        let codex_unauth = client
+            .post(format!("http://{addr}/_api/test_connection"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"provider":"codex"}"#)
+            .send()
+            .await
+            .expect("codex unauth");
+        assert_eq!(codex_unauth.status(), StatusCode::OK);
+        assert_eq!(
+            codex_unauth.json::<serde_json::Value>().await.unwrap()["ok"].as_bool(),
+            Some(false)
+        );
+
+        // 3. start_codex_login -> cancel_codex_login (with conversation_id forwarding).
+        let start1 = client
+            .post(format!("http://{addr}/_api/start_codex_login"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("start1");
+        assert_eq!(start1.status(), StatusCode::OK);
+        let start1_json: serde_json::Value = start1.json().await.expect("start1 json");
+        assert_eq!(start1_json["callback_listening"].as_bool(), Some(true));
+        assert_eq!(start1_json["manual_fallback"].as_bool(), Some(false));
+
+        let cancel = client
+            .post(format!("http://{addr}/_api/cancel_codex_login"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"conversation_id":"conv-cancel-1111"}"#)
+            .send()
+            .await
+            .expect("cancel");
+        assert_eq!(cancel.status(), StatusCode::OK);
+        let cancel_json: serde_json::Value = cancel.json().await.expect("cancel json");
+        assert_eq!(cancel_json["codex_login_pending"].as_bool(), Some(false));
+
+        // 4. start_codex_login -> complete_codex_login (with conversation_id forwarding) -> test_connection(codex) ok.
+        let start2 = client
+            .post(format!("http://{addr}/_api/start_codex_login"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("start2");
+        let start2_json: serde_json::Value = start2.json().await.expect("start2 json");
+        let auth_url = start2_json["authorize_url"]
+            .as_str()
+            .expect("authorize_url");
+        let state_param = auth_url
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("state="))
+            .expect("state");
+
+        let complete = client
+            .post(format!("http://{addr}/_api/complete_codex_login"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                serde_json::json!({
+                    "callback_input": format!("http://localhost:1455/auth/callback?code=sc-code-1&state={state_param}"),
+                    "conversation_id": "conv-complete-2222"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("complete");
+        assert_eq!(complete.status(), StatusCode::OK);
+        let complete_raw = complete.text().await.expect("complete text");
+        assert!(!complete_raw.contains(&access_jwt));
+        assert!(!complete_raw.contains(refresh_secret));
+        let complete_json: serde_json::Value =
+            serde_json::from_str(&complete_raw).expect("complete json");
+        assert_eq!(
+            complete_json["config"]["providers"]["codex"]["authenticated"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            complete_json["config"]["providers"]["codex"]["plan_type"].as_str(),
+            Some("plus")
+        );
+
+        let codex_ok = client
+            .post(format!("http://{addr}/_api/test_connection"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"provider":"codex"}"#)
+            .send()
+            .await
+            .expect("codex ok");
+        assert_eq!(codex_ok.status(), StatusCode::OK);
+        let codex_ok_json: serde_json::Value = codex_ok.json().await.expect("codex ok json");
+        assert_eq!(codex_ok_json["ok"].as_bool(), Some(true));
+
+        // 5. disconnect_codex clears auth/codex.json and forwards conversation_id.
+        let disc = client
+            .post(format!("http://{addr}/_api/disconnect_codex"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"conversation_id":"conv-disconnect-3333"}"#)
+            .send()
+            .await
+            .expect("disconnect");
+        assert_eq!(disc.status(), StatusCode::OK);
+        let disc_json: serde_json::Value = disc.json().await.expect("disc json");
+        assert_eq!(
+            disc_json["config"]["providers"]["codex"]["authenticated"].as_bool(),
+            Some(false)
+        );
+
+        let queries = captured_conv_ids.lock().await.clone();
+        assert!(
+            queries.iter().any(|q| q.contains("conv-cancel-1111")),
+            "cancel_codex_login must forward conversation_id: {queries:?}"
+        );
+        assert!(
+            queries.iter().any(|q| q.contains("conv-complete-2222")),
+            "complete_codex_login must forward conversation_id: {queries:?}"
+        );
+        assert!(
+            queries.iter().any(|q| q.contains("conv-disconnect-3333")),
+            "disconnect_codex must forward conversation_id: {queries:?}"
+        );
+
+        server.abort();
+        mock_server.abort();
     }
 }

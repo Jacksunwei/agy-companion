@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { describe, it } from "node:test";
 import {
   DEFAULT_CODEX_CONFIG,
+  DEFAULT_CODEX_MODEL_PRESETS,
   DEFAULT_ENABLED_CODEX_MODELS,
   DEFAULT_ENABLED_MODELS,
   DEFAULT_MODEL_PRESETS,
@@ -13,6 +14,7 @@ import {
   formatCaughtError,
   normalizeHostPlatform,
   parseSettingsSnapshot,
+  parseStartCodexLoginPayload,
   parseTestConnectionPayload,
   parseUsageSummary,
   validateApiKey,
@@ -68,6 +70,9 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
 
     assert.equal(parsed.supported_models.length, 5);
     assert.deepEqual(parsed.supported_models, DEFAULT_MODEL_PRESETS);
+    assert.equal(parsed.supported_codex_models.length, 4);
+    assert.deepEqual(parsed.supported_codex_models, DEFAULT_CODEX_MODEL_PRESETS);
+    assert.equal(parsed.codex_login_pending, false);
 
     assert.ok(parsed.stats !== null);
     assert.equal(parsed.stats.usage.requests, 2);
@@ -140,7 +145,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
     assert.equal(parsed.by_provider[1].model_count, 1);
   });
 
-  it("parses test_connection_ok.json", () => {
+  it("parses test_connection_ok.json and start_codex_login.json", () => {
     const raw = loadFixture("test_connection_ok.json");
     const parsed = parseTestConnectionPayload(raw);
     assert.deepEqual(parsed, {
@@ -148,6 +153,18 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
       message:
         "Connected to Gemini upstream (https://generativelanguage.googleapis.com) successfully.",
     });
+
+    const startRaw = loadFixture("start_codex_login.json");
+    const startParsed = parseStartCodexLoginPayload(startRaw);
+    assert.deepEqual(startParsed, {
+      authorize_url:
+        "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann",
+      callback_listening: true,
+      manual_fallback: false,
+    });
+    assert.equal(parseStartCodexLoginPayload({ authorize_url: "", callback_listening: true, manual_fallback: false }), null);
+    assert.equal(parseStartCodexLoginPayload({ authorize_url: "https://auth.openai.com", callback_listening: "yes", manual_fallback: false }), null);
+    assert.equal(parseStartCodexLoginPayload(null), null);
   });
 });
 
@@ -349,6 +366,18 @@ describe("parseSettingsSnapshot defensive invariants", () => {
     assert.deepEqual(parseSettingsSnapshot(partial)?.supported_models, [
       { id: "custom-1", display_name: "Custom 1", short_label: "C1" },
     ]);
+
+    // supported_codex_models fallback and strict boolean codex_login_pending validation
+    const codexOmitted = cloneJson(activeBase);
+    delete codexOmitted.supported_codex_models;
+    delete codexOmitted.codex_login_pending;
+    const parsedCodexOmitted = parseSettingsSnapshot(codexOmitted);
+    assert.deepEqual(parsedCodexOmitted?.supported_codex_models, DEFAULT_CODEX_MODEL_PRESETS);
+    assert.equal(parsedCodexOmitted?.codex_login_pending, false);
+
+    const badPending = cloneJson(activeBase);
+    badPending.codex_login_pending = "true";
+    assert.equal(parseSettingsSnapshot(badPending), null);
   });
 
   it("parses all account_plan modes and defaults unknown values safely", () => {

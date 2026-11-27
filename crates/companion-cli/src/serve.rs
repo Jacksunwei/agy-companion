@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use companion_core::{SqliteUsageSink, UsageSink};
-use companion_providers::LoopbackProxyClient;
+use companion_core::{AuthStore, FileAuthStore, SqliteUsageSink, UsageSink};
+use companion_providers::{CodexAuth, CodexAuthManager, CodexAuthOptions, LoopbackProxyClient};
 use companion_proxy::{ProxyError, ProxyState, ProxyStateOptions};
 
 use crate::daemon::{
@@ -16,6 +16,31 @@ use crate::daemon::{
 use crate::{CliError, load_config_checked, precheck_existing_data_dir, resolve_cli_config_path};
 
 pub const ADOPT_RUNNING_POLL_INTERVAL: Duration = Duration::from_millis(500);
+pub const CODEX_OAUTH_ISSUER_ENV: &str = "AGY_COMPANION_CODEX_OAUTH_ISSUER";
+pub const CODEX_CALLBACK_PORT_ENV: &str = "AGY_COMPANION_CODEX_CALLBACK_PORT";
+
+fn codex_auth_options_from_env() -> Result<CodexAuthOptions, CliError> {
+    let mut opts = CodexAuthOptions::default();
+    if let Ok(raw_issuer) = std::env::var(CODEX_OAUTH_ISSUER_ENV) {
+        let trimmed = raw_issuer.trim();
+        if !trimmed.is_empty() {
+            companion_core::validate_upstream_url(trimmed)?;
+            opts.oauth_issuer = trimmed.to_string();
+        }
+    }
+    if let Ok(raw_port) = std::env::var(CODEX_CALLBACK_PORT_ENV) {
+        let trimmed = raw_port.trim();
+        if !trimmed.is_empty() {
+            let port: u16 = trimmed.parse().map_err(|_| {
+                CliError::Install(format!(
+                    "invalid {CODEX_CALLBACK_PORT_ENV} value '{trimmed}': expected integer 0..=65535"
+                ))
+            })?;
+            opts.callback_bind_port = port;
+        }
+    }
+    Ok(opts)
+}
 
 #[derive(Default)]
 pub struct ServeOptions {
@@ -120,6 +145,12 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
 
     let sqlite_sink = Arc::new(SqliteUsageSink::new(usage_dir)?);
     let usage_sink: Arc<dyn UsageSink> = Arc::clone(&sqlite_sink) as Arc<dyn UsageSink>;
+    let auth_store: Arc<dyn AuthStore> = Arc::new(FileAuthStore::for_config_path(&config_path)?);
+    let codex_auth_options = codex_auth_options_from_env()?;
+    let codex_auth = Arc::new(
+        CodexAuthManager::with_options(Arc::clone(&auth_store), codex_auth_options)
+            .map_err(|err| CliError::Proxy(ProxyError::Provider(err)))?,
+    );
 
     // Pre-register SIGTERM and SIGHUP before binding so host-restart signals are never missed.
     #[cfg(unix)]
@@ -186,9 +217,11 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
     );
     let _sidecar_ui_handle =
         if let Some(sidecar_cfg) = crate::sidecar_ui::SidecarUiConfig::from_env() {
-            match crate::sidecar_ui::bind_and_spawn_sidecar_ui_with_ls(
+            match crate::sidecar_ui::bind_and_spawn_sidecar_ui_with_auth_and_ls(
                 config_path.clone(),
                 sidecar_cfg,
+                Some(Arc::clone(&auth_store)),
+                Some(Arc::clone(&codex_auth)),
                 ls_collector.clone(),
                 async move {
                     let _ = sidecar_shutdown_rx.wait_for(|&stopped| stopped).await;
@@ -270,13 +303,15 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         &runtime_data_dir.join(PROXY_PID_FILENAME),
         &ProxyPidInfo::for_current_process(bound_addr.port()),
     )?;
-    let state = ProxyState::from_config_with_options(
+    let state = ProxyState::from_config_with_codex_auth(
         config,
         usage_sink,
         ProxyStateOptions {
             config_path: Some(config_path),
+            auth_store: Some(auth_store),
             ..Default::default()
         },
+        Arc::clone(&codex_auth) as Arc<dyn CodexAuth>,
     )?;
 
     tracing::info!(
