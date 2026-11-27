@@ -967,3 +967,263 @@ async fn concurrent_replace_stale_racers_converge_to_one_winner_and_zero_nonzero
     }
     drop(stale_guard);
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_stale_carries_over_catalog_refresh_metadata() {
+    let cc_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock cloudcode");
+    let cc_port = cc_listener.local_addr().expect("cc addr").port();
+    let cc_handle = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = cc_listener.accept().await {
+            let mut req_buf = [0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+            let body = r#"{"models":{}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let temp = TempDir::new().expect("tempdir");
+    let cfg_path = temp.path().join("config.json");
+    let usage_dir = temp.path().join("usage");
+    let mut cfg = config_with_port(free_loopback_port());
+    cfg.cloudcode.upstream =
+        companion_core::CloudCodeUpstream::parse(&format!("http://127.0.0.1:{cc_port}"))
+            .expect("parse mock cloudcode upstream");
+    cfg.usage_dir = Some(usage_dir);
+    cfg.save_secure(&cfg_path).expect("save_secure");
+    FileAuthStore::for_config_path(&cfg_path)
+        .expect("auth store")
+        .save_gemini(&GeminiCredentials::new(
+            ApiKey::parse_strict("AIzaSyLifecycleTestKey1").unwrap(),
+        ))
+        .expect("save gemini auth");
+
+    let pid_path = temp.path().join("proxy.pid");
+    let client = loopback_http_client();
+    let _detached_cleanup = DetachedPidFileGuard::new(pid_path.clone());
+
+    // 1. Start stale-version daemon and trigger one fetchAvailableModels so its stats record
+    //    `last_catalog_refresh_at_ms` and `last_catalog_included_proxy_models`.
+    let (old_guard, port, _) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
+        let mut cmd = isolated_cli_command(temp.path());
+        cmd.env("AGY_COMPANION_TEST_HEALTH_VERSION", "0.0.1-old")
+            .args(["serve", "--port", &port.to_string(), "--config"])
+            .arg(&cfg_path);
+        cmd
+    })
+    .await;
+
+    let catalog_resp = client
+        .post(format!(
+            "http://127.0.0.1:{port}/v1internal:fetchAvailableModels"
+        ))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("call fetchAvailableModels");
+    assert_eq!(catalog_resp.status(), reqwest::StatusCode::OK);
+
+    let old_stats: companion_core::StatsSnapshot = client
+        .get(format!("http://127.0.0.1:{port}/api/stats"))
+        .send()
+        .await
+        .expect("fetch old stats")
+        .json()
+        .await
+        .expect("parse old stats");
+    let expected_ts = old_stats
+        .cloudcode
+        .last_catalog_refresh_at_ms
+        .expect("old daemon must have recorded last_catalog_refresh_at_ms");
+    assert_eq!(
+        old_stats.cloudcode.last_catalog_included_proxy_models,
+        Some(true)
+    );
+
+    // 2. Replace with current-version daemon via `--replace-stale` without any new catalog call.
+    let mut new_cmd = isolated_cli_command(temp.path());
+    new_cmd
+        .args(["serve", "--port", &port.to_string(), "--config"])
+        .arg(&cfg_path)
+        .arg("--replace-stale");
+    let new_guard = ChildGuard::new(new_cmd.spawn().expect("spawn replacement"));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut replaced = false;
+    while Instant::now() < deadline {
+        if let Some(health) = poll_health(client, port).await
+            && health.version == env!("CARGO_PKG_VERSION")
+        {
+            replaced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(replaced, "replacement daemon must take over port");
+
+    // 3. Verify the newly bound daemon carried over the catalog refresh metadata.
+    let new_stats: companion_core::StatsSnapshot = client
+        .get(format!("http://127.0.0.1:{port}/api/stats"))
+        .send()
+        .await
+        .expect("fetch new stats")
+        .json()
+        .await
+        .expect("parse new stats");
+    assert_eq!(
+        new_stats.cloudcode.last_catalog_refresh_at_ms,
+        Some(expected_ts),
+        "replacement daemon must preserve last_catalog_refresh_at_ms across --replace-stale handoff"
+    );
+    assert_eq!(
+        new_stats.cloudcode.last_catalog_included_proxy_models,
+        Some(true),
+        "replacement daemon must preserve last_catalog_included_proxy_models across --replace-stale handoff"
+    );
+
+    drop(new_guard);
+    drop(old_guard);
+    cc_handle.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sidecar_self_execs_in_place_after_bootstrap_upgrade_preserving_pid_and_web_ui() {
+    let temp = TempDir::new().expect("tempdir");
+    let cfg_path = write_test_config_with_upstream(&temp, None);
+    let pid_path = temp.path().join("proxy.pid");
+    let plugin_dir = temp.path().join("plugin");
+    std::fs::create_dir_all(&plugin_dir).expect("mkdir plugin");
+    let manifest_path = plugin_dir.join("plugin.json");
+    std::fs::write(
+        &manifest_path,
+        r#"{"name":"agy-companion","version":"0.0.2-old"}"#,
+    )
+    .expect("write initial manifest");
+
+    let client = loopback_http_client();
+    let _detached_cleanup = DetachedPidFileGuard::new(pid_path.clone());
+
+    // 1. Start vOld bootstrap daemon on :port.
+    let (old_guard, port, _) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
+        let mut cmd = isolated_cli_command(temp.path());
+        cmd.env("AGY_COMPANION_TEST_HEALTH_VERSION", "0.0.2-old")
+            .args(["serve", "--port", &port.to_string(), "--config"])
+            .arg(&cfg_path);
+        cmd
+    })
+    .await;
+
+    // 2. Start vOld sidecar with Sidecar Web UI enabled.
+    let ui_port = free_loopback_port();
+    let ui_token = "sidecar-self-exec-test-token";
+    let mut sidecar_cmd = isolated_cli_command(temp.path());
+    sidecar_cmd
+        .env("AGY_COMPANION_TEST_HEALTH_VERSION", "0.0.2-old")
+        .env("AGY_COMPANION_PLUGIN_DIR", &plugin_dir)
+        .env("AGY_COMPANION_TEST_PLUGIN_POLL_MS", "75")
+        .env("ANTIGRAVITY_SIDECAR_WEB_PORT", ui_port.to_string())
+        .env("ANTIGRAVITY_SIDECAR_UI_TOKEN", ui_token)
+        .args(["serve", "--port", &port.to_string(), "--config"])
+        .arg(&cfg_path)
+        .arg("--adopt-running");
+    let stderr_path = temp.path().join("self_exec_sidecar.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr file");
+    sidecar_cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file));
+    let mut sidecar_guard = ChildGuard::new(sidecar_cmd.spawn().expect("spawn sidecar"));
+    let sidecar_pid = sidecar_guard.id();
+
+    // Wait for initial Sidecar Web UI to be ready.
+    let ui_ready_deadline = Instant::now() + Duration::from_secs(5);
+    let mut ui_ready = false;
+    while Instant::now() < ui_ready_deadline {
+        if let Ok(resp) = client
+            .get(format!("http://127.0.0.1:{ui_port}/"))
+            .timeout(Duration::from_millis(250))
+            .send()
+            .await
+            && resp.status() == reqwest::StatusCode::OK
+        {
+            ui_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(ui_ready, "initial sidecar Web UI must be listening");
+
+    // 3. Advance plugin.json to CARGO_PKG_VERSION -> sidecar upgrades bootstrap and self-execs.
+    std::fs::write(
+        &manifest_path,
+        format!(
+            r#"{{"name":"agy-companion","version":"{}"}}"#,
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .expect("write upgraded manifest");
+
+    let exec_deadline = Instant::now() + Duration::from_secs(8);
+    let mut saw_self_exec = false;
+    while Instant::now() < exec_deadline {
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if stderr.contains("self-execing upgraded sidecar binary") {
+            saw_self_exec = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_self_exec,
+        "sidecar must self-exec in-place once bootstrap converges; stderr={}",
+        std::fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
+
+    // 4. Verify the sidecar kept the EXACT same PID and re-bound the Sidecar Web UI with zero version skew.
+    assert!(
+        sidecar_guard
+            .try_wait()
+            .expect("try_wait sidecar")
+            .is_none(),
+        "self-exec must keep the exact same sidecar PID ({sidecar_pid}) alive"
+    );
+
+    let rebind_deadline = Instant::now() + Duration::from_secs(5);
+    let mut converged_settings: Option<serde_json::Value> = None;
+    while Instant::now() < rebind_deadline {
+        if let Ok(resp) = client
+            .post(format!("http://127.0.0.1:{ui_port}/_api/get_settings"))
+            .header("content-type", "application/json")
+            .header("x-sidecar-token", ui_token)
+            .body("{}")
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            && resp.status() == reqwest::StatusCode::OK
+            && let Ok(val) = resp.json::<serde_json::Value>().await
+            && val.get("version_skew") == Some(&serde_json::Value::Bool(false))
+        {
+            converged_settings = Some(val);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let settings = converged_settings.expect(
+        "re-exec'd sidecar Web UI must re-bind ANTIGRAVITY_SIDECAR_WEB_PORT with version_skew=false",
+    );
+    assert_eq!(
+        settings.pointer("/proxy/version").and_then(|v| v.as_str()),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+
+    drop(sidecar_guard);
+    drop(old_guard);
+}
