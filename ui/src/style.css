@@ -541,9 +541,36 @@ input {
 .prov-id {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   min-width: 0;
   flex: 1 1 215px;
+}
+
+.prov-inline-status {
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--fg-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.prov-inline-status.ok {
+  color: var(--ok);
+}
+
+.prov-inline-status.warn {
+  color: var(--warn);
+}
+
+.prov-inline-status.err {
+  color: var(--err);
+}
+
+.prov-inline-status.info {
+  color: var(--brand);
 }
 
 .prov-actions {

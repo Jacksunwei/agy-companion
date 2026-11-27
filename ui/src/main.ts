@@ -11,8 +11,10 @@ import { createFooterController } from "./footer.ts";
 import { buildMonitorView, computeMonitorSignature } from "./monitor.ts";
 import { createSettingsView } from "./settings.ts";
 import {
+  FEEDBACK_AUTO_DISMISS_MS,
   UNHEALTHY_BACKOFF_MS,
   chooseInitialTab,
+  createAutoDismissTimer,
   createCatalogRefreshReminder,
   needsSettingsAttention,
   nextPollDelayMs,
@@ -34,6 +36,7 @@ import {
   type AccountPlanChoice,
   type ActiveTab,
   type AppState,
+  type InlineFeedback,
   type SaveSettingsArgs,
   type SettingsSnapshot,
   type UsageGroup,
@@ -111,10 +114,38 @@ async function main(): Promise<void> {
 
   let pollTimer: number | null = null;
   let toastTimer: number | null = null;
+  const keyFeedbackTimer = createAutoDismissTimer();
+  const codexFeedbackTimer = createAutoDismissTimer();
   let lastPollCompletedAt = 0;
   let lastBannerSig: string | null = null;
   let lastMonitorSig: string | null = null;
   let lastUsageSig: string | null = null;
+
+  function setKeyFeedback(feedback: InlineFeedback | null, autoDismissMs?: number): void {
+    keyFeedbackTimer.cancel();
+    state.keyFeedback = feedback;
+    if (feedback !== null && autoDismissMs && autoDismissMs > 0) {
+      keyFeedbackTimer.schedule(autoDismissMs, () => {
+        if (state.keyFeedback === feedback) {
+          state.keyFeedback = null;
+          settingsView.update(state);
+        }
+      });
+    }
+  }
+
+  function setCodexFeedback(feedback: InlineFeedback | null, autoDismissMs?: number): void {
+    codexFeedbackTimer.cancel();
+    state.codexFeedback = feedback;
+    if (feedback !== null && autoDismissMs && autoDismissMs > 0) {
+      codexFeedbackTimer.schedule(autoDismissMs, () => {
+        if (state.codexFeedback === feedback) {
+          state.codexFeedback = null;
+          settingsView.update(state);
+        }
+      });
+    }
+  }
 
   function isWriteInFlight(): boolean {
     return (
@@ -500,7 +531,7 @@ async function main(): Promise<void> {
         settingsView.clearCodexManualInputDom();
       }
       if (!wasCodexAuthed && snap.config.providers.codex.authenticated && wasCodexPending) {
-        state.codexFeedback = { tone: "ok", text: "Signed in" };
+        setCodexFeedback({ tone: "ok", text: "Signed in" }, FEEDBACK_AUTO_DISMISS_MS);
         state.catalogRefreshReminder = createCatalogRefreshReminder(
           prevSnap,
           snap,
@@ -631,7 +662,7 @@ async function main(): Promise<void> {
     if (!state.connected || state.standalone || isWriteInFlight()) return;
     const validationErr = validateApiKey(state.apiKeyDraft);
     if (validationErr) {
-      state.keyFeedback = { tone: "err", text: validationErr };
+      setKeyFeedback({ tone: "err", text: validationErr });
       settingsView.update(state);
       return;
     }
@@ -639,7 +670,7 @@ async function main(): Promise<void> {
     const trimmed = state.apiKeyDraft.trim();
     state.snapshotEpoch += 1;
     state.saving = true;
-    state.keyFeedback = null;
+    setKeyFeedback(null);
     settingsView.update(state);
 
     const args: SaveSettingsArgs = {
@@ -662,7 +693,7 @@ async function main(): Promise<void> {
       state.geminiKeyEditOpen = false;
       state.clearConfirmOpen = false;
       settingsView.clearKeyInputDom();
-      state.keyFeedback = { tone: "ok", text: "Key saved" };
+      setKeyFeedback({ tone: "ok", text: "Key saved" }, FEEDBACK_AUTO_DISMISS_MS);
       state.catalogRefreshReminder = createCatalogRefreshReminder(
         state.snapshot,
         outcome.data,
@@ -670,7 +701,7 @@ async function main(): Promise<void> {
       );
       applySnapshot(outcome.data);
     } else {
-      state.keyFeedback = { tone: "err", text: outcome.error };
+      setKeyFeedback({ tone: "err", text: outcome.error });
       renderAll();
     }
   }
@@ -679,7 +710,7 @@ async function main(): Promise<void> {
     if (!state.connected || state.standalone || isWriteInFlight()) return;
     state.snapshotEpoch += 1;
     state.clearing = true;
-    state.keyFeedback = null;
+    setKeyFeedback(null);
     settingsView.update(state);
 
     const args: SaveSettingsArgs = {
@@ -700,7 +731,7 @@ async function main(): Promise<void> {
       state.snapshotEpoch += 1;
       state.geminiKeyEditOpen = false;
       state.clearConfirmOpen = false;
-      state.keyFeedback = { tone: "warn", text: "Key cleared" };
+      setKeyFeedback({ tone: "warn", text: "Key cleared" }, FEEDBACK_AUTO_DISMISS_MS);
       state.catalogRefreshReminder = createCatalogRefreshReminder(
         state.snapshot,
         outcome.data,
@@ -708,7 +739,7 @@ async function main(): Promise<void> {
       );
       applySnapshot(outcome.data);
     } else {
-      state.keyFeedback = { tone: "err", text: outcome.error };
+      setKeyFeedback({ tone: "err", text: outcome.error });
       renderAll();
     }
   }
@@ -716,19 +747,22 @@ async function main(): Promise<void> {
   async function handleTestConnection(): Promise<void> {
     if (!state.connected || state.standalone || state.testing || isWriteInFlight()) return;
     state.testing = true;
-    state.keyFeedback = { tone: "info", text: "Testing connection\u2026" };
+    setKeyFeedback({ tone: "info", text: "Testing connection\u2026" });
     settingsView.update(state);
 
     const outcome = await callTool("test_connection", {}, parseTestConnectionPayload);
     state.testing = false;
 
     if (outcome.ok) {
-      state.keyFeedback = {
-        tone: outcome.data.ok ? "ok" : "err",
-        text: outcome.data.message,
-      };
+      setKeyFeedback(
+        {
+          tone: outcome.data.ok ? "ok" : "err",
+          text: outcome.data.message,
+        },
+        outcome.data.ok ? FEEDBACK_AUTO_DISMISS_MS : undefined,
+      );
     } else {
-      state.keyFeedback = { tone: "err", text: outcome.error };
+      setKeyFeedback({ tone: "err", text: outcome.error });
     }
     settingsView.update(state);
   }
@@ -832,7 +866,7 @@ async function main(): Promise<void> {
     if (!state.connected || state.standalone || isWriteInFlight()) return;
     state.snapshotEpoch += 1;
     state.codexBusy = true;
-    state.codexFeedback = null;
+    setCodexFeedback(null);
     state.codexSignOutConfirmOpen = false;
     settingsView.update(state);
 
@@ -851,23 +885,23 @@ async function main(): Promise<void> {
 
       const opened = openExternalUrlSync(outcome.data.authorize_url);
       if (outcome.data.manual_fallback) {
-        state.codexFeedback = {
+        setCodexFeedback({
           tone: "warn",
           text: "Local callback port busy \u2014 paste the redirect URL below after signing in.",
-        };
+        });
       } else if (!opened) {
         const copied = await copyTextWithFallback(outcome.data.authorize_url);
-        state.codexFeedback = {
+        setCodexFeedback({
           tone: "info",
           text: copied
             ? "Pop-up blocked \u2014 sign-in link copied, or click Open sign-in page."
             : "Click Open sign-in page to continue in your browser.",
-        };
+        });
       }
       renderAll();
       scheduleNextPoll();
     } else {
-      state.codexFeedback = { tone: "err", text: outcome.error };
+      setCodexFeedback({ tone: "err", text: outcome.error });
       renderAll();
     }
   }
@@ -876,7 +910,7 @@ async function main(): Promise<void> {
     if (!state.connected || state.standalone || isWriteInFlight()) return;
     state.snapshotEpoch += 1;
     state.codexBusy = true;
-    state.codexFeedback = null;
+    setCodexFeedback(null);
     settingsView.update(state);
 
     const outcome = await callTool("cancel_codex_login", {}, parseSettingsSnapshot);
@@ -888,11 +922,11 @@ async function main(): Promise<void> {
       state.codexManualFallbackOpen = false;
       state.codexManualInputDraft = "";
       settingsView.clearCodexManualInputDom();
-      state.codexFeedback = { tone: "info", text: "Sign-in canceled" };
+      setCodexFeedback({ tone: "info", text: "Sign-in canceled" }, FEEDBACK_AUTO_DISMISS_MS);
       applySnapshot(outcome.data);
       scheduleNextPoll();
     } else {
-      state.codexFeedback = { tone: "err", text: outcome.error };
+      setCodexFeedback({ tone: "err", text: outcome.error });
       renderAll();
     }
   }
@@ -901,14 +935,14 @@ async function main(): Promise<void> {
     if (!state.connected || state.standalone || isWriteInFlight()) return;
     const trimmed = state.codexManualInputDraft.trim();
     if (!trimmed) {
-      state.codexFeedback = { tone: "err", text: "Paste the callback URL or authorization code first." };
+      setCodexFeedback({ tone: "err", text: "Paste the callback URL or authorization code first." });
       settingsView.update(state);
       return;
     }
 
     state.snapshotEpoch += 1;
     state.codexBusy = true;
-    state.codexFeedback = { tone: "info", text: "Completing OpenAI Codex sign-in\u2026" };
+    setCodexFeedback({ tone: "info", text: "Completing OpenAI Codex sign-in\u2026" });
     settingsView.update(state);
 
     const outcome = await callTool(
@@ -924,7 +958,7 @@ async function main(): Promise<void> {
       state.codexManualFallbackOpen = false;
       state.codexManualInputDraft = "";
       settingsView.clearCodexManualInputDom();
-      state.codexFeedback = { tone: "ok", text: "Signed in" };
+      setCodexFeedback({ tone: "ok", text: "Signed in" }, FEEDBACK_AUTO_DISMISS_MS);
       state.catalogRefreshReminder = createCatalogRefreshReminder(
         state.snapshot,
         outcome.data,
@@ -933,7 +967,7 @@ async function main(): Promise<void> {
       applySnapshot(outcome.data);
       scheduleNextPoll();
     } else {
-      state.codexFeedback = { tone: "err", text: outcome.error };
+      setCodexFeedback({ tone: "err", text: outcome.error });
       renderAll();
     }
   }
@@ -941,7 +975,7 @@ async function main(): Promise<void> {
   async function handleTestCodexConnection(): Promise<void> {
     if (!state.connected || state.standalone || state.codexTesting || isWriteInFlight()) return;
     state.codexTesting = true;
-    state.codexFeedback = { tone: "info", text: "Testing connection\u2026" };
+    setCodexFeedback({ tone: "info", text: "Testing connection\u2026" });
     settingsView.update(state);
 
     const outcome = await callTool(
@@ -952,12 +986,15 @@ async function main(): Promise<void> {
     state.codexTesting = false;
 
     if (outcome.ok) {
-      state.codexFeedback = {
-        tone: outcome.data.ok ? "ok" : "err",
-        text: outcome.data.message,
-      };
+      setCodexFeedback(
+        {
+          tone: outcome.data.ok ? "ok" : "err",
+          text: outcome.data.message,
+        },
+        outcome.data.ok ? FEEDBACK_AUTO_DISMISS_MS : undefined,
+      );
     } else {
-      state.codexFeedback = { tone: "err", text: outcome.error };
+      setCodexFeedback({ tone: "err", text: outcome.error });
     }
     settingsView.update(state);
   }
@@ -966,7 +1003,7 @@ async function main(): Promise<void> {
     if (!state.connected || state.standalone || isWriteInFlight()) return;
     state.snapshotEpoch += 1;
     state.codexBusy = true;
-    state.codexFeedback = null;
+    setCodexFeedback(null);
     settingsView.update(state);
 
     const outcome = await callTool("disconnect_codex", {}, parseSettingsSnapshot);
@@ -979,7 +1016,7 @@ async function main(): Promise<void> {
       state.codexManualFallbackOpen = false;
       state.codexManualInputDraft = "";
       settingsView.clearCodexManualInputDom();
-      state.codexFeedback = { tone: "warn", text: "Signed out" };
+      setCodexFeedback({ tone: "warn", text: "Signed out" }, FEEDBACK_AUTO_DISMISS_MS);
       state.catalogRefreshReminder = createCatalogRefreshReminder(
         state.snapshot,
         outcome.data,
@@ -988,7 +1025,7 @@ async function main(): Promise<void> {
       applySnapshot(outcome.data);
       scheduleNextPoll();
     } else {
-      state.codexFeedback = { tone: "err", text: outcome.error };
+      setCodexFeedback({ tone: "err", text: outcome.error });
       renderAll();
     }
   }
@@ -1171,6 +1208,8 @@ async function main(): Promise<void> {
 
   window.addEventListener("pagehide", () => {
     clearPollTimer();
+    keyFeedbackTimer.cancel();
+    codexFeedbackTimer.cancel();
     if (toastTimer !== null) {
       window.clearTimeout(toastTimer);
       toastTimer = null;

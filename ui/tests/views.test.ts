@@ -1244,6 +1244,42 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     testBtn.click();
     assert.equal(calls.at(-1), "testConn");
 
+    // Non-error keyFeedback ("Connected · Google AI Studio", "Testing connection…") renders inline
+    // inside .prov-id right next to the API key tag, keeping the below-row .status-line hidden.
+    const geminiProvId = geminiCard.querySelector(".prov-id")!;
+    const geminiInlineStatus = geminiProvId.querySelector(".prov-inline-status")!;
+    const geminiStatusLine = geminiCard.querySelector(".status-line")!;
+    assert.ok(geminiInlineStatus, "expected .prov-inline-status inside .prov-id");
+    assert.equal(geminiInlineStatus.hidden, true);
+
+    view.update(
+      makeState({
+        snapshot: loadActiveSnapshot(),
+        keyFeedback: { tone: "ok", text: "Connected \u00b7 Google AI Studio" },
+      }),
+    );
+    assert.equal(geminiInlineStatus.hidden, false);
+    assert.equal(geminiInlineStatus.className, "prov-inline-status ok");
+    assert.equal(geminiInlineStatus.textContent, "Connected \u00b7 Google AI Studio");
+    assert.equal(geminiStatusLine.hidden, true);
+
+    // Error keyFeedback renders on the full-width .status-line below instead of the header inline slot
+    view.update(
+      makeState({
+        snapshot: loadActiveSnapshot(),
+        keyFeedback: { tone: "err", text: "Invalid API key (400)" },
+      }),
+    );
+    assert.equal(geminiInlineStatus.hidden, true);
+    assert.equal(geminiStatusLine.hidden, false);
+    assert.equal(geminiStatusLine.className, "status-line err");
+    assert.equal(geminiStatusLine.textContent, "Invalid API key (400)");
+
+    // Clearing keyFeedback (e.g. after auto-dismiss) hides both
+    view.update(makeState({ snapshot: loadActiveSnapshot(), keyFeedback: null }));
+    assert.equal(geminiInlineStatus.hidden, true);
+    assert.equal(geminiStatusLine.hidden, true);
+
     // Replace opens inline key-row with Cancel + swaps header to Get API key; Escape or Cancel closes
     replaceBtn.click();
     assert.equal(calls.at(-1), "openGeminiKeyEdit");
@@ -1553,6 +1589,32 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     assert.equal(codexTestBtn.disabled, false);
     codexTestBtn.click();
     assert.equal(calls.at(-1), "codexTest");
+
+    // Codex non-error feedback when signed in renders inline next to the status tag; errors stay below
+    const codexProvId = codexCard.querySelector(".prov-id")!;
+    const codexInlineStatus = codexProvId.querySelector(".prov-inline-status")!;
+    const codexStatusLine = codexCard.querySelector(".status-line")!;
+    assert.ok(codexInlineStatus, "expected .prov-inline-status inside codex .prov-id");
+    view.update(
+      makeState({
+        snapshot: codexSignedInSnap,
+        codexFeedback: { tone: "ok", text: "Connected \u00b7 OpenAI Codex" },
+      }),
+    );
+    assert.equal(codexInlineStatus.hidden, false);
+    assert.equal(codexInlineStatus.className, "prov-inline-status ok");
+    assert.equal(codexInlineStatus.textContent, "Connected \u00b7 OpenAI Codex");
+    assert.equal(codexStatusLine.hidden, true);
+
+    view.update(
+      makeState({
+        snapshot: codexSignedInSnap,
+        codexFeedback: { tone: "err", text: "Token expired" },
+      }),
+    );
+    assert.equal(codexInlineStatus.hidden, true);
+    assert.equal(codexStatusLine.hidden, false);
+    assert.equal(codexStatusLine.textContent, "Token expired");
 
     codexSignOutBtn.click();
     assert.equal(calls.at(-1), "codexToggleSignOut");

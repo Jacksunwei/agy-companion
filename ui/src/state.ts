@@ -10,7 +10,42 @@ export const HEALTHY_POLL_MS = 10_000;
 export const CODEX_PENDING_POLL_MS = 2_000;
 export const UNHEALTHY_BACKOFF_MS: ReadonlyArray<number> = [3_000, 5_000, 10_000];
 export const CATALOG_POLL_INTERVAL_MS = 300_000;
+export const FEEDBACK_AUTO_DISMISS_MS = 4_000;
 const CATALOG_OVERDUE_GRACE_MS = 60_000;
+
+export interface AutoDismissTimer {
+  schedule: (delayMs: number, onDismiss: () => void) => void;
+  cancel: () => void;
+}
+
+export function createAutoDismissTimer(
+  scheduleFn: (cb: () => void, ms: number) => number = (cb, ms) => window.setTimeout(cb, ms),
+  clearFn: (id: number) => void = (id) => window.clearTimeout(id),
+): AutoDismissTimer {
+  let timerId: number | null = null;
+  let epoch = 0;
+
+  const cancel = () => {
+    epoch += 1;
+    if (timerId !== null) {
+      clearFn(timerId);
+      timerId = null;
+    }
+  };
+
+  const schedule = (delayMs: number, onDismiss: () => void) => {
+    cancel();
+    if (!Number.isFinite(delayMs) || delayMs <= 0) return;
+    const myEpoch = epoch;
+    timerId = scheduleFn(() => {
+      if (epoch !== myEpoch) return;
+      timerId = null;
+      onDismiss();
+    }, delayMs);
+  };
+
+  return { schedule, cancel };
+}
 
 export function hasConfiguredByomProvider(snapshot: SettingsSnapshot): boolean {
   return (

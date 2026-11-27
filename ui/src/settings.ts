@@ -118,7 +118,10 @@ export function createSettingsView(
   const statusDot = el("span", "sdot ok");
   const statusText = el("span", null, "Not set");
   statusTag.append(statusDot, statusText);
-  provId.append(statusTag);
+  const keyInlineFeedbackEl = el("span", "prov-inline-status");
+  keyInlineFeedbackEl.setAttribute("role", "status");
+  keyInlineFeedbackEl.hidden = true;
+  provId.append(statusTag, keyInlineFeedbackEl);
 
   const geminiActions = el("div", "prov-actions");
   const getKeyBtn = el("button", "lnk", "Get API key \u2197");
@@ -283,7 +286,10 @@ export function createSettingsView(
   codexStatusDot.hidden = true;
   const codexStatusText = el("span", "codex-status-text", "Not signed in");
   codexStatusTag.append(codexStatusDot, codexStatusText);
-  codexProvId.append(codexStatusTag);
+  const codexInlineFeedbackEl = el("span", "prov-inline-status");
+  codexInlineFeedbackEl.setAttribute("role", "status");
+  codexInlineFeedbackEl.hidden = true;
+  codexProvId.append(codexStatusTag, codexInlineFeedbackEl);
 
   const codexActions = el("div", "prov-actions");
   const codexSignInBtn = el("button", "btn btn-primary btn-sm", "Sign in with ChatGPT \u2197");
@@ -637,10 +643,19 @@ export function createSettingsView(
     cancelClearBtn.disabled = writeBusy;
 
     if (state.keyFeedback) {
-      keyFeedbackEl.className = `status-line ${state.keyFeedback.tone}`;
-      keyFeedbackEl.textContent = state.keyFeedback.text;
-      keyFeedbackEl.hidden = false;
+      if (state.keyFeedback.tone === "err") {
+        keyInlineFeedbackEl.hidden = true;
+        keyFeedbackEl.className = `status-line ${state.keyFeedback.tone}`;
+        keyFeedbackEl.textContent = state.keyFeedback.text;
+        keyFeedbackEl.hidden = false;
+      } else {
+        keyInlineFeedbackEl.className = `prov-inline-status ${state.keyFeedback.tone}`;
+        keyInlineFeedbackEl.textContent = state.keyFeedback.text;
+        keyInlineFeedbackEl.hidden = false;
+        keyFeedbackEl.hidden = true;
+      }
     } else {
+      keyInlineFeedbackEl.hidden = true;
       keyFeedbackEl.hidden = true;
     }
 
@@ -738,10 +753,19 @@ export function createSettingsView(
     codexCancelSignOutBtn.disabled = writeBusy;
 
     if (state.codexFeedback) {
-      codexFeedbackEl.className = `status-line ${state.codexFeedback.tone}`;
-      codexFeedbackEl.textContent = state.codexFeedback.text;
-      codexFeedbackEl.hidden = false;
+      if (state.codexFeedback.tone === "err" || codexPending) {
+        codexInlineFeedbackEl.hidden = true;
+        codexFeedbackEl.className = `status-line ${state.codexFeedback.tone}`;
+        codexFeedbackEl.textContent = state.codexFeedback.text;
+        codexFeedbackEl.hidden = false;
+      } else {
+        codexInlineFeedbackEl.className = `prov-inline-status ${state.codexFeedback.tone}`;
+        codexInlineFeedbackEl.textContent = state.codexFeedback.text;
+        codexInlineFeedbackEl.hidden = false;
+        codexFeedbackEl.hidden = true;
+      }
     } else {
+      codexInlineFeedbackEl.hidden = true;
       codexFeedbackEl.hidden = true;
     }
 
