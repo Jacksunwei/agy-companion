@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 
 use companion_core::fs_safe::{inspect_file_stamp, read_verified_bytes_for_stamp};
 use companion_core::{
-    AuthStore, Config, CoreError, FileStamp, FsError, GEMINI_AUTH_FILENAME, GeminiCredentials,
-    MAX_AUTH_FILE_BYTES, MAX_CONFIG_FILE_BYTES, RejectedReason, inspect_auth_file_stamp,
-    read_verified_auth_bytes_for_stamp, validate_path,
+    AuthStore, CODEX_AUTH_FILENAME, CodexCredentials, Config, CoreError, FileStamp, FsError,
+    GEMINI_AUTH_FILENAME, GeminiCredentials, MAX_AUTH_FILE_BYTES, MAX_CONFIG_FILE_BYTES,
+    RejectedReason, inspect_auth_file_stamp, read_verified_auth_bytes_for_stamp, validate_path,
 };
+use companion_providers::CodexAuth;
 
 use crate::{ActiveProvider, ProxyError, build_active_provider};
 
@@ -228,11 +229,13 @@ struct HotReloadInner {
     active: ActiveProvider,
     config_state: WatchedFileState<Config>,
     auth_state: Option<WatchedFileState<Option<GeminiCredentials>>>,
+    codex_auth_state: Option<WatchedFileState<Option<CodexCredentials>>>,
 }
 
 pub(crate) struct HotReloadProvider {
     config_path: PathBuf,
     auth_store: Arc<dyn AuthStore>,
+    codex_auth: Arc<dyn CodexAuth>,
     auth_dir: Option<PathBuf>,
     env_fallback: bool,
     inner: RwLock<HotReloadInner>,
@@ -243,20 +246,25 @@ struct ReloadBaseline {
     active: ActiveProvider,
     config: WatchedFileBaseline<Config>,
     auth: Option<WatchedFileBaseline<Option<GeminiCredentials>>>,
+    codex_auth: Option<WatchedFileBaseline<Option<CodexCredentials>>>,
 }
 
 struct CombinedReloadOutcome {
     config_outcome: FileEvalOutcome<Config>,
     auth_outcome: Option<FileEvalOutcome<Option<GeminiCredentials>>>,
+    codex_auth_outcome: Option<FileEvalOutcome<Option<CodexCredentials>>>,
     new_active: Option<ActiveProvider>,
 }
 
 impl HotReloadProvider {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config_path: PathBuf,
         auth_store: Arc<dyn AuthStore>,
+        codex_auth: Arc<dyn CodexAuth>,
         initial_config: Config,
         initial_gemini_creds: Option<GeminiCredentials>,
+        initial_codex_creds: Option<CodexCredentials>,
         active: ActiveProvider,
         env_fallback: bool,
     ) -> Result<Self, ProxyError> {
@@ -276,7 +284,7 @@ impl HotReloadProvider {
                 .flatten();
 
         let auth_dir = auth_store.auth_dir().map(Path::to_path_buf);
-        let auth_state = if let Some(ref dir) = auth_dir {
+        let (auth_state, codex_auth_state) = if let Some(ref dir) = auth_dir {
             validate_path(dir)?;
             let auth_stamp = inspect_auth_file_stamp(dir, GEMINI_AUTH_FILENAME);
             if let FileStamp::Rejected(reason) = auth_stamp {
@@ -292,40 +300,69 @@ impl HotReloadProvider {
                 read_verified_auth_bytes_for_stamp(dir, GEMINI_AUTH_FILENAME, &auth_stamp)
                     .ok()
                     .flatten();
-            Some(WatchedFileState::new(
-                initial_gemini_creds,
-                auth_stamp,
-                auth_raw_bytes,
-            ))
+
+            let codex_stamp = inspect_auth_file_stamp(dir, CODEX_AUTH_FILENAME);
+            if let FileStamp::Rejected(reason) = codex_stamp {
+                let codex_path = dir.join(CODEX_AUTH_FILENAME);
+                return Err(match reason {
+                    RejectedReason::Symlink => FsError::SymlinkRejected { path: codex_path }.into(),
+                    RejectedReason::NotRegularFile => {
+                        FsError::NotRegularFile { path: codex_path }.into()
+                    }
+                });
+            }
+            let codex_raw_bytes =
+                read_verified_auth_bytes_for_stamp(dir, CODEX_AUTH_FILENAME, &codex_stamp)
+                    .ok()
+                    .flatten();
+
+            (
+                Some(WatchedFileState::new(
+                    initial_gemini_creds,
+                    auth_stamp,
+                    auth_raw_bytes,
+                )),
+                Some(WatchedFileState::new(
+                    initial_codex_creds,
+                    codex_stamp,
+                    codex_raw_bytes,
+                )),
+            )
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
             config_path,
             auth_store,
+            codex_auth,
             auth_dir,
             env_fallback,
             inner: RwLock::new(HotReloadInner {
                 active,
                 config_state: WatchedFileState::new(initial_config, config_stamp, config_raw_bytes),
                 auth_state,
+                codex_auth_state,
             }),
             reload_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     pub(crate) async fn active_provider(&self) -> ActiveProvider {
-        // Immediate off-thread stat of config.json + sibling auth/gemini.json in one blocking call
-        // so config or credential changes are observed instantaneously without holding locks.
+        // Immediate off-thread stat of config.json + sibling auth/{gemini,codex}.json in one
+        // blocking call so config or credential changes are observed instantaneously without
+        // holding locks.
         let stat_config_path = self.config_path.clone();
         let stat_auth_dir = self.auth_dir.clone();
-        let (cfg_stamp, auth_stamp) = match tokio::task::spawn_blocking(move || {
+        let (cfg_stamp, auth_stamp, codex_stamp) = match tokio::task::spawn_blocking(move || {
             let cfg = inspect_file_stamp(&stat_config_path);
             let auth = stat_auth_dir
                 .as_deref()
                 .map(|dir| inspect_auth_file_stamp(dir, GEMINI_AUTH_FILENAME));
-            (cfg, auth)
+            let codex = stat_auth_dir
+                .as_deref()
+                .map(|dir| inspect_auth_file_stamp(dir, CODEX_AUTH_FILENAME));
+            (cfg, auth, codex)
         })
         .await
         {
@@ -339,24 +376,37 @@ impl HotReloadProvider {
             }
         };
 
-        let (cfg_dec, auth_dec) = {
+        let (cfg_dec, auth_dec, codex_dec) = {
             let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
             let cfg_dec = guard.config_state.fast_check(&cfg_stamp);
             let auth_dec = match (&guard.auth_state, &auth_stamp) {
                 (Some(st), Some(stamp)) => st.fast_check(stamp),
                 _ => FileFastDecision::Cached,
             };
-            if cfg_dec == FileFastDecision::Cached && auth_dec == FileFastDecision::Cached {
+            let codex_dec = match (&guard.codex_auth_state, &codex_stamp) {
+                (Some(st), Some(stamp)) => st.fast_check(stamp),
+                _ => FileFastDecision::Cached,
+            };
+            if cfg_dec == FileFastDecision::Cached
+                && auth_dec == FileFastDecision::Cached
+                && codex_dec == FileFastDecision::Cached
+            {
                 return guard.active.clone();
             }
-            (cfg_dec, auth_dec)
+            (cfg_dec, auth_dec, codex_dec)
         };
 
-        if cfg_dec != FileFastDecision::NeedsReload && auth_dec != FileFastDecision::NeedsReload {
+        if cfg_dec != FileFastDecision::NeedsReload
+            && auth_dec != FileFastDecision::NeedsReload
+            && codex_dec != FileFastDecision::NeedsReload
+        {
             let verify_cfg = matches!(cfg_dec, FileFastDecision::VerifySameStampBytes { .. })
                 .then(|| (self.config_path.clone(), cfg_stamp.clone()));
             let verify_auth = matches!(auth_dec, FileFastDecision::VerifySameStampBytes { .. })
                 .then(|| self.auth_dir.clone().zip(auth_stamp.clone()))
+                .flatten();
+            let verify_codex = matches!(codex_dec, FileFastDecision::VerifySameStampBytes { .. })
+                .then(|| self.auth_dir.clone().zip(codex_stamp.clone()))
                 .flatten();
 
             let verify_res = tokio::task::spawn_blocking(move || {
@@ -366,12 +416,15 @@ impl HotReloadProvider {
                 let auth_bytes = verify_auth.map(|(dir, stamp)| {
                     read_verified_auth_bytes_for_stamp(&dir, GEMINI_AUTH_FILENAME, &stamp)
                 });
-                (cfg_bytes, auth_bytes)
+                let codex_bytes = verify_codex.map(|(dir, stamp)| {
+                    read_verified_auth_bytes_for_stamp(&dir, CODEX_AUTH_FILENAME, &stamp)
+                });
+                (cfg_bytes, auth_bytes, codex_bytes)
             })
             .await;
 
             match verify_res {
-                Ok((cfg_bytes_opt, auth_bytes_opt)) => {
+                Ok((cfg_bytes_opt, auth_bytes_opt, codex_bytes_opt)) => {
                     let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
                     let cfg_ok = match (cfg_dec, cfg_bytes_opt) {
                         (FileFastDecision::Cached, _) => true,
@@ -395,7 +448,22 @@ impl HotReloadProvider {
                         ) => st.matches_cached_bytes(stamp, &bytes, match_failed_bytes),
                         _ => false,
                     };
-                    if cfg_ok && auth_ok {
+                    let codex_ok = match (
+                        codex_dec,
+                        codex_bytes_opt,
+                        &guard.codex_auth_state,
+                        &codex_stamp,
+                    ) {
+                        (FileFastDecision::Cached, _, _, _) => true,
+                        (
+                            FileFastDecision::VerifySameStampBytes { match_failed_bytes },
+                            Some(Ok(Some(bytes))),
+                            Some(st),
+                            Some(stamp),
+                        ) => st.matches_cached_bytes(stamp, &bytes, match_failed_bytes),
+                        _ => false,
+                    };
+                    if cfg_ok && auth_ok && codex_ok {
                         return guard.active.clone();
                     }
                 }
@@ -414,12 +482,14 @@ impl HotReloadProvider {
         let reload_config_path = self.config_path.clone();
         let reload_auth_dir = self.auth_dir.clone();
         let reload_auth_store = Arc::clone(&self.auth_store);
+        let reload_codex_auth = Arc::clone(&self.codex_auth);
         let env_fallback = self.env_fallback;
         let outcome = match tokio::task::spawn_blocking(move || {
             evaluate_reload(
                 reload_config_path,
                 reload_auth_dir,
                 reload_auth_store,
+                reload_codex_auth,
                 env_fallback,
                 baseline,
             )
@@ -453,6 +523,10 @@ impl HotReloadProvider {
                 .auth_state
                 .as_ref()
                 .map(WatchedFileState::snapshot_baseline),
+            codex_auth: guard
+                .codex_auth_state
+                .as_ref()
+                .map(WatchedFileState::snapshot_baseline),
         }
     }
 
@@ -463,6 +537,11 @@ impl HotReloadProvider {
             (&mut guard.auth_state, outcome.auth_outcome)
         {
             auth_state.apply_outcome(auth_outcome);
+        }
+        if let (Some(codex_state), Some(codex_outcome)) =
+            (&mut guard.codex_auth_state, outcome.codex_auth_outcome)
+        {
+            codex_state.apply_outcome(codex_outcome);
         }
         if let Some(new_active) = outcome.new_active {
             guard.active = new_active;
@@ -632,6 +711,7 @@ fn evaluate_reload(
     config_path: PathBuf,
     auth_dir: Option<PathBuf>,
     auth_store: Arc<dyn AuthStore>,
+    codex_auth: Arc<dyn CodexAuth>,
     env_fallback: bool,
     baseline: ReloadBaseline,
 ) -> CombinedReloadOutcome {
@@ -663,12 +743,32 @@ fn evaluate_reload(
         _ => None,
     };
 
+    let mut codex_auth_outcome = match (auth_dir.as_deref(), baseline.codex_auth.as_ref()) {
+        (Some(dir), Some(codex_baseline)) => {
+            let codex_path = dir.join(CODEX_AUTH_FILENAME);
+            let codex_stamp = inspect_auth_file_stamp(dir, CODEX_AUTH_FILENAME);
+            Some(evaluate_file(
+                "auth/codex.json",
+                MAX_AUTH_FILE_BYTES,
+                codex_baseline,
+                codex_stamp,
+                |stamp| read_verified_auth_bytes_for_stamp(dir, CODEX_AUTH_FILENAME, stamp),
+                || None,
+                |bytes| CodexCredentials::from_json_bytes(bytes, &codex_path).map(Some),
+            ))
+        }
+        _ => None,
+    };
+
     let cfg_changed = config_outcome.changed_value();
     let auth_changed = auth_outcome
         .as_ref()
         .is_some_and(FileEvalOutcome::changed_value);
+    let codex_changed = codex_auth_outcome
+        .as_ref()
+        .is_some_and(FileEvalOutcome::changed_value);
 
-    let new_active = if cfg_changed || auth_changed {
+    let new_active = if cfg_changed || auth_changed || codex_changed {
         let effective_config = config_outcome.effective_value(&baseline.config.value);
         let fallback_memory_creds;
         let effective_creds: &Option<GeminiCredentials> =
@@ -681,10 +781,23 @@ fn evaluate_reload(
                     &fallback_memory_creds
                 }
             };
+        let fallback_memory_codex;
+        let effective_codex_creds: &Option<CodexCredentials> =
+            match (codex_auth_outcome.as_ref(), baseline.codex_auth.as_ref()) {
+                (Some(outcome), Some(codex_baseline)) => {
+                    outcome.effective_value(&codex_baseline.value)
+                }
+                _ => {
+                    fallback_memory_codex = auth_store.load_codex().ok().flatten();
+                    &fallback_memory_codex
+                }
+            };
 
         match build_active_provider(
             effective_config,
             effective_creds.as_ref().map(|c| &c.api_key),
+            effective_codex_creds.is_some(),
+            &codex_auth,
             env_fallback,
             Some(&baseline.active),
         ) {
@@ -700,6 +813,10 @@ fn evaluate_reload(
                     auth_outcome =
                         auth_outcome.map(FileEvalOutcome::into_failed_after_rebuild_error);
                 }
+                if codex_changed {
+                    codex_auth_outcome =
+                        codex_auth_outcome.map(FileEvalOutcome::into_failed_after_rebuild_error);
+                }
                 None
             }
         }
@@ -710,6 +827,7 @@ fn evaluate_reload(
     CombinedReloadOutcome {
         config_outcome,
         auth_outcome,
+        codex_auth_outcome,
         new_active,
     }
 }

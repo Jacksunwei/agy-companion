@@ -20,10 +20,12 @@ use std::time::Duration;
 
 use companion_core::{
     ApiKey, AuthStore, CloudCodeUpstream, Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL,
-    DEFAULT_GEMINI_MODEL, DEFAULT_TIMEOUT_SECS, FileAuthStore, FsError, MemoryAuthStore, UsageSink,
-    default_enabled_gemini_models,
+    DEFAULT_CODEX_BASE_URL, DEFAULT_CODEX_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_TIMEOUT_SECS,
+    FileAuthStore, FsError, MemoryAuthStore, UsageSink, default_enabled_gemini_models,
 };
-use companion_providers::{GeminiProvider, ProviderAdapter, ProviderError};
+use companion_providers::{
+    CodexAuth, CodexAuthManager, CodexProvider, GeminiProvider, ProviderAdapter, ProviderError,
+};
 use thiserror::Error;
 use tokio::net::TcpListener;
 
@@ -33,7 +35,7 @@ use hot_reload::HotReloadProvider;
 
 pub use cloudcode::{
     CloudCodeClient, CloudCodeError, MAX_CLOUDCODE_CATALOG_BYTES, is_cloudcode_path,
-    merge_available_models, validate_cloudcode_path,
+    merge_available_models, merge_available_models_multi_provider, validate_cloudcode_path,
 };
 pub use companion_core::protocol::{HealthResponse, PROTOCOL_VERSION, StatsSnapshot};
 pub use routes::{DEFAULT_MAX_JSON_TEE_BYTES, MAX_PROXY_BODY_BYTES, build_router};
@@ -68,12 +70,18 @@ impl From<FsError> for ProxyError {
 #[derive(Clone)]
 pub(crate) struct ActiveProvider {
     pub(crate) provider: Arc<dyn ProviderAdapter>,
+    pub(crate) codex_provider: Option<Arc<dyn ProviderAdapter>>,
     pub(crate) cloudcode: Arc<CloudCodeClient>,
     pub(crate) cloudcode_upstream: CloudCodeUpstream,
     pub(crate) cloudcode_timeout_secs: u64,
     pub(crate) has_configured_api_key: bool,
     pub(crate) default_model: String,
     pub(crate) enabled_models: Vec<String>,
+    pub(crate) codex_authenticated: bool,
+    pub(crate) codex_base_url: String,
+    pub(crate) codex_timeout_secs: u64,
+    pub(crate) codex_default_model: String,
+    pub(crate) codex_enabled_models: Vec<String>,
 }
 
 enum ProviderSource {
@@ -152,12 +160,18 @@ impl ProxyState {
             inner: Arc::new(ProxyStateInner {
                 source: ProviderSource::Static(ActiveProvider {
                     provider,
+                    codex_provider: None,
                     cloudcode,
                     cloudcode_upstream: CloudCodeUpstream::Auto,
                     cloudcode_timeout_secs: DEFAULT_TIMEOUT_SECS,
                     has_configured_api_key,
                     default_model: DEFAULT_GEMINI_MODEL.to_string(),
                     enabled_models: default_enabled_gemini_models(),
+                    codex_authenticated: false,
+                    codex_base_url: DEFAULT_CODEX_BASE_URL.to_string(),
+                    codex_timeout_secs: DEFAULT_TIMEOUT_SECS,
+                    codex_default_model: DEFAULT_CODEX_MODEL.to_string(),
+                    codex_enabled_models: Vec::new(),
                 }),
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
@@ -176,6 +190,24 @@ impl ProxyState {
         usage_sink: Arc<dyn UsageSink>,
         options: ProxyStateOptions,
     ) -> Result<Self, ProxyError> {
+        Self::from_config_with_options_and_codex_auth(config, usage_sink, options, None)
+    }
+
+    pub fn from_config_with_codex_auth(
+        config: Config,
+        usage_sink: Arc<dyn UsageSink>,
+        options: ProxyStateOptions,
+        codex_auth: Arc<dyn CodexAuth>,
+    ) -> Result<Self, ProxyError> {
+        Self::from_config_with_options_and_codex_auth(config, usage_sink, options, Some(codex_auth))
+    }
+
+    fn from_config_with_options_and_codex_auth(
+        config: Config,
+        usage_sink: Arc<dyn UsageSink>,
+        options: ProxyStateOptions,
+        codex_auth_override: Option<Arc<dyn CodexAuth>>,
+    ) -> Result<Self, ProxyError> {
         config.validate()?;
         let auth_store: Arc<dyn AuthStore> = match options.auth_store {
             Some(store) => store,
@@ -184,10 +216,17 @@ impl ProxyState {
                 None => Arc::new(MemoryAuthStore::new()),
             },
         };
+        let codex_auth: Arc<dyn CodexAuth> = match codex_auth_override {
+            Some(auth) => auth,
+            None => Arc::new(CodexAuthManager::new(Arc::clone(&auth_store))?),
+        };
         let initial_gemini_creds = auth_store.load_gemini()?;
+        let initial_codex_creds = auth_store.load_codex()?;
         let active = build_active_provider(
             &config,
             initial_gemini_creds.as_ref().map(|c| &c.api_key),
+            initial_codex_creds.is_some(),
+            &codex_auth,
             options.env_fallback,
             None,
         )?;
@@ -196,8 +235,10 @@ impl ProxyState {
             Some(path) => ProviderSource::HotReload(Box::new(HotReloadProvider::new(
                 path,
                 auth_store,
+                codex_auth,
                 config,
                 initial_gemini_creds,
+                initial_codex_creds,
                 active,
                 options.env_fallback,
             )?)),
@@ -250,11 +291,27 @@ impl ProxyState {
 pub(crate) fn build_active_provider(
     config: &Config,
     gemini_api_key: Option<&ApiKey>,
+    codex_authenticated: bool,
+    codex_auth: &Arc<dyn CodexAuth>,
     env_fallback: bool,
     previous_active: Option<&ActiveProvider>,
 ) -> Result<ActiveProvider, ProxyError> {
     let provider = GeminiProvider::from_config(&config.providers.gemini, gemini_api_key)?
         .with_env_fallback(env_fallback);
+    let codex_provider: Arc<dyn ProviderAdapter> = match previous_active {
+        Some(prev)
+            if prev.codex_base_url == config.providers.codex.base_url
+                && prev.codex_timeout_secs == config.providers.codex.timeout_secs
+                && prev.codex_default_model == config.providers.codex.default_model
+                && let Some(ref existing) = prev.codex_provider =>
+        {
+            Arc::clone(existing)
+        }
+        _ => Arc::new(CodexProvider::from_config(
+            &config.providers.codex,
+            Arc::clone(codex_auth),
+        )?),
+    };
     let cloudcode = match previous_active {
         Some(prev)
             if prev.cloudcode_upstream == config.cloudcode.upstream
@@ -270,12 +327,18 @@ pub(crate) fn build_active_provider(
     let has_configured_api_key = provider.api_key_hint().is_some();
     Ok(ActiveProvider {
         provider: Arc::new(provider),
+        codex_provider: Some(codex_provider),
         cloudcode,
         cloudcode_upstream: config.cloudcode.upstream.clone(),
         cloudcode_timeout_secs: config.providers.gemini.timeout_secs,
         has_configured_api_key,
         default_model: config.providers.gemini.default_model.clone(),
         enabled_models: config.providers.gemini.enabled_models.clone(),
+        codex_authenticated,
+        codex_base_url: config.providers.codex.base_url.clone(),
+        codex_timeout_secs: config.providers.codex.timeout_secs,
+        codex_default_model: config.providers.codex.default_model.clone(),
+        codex_enabled_models: config.providers.codex.enabled_models.clone(),
     })
 }
 

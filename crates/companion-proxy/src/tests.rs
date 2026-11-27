@@ -1377,3 +1377,79 @@ async fn hot_reload_updates_enabled_models_immediately_and_preserves_cloudcode_r
         companion_core::CLOUDCODE_PROD_UPSTREAM_URL
     );
 }
+
+#[tokio::test]
+async fn hot_reload_watches_codex_auth_sign_in_refresh_corrupt_and_sign_out() {
+    use companion_core::{
+        AUTH_SCHEMA_VERSION, CODEX_AUTH_FILENAME, CodexAuthMode, CodexCredentials, SecretString,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.json");
+    let auth_store = FileAuthStore::for_config_path(&config_path).unwrap();
+
+    let cfg = Config::default();
+    cfg.save_secure(&config_path).unwrap();
+
+    let state = ProxyState::from_config_with_options(
+        cfg,
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: Some(config_path.clone()),
+            auth_store: None,
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+
+    // 1. Starts signed out.
+    let initial = state.active_provider().await;
+    assert!(!initial.codex_authenticated);
+
+    // 2. Writing auth/codex.json hot-reloads immediately to authenticated.
+    let mut creds = CodexCredentials {
+        schema_version: AUTH_SCHEMA_VERSION,
+        auth_mode: CodexAuthMode::ChatGptOAuth,
+        access_token: SecretString::new("codex_hot_reload_tok_1"),
+        refresh_token: SecretString::new("codex_hot_reload_ref_1"),
+        id_token: None,
+        account_id: "acct_hot_reload_1".to_string(),
+        expires_at_ms: 4_102_444_800_000,
+        plan_type: Some("pro".to_string()),
+        email_hint: Some("h***@example.com".to_string()),
+        last_refresh_utc: "2026-11-26T00:00:00Z".to_string(),
+    };
+    auth_store.save_codex(&creds).unwrap();
+    let signed_in = state.active_provider().await;
+    assert!(signed_in.codex_authenticated);
+
+    // 3. Updating auth/codex.json (token refresh) stays authenticated cleanly.
+    creds.access_token = SecretString::new("codex_hot_reload_tok_2");
+    auth_store.save_codex(&creds).unwrap();
+    let refreshed = state.active_provider().await;
+    assert!(refreshed.codex_authenticated);
+
+    // 4. Corrupt auth/codex.json fails closed and retains previous authenticated state.
+    let codex_path = auth_store.auth_dir().unwrap().join(CODEX_AUTH_FILENAME);
+    std::fs::write(&codex_path, "{corrupt-json").unwrap();
+    let after_corrupt = state.active_provider().await;
+    assert!(after_corrupt.codex_authenticated);
+
+    // 5. Deleting auth/codex.json (sign-out) hot-reloads immediately to unauthenticated.
+    auth_store.clear_codex().unwrap();
+    let signed_out = state.active_provider().await;
+    assert!(!signed_out.codex_authenticated);
+
+    // 6. Post-startup symlinked auth/codex.json is ignored fail-closed on Unix.
+    #[cfg(unix)]
+    {
+        let victim = tmp.path().join("victim_codex.json");
+        std::fs::write(&victim, serde_json::to_vec(&creds).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &codex_path).unwrap();
+        let after_symlink = state.active_provider().await;
+        assert!(
+            !after_symlink.codex_authenticated,
+            "symlinked auth/codex.json must be rejected fail-closed"
+        );
+    }
+}

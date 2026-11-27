@@ -1336,7 +1336,7 @@ async fn rejects_unsupported_non_gemini_3_or_4_models_with_400_and_zero_upstream
         "/v1beta/models/gemini-5:generateContent",
         "/v1beta/models/gemini-5-:generateContent",
         "/v1beta/models/gemini-5pro:generateContent",
-        "/v1beta/models/gpt-4o:generateContent",
+        "/v1beta/models/llama-3-70b:generateContent",
     ] {
         let resp = app
             .clone()
@@ -3599,4 +3599,369 @@ async fn proxy_tee_propagates_response_id_and_conversation_id_for_sse_and_unary_
     assert_eq!(unary_events[0].input_tokens, 180);
     assert_eq!(unary_events[0].output_tokens, 25);
     assert_eq!(unary_events[0].reasoning_tokens, 7);
+}
+
+fn sample_codex_creds_for_route_test(token: &str) -> companion_core::CodexCredentials {
+    companion_core::CodexCredentials {
+        schema_version: companion_core::AUTH_SCHEMA_VERSION,
+        auth_mode: companion_core::CodexAuthMode::ChatGptOAuth,
+        access_token: companion_core::SecretString::new(token),
+        refresh_token: companion_core::SecretString::new("refresh_tok_route_test"),
+        id_token: None,
+        account_id: "acct_route_test_1234".to_string(),
+        expires_at_ms: 4_102_444_800_000,
+        plan_type: Some("pro".to_string()),
+        email_hint: Some("r***@example.com".to_string()),
+        last_refresh_utc: "2026-11-26T00:00:00Z".to_string(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_proxy_dispatches_sse_and_unary_records_codex_usage_and_conversation_id() {
+    use axum::routing::post;
+    use companion_core::{Config, MemoryAuthStore, SqliteUsageSink};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = Arc::clone(&upstream_hits);
+    let mock_codex_app = axum::Router::new().route(
+        "/backend-api/codex/responses",
+        post(move |_body: Bytes| {
+            let hits = Arc::clone(&hits_clone);
+            async move {
+                let n = hits.fetch_add(1, Ordering::SeqCst);
+                if n == 2 {
+                    // 3rd call simulates 400 to verify Gemini INVALID_THOUGHT_SIGNATURE strip-retry
+                    // does NOT run for Codex models.
+                    return axum::response::Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"error":{"code":"invalid_request_error","message":"INVALID_THOUGHT_SIGNATURE"}}"#,
+                        ))
+                        .unwrap();
+                }
+                let sse = concat!(
+                    "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Thinking...\"}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Codex says hi\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":400,\"input_tokens_details\":{\"cached_tokens\":250},\"output_tokens\":60,\"output_tokens_details\":{\"reasoning_tokens\":20},\"total_tokens\":460}}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .expect("bind mock codex");
+    let port = listener.local_addr().unwrap().port();
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_codex_app).await;
+    });
+    tokio::task::yield_now().await;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sqlite_sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).unwrap());
+    let auth_store = Arc::new(MemoryAuthStore::with_codex_credentials(
+        sample_codex_creds_for_route_test("codex_access_tok_1"),
+    ));
+
+    let mut cfg = Config::default();
+    cfg.providers.codex.base_url = format!("http://127.0.0.1:{port}/backend-api/codex");
+
+    let state = ProxyState::from_config_with_options(
+        cfg,
+        sqlite_sink.clone(),
+        ProxyStateOptions {
+            config_path: None,
+            auth_store: Some(auth_store),
+            env_fallback: false,
+        },
+    )
+    .expect("proxy state");
+    let app = build_router(state.clone());
+
+    // 1. Streaming SSE to Codex model WITHOUT any x-goog-api-key header + with conversation_id.
+    let sse_req_body = serde_json::json!({
+        "systemInstruction": {
+            "parts": [{ "text": "Conversation ID: conv-codex-123456\nBe concise." }]
+        },
+        "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }]
+    });
+    let sse_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1beta/models/gpt-6.2-astra:streamGenerateContent?alt=sse")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(sse_req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let sse_body = axum::body::to_bytes(sse_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let sse_text = String::from_utf8_lossy(&sse_body);
+    assert!(sse_text.contains("\"thought\":true"));
+    assert!(sse_text.contains("Codex says hi"));
+
+    // 2. Unary :generateContent to Codex model with placeholder Gemini key ignored cleanly.
+    let unary_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1beta/models/gpt-6.2-sol:generateContent")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-goog-api-key", companion_core::PROXY_PLACEHOLDER_API_KEY)
+                .body(Body::from(sse_req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unary_resp.status(), StatusCode::OK);
+    let unary_bytes = axum::body::to_bytes(unary_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let unary_json: serde_json::Value = serde_json::from_slice(&unary_bytes).unwrap();
+    assert_eq!(
+        unary_json["candidates"][0]["content"]["parts"][1]["text"],
+        "Codex says hi"
+    );
+
+    // Verify both calls recorded in SQLite under provider="openai-codex", source="proxy".
+    let events = sqlite_sink.read_all_events().expect("read sqlite events");
+    assert_eq!(events.len(), 2);
+    for ev in &events {
+        assert_eq!(ev.provider, "openai-codex");
+        assert_eq!(ev.source, "proxy");
+        assert_eq!(ev.input_tokens, 400);
+        assert_eq!(ev.cached_tokens, 250);
+        assert_eq!(ev.output_tokens, 60);
+        assert_eq!(ev.reasoning_tokens, 20);
+    }
+    assert_eq!(events[0].model, "gpt-6.2-astra");
+    assert_eq!(events[1].model, "gpt-6.2-sol");
+
+    // Verify per-conversation stats isolation works identically for Codex!
+    let stats_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/stats?conversation_id=conv-codex-123456")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_resp.status(), StatusCode::OK);
+    let stats_bytes = axum::body::to_bytes(stats_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let stats_snap: StatsSnapshot = serde_json::from_slice(&stats_bytes).unwrap();
+    assert_eq!(stats_snap.usage.requests, 2);
+    assert_eq!(stats_snap.usage.cached_tokens, 500);
+
+    // 3. Unsupported binary MIME fails with clean 400 and 0 extra upstream hits.
+    let hits_before_bad_mime = upstream_hits.load(Ordering::SeqCst);
+    let pdf_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1beta/models/gpt-6.2-sol:generateContent")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contents": [{
+                            "role": "user",
+                            "parts": [{ "inlineData": { "mimeType": "application/pdf", "data": "JVBERi0=" } }]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pdf_resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), hits_before_bad_mime);
+
+    // 4. Codex 400 with thoughtSignature in request body must NOT trigger Gemini strip-retry.
+    let ts_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1beta/models/gpt-6.2-sol:generateContent")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contents": [{
+                            "role": "model",
+                            "parts": [{ "text": "prev", "thoughtSignature": "sig-abc" }]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ts_resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        upstream_hits.load(Ordering::SeqCst),
+        hits_before_bad_mime + 1,
+        "Gemini INVALID_THOUGHT_SIGNATURE strip-retry must never fire for Codex"
+    );
+
+    server_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloudcode_fetch_available_models_gates_day0_codex_only_and_both_providers() {
+    use axum::routing::post;
+    use companion_core::{ApiKey, AuthStore, CloudCodeUpstream, Config, MemoryAuthStore};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::net::TcpListener;
+
+    let raw_upstream_payload = br#"{"models":{"native-gem":{"model":"MODEL_PLACEHOLDER_M427","displayName":"Native"}},"agentModelSorts":[{"displayName":"Recommended","groups":[{"displayName":"Models","modelIds":["native-gem"]}]}]}"#;
+    let mock_cc = axum::Router::new().route(
+        "/v1internal:fetchAvailableModels",
+        post(move || async move {
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(raw_upstream_payload.as_slice()))
+                .unwrap()
+        }),
+    );
+
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .expect("bind mock cloudcode");
+    let port = listener.local_addr().unwrap().port();
+    let cc_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_cc).await;
+    });
+    tokio::task::yield_now().await;
+
+    let mut base_cfg = Config::default();
+    base_cfg.cloudcode.upstream =
+        CloudCodeUpstream::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+
+    // Case 1: Neither ready (Day-0) -> untouched byte-for-byte.
+    let day0_state = ProxyState::from_config_with_options(
+        base_cfg.clone(),
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: None,
+            auth_store: Some(Arc::new(MemoryAuthStore::new())),
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+    let day0_resp = build_router(day0_state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:fetchAvailableModels")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let day0_bytes = axum::body::to_bytes(day0_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(day0_bytes.as_ref(), raw_upstream_payload.as_slice());
+
+    // Case 2: Codex-only authenticated -> injects ONLY enabled Codex models (default 8 slots).
+    let codex_only_state = ProxyState::from_config_with_options(
+        base_cfg.clone(),
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: None,
+            auth_store: Some(Arc::new(MemoryAuthStore::with_codex_credentials(
+                sample_codex_creds_for_route_test("tok_only"),
+            ))),
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+    let codex_resp = build_router(codex_only_state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:fetchAvailableModels")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let codex_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(codex_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let codex_models = codex_json["models"].as_object().unwrap();
+    assert!(codex_models.contains_key("companion/gpt-6.2-astra-high"));
+    assert!(codex_models.contains_key("companion/gpt-6.2-sol-xhigh"));
+    assert!(
+        !codex_models
+            .keys()
+            .any(|k| k.starts_with("companion/gemini-")),
+        "Codex-only must not inject Gemini models"
+    );
+
+    // Case 3: Both Gemini + Codex ready -> injects both without slot collisions.
+    let both_store = Arc::new(MemoryAuthStore::with_gemini_key(
+        ApiKey::parse_strict("AIzaBothProvidersTestKey1").unwrap(),
+    ));
+    both_store
+        .save_codex(&sample_codex_creds_for_route_test("tok_both"))
+        .unwrap();
+    let both_state = ProxyState::from_config_with_options(
+        base_cfg,
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: None,
+            auth_store: Some(both_store),
+            env_fallback: false,
+        },
+    )
+    .unwrap();
+    let both_resp = build_router(both_state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:fetchAvailableModels")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let both_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(both_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let both_models = both_json["models"].as_object().unwrap();
+    assert!(both_models.contains_key("companion/gemini-4-hydrogen-high"));
+    assert!(both_models.contains_key("companion/gpt-6.2-sol-high"));
+
+    cc_handle.abort();
 }

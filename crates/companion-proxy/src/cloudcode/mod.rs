@@ -14,7 +14,9 @@ mod slots;
 #[cfg(test)]
 mod tests;
 
-pub use catalog::{merge_available_models, pretty_model_name};
+pub use catalog::{
+    merge_available_models, merge_available_models_multi_provider, pretty_model_name,
+};
 pub use client::CloudCodeClient;
 pub(crate) use routing::is_uncompressed_content_encoding;
 pub use routing::{is_cloudcode_path, validate_cloudcode_path};

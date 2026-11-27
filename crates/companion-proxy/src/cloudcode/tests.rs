@@ -2517,3 +2517,287 @@ fn copy_safe_response_headers_preserves_multiple_content_encoding_headers() {
         &identity_only
     ));
 }
+
+#[test]
+fn merge_available_models_multi_provider_allocates_31_of_32_slots_with_explicit_codex_metadata() {
+    let upstream = json!({
+        "models": {
+            "gemini-4-carbon-high": {
+                "model": "MODEL_PLACEHOLDER_M427",
+                "displayName": "Gemini 4 Carbon (High)",
+                "thinkingLevel": 3,
+                "supportsThoughtCirculation": true,
+                "modelExperimentIds": ["exp-gemini-only-123"]
+            }
+        },
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{
+                "displayName": "Google AI Pro",
+                "modelIds": ["gemini-4-carbon-high"]
+            }]
+        }],
+        "groupedModels": {
+            "gemini-4-carbon": {
+                "displayName": "Gemini 4 Carbon",
+                "supportedThinkingLevels": [
+                    { "thinkingSuffix": "high", "thinkingDisplayName": "High" }
+                ]
+            }
+        }
+    });
+
+    let all_gemini: Vec<String> = companion_core::CURATED_GEMINI_MODELS
+        .iter()
+        .map(|m| m.id.to_string())
+        .collect();
+    let all_codex: Vec<String> = companion_core::CURATED_CODEX_MODELS
+        .iter()
+        .map(|m| m.id.to_string())
+        .collect();
+
+    let merged_bytes = merge_available_models_multi_provider(
+        &serde_json::to_vec(&upstream).unwrap(),
+        &all_gemini,
+        "gemini-4-hydrogen",
+        &all_codex,
+        "gpt-6.2-sol",
+    )
+    .expect("merge all 5 gemini + 4 codex");
+    let merged: Value = serde_json::from_slice(&merged_bytes).expect("valid json");
+    let models = merged["models"].as_object().expect("models");
+
+    // Verify exact slot partition: 17 Gemini (M334..=M350) + 14 Codex (M351..=M364) = 31 unique slots.
+    let expected_codex_slots = [
+        (
+            "companion/gpt-6.2-astra-low",
+            "MODEL_PLACEHOLDER_M351",
+            "GPT-6.2 Astra (Codex) (Low)",
+            1,
+            272_000u64,
+        ),
+        (
+            "companion/gpt-6.2-astra-medium",
+            "MODEL_PLACEHOLDER_M352",
+            "GPT-6.2 Astra (Codex) (Medium)",
+            2,
+            272_000,
+        ),
+        (
+            "companion/gpt-6.2-astra-high",
+            "MODEL_PLACEHOLDER_M353",
+            "GPT-6.2 Astra (Codex) (High)",
+            3,
+            272_000,
+        ),
+        (
+            "companion/gpt-6.2-astra-xhigh",
+            "MODEL_PLACEHOLDER_M354",
+            "GPT-6.2 Astra (Codex) (XHigh)",
+            7,
+            272_000,
+        ),
+        (
+            "companion/gpt-6.2-sol-low",
+            "MODEL_PLACEHOLDER_M355",
+            "GPT-6.2 Sol (Codex) (Low)",
+            1,
+            500_000,
+        ),
+        (
+            "companion/gpt-6.2-sol-medium",
+            "MODEL_PLACEHOLDER_M356",
+            "GPT-6.2 Sol (Codex) (Medium)",
+            2,
+            500_000,
+        ),
+        (
+            "companion/gpt-6.2-sol-high",
+            "MODEL_PLACEHOLDER_M357",
+            "GPT-6.2 Sol (Codex) (High)",
+            3,
+            500_000,
+        ),
+        (
+            "companion/gpt-6.2-sol-xhigh",
+            "MODEL_PLACEHOLDER_M358",
+            "GPT-6.2 Sol (Codex) (XHigh)",
+            7,
+            500_000,
+        ),
+        (
+            "companion/gpt-6.1-terra-low",
+            "MODEL_PLACEHOLDER_M359",
+            "GPT-6.1 Terra (Codex) (Low)",
+            1,
+            500_000,
+        ),
+        (
+            "companion/gpt-6.1-terra-medium",
+            "MODEL_PLACEHOLDER_M360",
+            "GPT-6.1 Terra (Codex) (Medium)",
+            2,
+            500_000,
+        ),
+        (
+            "companion/gpt-6.1-terra-high",
+            "MODEL_PLACEHOLDER_M361",
+            "GPT-6.1 Terra (Codex) (High)",
+            3,
+            500_000,
+        ),
+        (
+            "companion/gpt-6-luna-low",
+            "MODEL_PLACEHOLDER_M362",
+            "GPT-6 Luna (Codex) (Low)",
+            1,
+            272_000,
+        ),
+        (
+            "companion/gpt-6-luna-medium",
+            "MODEL_PLACEHOLDER_M363",
+            "GPT-6 Luna (Codex) (Medium)",
+            2,
+            272_000,
+        ),
+        (
+            "companion/gpt-6-luna-high",
+            "MODEL_PLACEHOLDER_M364",
+            "GPT-6 Luna (Codex) (High)",
+            3,
+            272_000,
+        ),
+    ];
+
+    let mut seen_enums = HashSet::new();
+    for (id, details) in models {
+        if id.starts_with("companion/") {
+            let slot = details["model"].as_str().expect("slot string").to_string();
+            assert!(
+                seen_enums.insert(slot.clone()),
+                "duplicate slot {slot} for {id}"
+            );
+        }
+    }
+    assert_eq!(seen_enums.len(), 31, "17 Gemini + 14 Codex = 31 slots");
+    assert!(
+        !seen_enums.contains("MODEL_PLACEHOLDER_M365"),
+        "M365 remains spare"
+    );
+
+    for (variant_id, expected_slot, expected_name, expected_level, expected_max_tokens) in
+        expected_codex_slots
+    {
+        let entry = models
+            .get(variant_id)
+            .unwrap_or_else(|| panic!("missing Codex variant {variant_id}"));
+        let raw_model_id = variant_id
+            .strip_prefix("companion/")
+            .unwrap()
+            .rsplit_once('-')
+            .unwrap()
+            .0;
+        assert_eq!(entry["model"], expected_slot);
+        assert_eq!(entry["displayName"], expected_name);
+        assert_eq!(entry["modelUrl"], format!("gemini-api://{raw_model_id}"));
+        assert_eq!(entry["maxTokens"], expected_max_tokens);
+        assert_eq!(entry["maxOutputTokens"], 128_000);
+        assert_eq!(entry["supportsThinking"], true);
+        assert_eq!(entry["thinkingLevel"], expected_level);
+        assert_eq!(entry["supportsThoughtCirculation"], false);
+        assert_eq!(entry["supportsImages"], true);
+        assert_eq!(entry["supportsVideo"], false);
+        assert_eq!(entry["supportsPdf"], false);
+        assert_eq!(
+            entry["supportedMimeTypes"],
+            json!({
+                "text/plain": true,
+                "image/png": true,
+                "image/jpeg": true,
+                "image/webp": true
+            })
+        );
+        assert_eq!(entry["quotaInfo"], json!({ "remainingFraction": 1.0 }));
+        assert!(entry.get("modelExperimentIds").is_none());
+        assert!(entry.get("modelExperiments").is_none());
+    }
+
+    // Grouped models include Codex base entries with proper display names.
+    let grouped = merged["groupedModels"].as_object().expect("groupedModels");
+    assert_eq!(
+        grouped["companion/gpt-6.2-astra"]["displayName"],
+        "GPT-6.2 Astra (Codex)"
+    );
+    assert_eq!(
+        grouped["companion/gpt-6.2-astra"]["supportedThinkingLevels"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        grouped["companion/gpt-6.1-terra"]["supportedThinkingLevels"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn merge_available_models_multi_provider_codex_only_and_slot_pressure_default_reservation() {
+    let upstream = json!({
+        "models": {},
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "displayName": "Models", "modelIds": [] }]
+        }]
+    });
+
+    // Codex-only merge injects ONLY enabled Codex models (no Gemini models).
+    let codex_only_bytes = merge_available_models_multi_provider(
+        &serde_json::to_vec(&upstream).unwrap(),
+        &[],
+        "",
+        &["gpt-6.2-astra".to_string(), "gpt-6.2-sol".to_string()],
+        "gpt-6.2-sol",
+    )
+    .expect("codex only merge");
+    let codex_only: Value = serde_json::from_slice(&codex_only_bytes).unwrap();
+    let model_keys: Vec<&String> = codex_only["models"].as_object().unwrap().keys().collect();
+    assert_eq!(model_keys.len(), 8);
+    assert!(model_keys.iter().all(|k| k.contains("gpt-6.2-")));
+
+    // Under tight slot pressure (only 8 slots free), both Gemini default and Codex default are reserved.
+    let mut busy_models = Map::new();
+    for m in 334..=357 {
+        busy_models.insert(
+            format!("occupied-{m}"),
+            json!({ "model": format!("MODEL_PLACEHOLDER_M{m}") }),
+        );
+    }
+    let tight_upstream = json!({
+        "models": busy_models,
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "displayName": "Models", "modelIds": [] }]
+        }]
+    });
+    let tight_bytes = merge_available_models_multi_provider(
+        &serde_json::to_vec(&tight_upstream).unwrap(),
+        &[
+            "gemini-4-carbon".to_string(),
+            "gemini-4-hydrogen".to_string(),
+        ],
+        "gemini-4-hydrogen",
+        &["gpt-6.2-astra".to_string(), "gpt-6.2-sol".to_string()],
+        "gpt-6.2-sol",
+    )
+    .expect("tight merge");
+    let tight: Value = serde_json::from_slice(&tight_bytes).unwrap();
+    let models = tight["models"].as_object().unwrap();
+    assert!(models.contains_key("companion/gemini-4-hydrogen-high"));
+    assert!(models.contains_key("companion/gpt-6.2-sol-high"));
+    assert!(!models.contains_key("companion/gemini-4-carbon-high"));
+    assert!(!models.contains_key("companion/gpt-6.2-astra-high"));
+}
