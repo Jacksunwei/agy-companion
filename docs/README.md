@@ -13,7 +13,7 @@ Keep design intent and architectural decisions close to the code:
 - [User Version Upgrades (TODO)](design/upgrade-lifecycle-todo.md) — Post-M1 binary + plugin upgrade design notes + day-1 version/skew seams.
 - [Testing Strategy & CUJ Verification Guide](design/testing-strategy.md) — Enduring CUJ-first Testing Trophy, Single-Owner layer matrix, strict hermetic local-config/port isolation, fast latency SLOs, anti-slop rules, UI & Rust↔TS contract testing, and UX v2 testing standards.
 - [Testing Infrastructure Improvement Plan](design/testing-infra-improvement-plan.md) — Implemented Phase 0–3 overhaul record (`PRs #47–#51` + final doc sync): `ISO-1..ISO-11` hermeticity remediations, S1–S8 red lines, `WS1–WS6` deliverables, and achieved warm SLO verification posture.
-- [Release Pipeline (GitHub Releases, npm & PyPI)](design/release-pipeline.md) — Hermetic 5-target build-once release automation, SHA-pinned GitHub Actions, SLSA Build Provenance (`actions/attest`), OIDC Trusted Publishing for npm & PyPI, and one-time setup runbook.
+- [Release Pipeline (GitHub Releases, npm & PyPI)](design/release-pipeline.md) — Hermetic 5-target build-once release automation, `X.Y.0-dev.N` vs final `X.Y.Z` SemVer lifecycle, SHA-pinned GitHub Actions, SLSA Build Provenance (`actions/attest`), OIDC Trusted Publishing for npm & PyPI, and companion release skill (`.agents/skills/release/SKILL.md`).
 
 ## Architecture Decision Records (`docs/decisions/`)
 

@@ -2,7 +2,7 @@
 
 All notable changes to **Antigravity Companion** (`agy-companion`) are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Daily development PRs bump the patch version (`X.Y.Z+1`); public releases bump the minor version (`X.Y+1.0`) and summarize changes here.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Daily development PRs bump the prerelease dev version (`X.Y.0-dev.N` via `python3 -B scripts/bump_version.py`) without publishing; public releases promote `X.Y.0-dev.N` to `X.Y.0` (via `--release`) and summarize changes here.
 
 ## [Unreleased]
 

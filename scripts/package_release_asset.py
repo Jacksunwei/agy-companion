@@ -2,10 +2,12 @@
 """Release packaging helpers for agy-companion.
 
 Subcommands:
-  package-wheel  Extract the native binary from a maturin-built wheel, smoke-test
-                 `--version`, build the deterministic GitHub Release archive
-                 (`.tar.gz` on Unix, `.zip` on Windows), and write `<archive>.sha256`.
-  checksums      Assemble and strictly validate `checksums.txt` across all 5 targets.
+  resolve-release  Resolve workspace version from Cargo.toml and enforce release
+                   trigger policy (refusing live publish on -dev.N versions).
+  package-wheel    Extract the native binary from a maturin-built wheel, smoke-test
+                   `--version`, build the deterministic GitHub Release archive
+                   (`.tar.gz` on Unix, `.zip` on Windows), and write `<archive>.sha256`.
+  checksums        Assemble and strictly validate `checksums.txt` across all 5 targets.
 """
 
 from __future__ import annotations
@@ -21,9 +23,16 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tomllib
 import zipfile
 
 sys.dont_write_bytecode = True
+
+SCRIPTS_DIR = pathlib.Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import versioning  # noqa: E402
 
 BINARY_NAME = "agy-companion"
 
@@ -35,13 +44,69 @@ SUPPORTED_TARGETS: dict[str, tuple[str, str]] = {
     "win32-x64": ("agy-companion.exe", "zip"),
 }
 
-SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 SHA256_LINE_RE = re.compile(r"^([0-9a-f]{64})  ([^\s/\\]+)$")
 
 
 def _validate_semver(version: str) -> None:
-    if not SEMVER_RE.fullmatch(version):
-        raise ValueError(f"invalid SemVer version {version!r} (expected X.Y.Z)")
+    versioning.parse_version(version)
+
+
+def resolve_release_trigger(
+    version: str,
+    *,
+    event_name: str,
+    ref_name: str,
+    full_ref: str,
+    dry_run: str = "true",
+) -> tuple[str, bool]:
+    """Validate workspace version and release trigger; fail closed on live dev publishes."""
+    parsed = versioning.parse_version(version)
+    if event_name not in ("push", "workflow_dispatch"):
+        raise ValueError(
+            f"Unsupported GitHub event {event_name!r} (expected 'push' or 'workflow_dispatch')"
+        )
+    if not isinstance(ref_name, str) or not isinstance(full_ref, str):
+        raise ValueError(
+            f"Invalid GitHub ref values (ref_name={ref_name!r}, full_ref={full_ref!r})"
+        )
+
+    expected_tag = f"v{version}"
+    expected_full_ref = f"refs/tags/{expected_tag}"
+
+    if full_ref.startswith("refs/tags/"):
+        if ref_name != expected_tag or full_ref != expected_full_ref:
+            raise ValueError(
+                f"Tag ref ({full_ref!r}, {ref_name!r}) does not match "
+                f"Cargo.toml workspace version {expected_tag!r}"
+            )
+
+    if event_name == "push":
+        if full_ref != expected_full_ref or ref_name != expected_tag:
+            raise ValueError(
+                f"Refusing push event from a non-tag ref ({full_ref!r}, {ref_name!r}); "
+                f"expected tag {expected_tag!r}"
+            )
+        publish = True
+    else:
+        if not isinstance(dry_run, str):
+            raise ValueError(f"Invalid dry_run value {dry_run!r} (expected 'true' or 'false')")
+        normalized_dry_run = dry_run.strip().lower()
+        if normalized_dry_run not in ("true", "false"):
+            raise ValueError(f"Invalid dry_run value {dry_run!r} (expected 'true' or 'false')")
+        publish = normalized_dry_run == "false"
+        if publish and (full_ref != expected_full_ref or ref_name != expected_tag):
+            raise ValueError(
+                f"Refusing live publish from a non-tag ref ({full_ref!r}). "
+                f"Push tag {expected_tag!r} or run workflow_dispatch on that tag."
+            )
+
+    if publish and parsed.is_dev:
+        raise ValueError(
+            f"Refusing live publish for dev prerelease version {version!r}; "
+            "promote to a final X.Y.Z release with 'python3 -B scripts/bump_version.py --release' before tagging."
+        )
+
+    return version, publish
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -78,7 +143,8 @@ def extract_binary_from_wheel(
                 f"refusing symlink entry {entry.filename!r} inside wheel {wheel_path.name}"
             )
         if expected_version is not None:
-            expected_entry = f"agy_companion-{expected_version}.data/scripts/{expected_exe_name}"
+            pep440_version = versioning.to_pep440(expected_version)
+            expected_entry = f"agy_companion-{pep440_version}.data/scripts/{expected_exe_name}"
             if entry.filename != expected_entry:
                 raise ValueError(
                     f"unexpected wheel binary path {entry.filename!r} in {wheel_path.name} "
@@ -276,6 +342,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Release packaging helpers for agy-companion.")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_rel = sub.add_parser(
+        "resolve-release",
+        help="Resolve workspace version from Cargo.toml and validate release trigger policy.",
+    )
+    p_rel.add_argument("--cargo-toml", type=pathlib.Path, required=True)
+    p_rel.add_argument("--event-name", required=True)
+    p_rel.add_argument("--ref-name", required=True)
+    p_rel.add_argument("--full-ref", required=True)
+    p_rel.add_argument("--dry-run", default="true")
+    p_rel.add_argument("--github-output", type=pathlib.Path, default=None)
+
     p_pkg = sub.add_parser("package-wheel", help="Extract binary from wheel and build release archive.")
     p_pkg.add_argument("--wheels-dir", type=pathlib.Path, required=True)
     p_pkg.add_argument("--target", choices=sorted(SUPPORTED_TARGETS), required=True)
@@ -294,6 +371,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.command == "resolve-release":
+        try:
+            cargo = tomllib.loads(args.cargo_toml.read_text(encoding="utf-8"))
+            version = cargo["workspace"]["package"]["version"]
+            resolved_version, publish = resolve_release_trigger(
+                version,
+                event_name=args.event_name,
+                ref_name=args.ref_name,
+                full_ref=args.full_ref,
+                dry_run=args.dry_run,
+            )
+        except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError) as exc:
+            print(f"package_release_asset.py: {exc}", file=sys.stderr)
+            return 1
+        if args.github_output is not None:
+            with args.github_output.open("a", encoding="utf-8") as out:
+                out.write(f"version={resolved_version}\n")
+                out.write(f"publish={'true' if publish else 'false'}\n")
+        print(f"Resolved version={resolved_version} publish={publish} ref={args.full_ref}")
+        return 0
     if args.command == "package-wheel":
         binary_path, archive_path, sha_path = package_wheel(
             wheels_dir=args.wheels_dir,

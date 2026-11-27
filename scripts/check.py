@@ -30,6 +30,12 @@ import tokenize
 
 sys.dont_write_bytecode = True
 
+SCRIPTS_DIR = pathlib.Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import versioning  # noqa: E402
+
 MAX_UI_BUNDLE_BYTES = 512_000
 
 FORBIDDEN_TRACKED_RE = re.compile(
@@ -581,17 +587,26 @@ class CheckRunner:
         except Exception as exc:
             return f"failed to read base version from {base_ref}:Cargo.toml: {exc}"
 
-        cur_tuple = _parse_semver_tuple(current_ver)
-        base_tuple = _parse_semver_tuple(base_ver)
-        if cur_tuple is None:
-            return f"current workspace version {current_ver!r} is not valid MAJOR.MINOR.PATCH SemVer"
-        if base_tuple is None:
-            return f"base version {base_ver!r} on {base_ref} is not valid MAJOR.MINOR.PATCH SemVer"
+        try:
+            cur_parsed = versioning.parse_version(current_ver)
+        except ValueError:
+            return (
+                f"current workspace version {current_ver!r} is not valid SemVer "
+                "(expected MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-dev.N)"
+            )
+        try:
+            base_parsed = versioning.parse_version(base_ver)
+        except ValueError:
+            return (
+                f"base version {base_ver!r} on {base_ref} is not valid SemVer "
+                "(expected MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-dev.N)"
+            )
 
-        if cur_tuple <= base_tuple:
+        if cur_parsed <= base_parsed:
             return (
                 f"PR version bump required: workspace version {current_ver} is not greater than "
-                f"{base_ref} ({base_ver}); run 'python3 -B scripts/bump_version.py' to bump the patch version"
+                f"{base_ref} ({base_ver}); run 'python3 -B scripts/bump_version.py' to bump the dev "
+                "version (or '--release' for a release-prep PR)"
             )
         return None
 
@@ -898,16 +913,6 @@ class CheckRunner:
 # ----------------------------------------------------------------------
 
 
-SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
-
-
-def _parse_semver_tuple(version: str) -> tuple[int, int, int] | None:
-    m = SEMVER_RE.match(version.strip())
-    if not m:
-        return None
-    return int(m.group(1)), int(m.group(2)), int(m.group(3))
-
-
 def _parse_toml_value(path: pathlib.Path, section: str, key: str) -> str:
     return _parse_toml_value_text(path.read_text(encoding="utf-8"), section, key, str(path))
 
@@ -984,6 +989,11 @@ def _validate_manifests_and_py_compile(root: pathlib.Path) -> tuple[str | None, 
             f"packages/npm/agy-companion/package.json={npm_ver!r}, "
             f"packages/python/pyproject.toml={py_ver!r}"
         )
+
+    try:
+        versioning.parse_version(cargo_ver)
+    except ValueError as exc:
+        errors.append(f"Cargo.toml [workspace.package].version {exc}")
 
     expected_publish = {"registry": "https://registry.npmjs.org/", "access": "public"}
     if npm_data.get("publishConfig") != expected_publish:

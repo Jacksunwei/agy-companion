@@ -58,40 +58,13 @@ jobs:
           FULL_REF: ${{ github.ref }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          python -B - <<'PY'
-          import os, pathlib, re, tomllib
-
-          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
-          version = cargo["workspace"]["package"]["version"]
-          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-              raise SystemExit(f"Invalid workspace version: {version!r}")
-
-          event = os.environ["EVENT_NAME"]
-          ref_name = os.environ["REF_NAME"]
-          full_ref = os.environ["FULL_REF"]
-          is_tag = full_ref.startswith("refs/tags/v")
-
-          if is_tag and ref_name != f"v{version}":
-              raise SystemExit(
-                  f"Tag {ref_name!r} does not match Cargo.toml workspace version 'v{version}'"
-              )
-
-          if event == "push":
-              publish = is_tag
-          else:
-              publish = os.environ.get("DRY_RUN", "true").lower() == "false"
-              if publish and not is_tag:
-                  raise SystemExit(
-                      "Refusing live publish from a non-tag ref. Push tag 'v"
-                      + version
-                      + "' or run workflow_dispatch on that tag."
-                  )
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"version={version}\n")
-              out.write(f"publish={'true' if publish else 'false'}\n")
-          print(f"Resolved version={version} publish={publish} ref={full_ref}")
-          PY
+          python -B scripts/package_release_asset.py resolve-release \
+            --cargo-toml Cargo.toml \
+            --event-name "${EVENT_NAME}" \
+            --ref-name "${REF_NAME}" \
+            --full-ref "${FULL_REF}" \
+            --dry-run "${DRY_RUN:-true}" \
+            --github-output "${GITHUB_OUTPUT}"
 
       - name: Run OS-independent repo checks and verify deterministic UI bundle
         run: python -B scripts/check.py --profile repo --verify-ui-build
@@ -385,7 +358,7 @@ jobs:
   github-release:
     name: Publish GitHub Release
     needs: [verify, package-verify]
-    if: needs.verify.outputs.publish == 'true'
+    if: needs.verify.outputs.publish == 'true' && !contains(needs.verify.outputs.version, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -456,7 +429,7 @@ jobs:
   publish-npm:
     name: Publish to npm
     needs: [verify, package-verify, github-release]
-    if: needs.verify.outputs.publish == 'true'
+    if: needs.verify.outputs.publish == 'true' && !contains(needs.verify.outputs.version, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: npm
@@ -558,7 +531,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [verify, package-verify, github-release]
-    if: needs.verify.outputs.publish == 'true'
+    if: needs.verify.outputs.publish == 'true' && !contains(needs.verify.outputs.version, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pypi
