@@ -1,3 +1,4 @@
+import { BRAND_LOGO_CHILDREN, type SvgNodeSpec } from "./brand_logo.ts";
 import type { AccountPlanStatus, CuratedModelInfo, HostPlatform } from "./types.ts";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -33,37 +34,27 @@ export function svgEl(tag: string, attrs?: Record<string, string | number>): SVG
   return node;
 }
 
+function buildSvgTree(spec: SvgNodeSpec): SVGElement {
+  const [tag, attrs, children] = spec;
+  const node = svgEl(tag, attrs);
+  if (children) {
+    for (const child of children) {
+      node.append(buildSvgTree(child));
+    }
+  }
+  return node;
+}
+
 export function createBrandMarkSvg(): SVGElement {
   const svg = svgEl("svg", {
     viewBox: "0 0 128 128",
+    fill: "none",
     "aria-hidden": "true",
     focusable: "false",
   });
-  const bg = svgEl("rect", {
-    x: 6,
-    y: 6,
-    width: 116,
-    height: 116,
-    rx: 28,
-    fill: "#1A73E8",
-  });
-  const orbit = svgEl("ellipse", {
-    cx: 64,
-    cy: 64,
-    rx: 40,
-    ry: 16,
-    transform: "rotate(-28 64 64)",
-    fill: "none",
-    stroke: "#CFE3FF",
-    "stroke-width": 4.5,
-    "stroke-opacity": 0.85,
-  });
-  const spark = svgEl("path", {
-    d: "M64 32 C64 51 77 64 96 64 C77 64 64 77 64 96 C64 77 51 64 32 64 C51 64 64 51 64 32 Z",
-    fill: "#FFFFFF",
-  });
-  const sat = svgEl("circle", { cx: 99, cy: 45, r: 6.5, fill: "#FFFFFF" });
-  svg.append(bg, orbit, spark, sat);
+  for (const child of BRAND_LOGO_CHILDREN) {
+    svg.append(buildSvgTree(child));
+  }
   return svg;
 }
 
