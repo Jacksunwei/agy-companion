@@ -475,6 +475,10 @@ mod tests {
         for ok in [
             "0.0.3",
             "0.0.4",
+            "0.1.0-dev.0",
+            "0.1.0-dev.1",
+            "0.2.0-dev.0",
+            "0.2.0-dev.1",
             "1.2.3-alpha.1",
             "1.2.3+build.42",
             "0.0.1-stale",
@@ -504,6 +508,22 @@ mod tests {
         assert_eq!(
             parse_cli_version_output("agy-companion 0.0.4-rc.1"),
             Some("0.0.4-rc.1".to_string())
+        );
+        assert_eq!(
+            parse_cli_version_output("agy-companion 0.1.0-dev.0\n"),
+            Some("0.1.0-dev.0".to_string())
+        );
+        assert_eq!(
+            parse_cli_version_output("agy-companion 0.1.0-dev.1"),
+            Some("0.1.0-dev.1".to_string())
+        );
+        assert_eq!(
+            parse_cli_version_output("agy-companion 0.2.0-dev.0\n"),
+            Some("0.2.0-dev.0".to_string())
+        );
+        assert_eq!(
+            parse_cli_version_output("agy-companion 0.2.0-dev.1"),
+            Some("0.2.0-dev.1".to_string())
         );
         assert_eq!(parse_cli_version_output("other-bin 0.0.4\n"), None);
         assert_eq!(parse_cli_version_output("agy-companion ../0.0.4\n"), None);
@@ -761,5 +781,151 @@ mod tests {
             Some(fake_bin)
         );
         assert_eq!(cache.probe_invocations, 2);
+    }
+
+    #[test]
+    fn dev_prerelease_manifest_and_desired_version_transitions() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest_path = temp.path().join("plugin.json");
+
+        for ver in ["0.1.0-dev.0", "0.1.0-dev.1", "0.2.0-dev.0", "0.2.0-dev.1"] {
+            fs::write(
+                &manifest_path,
+                format!(r#"{{"name":"agy-companion","version":"{ver}"}}"#),
+            )
+            .expect("write dev manifest");
+            assert_eq!(
+                read_plugin_manifest_version(temp.path()),
+                PluginManifestRead::Valid(ver.to_string())
+            );
+        }
+
+        // Dev-to-dev and dev-to-final desired version transitions
+        assert_eq!(
+            resolve_desired_version(
+                &PluginManifestRead::Valid("0.1.0-dev.1".to_string()),
+                true,
+                "0.1.0-dev.0",
+            ),
+            Some("0.1.0-dev.1")
+        );
+        assert_eq!(
+            resolve_desired_version(
+                &PluginManifestRead::Valid("0.2.0-dev.1".to_string()),
+                true,
+                "0.2.0-dev.0",
+            ),
+            Some("0.2.0-dev.1")
+        );
+        assert_eq!(
+            resolve_desired_version(
+                &PluginManifestRead::Valid("0.2.0".to_string()),
+                true,
+                "0.2.0-dev.1",
+            ),
+            Some("0.2.0")
+        );
+        // Fail closed once a valid manifest was observed and then becomes invalid or absent
+        assert_eq!(
+            resolve_desired_version(&PluginManifestRead::Invalid, true, "0.2.0-dev.0"),
+            None
+        );
+        assert_eq!(
+            resolve_desired_version(&PluginManifestRead::Absent, true, "0.2.0-dev.0"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_cache_tracks_dev_prerelease_transitions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let fake_bin = temp.path().join("agy-companion");
+        fs::write(&fake_bin, "#!/bin/sh\necho 'agy-companion 0.2.0-dev.0'\n").expect("write dev.0");
+        fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mut cache = BinaryVersionProbeCache::new();
+        let candidates = vec![fake_bin.clone()];
+
+        // First probe executes script (1 invocation): 0.2.0-dev.0 != 0.2.0-dev.1.
+        assert_eq!(cache.find_matching_binary(&candidates, "0.2.0-dev.1"), None);
+        assert_eq!(cache.probe_invocations, 1);
+
+        // Cache hit against final 0.2.0 and exact match 0.2.0-dev.0 (still 1 invocation).
+        assert_eq!(cache.find_matching_binary(&candidates, "0.2.0"), None);
+        assert_eq!(
+            cache.find_matching_binary(&candidates, "0.2.0-dev.0"),
+            Some(fake_bin.clone())
+        );
+        assert_eq!(cache.probe_invocations, 1);
+
+        // Rewrite with different byte length so cache invalidates even within the same 1s mtime.
+        fs::write(
+            &fake_bin,
+            "#!/bin/sh\n# upgraded to 0.2.0-dev.1\necho 'agy-companion 0.2.0-dev.1'\n",
+        )
+        .expect("write dev.1");
+        fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(
+            cache.find_matching_binary(&candidates, "0.2.0-dev.1"),
+            Some(fake_bin.clone())
+        );
+        assert_eq!(cache.probe_invocations, 2);
+        assert_eq!(
+            cache.find_matching_binary(&candidates, "0.2.0-dev.1"),
+            Some(fake_bin.clone())
+        );
+        assert_eq!(cache.probe_invocations, 2);
+
+        // Promote to final 0.2.0 (distinct byte length) -> invalidates cache and matches final.
+        fs::write(
+            &fake_bin,
+            "#!/bin/sh\n# promoted to final release 0.2.0\necho 'agy-companion 0.2.0'\n",
+        )
+        .expect("write 0.2.0");
+        fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(cache.find_matching_binary(&candidates, "0.2.0-dev.1"), None);
+        assert_eq!(
+            cache.find_matching_binary(&candidates, "0.2.0"),
+            Some(fake_bin)
+        );
+        assert_eq!(cache.probe_invocations, 3);
+
+        // Also cover 0.1.0-dev.0 -> 0.1.0-dev.1 transition on a second candidate binary.
+        let fake_bin_01 = temp.path().join("agy-companion-01");
+        fs::write(
+            &fake_bin_01,
+            "#!/bin/sh\necho 'agy-companion 0.1.0-dev.0'\n",
+        )
+        .expect("write 0.1.0-dev.0");
+        fs::set_permissions(&fake_bin_01, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let candidates_01 = vec![fake_bin_01.clone()];
+
+        assert_eq!(
+            cache.find_matching_binary(&candidates_01, "0.1.0-dev.1"),
+            None
+        );
+        assert_eq!(
+            cache.find_matching_binary(&candidates_01, "0.1.0-dev.0"),
+            Some(fake_bin_01.clone())
+        );
+        assert_eq!(cache.probe_invocations, 4);
+
+        fs::write(
+            &fake_bin_01,
+            "#!/bin/sh\n# upgraded to 0.1.0-dev.1\necho 'agy-companion 0.1.0-dev.1'\n",
+        )
+        .expect("write 0.1.0-dev.1");
+        fs::set_permissions(&fake_bin_01, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(
+            cache.find_matching_binary(&candidates_01, "0.1.0-dev.1"),
+            Some(fake_bin_01)
+        );
+        assert_eq!(cache.probe_invocations, 5);
     }
 }

@@ -1,6 +1,8 @@
 # Release Pipeline (GitHub Releases, npm & PyPI)
 
-This document describes the automated release pipeline in [`.github/workflows/release.yml`](../../.github/workflows/release.yml) and the one-time setup required on GitHub, PyPI, and npm before tagging a release.
+> **Companion Skill:** [`.agents/skills/release/SKILL.md`](../../.agents/skills/release/SKILL.md) (step-by-step release runbook, OIDC preflight, tagging, and live verification).
+
+This document describes the automated release pipeline in [`.github/workflows/release.yml`](../../.github/workflows/release.yml) and the setup required on GitHub, PyPI, and npm before tagging a release.
 
 ## Distribution Channels & Target Matrix
 
@@ -47,8 +49,8 @@ flowchart LR
     GH --> PYPI
 ```
 
-- **Dry-run verification:** Trigger `Release` via GitHub Actions `workflow_dispatch` with `dry_run: true` (the default) from `main`. This executes `verify`, all 5 `build` jobs, and `package-verify` (including real `linux-x64` npm and wheel install smoke tests) without creating a GitHub Release, public attestations, or publishing to npm/PyPI.
-- **Live release:** Push a matching SemVer tag `vX.Y.Z` (where `X.Y.Z` matches `Cargo.toml`, `plugin/plugin.json`, `packages/npm/agy-companion/package.json`, and `packages/python/pyproject.toml`). `github-release`, `publish-npm`, and `publish-pypi` are idempotent on re-run.
+- **Dry-run verification:** Trigger `Release` via GitHub Actions `workflow_dispatch` with `dry_run: true` (the default) from `main`. Dry runs support both daily dev prereleases (`X.Y.Z-dev.N`, normalized by `maturin` to PEP 440 `X.Y.Z.devN` inside wheels while binaries report raw SemVer) and final releases (`X.Y.Z`), executing `verify`, all 5 `build` jobs, and `package-verify` (including real `linux-x64` npm and wheel install smoke tests) without creating a GitHub Release, public attestations, or publishing to npm/PyPI.
+- **Live release (fail-closed on `-dev.N`):** Push a matching clean final SemVer tag `vX.Y.Z` (where `X.Y.Z` matches `Cargo.toml`, `plugin/plugin.json`, `packages/npm/agy-companion/package.json`, and `packages/python/pyproject.toml`). `scripts/package_release_asset.py resolve-release` and job-level `!contains(needs.verify.outputs.version, '-')` guards strictly refuse `publish: true` on any `-dev.N` version. `github-release`, `publish-npm`, and `publish-pypi` are idempotent on re-run.
 
 ## One-Time Setup (GitHub, PyPI & npm)
 
@@ -74,30 +76,27 @@ No `PYPI_API_TOKEN` secret is needed; PEP 740 attestations are uploaded automati
 
 ### 3. npm Organization & Trusted Publishing
 
-1. The **`@agy-companion`** npm organization already exists on npmjs.com (verified `HTTP 200` on `registry.npmjs.org/-/org/agy-companion/package`, currently 0 published packages). Confirm under **npm Settings -> Organizations** that your npm account (`jacksunwei`) owns / has publish permissions on both `agy-companion` and `@agy-companion`.
-2. **First release bootstrap (needed once for brand-new `@agy-companion/*` packages):**
-   npm Trusted Publishing (OIDC) can only be attached to packages that already exist on npm. For the first release that creates `@agy-companion/{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}`:
-   - Create a short-lived **Granular Access Token** on npmjs.com (e.g., 7-day expiration) scoped to read+write on `agy-companion` and the `@agy-companion` org (bypass 2FA for CI automation).
-   - Add it as secret `NPM_TOKEN` inside the **`npm`** GitHub Environment.
-   - Cut the first tag (`git tag -a vX.Y.Z -m "Release vX.Y.Z" && git push origin vX.Y.Z`). The workflow writes `NPM_TOKEN` to a temporary `0600` `NPM_CONFIG_USERCONFIG`, unsets `NPM_TOKEN`, and publishes all 5 `@agy-companion/*` packages and `agy-companion` with `--provenance --access public`.
-3. **Switch to tokenless OIDC Trusted Publishing & lock down tokens (after the first release):**
-   - On npmjs.com, open **Settings -> Trusted Publishers -> GitHub Actions** for all 6 packages (`agy-companion` and the 5 `@agy-companion/*` packages) and configure:
+1. All 6 npm packages (`agy-companion` and `@agy-companion/{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}`) are published under the **`@agy-companion`** organization since `v0.1.0` and use tokenless **OIDC Trusted Publishing** with **zero static `NPM_TOKEN` secret** in the `npm` GitHub Environment.
+2. **Trusted Publisher settings (all 6 packages):**
+   - On npmjs.com, under **Settings -> Trusted Publishers -> GitHub Actions** for `agy-companion` and all 5 `@agy-companion/*` packages:
      - **Organization / user:** `Jacksunwei`
      - **Repository:** `agy-companion`
      - **Workflow filename:** `release.yml`
      - **Environment name:** `npm`
-   - **48-hour activation rule:** npm expires a newly configured Trusted Publisher connection if no successful OIDC publish completes within **48 hours** of adding it. Delete `NPM_TOKEN` from the `npm` GitHub Environment, revoke the bootstrap token on npmjs.com, and cut the next patch release within 48 hours of adding the Trusted Publishers (or wait to attach them until right before cutting that release).
-   - **Post-bootstrap lockdown:** Once OIDC publishing succeeds for all 6 packages, enable **"Require two-factor authentication and disallow tokens"** under each package's **Publishing access** on npmjs.com so static tokens can never be used to publish.
+     - **`Allow npm publish`** enabled (and **"Require two-factor authentication and disallow tokens"** enabled under **Publishing access**).
+   - **48-hour activation rule:** npm expires a newly configured Trusted Publisher connection if no successful OIDC publish completes within **48 hours** of adding it. If adding or rotating a Trusted Publisher connection, configure it right before cutting the release tag.
+3. **Bootstrap note (only when adding a brand-new platform target package):**
+   npm Trusted Publishing (OIDC) can only be attached to packages that already exist on npm. If a future release adds a new `@agy-companion/<new-target>` package, temporarily add a short-lived Granular Access Token as `NPM_TOKEN` in the `npm` GitHub Environment for that single bootstrap release (the workflow writes it to a temporary `0600` `NPM_CONFIG_USERCONFIG`, unsets `NPM_TOKEN`, and publishes with `--provenance --access public`), then immediately attach the OIDC Trusted Publisher, delete `NPM_TOKEN`, and revoke the token.
 
 ## Cutting a Release
 
-Daily development PRs bump the **patch** version (`python3 -B scripts/bump_version.py`) without triggering a release. When ready to cut a public release:
+Daily development PRs advance the prerelease dev version (`X.Y.0-dev.N` via `python3 -B scripts/bump_version.py`) without triggering a live release. When ready to cut a public release (see [`.agents/skills/release/SKILL.md`](../../.agents/skills/release/SKILL.md) for the full preflight and post-release live verification runbook):
 
-1. Open a release-prep PR bumping the **minor** version and updating [`CHANGELOG.md`](../../CHANGELOG.md):
+1. Open a release-prep PR promoting `X.Y.Z-dev.N` to final `X.Y.Z` and curating [`CHANGELOG.md`](../../CHANGELOG.md):
    ```bash
-   git checkout -b chore/release-vX.Y.0
-   python3 -B scripts/bump_version.py --part minor
-   # Move [Unreleased] highlights in CHANGELOG.md under [X.Y.0] - YYYY-MM-DD
+   git checkout -b chore/release-vX.Y.Z
+   python3 -B scripts/bump_version.py --release
+   # Move [Unreleased] highlights in CHANGELOG.md under [X.Y.Z] - YYYY-MM-DD and update compare links
    ./scripts/agent_check.sh
    ```
    Merge the PR to `main` once CI is green.
@@ -105,7 +104,9 @@ Daily development PRs bump the **patch** version (`python3 -B scripts/bump_versi
 2. Tag `main` and push the tag to trigger `.github/workflows/release.yml`:
    ```bash
    git checkout main && git pull --ff-only
-   ver="$(python3 -B -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'])")"
+   ver="$(python3 -B -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['workspace']['package']['version'])")"
    git tag -a "v${ver}" -m "Release v${ver}"
    git push origin "v${ver}"
    ```
+
+3. On the next development PR after tagging `vX.Y.Z`, running `python3 -B scripts/bump_version.py` automatically begins the next `X.(Y+1).0-dev.0` dev cycle.

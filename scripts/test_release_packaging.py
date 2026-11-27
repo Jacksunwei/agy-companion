@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import pathlib
 import shlex
@@ -21,6 +23,7 @@ REPO_ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import package_release_asset as pra  # noqa: E402
+import versioning  # noqa: E402
 
 
 def _make_fake_wheel(
@@ -29,12 +32,15 @@ def _make_fake_wheel(
     version: str,
     exe_name: str,
     payload: bytes,
+    *,
+    raw_entry_version: str | None = None,
 ) -> pathlib.Path:
     wheels_dir.mkdir(parents=True, exist_ok=True)
     wheel_path = wheels_dir / wheel_name
+    entry_ver = raw_entry_version if raw_entry_version is not None else versioning.to_pep440(version)
     with zipfile.ZipFile(wheel_path, "w") as zf:
         zf.writestr("agy_companion/__init__.py", "__all__ = []\n")
-        zf.writestr(f"agy_companion-{version}.data/scripts/{exe_name}", payload)
+        zf.writestr(f"agy_companion-{entry_ver}.data/scripts/{exe_name}", payload)
     return wheel_path
 
 
@@ -509,6 +515,339 @@ class PackageReleaseAssetTests(unittest.TestCase):
             )
             self.assertEqual(rc, 0)
             self.assertEqual(len(out_file.read_text(encoding="utf-8").splitlines()), 5)
+
+    def test_package_dev_prerelease_wheel_pep440_and_checksums(self) -> None:
+        version = "0.2.0-dev.0"
+        pep440 = "0.2.0.dev0"
+        payload = f"#!/bin/sh\necho 'agy-companion {version}'\n".encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            release_dir = root / "release"
+            bin_dir = root / "bin"
+
+            # Raw non-PEP440 .data/scripts/ path must be rejected fail-closed.
+            bad_wdir = root / "wheels-bad"
+            _make_fake_wheel(
+                bad_wdir,
+                f"agy_companion-{pep440}-py3-none-linux_x86_64.whl",
+                version,
+                "agy-companion",
+                payload,
+                raw_entry_version=version,
+            )
+            with self.assertRaisesRegex(
+                ValueError, f"agy_companion-{pep440}\\.data/scripts/agy-companion"
+            ):
+                pra.package_wheel(
+                    wheels_dir=bad_wdir,
+                    target="linux-x64",
+                    version=version,
+                    bin_out_dir=bin_dir,
+                    release_out_dir=release_dir,
+                    skip_smoke_test=True,
+                )
+
+            # Package all 5 targets using PEP 440 wheel paths and raw SemVer --version output.
+            linux_archive: pathlib.Path | None = None
+            for target, (exe_name, _ext) in pra.SUPPORTED_TARGETS.items():
+                wdir = root / f"wheels-{target}"
+                _make_fake_wheel(
+                    wdir,
+                    f"agy_companion-{pep440}-py3-none-{target.replace('-', '_')}.whl",
+                    version,
+                    exe_name,
+                    payload if target == "linux-x64" else f"fake-{target}".encode("utf-8"),
+                )
+                _, archive_path, _ = pra.package_wheel(
+                    wheels_dir=wdir,
+                    target=target,
+                    version=version,
+                    bin_out_dir=bin_dir,
+                    release_out_dir=release_dir,
+                    skip_smoke_test=(target != "linux-x64" or os.name == "nt"),
+                )
+                if target == "linux-x64":
+                    linux_archive = archive_path
+
+            self.assertIsNotNone(linux_archive)
+            assert linux_archive is not None
+            self.assertEqual(linux_archive.name, f"agy-companion-v{version}-linux-x64.tar.gz")
+
+            checksums_file = release_dir / "checksums.txt"
+            pra.assemble_checksums(release_dir=release_dir, version=version, out_file=checksums_file)
+            lines = checksums_file.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 5)
+            for line in lines:
+                self.assertIn(f"agy-companion-v{version}-", line)
+
+            if os.name != "nt":
+                extract_dir = root / "extract-dev"
+                launcher = REPO_ROOT / "plugin" / "scripts" / "run-companion.sh"
+                script = (
+                    f"source {shlex.quote(str(launcher))}\n"
+                    f"verify_sha256 {shlex.quote(str(linux_archive))} "
+                    f"{shlex.quote(str(checksums_file))} {shlex.quote(linux_archive.name)}\n"
+                    f"extracted=$(extract_verified_binary {shlex.quote(str(linux_archive))} "
+                    f"{shlex.quote(str(extract_dir))})\n"
+                    f'test -f "$extracted"\n'
+                )
+                proc = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+    def test_resolve_release_trigger_policy(self) -> None:
+        # Allowed dry-runs on dev and final versions
+        self.assertEqual(
+            pra.resolve_release_trigger(
+                "0.2.0-dev.0",
+                event_name="workflow_dispatch",
+                ref_name="main",
+                full_ref="refs/heads/main",
+                dry_run="true",
+            ),
+            ("0.2.0-dev.0", False),
+        )
+        self.assertEqual(
+            pra.resolve_release_trigger(
+                "0.2.0",
+                event_name="workflow_dispatch",
+                ref_name="main",
+                full_ref="refs/heads/main",
+                dry_run="true",
+            ),
+            ("0.2.0", False),
+        )
+        self.assertEqual(
+            pra.resolve_release_trigger(
+                "0.2.0-dev.0",
+                event_name="workflow_dispatch",
+                ref_name="v0.2.0-dev.0",
+                full_ref="refs/tags/v0.2.0-dev.0",
+                dry_run="true",
+            ),
+            ("0.2.0-dev.0", False),
+        )
+
+        # Allowed live publish on clean final X.Y.Z tag
+        self.assertEqual(
+            pra.resolve_release_trigger(
+                "0.2.0",
+                event_name="push",
+                ref_name="v0.2.0",
+                full_ref="refs/tags/v0.2.0",
+                dry_run="",
+            ),
+            ("0.2.0", True),
+        )
+        self.assertEqual(
+            pra.resolve_release_trigger(
+                "0.2.0",
+                event_name="workflow_dispatch",
+                ref_name="v0.2.0",
+                full_ref="refs/tags/v0.2.0",
+                dry_run="false",
+            ),
+            ("0.2.0", True),
+        )
+
+        # Fail closed: live publish on -dev.N (tag push OR workflow_dispatch dry_run=false)
+        with self.assertRaisesRegex(ValueError, "Refusing live publish for dev prerelease"):
+            pra.resolve_release_trigger(
+                "0.2.0-dev.0",
+                event_name="push",
+                ref_name="v0.2.0-dev.0",
+                full_ref="refs/tags/v0.2.0-dev.0",
+                dry_run="",
+            )
+        with self.assertRaisesRegex(ValueError, "Refusing live publish for dev prerelease"):
+            pra.resolve_release_trigger(
+                "0.2.0-dev.0",
+                event_name="workflow_dispatch",
+                ref_name="v0.2.0-dev.0",
+                full_ref="refs/tags/v0.2.0-dev.0",
+                dry_run="false",
+            )
+
+        # Fail closed: live publish from non-tag ref
+        for ver in ("0.2.0", "0.2.0-dev.0"):
+            with self.assertRaisesRegex(ValueError, "non-tag ref"):
+                pra.resolve_release_trigger(
+                    ver,
+                    event_name="workflow_dispatch",
+                    ref_name="main",
+                    full_ref="refs/heads/main",
+                    dry_run="false",
+                )
+
+        # Fail closed: tag mismatch and invalid SemVer
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            pra.resolve_release_trigger(
+                "0.2.0",
+                event_name="push",
+                ref_name="v0.2.1",
+                full_ref="refs/tags/v0.2.1",
+            )
+        with self.assertRaisesRegex(ValueError, "invalid SemVer"):
+            pra.resolve_release_trigger(
+                "0.2.0-rc.1",
+                event_name="workflow_dispatch",
+                ref_name="main",
+                full_ref="refs/heads/main",
+                dry_run="true",
+            )
+        with self.assertRaisesRegex(ValueError, "invalid SemVer"):
+            pra.resolve_release_trigger(
+                "1\u0660.0.0",
+                event_name="push",
+                ref_name="v1\u0660.0.0",
+                full_ref="refs/tags/v1\u0660.0.0",
+            )
+
+        # Fail closed: unknown event_name
+        for bad_event_kw in (
+            dict(event_name="pull_request", ref_name="v0.2.0", full_ref="refs/tags/v0.2.0", dry_run="false"),
+            dict(event_name="pull_request", ref_name="main", full_ref="refs/heads/main", dry_run="true"),
+            dict(event_name="schedule", ref_name="main", full_ref="refs/heads/main", dry_run="true"),
+            dict(event_name="", ref_name="main", full_ref="refs/heads/main", dry_run="true"),
+        ):
+            with self.subTest(bad_event=bad_event_kw):
+                with self.assertRaisesRegex(ValueError, "Unsupported GitHub event"):
+                    pra.resolve_release_trigger("0.2.0", **bad_event_kw)
+
+        # Fail closed: mismatched full_ref vs ref_name and non-v tags
+        for mismatch_kw in (
+            dict(event_name="push", ref_name="v0.2.0", full_ref="refs/tags/v9.9.9"),
+            dict(event_name="workflow_dispatch", ref_name="v0.2.0", full_ref="refs/tags/v9.9.9", dry_run="true"),
+            dict(event_name="workflow_dispatch", ref_name="v0.2.0", full_ref="refs/tags/v9.9.9", dry_run="false"),
+            dict(event_name="push", ref_name="0.2.0", full_ref="refs/tags/0.2.0"),
+            dict(event_name="workflow_dispatch", ref_name="0.2.0", full_ref="refs/tags/0.2.0", dry_run="true"),
+        ):
+            with self.subTest(mismatch=mismatch_kw):
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    pra.resolve_release_trigger("0.2.0", **mismatch_kw)
+
+        # Fail closed: push on branch ref
+        with self.assertRaisesRegex(ValueError, "non-tag ref"):
+            pra.resolve_release_trigger(
+                "0.2.0",
+                event_name="push",
+                ref_name="main",
+                full_ref="refs/heads/main",
+            )
+
+        # Fail closed: non-str ref_name or full_ref
+        with self.assertRaises(ValueError):
+            pra.resolve_release_trigger(
+                "0.2.0",
+                event_name="workflow_dispatch",
+                ref_name=None,  # type: ignore[arg-type]
+                full_ref="refs/heads/main",
+                dry_run="true",
+            )
+        with self.assertRaises(ValueError):
+            pra.resolve_release_trigger(
+                "0.2.0",
+                event_name="workflow_dispatch",
+                ref_name="main",
+                full_ref=None,  # type: ignore[arg-type]
+                dry_run="true",
+            )
+
+        # Fail closed: invalid dry_run values on workflow_dispatch
+        for bad_dry_run in ("maybe", "", None):
+            with self.subTest(dry_run=bad_dry_run):
+                with self.assertRaisesRegex(ValueError, "Invalid dry_run"):
+                    pra.resolve_release_trigger(
+                        "0.2.0",
+                        event_name="workflow_dispatch",
+                        ref_name="main",
+                        full_ref="refs/heads/main",
+                        dry_run=bad_dry_run,  # type: ignore[arg-type]
+                    )
+
+    def test_cli_resolve_release_writes_github_output_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            cargo_toml = root / "Cargo.toml"
+            gh_out = root / "github_output.txt"
+            cargo_toml.write_text(
+                '[workspace.package]\nversion = "0.2.0-dev.0"\n',
+                encoding="utf-8",
+            )
+
+            rc = pra.main(
+                [
+                    "resolve-release",
+                    "--cargo-toml",
+                    str(cargo_toml),
+                    "--event-name",
+                    "workflow_dispatch",
+                    "--ref-name",
+                    "main",
+                    "--full-ref",
+                    "refs/heads/main",
+                    "--dry-run",
+                    "true",
+                    "--github-output",
+                    str(gh_out),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                gh_out.read_text(encoding="utf-8"),
+                "version=0.2.0-dev.0\npublish=false\n",
+            )
+
+            # Live publish on -dev.0 tag exits non-zero
+            rc_fail = pra.main(
+                [
+                    "resolve-release",
+                    "--cargo-toml",
+                    str(cargo_toml),
+                    "--event-name",
+                    "push",
+                    "--ref-name",
+                    "v0.2.0-dev.0",
+                    "--full-ref",
+                    "refs/tags/v0.2.0-dev.0",
+                ]
+            )
+            self.assertEqual(rc_fail, 1)
+
+            # Malformed [workspace] TOML (TypeError) and broken TOML syntax exit 1 cleanly without traceback
+            for label, bad_toml in (
+                ("non-table workspace", 'workspace = "bad"\n'),
+                ("invalid toml syntax", "[workspace\n"),
+            ):
+                with self.subTest(case=label):
+                    bad_cargo = root / f"Cargo-{label.replace(' ', '_')}.toml"
+                    bad_cargo.write_text(bad_toml, encoding="utf-8")
+                    stderr_buf = io.StringIO()
+                    with contextlib.redirect_stderr(stderr_buf):
+                        rc_bad = pra.main(
+                            [
+                                "resolve-release",
+                                "--cargo-toml",
+                                str(bad_cargo),
+                                "--event-name",
+                                "workflow_dispatch",
+                                "--ref-name",
+                                "main",
+                                "--full-ref",
+                                "refs/heads/main",
+                                "--dry-run",
+                                "true",
+                            ]
+                        )
+                    self.assertEqual(rc_bad, 1)
+                    err_text = stderr_buf.getvalue()
+                    self.assertIn("package_release_asset.py:", err_text)
+                    self.assertNotIn("Traceback", err_text)
 
 
 if __name__ == "__main__":

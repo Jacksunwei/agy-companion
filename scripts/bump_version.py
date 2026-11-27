@@ -9,10 +9,12 @@ Updates:
   - packages/python/pyproject.toml ([project].version)
 
 Usage:
-  python3 -B scripts/bump_version.py                 # bump patch (default)
-  python3 -B scripts/bump_version.py --part minor    # bump minor
-  python3 -B scripts/bump_version.py --part major    # bump major
-  python3 -B scripts/bump_version.py --set 0.1.0     # set explicit SemVer
+  python3 -B scripts/bump_version.py                     # daily dev bump (X.Y.Z -> X.(Y+1).0-dev.0; X.Y.Z-dev.N -> X.Y.Z-dev.(N+1))
+  python3 -B scripts/bump_version.py --release           # promote X.Y.Z-dev.N -> X.Y.Z (fails if already final)
+  python3 -B scripts/bump_version.py --part patch        # bump explicit final patch version
+  python3 -B scripts/bump_version.py --part minor        # bump explicit final minor version
+  python3 -B scripts/bump_version.py --part major        # bump explicit final major version
+  python3 -B scripts/bump_version.py --set 0.2.0-dev.0   # set explicit SemVer (X.Y.Z or X.Y.Z-dev.N)
 """
 
 from __future__ import annotations
@@ -25,7 +27,11 @@ import sys
 
 sys.dont_write_bytecode = True
 
-SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+SCRIPTS_DIR = pathlib.Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import versioning  # noqa: E402
 
 WORKSPACE_CRATES = frozenset(
     {
@@ -38,23 +44,42 @@ WORKSPACE_CRATES = frozenset(
 )
 
 
-def parse_semver(version: str) -> tuple[int, int, int]:
-    match = SEMVER_RE.match(version.strip())
-    if not match:
-        raise ValueError(f"invalid SemVer version {version!r} (expected MAJOR.MINOR.PATCH)")
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+def compute_next_version(
+    current: str,
+    *,
+    part: str | None = None,
+    release: bool = False,
+    explicit: str | None = None,
+) -> str:
+    selected_modes = sum(bool(flag) for flag in (part is not None, release, explicit is not None))
+    if selected_modes > 1:
+        raise ValueError("options 'part', 'release', and 'explicit' are mutually exclusive")
 
+    cur = versioning.parse_version(current)
 
-def compute_next_version(current: str, *, part: str | None = None, explicit: str | None = None) -> str:
-    major, minor, patch = parse_semver(current)
     if explicit is not None:
-        parse_semver(explicit)
-        return explicit.strip()
-    if part == "major":
-        return f"{major + 1}.0.0"
-    if part == "minor":
-        return f"{major}.{minor + 1}.0"
-    return f"{major}.{minor}.{patch + 1}"
+        return str(versioning.parse_version(explicit))
+
+    if release:
+        if cur.is_final:
+            raise ValueError(
+                f"cannot promote {current!r} with --release: version is already a final release"
+            )
+        return f"{cur.major}.{cur.minor}.{cur.patch}"
+
+    if part is not None:
+        if part == "major":
+            return f"{cur.major + 1}.0.0"
+        if part == "minor":
+            return f"{cur.major}.{cur.minor + 1}.0"
+        if part == "patch":
+            return f"{cur.major}.{cur.minor}.{cur.patch + 1}"
+        raise ValueError(f"unsupported bump part {part!r} (expected 'patch', 'minor', or 'major')")
+
+    if cur.is_dev:
+        assert cur.dev is not None
+        return f"{cur.major}.{cur.minor}.{cur.patch}-dev.{cur.dev + 1}"
+    return f"{cur.major}.{cur.minor + 1}.0-dev.0"
 
 
 def _read_toml_section_version(text: str, section: str) -> str:
@@ -140,7 +165,8 @@ def _update_cargo_lock(text: str, new_version: str) -> tuple[str, int]:
 def bump_repo_version(
     repo_root: pathlib.Path,
     *,
-    part: str = "patch",
+    part: str | None = None,
+    release: bool = False,
     explicit: str | None = None,
 ) -> tuple[str, str, list[str]]:
     cargo_toml = repo_root / "Cargo.toml"
@@ -151,7 +177,7 @@ def bump_repo_version(
 
     cargo_text = cargo_toml.read_text(encoding="utf-8")
     current_ver = _read_toml_section_version(cargo_text, "workspace.package")
-    new_ver = compute_next_version(current_ver, part=part, explicit=explicit)
+    new_ver = compute_next_version(current_ver, part=part, release=release, explicit=explicit)
 
     updated_files: list[str] = []
 
@@ -204,16 +230,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
+        "--release",
+        action="store_true",
+        default=False,
+        help="Promote current X.Y.Z-dev.N prerelease to final X.Y.Z release.",
+    )
+    group.add_argument(
         "--part",
         choices=("patch", "minor", "major"),
-        default="patch",
-        help="SemVer component to bump (default: patch).",
+        default=None,
+        help="Bump an explicit final SemVer component.",
     )
     group.add_argument(
         "--set",
         dest="explicit",
-        metavar="X.Y.Z",
-        help="Set an explicit MAJOR.MINOR.PATCH version.",
+        metavar="VERSION",
+        help="Set an explicit MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-dev.N version.",
     )
     parser.add_argument(
         "--repo-root",
@@ -226,11 +258,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    old_ver, new_ver, updated = bump_repo_version(
-        args.repo_root.resolve(),
-        part=args.part,
-        explicit=args.explicit,
-    )
+    try:
+        old_ver, new_ver, updated = bump_repo_version(
+            args.repo_root.resolve(),
+            part=args.part,
+            release=args.release,
+            explicit=args.explicit,
+        )
+    except ValueError as exc:
+        print(f"bump_version.py: {exc}", file=sys.stderr)
+        return 1
     print(f"Bumped version: {old_ver} -> {new_ver} ({', '.join(updated)})")
     return 0
 
