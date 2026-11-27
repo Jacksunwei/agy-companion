@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 import {
   CATALOG_POLL_INTERVAL_MS,
   CODEX_PENDING_POLL_MS,
+  FEEDBACK_AUTO_DISMISS_MS,
   HEALTHY_POLL_MS,
   UNHEALTHY_BACKOFF_MS,
   chooseInitialTab,
+  createAutoDismissTimer,
   createCatalogRefreshReminder,
   formatCatalogRefreshWaitHint,
   needsSettingsAttention,
@@ -80,6 +82,44 @@ function listFilesRecursive(dir: string): string[] {
 }
 
 describe("ui/src/state.ts pure state helpers", () => {
+  it("createAutoDismissTimer schedules dismissal, cancels stale timers on reschedule, and respects cancel()", () => {
+    assert.ok(FEEDBACK_AUTO_DISMISS_MS > 0 && FEEDBACK_AUTO_DISMISS_MS <= 10_000);
+    let nextId = 1;
+    const pending = new Map<number, { cb: () => void; ms: number }>();
+    const cleared: number[] = [];
+    const timer = createAutoDismissTimer(
+      (cb, ms) => {
+        const id = nextId++;
+        pending.set(id, { cb, ms });
+        return id;
+      },
+      (id) => {
+        cleared.push(id);
+        pending.delete(id);
+      },
+    );
+
+    const events: string[] = [];
+    timer.schedule(FEEDBACK_AUTO_DISMISS_MS, () => events.push("first"));
+    assert.equal(pending.size, 1);
+    assert.equal(pending.get(1)?.ms, FEEDBACK_AUTO_DISMISS_MS);
+
+    // Rescheduling cancels the first timer
+    timer.schedule(FEEDBACK_AUTO_DISMISS_MS, () => events.push("second"));
+    assert.deepEqual(cleared, [1]);
+    assert.equal(pending.size, 1);
+    pending.get(2)!.cb();
+    assert.deepEqual(events, ["second"]);
+
+    // Explicit cancel prevents firing
+    timer.schedule(FEEDBACK_AUTO_DISMISS_MS, () => events.push("third"));
+    const thirdCb = pending.get(3)!.cb;
+    timer.cancel();
+    assert.deepEqual(cleared, [1, 3]);
+    thirdCb(); // even if invoked late, epoch guard ignores it
+    assert.deepEqual(events, ["second"]);
+  });
+
   it("chooseInitialTab lands on monitor when hybrid_active or api_key_configured, else settings", () => {
     const day0 = loadSnapshot("settings_snapshot_day0_offline.json");
     assert.equal(chooseInitialTab(day0), "settings");
