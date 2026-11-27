@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use bytes::Bytes;
+use ring::digest::{Context as DigestContext, SHA256};
 use serde_json::{Map, Value, json};
 
 use crate::ProviderError;
 
 pub const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are a helpful coding assistant.";
 pub const MAX_CODEX_CALL_ID_LEN: usize = 64;
+pub const MAX_CODEX_CACHE_KEY_LEN: usize = 64;
 
 /// Maximum per-line / per-event byte buffer in [`CodexSseTranslator`] (S4/S7 OOM guard).
 pub const DEFAULT_MAX_CODEX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
@@ -36,10 +38,29 @@ const ALLOWED_STRING_FORMATS: &[&str] = &[
 ];
 
 /// Translates an inbound Gemini GenerateContent JSON payload directly into an OpenAI Codex
-/// Responses API JSON payload (`store: false`, `stream: true`).
+/// Responses API JSON payload (`store: false`, `stream: true`) with a deterministic fallback
+/// `prompt_cache_key`.
 pub fn translate_gemini_to_codex_request(
     model: &str,
     gemini_body: &[u8],
+) -> Result<Value, ProviderError> {
+    translate_gemini_to_codex_request_with_cache_key(model, gemini_body, None)
+}
+
+/// Translates an inbound Gemini GenerateContent JSON payload directly into an OpenAI Codex
+/// Responses API JSON payload (`store: false`, `stream: true`) with prompt-cache optimization:
+/// - Keeps top-level `instructions` as the short constant [`DEFAULT_CODEX_INSTRUCTIONS`] and
+///   prepends non-empty Gemini `systemInstruction` as `input[0]` (`role: "developer"`), because
+///   `chatgpt.com/backend-api/codex/responses` places implicit prompt-cache breakpoints after
+///   initial `developer` messages in `input[]` and does not cache top-level `instructions`.
+/// - Sets `prompt_cache_key` from the validated `explicit_cache_key` (Antigravity conversation ID),
+///   falling back to a deterministic SHA-256 prefix hash (`agyc-<32 hex>`) over
+///   `(model, developer_instructions, first_content_item)` so multi-turn callers without a
+///   conversation ID still route to the same KV-cache shard.
+pub fn translate_gemini_to_codex_request_with_cache_key(
+    model: &str,
+    gemini_body: &[u8],
+    explicit_cache_key: Option<&str>,
 ) -> Result<Value, ProviderError> {
     let parsed: Value = serde_json::from_slice(gemini_body).map_err(|_| {
         ProviderError::InvalidRequest("request body must be valid JSON".to_string())
@@ -48,12 +69,39 @@ pub fn translate_gemini_to_codex_request(
         ProviderError::InvalidRequest("request body must be a JSON object".to_string())
     })?;
 
-    let instructions = extract_instructions(root);
-    let input = translate_contents(root)?;
+    let developer_instructions = extract_developer_instructions(root);
+    let content_items = translate_contents(root)?;
+    let prompt_cache_key = explicit_cache_key
+        .and_then(sanitize_codex_cache_key)
+        .unwrap_or_else(|| {
+            derive_fallback_cache_key(
+                model,
+                developer_instructions.as_deref(),
+                content_items.first(),
+            )
+        });
+
+    let mut input =
+        Vec::with_capacity(content_items.len() + usize::from(developer_instructions.is_some()));
+    if let Some(dev_text) = developer_instructions {
+        input.push(json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{ "type": "input_text", "text": dev_text }]
+        }));
+    }
+    input.extend(content_items);
 
     let mut out = Map::new();
     out.insert("model".to_string(), Value::String(model.to_string()));
-    out.insert("instructions".to_string(), Value::String(instructions));
+    out.insert(
+        "instructions".to_string(),
+        Value::String(DEFAULT_CODEX_INSTRUCTIONS.to_string()),
+    );
+    out.insert(
+        "prompt_cache_key".to_string(),
+        Value::String(prompt_cache_key),
+    );
     out.insert("input".to_string(), Value::Array(input));
     out.insert("store".to_string(), Value::Bool(false));
     out.insert("stream".to_string(), Value::Bool(true));
@@ -80,13 +128,51 @@ pub fn translate_gemini_to_codex_request(
     Ok(Value::Object(out))
 }
 
-fn extract_instructions(root: &Map<String, Value>) -> String {
-    let Some(sys) = root
+fn sanitize_codex_cache_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_CODEX_CACHE_KEY_LEN {
+        return None;
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn derive_fallback_cache_key(
+    model: &str,
+    developer_instructions: Option<&str>,
+    first_content: Option<&Value>,
+) -> String {
+    let mut ctx = DigestContext::new(&SHA256);
+    ctx.update(model.as_bytes());
+    ctx.update(&[0]);
+    if let Some(dev) = developer_instructions {
+        ctx.update(dev.as_bytes());
+    }
+    ctx.update(&[0]);
+    if let Some(first) = first_content
+        && let Ok(bytes) = serde_json::to_vec(first)
+    {
+        ctx.update(&bytes);
+    }
+    let digest = ctx.finish();
+    let mut out = String::with_capacity(5 + 32);
+    out.push_str("agyc-");
+    for byte in &digest.as_ref()[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn extract_developer_instructions(root: &Map<String, Value>) -> Option<String> {
+    let sys = root
         .get("systemInstruction")
-        .or_else(|| root.get("system_instruction"))
-    else {
-        return DEFAULT_CODEX_INSTRUCTIONS.to_string();
-    };
+        .or_else(|| root.get("system_instruction"))?;
 
     let joined = match sys {
         Value::String(text) => text.clone(),
@@ -110,9 +196,9 @@ fn extract_instructions(root: &Map<String, Value>) -> String {
     };
 
     if joined.trim().is_empty() {
-        DEFAULT_CODEX_INSTRUCTIONS.to_string()
+        None
     } else {
-        joined
+        Some(joined)
     }
 }
 
@@ -1697,7 +1783,8 @@ mod tests {
                 .expect("blank sys fallback");
         assert_eq!(out_blank["instructions"], DEFAULT_CODEX_INSTRUCTIONS);
 
-        // Multi-part systemInstruction joins with \n\n.
+        // Multi-part systemInstruction joins with \n\n and is emitted as input[0] role="developer"
+        // while keeping top-level `instructions` constant so Codex backend prefix caching hits.
         let multi_sys = json!({
             "systemInstruction": {
                 "parts": [
@@ -1710,7 +1797,91 @@ mod tests {
         let out_multi =
             translate_gemini_to_codex_request("gpt-6.2-astra", multi_sys.to_string().as_bytes())
                 .expect("multi sys");
-        assert_eq!(out_multi["instructions"], "Rule one.\n\nRule two.");
+        assert_eq!(out_multi["instructions"], DEFAULT_CODEX_INSTRUCTIONS);
+        assert_eq!(
+            out_multi["input"][0],
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "Rule one.\n\nRule two." }]
+            })
+        );
+        assert_eq!(out_multi["input"][1]["role"], "user");
+        assert_eq!(out_blank["input"].as_array().unwrap().len(), 1);
+        assert_eq!(out_blank["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn emits_prompt_cache_key_from_conversation_id_or_stable_prefix_hash() {
+        let turn1 = json!({
+            "systemInstruction": { "parts": [{ "text": "You follow strict workspace rules." }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "Fix the bug" }] }]
+        });
+        let turn2 = json!({
+            "systemInstruction": { "parts": [{ "text": "You follow strict workspace rules." }] },
+            "contents": [
+                { "role": "user", "parts": [{ "text": "Fix the bug" }] },
+                { "role": "model", "parts": [{ "text": "Looking at it." }] },
+                { "role": "user", "parts": [{ "text": "Now add tests." }] }
+            ]
+        });
+        let other_conv = json!({
+            "systemInstruction": { "parts": [{ "text": "You follow strict workspace rules." }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "Different task" }] }]
+        });
+
+        // Explicit valid conversation ID is preserved verbatim.
+        let out_explicit = translate_gemini_to_codex_request_with_cache_key(
+            "gpt-6.2-sol",
+            turn1.to_string().as_bytes(),
+            Some("ecfc4539-0691-4383-9bed-d13c75277276"),
+        )
+        .expect("explicit key");
+        assert_eq!(
+            out_explicit["prompt_cache_key"],
+            "ecfc4539-0691-4383-9bed-d13c75277276"
+        );
+
+        // Missing conversation ID derives a deterministic fallback key identical across Turn 1 & Turn 2,
+        // and distinct for a different conversation.
+        let out_t1 = translate_gemini_to_codex_request_with_cache_key(
+            "gpt-6.2-sol",
+            turn1.to_string().as_bytes(),
+            None,
+        )
+        .expect("turn1 fallback");
+        let out_t2 = translate_gemini_to_codex_request_with_cache_key(
+            "gpt-6.2-sol",
+            turn2.to_string().as_bytes(),
+            None,
+        )
+        .expect("turn2 fallback");
+        let out_other = translate_gemini_to_codex_request_with_cache_key(
+            "gpt-6.2-sol",
+            other_conv.to_string().as_bytes(),
+            None,
+        )
+        .expect("other conv fallback");
+
+        let k1 = out_t1["prompt_cache_key"].as_str().expect("fallback str");
+        let k2 = out_t2["prompt_cache_key"].as_str().expect("fallback str");
+        let k_other = out_other["prompt_cache_key"].as_str().expect("other str");
+        assert!(k1.starts_with("agyc-"), "expected agyc- prefix, got {k1}");
+        assert_eq!(k1.len(), 37);
+        assert_eq!(k1, k2, "Turn 1 and Turn 2 must share fallback cache key");
+        assert_ne!(
+            k1, k_other,
+            "Different conversations must get distinct fallback keys"
+        );
+
+        // Unsafe explicit conversation ID falls back cleanly to derived key instead of injecting raw chars.
+        let out_unsafe = translate_gemini_to_codex_request_with_cache_key(
+            "gpt-6.2-sol",
+            turn1.to_string().as_bytes(),
+            Some("bad\r\nheader-injection"),
+        )
+        .expect("unsafe id fallback");
+        assert_eq!(out_unsafe["prompt_cache_key"], k1);
     }
 
     #[test]

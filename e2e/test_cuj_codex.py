@@ -297,6 +297,18 @@ class TestCujCodex(E2ETestCase):
         self.assertIn("Hello from Codex!", stream_resp.text)
         self.assertIn("usageMetadata", stream_resp.text)
 
+        # Verify outbound Codex request carries prompt_cache_key + session_id + developer SI placement.
+        codex_reqs = [r for r in mock.requests if r.path.startswith("/responses")]
+        self.assertGreaterEqual(len(codex_reqs), 2, f"Expected health check + stream /responses requests, got {len(codex_reqs)}")
+        stream_codex_req = codex_reqs[-1]
+        self.assertEqual(stream_codex_req.header("session_id"), conv_id)
+        stream_codex_json = json.loads(stream_codex_req.body.decode("utf-8"))
+        self.assertEqual(stream_codex_json["prompt_cache_key"], conv_id)
+        self.assertEqual(stream_codex_json["instructions"], "You are a helpful coding assistant.")
+        self.assertEqual(stream_codex_json["input"][0]["role"], "developer")
+        self.assertIn("Be concise.", stream_codex_json["input"][0]["content"][0]["text"])
+        self.assertEqual(stream_codex_json["input"][1]["role"], "user")
+
         # Verify SQLite usage & per-session /api/stats & Sidecar /_api/get_usage record provider="openai-codex".
         _files, events = poll_usage_events(env.usage_dir, min_count=1, timeout=5.0, interval=0.02)
         codex_events = [e for e in events if e["provider"] == "openai-codex"]

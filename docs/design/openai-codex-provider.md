@@ -265,6 +265,7 @@ flowchart LR
   - `OpenAI-Beta: responses=experimental` *(verify live header acceptance during PR 2 smoke check; keep constant centralized)*
   - `originator: codex_cli_rs`
   - `version: 0.166.0` *(or current Codex CLI client version; `gpt-6.2-*` specifies `minimal_client_version: "0.166.0"` in `models.json`)*
+  - `session_id: <prompt_cache_key>` *(Antigravity `conversation_id`, or deterministic `agyc-<32 hex>` SHA-256 prefix hash fallback when absent; omitted on health checks)*
   - `Content-Type: application/json`
   - `Accept: text/event-stream`
 
@@ -272,7 +273,8 @@ flowchart LR
 
 | Gemini Inbound Field | Codex Responses Outbound Field | Edge-Case Handling |
 | --- | --- | --- |
-| `systemInstruction.parts[].text` | `instructions: String` | Codex backend requires a non-empty `instructions` string; join text parts with `\n\n` and fall back to `"You are a helpful coding assistant."` if absent/blank. |
+| `systemInstruction.parts[].text` | `input[0]` `{ type: "message", role: "developer", content: [{ type: "input_text", text }] }` + constant `instructions: "You are a helpful coding assistant."` | `chatgpt.com/backend-api/codex/responses` requires a non-empty `instructions` string and places implicit prompt-cache breakpoints after initial `developer` messages in `input[]` (not on top-level `instructions`). Join non-thought text parts with `\n\n` into `input[0]` (`role: "developer"`), omitting the `developer` item when absent/blank. |
+| `conversation_id` (or prefix hash) | `prompt_cache_key: String` (mirrored in `session_id` header) | Routes sequential turns of the same conversation to the same KV-cache shard. Validates `[0-9a-zA-Z_-]` (`<= 64` chars) or falls back to `agyc-<32 hex>` SHA-256 of `(model, developer_instructions, first_content_item)`. |
 | *(always)* | `store: false`, `stream: true` | Required by `chatgpt.com/backend-api/codex/responses`. If the inbound caller used unary `:generateContent`, the adapter still streams upstream and aggregates into a single Gemini JSON response. |
 | `contents[]` (`role: "user"`) | `input[]` `{ type: "message", role: "user", content: [...] }` | `text` → `{ type: "input_text", text }`; `inlineData` (`image/*`) → `{ type: "input_image", image_url: "data:<mime>;base64,<data>" }`; unsupported binary MIME types return a clean `400` instead of silent data loss. |
 | `contents[]` (`role: "model"`) | `input[]` assistant `message` + `function_call` items | Skip `thought: true` parts and Gemini `thoughtSignature` fields. Emit `text` as `{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }`. Emit each `functionCall` as `{ type: "function_call", call_id, name, arguments: json_str }`. |

@@ -1163,6 +1163,7 @@ async fn hot_reload_concurrent_readers_see_immediate_rotation_with_zero_sleep() 
             body: Bytes::from_static(b"{}"),
             content_type: Some("application/json".to_string()),
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("forward with rotated provider");

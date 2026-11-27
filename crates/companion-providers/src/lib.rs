@@ -31,9 +31,10 @@ pub use codex::provider::{
 pub use codex::translate::{
     CodexSseTranslator, DEFAULT_CODEX_INSTRUCTIONS, DEFAULT_MAX_CODEX_SSE_EVENT_BYTES,
     DEFAULT_MAX_TOOL_CALL_ARGS_BYTES, DEFAULT_MAX_TOTAL_TOOL_CALL_ARGS_BYTES,
-    DEFAULT_MAX_UNARY_RESPONSE_BYTES, MAX_CODEX_CALL_ID_LEN, MAX_CONCURRENT_TOOL_CALLS,
-    UnaryGeminiAggregator, normalize_gemini_schema, sanitize_codex_error_json,
-    translate_gemini_to_codex_request,
+    DEFAULT_MAX_UNARY_RESPONSE_BYTES, MAX_CODEX_CACHE_KEY_LEN, MAX_CODEX_CALL_ID_LEN,
+    MAX_CONCURRENT_TOOL_CALLS, UnaryGeminiAggregator, normalize_gemini_schema,
+    sanitize_codex_error_json, translate_gemini_to_codex_request,
+    translate_gemini_to_codex_request_with_cache_key,
 };
 pub use gemini::{GEMINI_API_KEY_ENV_VAR, GeminiProvider};
 pub use ls_client::{
@@ -87,6 +88,7 @@ pub struct ForwardRequest {
     pub body: Bytes,
     pub content_type: Option<String>,
     pub api_key_override: Option<String>,
+    pub conversation_id: Option<String>,
 }
 
 fn redact_path_and_query_for_debug(path_and_query: &str) -> Cow<'_, str> {
@@ -109,6 +111,7 @@ impl fmt::Debug for ForwardRequest {
                 "api_key_override",
                 &api_key_hint(self.api_key_override.as_deref()),
             )
+            .field("conversation_id", &self.conversation_id)
             .finish()
     }
 }

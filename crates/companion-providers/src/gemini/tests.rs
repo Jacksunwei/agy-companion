@@ -128,6 +128,7 @@ async fn forwards_exact_request_bytes_and_sets_x_goog_api_key_header() {
             body: raw_payload.clone(),
             content_type: Some("application/json; charset=utf-8".to_string()),
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("forward_gemini should succeed");
@@ -201,6 +202,7 @@ async fn streams_sse_chunks_without_mutating_payload() {
             body: Bytes::from_static(br#"{"contents":[]}"#),
             content_type: None,
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("headers should arrive before stream closes");
@@ -282,6 +284,7 @@ async fn propagates_upstream_error_status_and_body() {
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect("forward_gemini must propagate non-2xx as Ok(ForwardResponse)");
@@ -338,6 +341,7 @@ async fn rejects_path_traversal_in_model_path() {
                     body: Bytes::from_static(b"{}"),
                     content_type: None,
                     api_key_override: None,
+                    conversation_id: None,
                 })
                 .await
                 .expect_err(&format!("must reject path: {candidate:?}"));
@@ -526,6 +530,7 @@ async fn normalizes_base_url_with_and_without_v1beta_and_trailing_slashes() {
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect("forward ok");
@@ -607,6 +612,7 @@ async fn strips_key_query_params_case_insensitively_and_preserves_alt_sse() {
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .unwrap_or_else(|err| panic!("query {query:?} should succeed: {err:?}"));
@@ -643,6 +649,7 @@ async fn strips_key_query_params_case_insensitively_and_preserves_alt_sse() {
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect_err(&format!("query must be rejected: {bad_q}"));
@@ -715,6 +722,7 @@ async fn rejects_encoded_traversal_matrix_fragment_empty_and_malformed_paths() {
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect_err(&format!("must reject: {bad:?}"));
@@ -743,6 +751,7 @@ async fn rejects_encoded_traversal_matrix_fragment_empty_and_malformed_paths() {
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .unwrap_or_else(|err| panic!("must accept valid path {ok_path:?}: {err:?}"));
@@ -851,6 +860,7 @@ async fn resolves_api_key_precedence_and_returns_missing_api_key_without_unsafe(
         body: Bytes::from_static(b"{}"),
         content_type: None,
         api_key_override: Some("  AIzaSyOverrideKey1234  ".to_string()),
+        conversation_id: None,
     })
     .await
     .expect("override should succeed");
@@ -865,6 +875,7 @@ async fn resolves_api_key_precedence_and_returns_missing_api_key_without_unsafe(
         body: Bytes::from_static(b"{}"),
         content_type: None,
         api_key_override: Some("   ".to_string()),
+        conversation_id: None,
     })
     .await
     .expect("configured fallback should succeed");
@@ -882,6 +893,7 @@ async fn resolves_api_key_precedence_and_returns_missing_api_key_without_unsafe(
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect("env fallback should succeed");
@@ -913,6 +925,7 @@ async fn resolves_api_key_precedence_and_returns_missing_api_key_without_unsafe(
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect_err("must return MissingApiKey");
@@ -970,6 +983,7 @@ async fn rejects_non_ascii_and_control_api_keys_without_leaking_secret() {
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: Some(bad.to_string()),
+                conversation_id: None,
             })
             .await
             .expect_err(&format!("must reject override key: {bad:?}"));
@@ -985,6 +999,7 @@ async fn rejects_non_ascii_and_control_api_keys_without_leaking_secret() {
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect_err(&format!("must reject env key: {bad:?}"));
@@ -1024,6 +1039,7 @@ fn debug_redacts_api_keys_on_gemini_provider_and_forward_request() {
         body: Bytes::from_static(b"SUPER_PRIVATE_PROMPT_BODY"),
         content_type: Some("application/json".to_string()),
         api_key_override: Some("AIzaSyTopSecretOverride8888".to_string()),
+        conversation_id: None,
     };
     let req_dbg = format!("{req:?}");
     assert!(!req_dbg.contains("TopSecretOverride"));
@@ -1039,6 +1055,7 @@ fn debug_redacts_api_keys_on_gemini_provider_and_forward_request() {
         body: Bytes::new(),
         content_type: None,
         api_key_override: None,
+        conversation_id: None,
     };
     let req_no_q_dbg = format!("{req_no_q:?}");
     assert!(!req_no_q_dbg.contains("?<redacted>"));
@@ -1086,6 +1103,7 @@ async fn handles_default_and_invalid_content_type_header() {
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("None content_type defaults to application/json");
@@ -1098,6 +1116,7 @@ async fn handles_default_and_invalid_content_type_header() {
             body: Bytes::from_static(b"{}"),
             content_type: Some("application/json; charset=utf-8".to_string()),
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("valid content_type succeeds");
@@ -1123,6 +1142,7 @@ async fn handles_default_and_invalid_content_type_header() {
                 body: Bytes::from_static(b"{}"),
                 content_type: Some(bad.to_string()),
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect_err(&format!("must reject bad content_type: {bad:?}"));
@@ -1319,6 +1339,7 @@ async fn refuses_redirects_and_never_forwards_api_key_to_redirect_target() {
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("forward_gemini propagates 302 verbatim");
@@ -1362,6 +1383,7 @@ async fn enforces_request_timeout_and_sanitizes_timeout_error() {
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect_err("slow upstream must time out");
@@ -1402,6 +1424,7 @@ async fn provider_adapter_is_object_safe_behind_arc_dyn() {
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("forward_gemini via dyn");
@@ -1493,6 +1516,7 @@ async fn rejects_unicode_whitespace_in_api_keys_without_silent_fallback_or_echo(
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: Some(bad.to_string()),
+                conversation_id: None,
             })
             .await
             .expect_err(&format!("api_key_override must reject {bad:?}"));
@@ -1509,6 +1533,7 @@ async fn rejects_unicode_whitespace_in_api_keys_without_silent_fallback_or_echo(
                 body: Bytes::from_static(b"{}"),
                 content_type: None,
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect_err(&format!("env api_key forward_gemini must reject {bad:?}"));
@@ -1540,6 +1565,7 @@ async fn rejects_unicode_whitespace_in_api_keys_without_silent_fallback_or_echo(
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("trimmed configured key forward ok");
@@ -1562,6 +1588,7 @@ async fn rejects_unicode_whitespace_in_api_keys_without_silent_fallback_or_echo(
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: Some("   ".to_string()),
+            conversation_id: None,
         })
         .await
         .expect("ASCII spaces-only override should fall back cleanly");
@@ -1577,6 +1604,7 @@ async fn rejects_unicode_whitespace_in_api_keys_without_silent_fallback_or_echo(
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: Some("  AIzaSyValid1234  ".to_string()),
+            conversation_id: None,
         })
         .await
         .expect("ASCII-padded override should trim cleanly");
@@ -1593,6 +1621,7 @@ async fn rejects_unicode_whitespace_in_api_keys_without_silent_fallback_or_echo(
             body: Bytes::from_static(b"{}"),
             content_type: None,
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("ASCII-padded env key should trim cleanly");
@@ -1642,6 +1671,7 @@ async fn rejects_unicode_whitespace_in_content_type_and_trims_ascii_spaces() {
                 body: Bytes::from_static(b"{}"),
                 content_type: Some(bad.to_string()),
                 api_key_override: None,
+                conversation_id: None,
             })
             .await
             .expect_err(&format!("Content-Type must reject {bad:?}"));
@@ -1681,6 +1711,7 @@ async fn rejects_unicode_whitespace_in_content_type_and_trims_ascii_spaces() {
             body: Bytes::from_static(b"{}"),
             content_type: Some("  application/json  ".to_string()),
             api_key_override: None,
+            conversation_id: None,
         })
         .await
         .expect("ASCII-padded Content-Type should trim cleanly");
@@ -1851,6 +1882,7 @@ async fn quarantines_placeholder_api_key_across_config_override_and_env() {
         body: Bytes::from_static(b"{}"),
         content_type: Some("application/json".to_string()),
         api_key_override: override_key.map(str::to_owned),
+        conversation_id: None,
     };
 
     // 1. Placeholder in config -> api_key_hint() == None, MissingApiKey across all 3 RPCs, 0 hits.
