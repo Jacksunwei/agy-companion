@@ -68,6 +68,7 @@ class MockLsServer:
         self._model_configs: list[dict[str, Any]] = list(model_configs or [])
         self._initial_snapshot_frames: list[dict[str, Any]] = list(initial_snapshot_frames or [])
         self._steps_by_cascade: dict[str, list[dict[str, Any]]] = {}
+        self._generator_metadata_by_cascade: dict[str, list[dict[str, Any]]] = {}
         self._summaries_by_cascade: dict[str, dict[str, Any]] = {}
         for frame in self._initial_snapshot_frames:
             updates = frame.get("updates")
@@ -175,6 +176,18 @@ class MockLsServer:
                     self._send_json(200, {"steps": sliced})
                     return
 
+                if method == "GetCascadeTrajectoryGeneratorMetadata":
+                    cid = str(parsed_body.get("cascadeId", ""))
+                    offset = int(parsed_body.get("generatorMetadataOffset", 0) or 0)
+                    with parent._lock:
+                        all_meta = parent._generator_metadata_by_cascade.get(cid)
+                        if all_meta is None:
+                            self._send_json(404, {"code": "not_found"})
+                            return
+                        sliced = list(all_meta[offset:])
+                    self._send_json(200, {"generatorMetadata": sliced})
+                    return
+
                 if method == "GetAllCascadeTrajectories":
                     with parent._lock:
                         summaries = {k: dict(v) for k, v in parent._summaries_by_cascade.items()}
@@ -254,6 +267,10 @@ class MockLsServer:
     def set_steps(self, cascade_id: str, steps: list[dict[str, Any]]) -> None:
         with self._lock:
             self._steps_by_cascade[cascade_id] = list(steps)
+
+    def set_generator_metadata(self, cascade_id: str, metadata: list[dict[str, Any]]) -> None:
+        with self._lock:
+            self._generator_metadata_by_cascade[cascade_id] = list(metadata)
 
     def push_summary_delta(
         self,

@@ -306,6 +306,7 @@ impl ProxyStats {
                 last_catalog_included_proxy_models: s.last_catalog_included_proxy_models,
             },
             proxy_rss_bytes,
+            max_context_tokens: None,
             recent_calls,
             by_model,
         }
@@ -346,8 +347,9 @@ mod tests {
         // Verify exact serialized JSON structure.
         let value = serde_json::to_value(snap).expect("serialize snapshot");
         let obj = value.as_object().expect("json object");
-        assert_eq!(obj.len(), 5);
+        assert_eq!(obj.len(), 6);
         assert!(obj.contains_key("proxy_rss_bytes"));
+        assert!(obj.contains_key("max_context_tokens"));
         assert!(obj.contains_key("recent_calls"));
         assert!(obj.contains_key("by_model"));
         let usage = obj

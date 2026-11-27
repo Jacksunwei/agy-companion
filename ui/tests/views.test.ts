@@ -569,6 +569,7 @@ describe("buildMonitorView empty states & active mixed session", () => {
           cache_hit_ratio: 0.8,
         },
         proxy_rss_bytes: 25_165_824,
+        max_context_tokens: null,
         recent_calls: [
           {
             timestamp_ms: 1747300200000,
@@ -606,6 +607,11 @@ describe("buildMonitorView empty states & active mixed session", () => {
     assert.equal(hdrTag?.className, "tag");
     assert.ok(host.textContent.includes("of 200K"));
     assert.ok(host.textContent.includes("50%"));
+    const firstBarSegs = host.querySelector(".prop-bar")?.querySelectorAll(".prop-seg") ?? [];
+    assert.deepEqual(
+      firstBarSegs.map((s) => s.style.width),
+      ["40.0%", "10.0%", "1.0%"],
+    );
     const costVal = host.querySelector(".cost-foot-val");
     assert.ok(costVal && costVal.textContent.startsWith("\u2248 $"));
   });
@@ -678,6 +684,113 @@ describe("buildMonitorView empty states & active mixed session", () => {
     assert.equal(tags[0].className, "tag tag-brand");
     assert.equal(tags[1].textContent, "Antigravity");
     assert.equal(tags[1].className, "tag");
+  });
+
+  it("scales Latest prompt hero and bar to live compaction window with fallback, overflow, and zero-token guards", () => {
+    const base = loadActiveSnapshot();
+    const makeNeonSnap = (
+      maxContextTokens: number | null,
+      inputTokens: number,
+      cachedTokens: number,
+      outputTokens: number,
+    ): SettingsSnapshot => ({
+      ...base,
+      ls_telemetry_active: true,
+      stats: {
+        usage: {
+          requests: 1,
+          prompt_tokens: inputTokens,
+          cached_tokens: cachedTokens,
+          output_tokens: outputTokens,
+          reasoning_tokens: 0,
+          cache_hit_ratio: inputTokens > 0 ? cachedTokens / inputTokens : 0,
+        },
+        proxy_rss_bytes: 25_165_824,
+        max_context_tokens: maxContextTokens,
+        recent_calls: [
+          {
+            timestamp_ms: 1747300300000,
+            provider: "antigravity",
+            source: "builtin",
+            model: "gemini-4-neon",
+            input_tokens: inputTokens,
+            cached_tokens: cachedTokens,
+            output_tokens: outputTokens,
+            reasoning_tokens: 0,
+            latency_ms: 400,
+            cold_start: false,
+            cache_break: false,
+          },
+        ],
+        by_model: [
+          {
+            provider: "antigravity",
+            source: "builtin",
+            model: "gemini-4-neon",
+            requests: 1,
+            input_tokens: inputTokens,
+            cached_tokens: cachedTokens,
+            output_tokens: outputTokens,
+            reasoning_tokens: 0,
+            total_latency_ms: 400,
+          },
+        ],
+      },
+    });
+
+    // 1. Live compaction window (512K) overrides Gemini 4 Neon 1M model window and scales bar with headroom
+    const host1 = env.document.createElement("div");
+    host1.append(
+      buildMonitorView(makeState({ snapshot: makeNeonSnap(512_000, 77_000, 64_000, 3_000) })) as unknown as FakeElement,
+    );
+    assert.ok(host1.textContent.includes("77K"));
+    assert.ok(host1.textContent.includes("of 512K"));
+    assert.ok(host1.textContent.includes("15%"));
+    const bars1 = host1.querySelectorAll(".prop-bar");
+    assert.equal(bars1.length, 2);
+    const promptSegs1 = bars1[0].querySelectorAll(".prop-seg");
+    assert.deepEqual(
+      promptSegs1.map((s) => s.style.width),
+      ["12.5%", "2.5%", "0.6%"],
+    );
+    // costBar (second .prop-bar) stays 100%-normalized
+    const costSegs1 = bars1[1].querySelectorAll(".prop-seg");
+    const costSum1 = costSegs1.reduce((acc, s) => acc + Number.parseFloat(s.style.width), 0);
+    assert.ok(Math.abs(costSum1 - 100) <= 0.2, `expected costBar ~100%, got ${costSum1}`);
+
+    // 2. Fallback to model context window (1M) on null, 0, -1, and NaN
+    for (const invalid of [null, 0, -1, Number.NaN]) {
+      const hostFb = env.document.createElement("div");
+      hostFb.append(
+        buildMonitorView(makeState({ snapshot: makeNeonSnap(invalid, 77_000, 64_000, 3_000) })) as unknown as FakeElement,
+      );
+      assert.ok(hostFb.textContent.includes("of 1M"));
+      assert.ok(hostFb.textContent.includes("8%"));
+    }
+
+    // 3. Overflow clamping when latestCached + latestNew + latestOutput > maxCtx
+    const hostOver = env.document.createElement("div");
+    hostOver.append(
+      buildMonitorView(makeState({ snapshot: makeNeonSnap(100_000, 100_000, 80_000, 20_000) })) as unknown as FakeElement,
+    );
+    assert.ok(hostOver.textContent.includes("of 100K"));
+    assert.ok(hostOver.textContent.includes("100%"));
+    const overSegs = hostOver.querySelector(".prop-bar")?.querySelectorAll(".prop-seg") ?? [];
+    assert.deepEqual(
+      overSegs.map((s) => s.style.width),
+      ["66.7%", "16.7%", "16.7%"],
+    );
+
+    // 4. Zero tokens: all 3 segments stay in DOM at 0.0% with no NaN
+    const hostZero = env.document.createElement("div");
+    hostZero.append(
+      buildMonitorView(makeState({ snapshot: makeNeonSnap(512_000, 0, 0, 0) })) as unknown as FakeElement,
+    );
+    const zeroSegs = hostZero.querySelector(".prop-bar")?.querySelectorAll(".prop-seg") ?? [];
+    assert.deepEqual(
+      zeroSegs.map((s) => s.style.width),
+      ["0.0%", "0.0%", "0.0%"],
+    );
   });
 });
 

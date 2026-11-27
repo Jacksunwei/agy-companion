@@ -45,6 +45,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
 
     assert.equal(parsed.proxy_rss_bytes, 25_165_824);
     assert.equal(parsed.stats?.proxy_rss_bytes, 25_165_824);
+    assert.equal(parsed.stats?.max_context_tokens, 512_000);
     assert.deepEqual(parsed.account_plan, {
       mode: "auto",
       resolved: "organization",
@@ -90,6 +91,31 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
     assert.equal("cloudcode" in parsed, false);
     assert.equal("cloudcode" in parsed.config, false);
     assert.equal("cloudcode" in parsed.stats, false);
+  });
+
+  it("normalizes stats.max_context_tokens across missing, non-positive, non-finite, and positive inputs", () => {
+    const cases: Array<[unknown, number | null]> = [
+      [undefined, null],
+      [null, null],
+      [0, null],
+      [-100, null],
+      [Number.NaN, null],
+      [Number.POSITIVE_INFINITY, null],
+      ["512000", null],
+      [512_000, 512_000],
+    ];
+    for (const [input, expected] of cases) {
+      const raw = loadFixture("settings_snapshot_active.json") as Record<string, unknown>;
+      const stats = { ...(raw.stats as Record<string, unknown>) };
+      if (input === undefined) {
+        delete stats.max_context_tokens;
+      } else {
+        stats.max_context_tokens = input;
+      }
+      const parsed = parseSettingsSnapshot({ ...raw, stats });
+      assert.ok(parsed !== null && parsed.stats !== null);
+      assert.equal(parsed.stats.max_context_tokens, expected);
+    }
   });
 
   it("parses settings_snapshot_day0_offline.json", () => {

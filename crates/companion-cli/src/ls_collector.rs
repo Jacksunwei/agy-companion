@@ -794,6 +794,8 @@ pub fn process_steps_slice(
 pub struct CascadeFoldState {
     pub trajectory_id: String,
     pub step_offset: u32,
+    pub generator_metadata_offset: u32,
+    pub max_context_tokens: Option<u64>,
     seen_variants: HashSet<(String, String, String)>,
     saw_checkpoint_since_last_planner: bool,
     pub usage: UsageStatsSnapshot,
@@ -982,6 +984,7 @@ pub fn merge_cascade_folds(folds: &[&CascadeFoldState]) -> StatsSnapshot {
         usage,
         cloudcode: Default::default(),
         proxy_rss_bytes: None,
+        max_context_tokens: folds.first().and_then(|f| f.max_context_tokens),
         recent_calls: all_recent,
         by_model,
     }
@@ -1470,7 +1473,9 @@ impl LsCollectorHandle {
                 return None;
             }
             let folds: Vec<&CascadeFoldState> = guard.monitor_cache.values().collect();
-            return Some(merge_cascade_folds(&folds));
+            let mut snap = merge_cascade_folds(&folds);
+            snap.max_context_tokens = None;
+            return Some(snap);
         };
 
         let target_cids =
@@ -1496,9 +1501,9 @@ impl LsCollectorHandle {
                 targets
             };
 
-        for cid in &target_cids {
+        for (idx, cid) in target_cids.iter().enumerate() {
             if let Err(LsError::Unauthenticated { .. }) =
-                hydrate_cascade_for_monitor(&self.inner, cid).await
+                hydrate_cascade_for_monitor(&self.inner, cid, idx == 0).await
             {
                 return None;
             }
@@ -1512,7 +1517,12 @@ impl LsCollectorHandle {
             .iter()
             .filter_map(|cid| guard.monitor_cache.get(cid))
             .collect();
-        Some(merge_cascade_folds(&folds))
+        let mut snap = merge_cascade_folds(&folds);
+        snap.max_context_tokens = guard
+            .monitor_cache
+            .get(&focused_cid)
+            .and_then(|f| f.max_context_tokens);
+        Some(snap)
     }
 }
 
@@ -1575,8 +1585,9 @@ async fn refresh_catalog(inner: &LsCollectorInner, force_rate_limit: bool) -> bo
 async fn hydrate_cascade_for_monitor(
     inner: &LsCollectorInner,
     cascade_id: &str,
+    fetch_generator_metadata: bool,
 ) -> Result<(), LsError> {
-    let (start_offset, reset_fold, summary_opt, traj_id) = {
+    let step_plan = {
         let guard = inner.state.lock().await;
         let summary_opt = guard.summaries.get(cascade_id).cloned();
         let summary_traj = summary_opt
@@ -1592,11 +1603,11 @@ async fn hydrate_cascade_for_monitor(
                     && summary_traj != existing.trajectory_id)
                     || (summary_opt.is_some() && summary_steps < existing.step_offset);
                 if reverted {
-                    (0, true, summary_opt, summary_traj)
+                    Some((0, true, summary_opt, summary_traj))
                 } else if summary_opt.is_some() && summary_steps <= existing.step_offset {
-                    return Ok(());
+                    None
                 } else {
-                    (existing.step_offset, false, summary_opt, summary_traj)
+                    Some((existing.step_offset, false, summary_opt, summary_traj))
                 }
             }
             None => {
@@ -1605,86 +1616,139 @@ async fn hydrate_cascade_for_monitor(
                 } else {
                     0
                 };
-                (initial_offset, true, summary_opt, summary_traj)
+                Some((initial_offset, true, summary_opt, summary_traj))
             }
         }
     };
 
-    let _permit = match inner.step_semaphore.clone().acquire_owned().await {
-        Ok(p) => p,
-        Err(_) => return Ok(()),
-    };
+    let mut steps_fetched = false;
+    if let Some((start_offset, reset_fold, summary_opt, traj_id)) = step_plan {
+        let _permit = match inner.step_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
 
-    let steps = match inner
-        .client
-        .get_cascade_trajectory_steps(cascade_id, start_offset)
-        .await
-    {
-        Ok(steps) => steps,
-        Err(LsError::Unauthenticated { rpc }) => {
-            let should_warn = inner.state.lock().await.mark_unauthenticated();
-            if should_warn {
-                tracing::warn!(
-                    rpc,
-                    "Antigravity LS returned 401 Unauthenticated during Monitor hydration; pausing LS collector"
+        let steps = match inner
+            .client
+            .get_cascade_trajectory_steps(cascade_id, start_offset)
+            .await
+        {
+            Ok(steps) => steps,
+            Err(LsError::Unauthenticated { rpc }) => {
+                let should_warn = inner.state.lock().await.mark_unauthenticated();
+                if should_warn {
+                    tracing::warn!(
+                        rpc,
+                        "Antigravity LS returned 401 Unauthenticated during Monitor hydration; pausing LS collector"
+                    );
+                }
+                return Err(LsError::Unauthenticated { rpc });
+            }
+            Err(err) => {
+                // Single-cascade 404/Unimplemented or transient error MUST NOT trip the circuit breaker.
+                tracing::debug!(
+                    cascade_id,
+                    error = %err,
+                    "on-demand LS step hydration skipped"
                 );
+                return Ok(());
             }
-            return Err(LsError::Unauthenticated { rpc });
-        }
-        Err(err) => {
-            // Single-cascade 404/Unimplemented or transient error MUST NOT trip the circuit breaker.
-            tracing::debug!(
+        };
+
+        let mut batch = {
+            let guard = inner.state.lock().await;
+            process_steps_slice(
                 cascade_id,
-                error = %err,
-                "on-demand LS step hydration skipped"
+                summary_opt.as_ref(),
+                start_offset,
+                &steps,
+                &guard.catalog,
+                None,
+                Utc::now(),
+            )
+        };
+
+        if batch.unknown_model_enum.is_some() && refresh_catalog(inner, true).await {
+            let guard = inner.state.lock().await;
+            batch = process_steps_slice(
+                cascade_id,
+                summary_opt.as_ref(),
+                start_offset,
+                &steps,
+                &guard.catalog,
+                None,
+                Utc::now(),
             );
-            return Ok(());
         }
-    };
 
-    let mut batch = {
-        let guard = inner.state.lock().await;
-        process_steps_slice(
-            cascade_id,
-            summary_opt.as_ref(),
-            start_offset,
-            &steps,
-            &guard.catalog,
-            None,
-            Utc::now(),
-        )
-    };
-
-    if batch.unknown_model_enum.is_some() && refresh_catalog(inner, true).await {
-        let guard = inner.state.lock().await;
-        batch = process_steps_slice(
-            cascade_id,
-            summary_opt.as_ref(),
-            start_offset,
-            &steps,
-            &guard.catalog,
-            None,
-            Utc::now(),
-        );
+        let mut guard = inner.state.lock().await;
+        let fold = if reset_fold {
+            guard.monitor_cache.insert(
+                cascade_id.to_string(),
+                CascadeFoldState::new(traj_id, start_offset),
+            );
+            guard
+                .monitor_cache
+                .get_mut(cascade_id)
+                .expect("inserted immediately above")
+        } else {
+            guard
+                .monitor_cache
+                .entry(cascade_id.to_string())
+                .or_insert_with(|| CascadeFoldState::new(traj_id.clone(), start_offset))
+        };
+        fold.apply_batch(&batch);
+        steps_fetched = true;
     }
 
-    let mut guard = inner.state.lock().await;
-    let fold = if reset_fold {
-        guard.monitor_cache.insert(
-            cascade_id.to_string(),
-            CascadeFoldState::new(traj_id, start_offset),
-        );
-        guard
-            .monitor_cache
-            .get_mut(cascade_id)
-            .expect("inserted immediately above")
-    } else {
-        guard
-            .monitor_cache
-            .entry(cascade_id.to_string())
-            .or_insert_with(|| CascadeFoldState::new(traj_id.clone(), start_offset))
-    };
-    fold.apply_batch(&batch);
+    if fetch_generator_metadata {
+        let gen_req_offset = {
+            let guard = inner.state.lock().await;
+            guard.monitor_cache.get(cascade_id).and_then(|fold| {
+                if steps_fetched || fold.max_context_tokens.is_none() {
+                    Some(fold.generator_metadata_offset)
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some(req_offset) = gen_req_offset {
+            let _permit = match inner.step_semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return Ok(()),
+            };
+            match inner
+                .client
+                .get_cascade_trajectory_generator_metadata(cascade_id, req_offset)
+                .await
+            {
+                Ok(entries) => {
+                    let mut guard = inner.state.lock().await;
+                    if let Some(fold) = guard.monitor_cache.get_mut(cascade_id) {
+                        fold.generator_metadata_offset = fold
+                            .generator_metadata_offset
+                            .max(req_offset.saturating_add(entries.len() as u32));
+                        for entry in &entries {
+                            if let Some(tokens) = entry.max_context_tokens() {
+                                fold.max_context_tokens = Some(tokens);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    // Strictly fail-open: never fail Monitor hydration, pause collector,
+                    // or trip the circuit breaker on generator metadata errors.
+                    tracing::debug!(
+                        cascade_id,
+                        error = %err,
+                        "on-demand LS generator metadata hydration skipped"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -3336,5 +3400,369 @@ mod tests {
             .expect("lock3")
             .expect("re-acquired after drop");
         drop(lock3);
+    }
+
+    #[test]
+    fn merge_cascade_folds_uses_focused_fold_max_context_tokens_only() {
+        let mut focused = CascadeFoldState::new("traj-root".to_string(), 1);
+        focused.max_context_tokens = Some(512_000);
+        let mut descendant = CascadeFoldState::new("traj-sub".to_string(), 1);
+        descendant.max_context_tokens = Some(200_000);
+
+        let merged = merge_cascade_folds(&[&focused, &descendant]);
+        assert_eq!(merged.max_context_tokens, Some(512_000));
+
+        focused.max_context_tokens = None;
+        let merged_none = merge_cascade_folds(&[&focused, &descendant]);
+        assert_eq!(merged_none.max_context_tokens, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn focused_cascade_generator_metadata_incremental_offset_model_switch_and_subagent_isolation()
+     {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct MockState {
+            root_steps: Vec<serde_json::Value>,
+            sub_steps: Vec<serde_json::Value>,
+            root_gen_meta: Vec<serde_json::Value>,
+            gen_meta_calls: Vec<(String, u32)>,
+        }
+
+        let mk_step = |tokens: u64, sid: &str| {
+            serde_json::json!({
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "status": "CORTEX_STEP_STATUS_DONE",
+                "metadata": {
+                    "createdAt": "2026-11-26T10:00:00Z",
+                    "finishedGeneratingAt": "2026-11-26T10:00:01Z",
+                    "generatorModel": "MODEL_PLACEHOLDER_M501",
+                    "modelUsage": {
+                        "inputTokens": tokens.to_string(),
+                        "cacheReadTokens": "0",
+                        "outputTokens": "100",
+                        "responseOutputTokens": "100",
+                        "apiProvider": "API_PROVIDER_ANTHROPIC_VERTEX",
+                        "responseHeader": { "sessionID": sid }
+                    }
+                }
+            })
+        };
+
+        let mk_gen = |max_ctx: Option<u64>| match max_ctx {
+            Some(n) => serde_json::json!({
+                "chatModel": {
+                    "chatStartMetadata": {
+                        "contextWindowMetadata": { "maxContextTokens": n.to_string() }
+                    }
+                }
+            }),
+            None => serde_json::json!({ "chatModel": {} }),
+        };
+
+        let state = Arc::new(StdMutex::new(MockState {
+            root_steps: vec![mk_step(1000, "s1")],
+            sub_steps: vec![mk_step(500, "sub1")],
+            root_gen_meta: vec![mk_gen(Some(512_000))],
+            gen_meta_calls: Vec::new(),
+        }));
+        let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let delta_rx = Arc::new(tokio::sync::Mutex::new(Some(delta_rx)));
+
+        let send_summaries = |tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>, root_count: u32| {
+            let payload = serde_json::json!({
+                "updates": {
+                    "root-conv": {
+                        "trajectoryId": "traj-root",
+                        "stepCount": root_count,
+                        "status": "CASCADE_RUN_STATUS_IDLE"
+                    },
+                    "sub-conv": {
+                        "trajectoryId": "traj-sub",
+                        "stepCount": 1,
+                        "status": "CASCADE_RUN_STATUS_IDLE",
+                        "trajectoryMetadata": {
+                            "parentConversationId": "root-conv"
+                        }
+                    }
+                }
+            });
+            let _ = tx.send(encode_connect_frame(0x00, payload.to_string().as_bytes()));
+        };
+        send_summaries(&delta_tx, 1);
+
+        let st_steps = Arc::clone(&state);
+        let st_gen = Arc::clone(&state);
+        let router = Router::new()
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "clientModelConfigs": [{
+                            "label": "Gemini 4 Neon",
+                            "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M501" },
+                            "provider": "MODEL_PROVIDER_GOOGLE",
+                            "modelId": "gemini-4-neon"
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let st = Arc::clone(&st_steps);
+                    async move {
+                        let cid = req["cascadeId"].as_str().unwrap_or("");
+                        let off = req["stepOffset"].as_u64().unwrap_or(0) as usize;
+                        let guard = st.lock().unwrap();
+                        let src = if cid == "root-conv" {
+                            &guard.root_steps
+                        } else {
+                            &guard.sub_steps
+                        };
+                        let slice = if off < src.len() { &src[off..] } else { &[] };
+                        axum::Json(serde_json::json!({ "steps": slice }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let st = Arc::clone(&st_gen);
+                    async move {
+                        let cid = req["cascadeId"].as_str().unwrap_or("").to_string();
+                        let off = req["generatorMetadataOffset"].as_u64().unwrap_or(0) as u32;
+                        let mut guard = st.lock().unwrap();
+                        guard.gen_meta_calls.push((cid.clone(), off));
+                        let off_usize = off as usize;
+                        let slice = if cid == "root-conv" && off_usize < guard.root_gen_meta.len() {
+                            guard.root_gen_meta[off_usize..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        axum::Json(serde_json::json!({ "generatorMetadata": slice }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                post(move || {
+                    let rx_slot = Arc::clone(&delta_rx);
+                    async move {
+                        let rx = rx_slot.lock().await.take().expect("single stream");
+                        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                            rx.recv().await.map(|frame| {
+                                (Ok::<_, std::io::Error>(axum::body::Bytes::from(frame)), rx)
+                            })
+                        });
+                        let mut resp = Response::new(Body::from_stream(stream));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/connect+json"),
+                        );
+                        resp
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::task::yield_now().await;
+
+        let tmp = TempDir::new().expect("tmp");
+        let sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).expect("sink"));
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).expect("ep"),
+            CsrfToken::parse(TEST_CSRF).expect("csrf"),
+        )
+        .expect("client");
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn_ls_collector(client, sink, LsCollectorConfig::default(), rx);
+
+        // Wait until initial summary frame is processed so sub-conv is known as a descendant.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = handle
+                .session_stats(Some("root-conv"))
+                .await
+                .expect("stats");
+            if snap.usage.requests == 2 {
+                assert_eq!(snap.max_context_tokens, Some(512_000));
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for rollup");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        // Only root-conv was queried for generator metadata (never sub-conv), at offset 0.
+        assert_eq!(
+            state.lock().unwrap().gen_meta_calls,
+            vec![("root-conv".to_string(), 0)]
+        );
+
+        // Idle poll issues zero extra generator metadata RPCs.
+        let idle_snap = handle
+            .session_stats(Some("root-conv"))
+            .await
+            .expect("idle stats");
+        assert_eq!(idle_snap.max_context_tokens, Some(512_000));
+        assert_eq!(state.lock().unwrap().gen_meta_calls.len(), 1);
+
+        // Global session_stats(None) must return None for max_context_tokens.
+        let global_snap = handle.session_stats(None).await.expect("global stats");
+        assert_eq!(global_snap.max_context_tokens, None);
+
+        // Turn 2: model switch to 200K + a trailing entry with missing/zero maxContextTokens (must not clobber).
+        {
+            let mut guard = state.lock().unwrap();
+            guard.root_steps.push(mk_step(2000, "s2"));
+            guard.root_gen_meta.push(mk_gen(Some(200_000)));
+            guard.root_gen_meta.push(mk_gen(Some(0)));
+            guard.root_gen_meta.push(mk_gen(None));
+        }
+        send_summaries(&delta_tx, 2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = handle
+                .session_stats(Some("root-conv"))
+                .await
+                .expect("turn2 stats");
+            if snap.max_context_tokens == Some(200_000) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for 200K");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(
+            state.lock().unwrap().gen_meta_calls,
+            vec![("root-conv".to_string(), 0), ("root-conv".to_string(), 1)]
+        );
+
+        // RevertToStep: step_count drops from 2 -> 1; offset resets to 0 and window reverts to 512K.
+        {
+            let mut guard = state.lock().unwrap();
+            guard.root_steps.truncate(1);
+            guard.root_gen_meta.truncate(1);
+        }
+        send_summaries(&delta_tx, 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = handle
+                .session_stats(Some("root-conv"))
+                .await
+                .expect("reverted stats");
+            if snap.max_context_tokens == Some(512_000) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for revert to 512K"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(
+            state.lock().unwrap().gen_meta_calls.last(),
+            Some(&("root-conv".to_string(), 0))
+        );
+
+        drop(delta_tx);
+        let _ = tx.send(true);
+        srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generator_metadata_error_fails_open_without_tripping_circuit_breaker() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
+            let router = Router::new()
+                .route(
+                    "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                    post(|| async {
+                        axum::Json(serde_json::json!({
+                            "clientModelConfigs": [{
+                                "label": "Gemini 4 Neon",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M501" },
+                                "provider": "MODEL_PROVIDER_GOOGLE",
+                                "modelId": "gemini-4-neon"
+                            }]
+                        }))
+                    }),
+                )
+                .route(
+                    "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                    post(|| async {
+                        axum::Json(serde_json::json!({
+                            "steps": [{
+                                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                                "status": "CORTEX_STEP_STATUS_DONE",
+                                "metadata": {
+                                    "createdAt": "2026-11-26T10:00:00Z",
+                                    "finishedGeneratingAt": "2026-11-26T10:00:01Z",
+                                    "generatorModel": "MODEL_PLACEHOLDER_M501",
+                                    "modelUsage": {
+                                        "inputTokens": "1000",
+                                        "cacheReadTokens": "500",
+                                        "outputTokens": "100",
+                                        "responseOutputTokens": "100",
+                                        "apiProvider": "API_PROVIDER_ANTHROPIC_VERTEX",
+                                        "responseHeader": { "sessionID": "s-err" }
+                                    }
+                                }
+                            }]
+                        }))
+                    }),
+                )
+                .route(
+                    "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                    post(move || async move { status }),
+                )
+                .route(
+                    "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                    post(|| async {
+                        let mut resp = Response::new(Body::from(encode_connect_frame(0x00, b"{}")));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/connect+json"),
+                        );
+                        resp
+                    }),
+                );
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let srv = tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            tokio::task::yield_now().await;
+
+            let tmp = TempDir::new().expect("tmp");
+            let sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).expect("sink"));
+            let client = LsClient::new(
+                LsEndpoint::parse(&format!("127.0.0.1:{port}")).expect("ep"),
+                CsrfToken::parse(TEST_CSRF).expect("csrf"),
+            )
+            .expect("client");
+            let (tx, rx) = watch::channel(false);
+            let handle = spawn_ls_collector(client, sink, LsCollectorConfig::default(), rx);
+
+            let snap = handle
+                .session_stats(Some("conv-fail-open"))
+                .await
+                .expect("stats must still succeed on generator metadata error");
+            assert_eq!(snap.usage.requests, 1);
+            assert_eq!(snap.max_context_tokens, None);
+            assert!(
+                handle.is_active().await,
+                "generator metadata {status} must NOT trip circuit breaker"
+            );
+
+            let _ = tx.send(true);
+            srv.abort();
+        }
     }
 }

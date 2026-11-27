@@ -38,11 +38,12 @@ pub use codex::translate::{
 pub use gemini::{GEMINI_API_KEY_ENV_VAR, GeminiProvider};
 pub use ls_client::{
     ANTIGRAVITY_CSRF_TOKEN_ENV_VAR, ANTIGRAVITY_LS_ADDRESS_ENV_VAR, DEFAULT_LS_CONNECT_TIMEOUT,
-    DEFAULT_LS_UNARY_TIMEOUT, HEADER_ANTIGRAVITY_CSRF_TOKEN, HEADER_CODEIUM_CSRF_TOKEN, LsClient,
-    LsContextWindowOption, LsError, LsModelConfig, LsModelInfo, LsModelOrAlias, LsModelUsage,
-    LsResponseHeaderFingerprint, LsRetryInfo, LsStepMetadata, LsSummaryDelta, LsSummaryStream,
-    LsTrajectoryMetadata, LsTrajectoryStep, LsTrajectorySummary, MAX_LS_MODEL_CONFIG_BYTES,
-    MAX_LS_RESPONSE_BYTES, TRAJECTORY_VERBOSITY_PROD_UI,
+    DEFAULT_LS_UNARY_TIMEOUT, HEADER_ANTIGRAVITY_CSRF_TOKEN, HEADER_CODEIUM_CSRF_TOKEN,
+    LsChatModelMetadata, LsChatStartMetadata, LsClient, LsContextWindowMetadata,
+    LsContextWindowOption, LsError, LsGeneratorMetadata, LsModelConfig, LsModelInfo,
+    LsModelOrAlias, LsModelUsage, LsResponseHeaderFingerprint, LsRetryInfo, LsStepMetadata,
+    LsSummaryDelta, LsSummaryStream, LsTrajectoryMetadata, LsTrajectoryStep, LsTrajectorySummary,
+    MAX_LS_MODEL_CONFIG_BYTES, MAX_LS_RESPONSE_BYTES, TRAJECTORY_VERBOSITY_PROD_UI,
 };
 pub use probe_client::{
     DEFAULT_PROBE_TIMEOUT, HealthEvaluation, LoopbackProxyClient, MAX_PROBE_BODY_BYTES, ProbeError,
