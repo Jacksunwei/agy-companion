@@ -9,7 +9,7 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use companion_core::UsageRange;
-use companion_ui_mcp::{CompanionUiServer, GetUsageArgs, SaveSettingsArgs, UiServerOptions};
+use companion_ui::{CompanionUiServer, GetUsageArgs, SaveSettingsArgs, UiServerOptions};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -157,7 +157,7 @@ async fn index_handler(State(state): State<SidecarUiState>) -> Response {
             );
             resp
         }
-        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.message.to_string()),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
 
@@ -343,7 +343,7 @@ where
 mod tests {
     use super::*;
     use companion_core::integration::IntegrationOptions;
-    use companion_ui_mcp::UiHtmlSource;
+    use companion_ui::UiHtmlSource;
     use tempfile::TempDir;
 
     fn isolated_ui_server(tmp: &TempDir) -> Arc<CompanionUiServer> {
@@ -432,21 +432,46 @@ mod tests {
         assert!(json.get("proxy").is_some());
         assert!(json.get("account_plan").is_some());
 
-        // POST /_api/save_settings persists nested config and still rejects unknown fields.
+        // POST /_api/save_settings persists nested config and API key (in AuthStore) without leaking plaintext.
         let save_ok = client
             .post(format!("http://{addr}/_api/save_settings"))
             .header(SIDECAR_TOKEN_HEADER, "secret-token-123")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"{"conversation_id":"conv-test-123456","providers":{"gemini":{"default_model":"gemini-4-neon"}}}"#)
+            .body(r#"{"conversation_id":"conv-test-123456","providers":{"gemini":{"api_key":{"set":"AIzaSySidecarSaveTest1234"},"default_model":"gemini-4-neon"}}}"#)
             .send()
             .await
             .expect("save_ok");
         assert_eq!(save_ok.status(), StatusCode::OK);
-        let saved: serde_json::Value = save_ok.json().await.expect("saved json");
+        let saved_raw = save_ok.text().await.expect("saved text");
+        assert!(
+            !saved_raw.contains("AIzaSySidecarSaveTest1234"),
+            "save_settings response must never leak plaintext API key"
+        );
+        let saved: serde_json::Value = serde_json::from_str(&saved_raw).expect("saved json");
         assert_eq!(
             saved["config"]["providers"]["gemini"]["default_model"].as_str(),
             Some("gemini-4-neon")
         );
+        assert_eq!(
+            saved["config"]["providers"]["gemini"]["api_key_configured"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            saved["config"]["providers"]["gemini"]["api_key_hint"].as_str(),
+            Some("AIza...1234")
+        );
+        let cfg_path = tmp.path().join("config.json");
+        let cfg_disk = std::fs::read_to_string(&cfg_path).expect("read config.json");
+        assert!(
+            !cfg_disk.contains("AIzaSySidecarSaveTest1234") && !cfg_disk.contains("api_key"),
+            "config.json must not store plaintext API key"
+        );
+        let auth_store =
+            companion_core::FileAuthStore::for_config_path(&cfg_path).expect("auth store");
+        let stored_key = companion_core::AuthStore::load_gemini(&auth_store)
+            .expect("load gemini auth")
+            .expect("persisted creds");
+        assert_eq!(stored_key.api_key.expose(), "AIzaSySidecarSaveTest1234");
 
         let save_unknown = client
             .post(format!("http://{addr}/_api/save_settings"))

@@ -12,7 +12,7 @@ use companion_core::fs_safe::{
 use companion_providers::LoopbackProxyClient;
 
 #[cfg(windows)]
-use super::windows::{render_windows_mcp_config, render_windows_sidecar_config};
+use super::windows::render_windows_sidecar_config;
 use crate::process::FRESH_PORT_PROBE_TIMEOUT;
 use crate::{BINARY_NAME, CliError, normalized_metadata_path};
 
@@ -30,8 +30,8 @@ pub struct EmbeddedPluginFile {
     pub executable: bool,
 }
 
-/// All 7 bundled plugin files, ordered with `plugin.json` LAST so staging writes the
-/// manifest only after scripts, assets, docs, and sidecar/MCP configs are already on disk.
+/// All 6 bundled plugin files, ordered with `plugin.json` LAST so staging writes the
+/// manifest only after scripts, assets, docs, and sidecar config are already on disk.
 pub const EMBEDDED_PLUGIN_FILES: &[EmbeddedPluginFile] = &[
     EmbeddedPluginFile {
         rel_path: "README.md",
@@ -41,11 +41,6 @@ pub const EMBEDDED_PLUGIN_FILES: &[EmbeddedPluginFile] = &[
     EmbeddedPluginFile {
         rel_path: "assets/logo.svg",
         content: include_str!("../../../../plugin/assets/logo.svg"),
-        executable: false,
-    },
-    EmbeddedPluginFile {
-        rel_path: "mcp_config.json",
-        content: include_str!("../../../../plugin/mcp_config.json"),
         executable: false,
     },
     EmbeddedPluginFile {
@@ -210,7 +205,6 @@ pub(crate) fn write_staged_plugin_dir(
 
         #[cfg(windows)]
         let rendered_override: Option<String> = match entry.rel_path {
-            "mcp_config.json" => Some(render_windows_mcp_config(stable_bin)?),
             "sidecars/proxy/sidecar.json" => Some(render_windows_sidecar_config(stable_bin)?),
             _ => None,
         };

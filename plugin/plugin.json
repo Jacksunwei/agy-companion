@@ -4,7 +4,7 @@
   "displayName": "Antigravity Companion",
   "logo": "assets/logo.svg",
   "version": "0.0.2",
-  "description": "Bring your own models (BYOM) and track token usage in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and embedded MCP App Settings UI.",
+  "description": "Bring your own models (BYOM) and track token usage in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and native Aux Pane Web UI.",
   "suggestedPrompts": [
     "Open the Antigravity Companion settings panel",
     "Generate customModelsConfig JSON for my local Antigravity Companion proxy",

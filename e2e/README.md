@@ -10,16 +10,15 @@ Pure Python 3 standard-library opaque-box E2E suite for `agy-companion`. Exercis
 | File | Role |
 | --- | --- |
 | `run_e2e.py` | Parallel intent-named CLI runner (`--suite`, `--workers`, `--binary`, `--repo-root`, `--filter`, `--list`, `--json`, `-x/--fail-fast`, `--timeout`, `-v/--verbose`, `--self-test`, deprecated `--tier` alias) |
-| `harness.py` | `E2ETestCase`, `IsolatedEnv`, `CompanionProcess`, `MockConnectProxy`, `reap_pidfile_daemon`, `run_cli`, `http_raw_request`, `http_stream_request`, `poll_usage_events`, `poll_stats`, `find_free_port` |
+| `harness.py` | `E2ETestCase`, `IsolatedEnv`, `CompanionProcess`, `SidecarUiClient`, `MockConnectProxy`, `reap_pidfile_daemon`, `run_cli`, `http_raw_request`, `http_stream_request`, `poll_usage_events`, `poll_stats`, `find_free_port` |
 | `mock_gemini.py` | Ephemeral loopback HTTP/1.1 `MockGeminiServer` (request capture, chunked SSE, raw bytes, fault queues, TCP RST) & `MockHealthServer` |
-| `mcp_client.py` | Strict newline-delimited JSON-RPC 2.0 `McpStdioClient` (stdout purity auditing, `save_settings_smart` schema introspection) |
-| `cdp_smoke.py` | Pure-stdlib headless Chrome CDP harness (RFC 6455 WebSocket, WCAG 2.1 contrast math, hermetic `ChromeBrowser`, loopback mock MCP App host) |
-| `test_cuj_core.py` | `--suite cuj` — Core binary CUJs (proxy routing, SSE pass-through, `ui-mcp` lifecycle, SQLite usage, daemon adoption, install/uninstall, CloudCode catalog) |
-| `test_cuj_ux_v2.py` | `--suite cuj` — UX v2 cross-process CUJs (Day-0 passive built-in usage tee + S4 gzip skip + `proxy_rss_bytes`, `enabled_models` hot-reload & `[]` pause, concurrent `--auto-enable-launcher` lock, opt-out parity & symlink fail-closed, semantic `account_plan`) |
+| `cdp_smoke.py` | Pure-stdlib headless Chrome CDP harness (RFC 6455 WebSocket, WCAG 2.1 contrast math, hermetic `ChromeBrowser`, loopback mock Sidecar Web UI host) |
+| `test_cuj_core.py` | `--suite cuj` — Core binary CUJs (proxy routing, SSE pass-through, Sidecar Web UI lifecycle, SQLite usage, daemon adoption, install/uninstall, CloudCode catalog) |
+| `test_cuj_ux_v2.py` | `--suite cuj` — UX v2 cross-process CUJs (Day-0 passive built-in usage tee + S4 gzip skip + `proxy_rss_bytes`, `enabled_models` hot-reload & `[]` pause, concurrent `--auto-enable-launcher` lock, opt-out parity & symlink fail-closed, semantic `account_plan`, per-session Monitor isolation) |
 | `test_boundary_security.py` | `--suite boundary` — Opaque-box S1–S7 security & error boundary canaries |
 | `test_shims_packaging.py` | `--suite shims` — Runtime launcher/dev-install/npm/Python packaging shims |
 | `test_ui_smoke.py` | `--suite ui-smoke` — Multi-viewport Dark/Light overflow, WCAG AA contrast, health-only `Live` footer popover, and RAM telemetry against compiled `ui/dist/index.html` |
-| `test_self.py` | `--self-test` — Dev-only harness safety guardrails (`IsolatedEnv`, `PidfileReaper`, `McpStdioClient`) |
+| `test_self.py` | `--self-test` — Dev-only harness safety guardrails (`IsolatedEnv`, `PidfileReaper`) |
 | `__init__.py` | Package marker |
 | `README.md` | This guide |
 
@@ -54,7 +53,7 @@ python3 -B e2e/run_e2e.py --self-test -v
 
 ## Headless Chrome CDP UI Smoke (`--suite ui-smoke`)
 
-`--suite ui-smoke` renders compiled `ui/dist/index.html` directly inside an isolated loopback mock MCP App host (no compiled Rust binary required) and is excluded from `--suite all`:
+`--suite ui-smoke` renders compiled `ui/dist/index.html` directly inside an isolated loopback mock Sidecar Web UI host (no compiled Rust binary required) and is excluded from `--suite all`:
 
 ```bash
 python3 -B e2e/run_e2e.py --suite ui-smoke --repo-root . -v

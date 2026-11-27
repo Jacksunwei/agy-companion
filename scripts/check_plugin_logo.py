@@ -156,7 +156,6 @@ def validate_plugin_dir(repo_root: pathlib.Path) -> list[str]:
     """Validate plugin JSON manifests and bundled logo path, file type, size, and SVG content."""
     manifests = (
         "plugin/plugin.json",
-        "plugin/mcp_config.json",
         "plugin/sidecars/proxy/sidecar.json",
     )
     errors: list[str] = []
@@ -199,10 +198,6 @@ def validate_plugin_dir(repo_root: pathlib.Path) -> list[str]:
             errors.append(f"{rel}: top-level JSON must be an object")
         else:
             parsed[rel] = data
-
-    mcp_manifest = parsed.get("plugin/mcp_config.json")
-    if isinstance(mcp_manifest, dict) and not isinstance(mcp_manifest.get("mcpServers"), dict):
-        errors.append("plugin/mcp_config.json: 'mcpServers' must be an object")
 
     sidecar_manifest = parsed.get("plugin/sidecars/proxy/sidecar.json")
     if isinstance(sidecar_manifest, dict):

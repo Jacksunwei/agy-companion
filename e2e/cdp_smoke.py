@@ -7,7 +7,7 @@ Provides:
 - Minimal RFC 6455 masked WebSocket + `CdpClient`
 - Hermetic `ChromeBrowser` (isolated `--user-data-dir`, proxy-free env, process-group
   + `atexit` teardown)
-- Loopback `MockMcpAppHostServer` (`127.0.0.1:0` avoiding `harness.RESERVED_PORT_RANGE`)
+- Loopback `MockSidecarHostServer` (`127.0.0.1:0` avoiding `harness.RESERVED_PORT_RANGE`)
   serving `/host.html` + `/app.html` (`ui/dist/index.html`)
 - `UiCdpSession` context manager
 """
@@ -654,7 +654,7 @@ class ChromeBrowser:
 
 
 # ---------------------------------------------------------------------------
-# Minimal Loopback Mock MCP App Host & UiCdpSession
+# Minimal Loopback Mock Sidecar Web UI Host & UiCdpSession
 # ---------------------------------------------------------------------------
 
 _MOCK_HOST_HTML = r"""<!doctype html>
@@ -669,76 +669,33 @@ _MOCK_HOST_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <iframe id="app-frame" src="/app.html"></iframe>
+  <iframe id="app-frame" src="/app.html?token=mock-smoke-token&conversationId=conv-smoke-123456"></iframe>
   <script>
     (function () {
       const boot = (window.__MOCK_BOOT_CONFIG && typeof window.__MOCK_BOOT_CONFIG === "object")
         ? window.__MOCK_BOOT_CONFIG : {};
       const frame = document.getElementById("app-frame");
-      const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
       let theme = boot.theme === "light" ? "light" : "dark";
-      let snapshot = boot.initialSnapshot !== undefined ? clone(boot.initialSnapshot) : null;
-      const usageByRange = boot.initialUsage ? clone(boot.initialUsage) : {};
-      let initialized = false;
+      let ready = false;
 
-      const post = (msg) => frame && frame.contentWindow && frame.contentWindow.postMessage(msg, "*");
-      const toolResult = (structured) => ({
-        content: [{ type: "text", text: JSON.stringify(structured) }],
-        structuredContent: structured,
-        isError: false,
-      });
-      const emptyUsage = (range) => ({
-        range: range || "7d",
-        since_utc: "2026-05-09T00:00:00Z",
-        totals: { label: "", requests: 0, input_tokens: 0, cached_tokens: 0, output_tokens: 0, reasoning_tokens: 0 },
-        buckets: [], by_model: [], by_provider: [],
-      });
+      const postTheme = (nextTheme) => {
+        const bg = nextTheme === "light" ? "#ffffff" : "#1b1c1f";
+        if (frame && frame.contentWindow) {
+          frame.contentWindow.postMessage({
+            type: "theme-change",
+            payload: { cssVariables: { "--background": bg } },
+          }, "*");
+        }
+      };
 
-      window.addEventListener("message", (event) => {
-        if (!frame || event.source !== frame.contentWindow) return;
-        const msg = event.data;
-        if (!msg || typeof msg !== "object" || msg.jsonrpc !== "2.0") return;
-        if (msg.method === "ui/initialize") {
-          post({
-            jsonrpc: "2.0", id: msg.id,
-            result: {
-              protocolVersion: "2026-01-26",
-              hostInfo: { name: "Antigravity Smoke Host", version: "0.1.0" },
-              hostCapabilities: { serverTools: {}, openLinks: {} },
-              hostContext: { theme, displayMode: "inline", platform: "desktop" },
-            },
-          });
-          return;
-        }
-        if (msg.method === "ui/notifications/initialized") {
-          initialized = true;
-          if (snapshot !== null) {
-            post({ jsonrpc: "2.0", method: "ui/notifications/tool-input", params: { arguments: {} } });
-            post({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: toolResult(clone(snapshot)) });
-          }
-          return;
-        }
-        if (msg.method === "ui/open-link") {
-          post({ jsonrpc: "2.0", id: msg.id, result: {} });
-          return;
-        }
-        if (msg.method === "tools/call") {
-          const name = msg.params && msg.params.name;
-          const args = (msg.params && msg.params.arguments) || {};
-          if (name === "open_settings" || name === "get_settings") {
-            post({ jsonrpc: "2.0", id: msg.id, result: toolResult(clone(snapshot || {})) });
-          } else if (name === "get_usage") {
-            const r = args.range || "7d";
-            post({ jsonrpc: "2.0", id: msg.id, result: toolResult(clone(usageByRange[r] || emptyUsage(r))) });
-          } else {
-            post({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Unknown tool: " + name } });
-          }
-        }
+      frame.addEventListener("load", () => {
+        ready = true;
+        postTheme(theme);
       });
 
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
       window.__mockHost = {
-        isInitialized: () => initialized,
+        isInitialized: () => ready,
         doc: () => (frame ? frame.contentDocument : null),
         evalApp: (source) => {
           const win = frame.contentWindow;
@@ -754,11 +711,17 @@ _MOCK_HOST_HTML = r"""<!doctype html>
         },
         setTheme: (nextTheme) => {
           theme = nextTheme === "light" ? "light" : "dark";
-          post({ jsonrpc: "2.0", method: "ui/notifications/host-context-changed", params: { theme } });
+          postTheme(theme);
         },
-        setSnapshot: (nextSnap) => {
-          snapshot = clone(nextSnap);
-          post({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: toolResult(clone(snapshot)) });
+        setSnapshot: async (nextSnap) => {
+          await fetch("/__mock/set_snapshot", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(nextSnap),
+          });
+          if (frame && frame.contentWindow) {
+            frame.contentWindow.postMessage({ type: "companion-refresh" }, "*");
+          }
         },
       };
     })();
@@ -781,12 +744,21 @@ class _ThreadingHttpServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.server_port = port
 
 
-class MockMcpAppHostServer:
-    """Loopback HTTP server serving `/host.html` and compiled `ui/dist/index.html`."""
+class MockSidecarHostServer:
+    """Loopback HTTP server serving `/host.html`, `ui/dist/index.html`, and mock `/_api/*`."""
 
-    def __init__(self, app_html_bytes: bytes) -> None:
+    def __init__(
+        self,
+        app_html_bytes: bytes,
+        *,
+        initial_snapshot: dict[str, Any] | None = None,
+        initial_usage: dict[str, Any] | None = None,
+    ) -> None:
         self._app_html = app_html_bytes
         self._host_html = _MOCK_HOST_HTML.encode("utf-8")
+        self._lock = threading.Lock()
+        self._snapshot: dict[str, Any] | None = initial_snapshot
+        self._usage_by_range: dict[str, Any] = dict(initial_usage or {})
         self._server: _ThreadingHttpServer | None = None
         self._thread: threading.Thread | None = None
         self.port: int = 0
@@ -795,34 +767,81 @@ class MockMcpAppHostServer:
     def host_url(self) -> str:
         return f"http://127.0.0.1:{self.port}/host.html"
 
-    def start(self) -> MockMcpAppHostServer:
+    def start(self) -> MockSidecarHostServer:
         host_bytes = self._host_html
         app_bytes = self._app_html
+        owner = self
+
+        def _empty_usage(rng: str) -> dict[str, Any]:
+            return {
+                "range": rng or "7d",
+                "since_utc": "2026-05-09T00:00:00Z",
+                "totals": {
+                    "label": "",
+                    "requests": 0,
+                    "input_tokens": 0,
+                    "cached_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_tokens": 0,
+                },
+                "buckets": [],
+                "by_model": [],
+                "by_provider": [],
+            }
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                 return
 
-            def do_GET(self) -> None:  # noqa: N802
-                path = urllib.parse.urlsplit(self.path).path
-                if path in ("/", "/host.html"):
-                    body = host_bytes
-                elif path == "/app.html":
-                    body = app_bytes
-                elif path == "/favicon.ico":
-                    self.send_response(204)
-                    self.end_headers()
-                    return
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+            def _send(self, status: int, content_type: str, body: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                path = urllib.parse.urlsplit(self.path).path
+                if path in ("/", "/host.html"):
+                    self._send(200, "text/html; charset=utf-8", host_bytes)
+                elif path == "/app.html":
+                    self._send(200, "text/html; charset=utf-8", app_bytes)
+                elif path == "/favicon.ico":
+                    self.send_response(204)
+                    self.end_headers()
+                else:
+                    self._send(404, "text/plain; charset=utf-8", b"not found")
+
+            def do_POST(self) -> None:  # noqa: N802
+                path = urllib.parse.urlsplit(self.path).path
+                length = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    req_json = json.loads(raw.decode("utf-8")) if raw else {}
+                except ValueError:
+                    req_json = {}
+
+                if path == "/__mock/set_snapshot":
+                    with owner._lock:
+                        owner._snapshot = req_json
+                    self._send(200, "application/json", b'{"ok":true}')
+                    return
+
+                if path == "/_api/get_settings":
+                    with owner._lock:
+                        snap = owner._snapshot or {}
+                    self._send(200, "application/json", json.dumps(snap).encode("utf-8"))
+                    return
+
+                if path == "/_api/get_usage":
+                    rng = str(req_json.get("range") or "7d")
+                    with owner._lock:
+                        usage = owner._usage_by_range.get(rng) or _empty_usage(rng)
+                    self._send(200, "application/json", json.dumps(usage).encode("utf-8"))
+                    return
+
+                self._send(404, "application/json", b'{"ok":false,"error":"unknown endpoint"}')
 
         skipped: list[_ThreadingHttpServer] = []
         try:
@@ -834,7 +853,7 @@ class MockMcpAppHostServer:
                     break
                 skipped.append(srv)
             if self._server is None:
-                raise CdpError("Unable to bind MockMcpAppHostServer outside reserved port range")
+                raise CdpError("Unable to bind MockSidecarHostServer outside reserved port range")
         finally:
             for s in skipped:
                 with contextlib.suppress(Exception):
@@ -861,7 +880,7 @@ class MockMcpAppHostServer:
 
 
 class UiCdpSession:
-    """Hermetic context manager binding MockMcpAppHostServer + ChromeBrowser + CdpClient."""
+    """Hermetic context manager binding MockSidecarHostServer + ChromeBrowser + CdpClient."""
 
     def __init__(
         self,
@@ -886,13 +905,17 @@ class UiCdpSession:
             else Path(user_data_dir)
         )
         self._timeout = float(timeout)
-        self._server: MockMcpAppHostServer | None = None
+        self._server: MockSidecarHostServer | None = None
         self._browser: ChromeBrowser | None = None
         self._cdp: CdpClient | None = None
 
     def __enter__(self) -> UiCdpSession:
         try:
-            self._server = MockMcpAppHostServer(self._app_html).start()
+            self._server = MockSidecarHostServer(
+                self._app_html,
+                initial_snapshot=self._boot_config.get("initialSnapshot"),
+                initial_usage=self._boot_config.get("initialUsage"),
+            ).start()
             self._browser = ChromeBrowser(
                 self._chrome_bin, self._user_data_dir, startup_timeout=self._timeout
             ).start()
@@ -906,7 +929,8 @@ class UiCdpSession:
             self._cdp.call("Page.navigate", {"url": self._server.host_url})
             self.wait_for(
                 "Boolean(window.__mockHost && window.__mockHost.isInitialized()"
-                " && window.__mockHost.doc() && window.__mockHost.doc().querySelector('footer.status-bar'))",
+                " && window.__mockHost.doc() && window.__mockHost.doc().querySelector('footer.status-bar')"
+                " && /Live|Proxy offline|Update pending/i.test(window.__mockHost.doc().body.innerText || ''))",
                 timeout=self._timeout,
                 in_app=False,
             )

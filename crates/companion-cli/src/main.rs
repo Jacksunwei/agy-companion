@@ -11,15 +11,18 @@ use companion_cli::install::{InstallOptions, UninstallOptions, run_install, run_
 use companion_cli::integration::run_integration;
 use companion_cli::launch::run_launch;
 use companion_cli::models::run_models;
-use companion_cli::{ServeOptions, run_serve_configured, run_ui_mcp_with_options};
+use companion_cli::{ServeOptions, run_serve_configured};
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-fn rmcp_ceiling_allows(target: &str, level: &tracing::Level) -> bool {
-    let is_rmcp = target == "rmcp" || target.starts_with("rmcp::");
-    !(is_rmcp && *level > tracing::Level::INFO)
+fn sensitive_transport_ceiling_allows(target: &str, level: &tracing::Level) -> bool {
+    const CAPPED: &[&str] = &["hyper", "hyper_util", "h2", "reqwest"];
+    let is_capped = CAPPED
+        .iter()
+        .any(|prefix| target == *prefix || target.starts_with(&format!("{prefix}::")));
+    !(is_capped && *level > tracing::Level::INFO)
 }
 
 fn init_tracing<W>(default_level: &str, writer: W)
@@ -28,13 +31,13 @@ where
 {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    // Hard ceiling: rmcp DEBUG/TRACE logs raw JSON-RPC request payloads (including save_settings
-    // plaintext api_key) before companion-ui-mcp deserializes into redacted argument structs.
-    let rmcp_ceiling = filter_fn(|meta| rmcp_ceiling_allows(meta.target(), meta.level()));
+    // Hard ceiling: HTTP transport DEBUG/TRACE logs can dump raw headers (API keys, sidecar
+    // tokens, CSRF tokens) or request/response bodies.
+    let ceiling = filter_fn(|meta| sensitive_transport_ceiling_allows(meta.target(), meta.level()));
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         .with_ansi(false)
-        .with_filter(env_filter.and(rmcp_ceiling));
+        .with_filter(env_filter.and(ceiling));
     let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
 }
 
@@ -61,19 +64,6 @@ async fn main() -> ExitCode {
                 log_target: Some(log_target),
             })
             .await
-            {
-                eprintln!("error: {err}");
-                return ExitCode::FAILURE;
-            }
-            ExitCode::SUCCESS
-        }
-        Commands::UiMcp {
-            data_dir,
-            config,
-            auto_enable_launcher,
-        } => {
-            init_tracing("warn", std::io::stderr);
-            if let Err(err) = run_ui_mcp_with_options(data_dir, config, auto_enable_launcher).await
             {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
@@ -214,7 +204,7 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{EnvFilter, Layer};
 
-    use super::rmcp_ceiling_allows;
+    use super::sensitive_transport_ceiling_allows;
 
     #[derive(Clone, Default)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
@@ -241,59 +231,79 @@ mod tests {
     }
 
     #[test]
-    fn rmcp_ceiling_blocks_rmcp_debug_and_trace_but_preserves_companion_and_info() {
-        assert!(!rmcp_ceiling_allows("rmcp", &tracing::Level::TRACE));
-        assert!(!rmcp_ceiling_allows("rmcp", &tracing::Level::DEBUG));
-        assert!(rmcp_ceiling_allows("rmcp", &tracing::Level::INFO));
-        assert!(rmcp_ceiling_allows("rmcp", &tracing::Level::WARN));
-        assert!(rmcp_ceiling_allows("rmcp", &tracing::Level::ERROR));
-
-        assert!(!rmcp_ceiling_allows(
-            "rmcp::service",
-            &tracing::Level::TRACE
-        ));
-        assert!(!rmcp_ceiling_allows(
-            "rmcp::service",
-            &tracing::Level::DEBUG
-        ));
-        assert!(rmcp_ceiling_allows("rmcp::service", &tracing::Level::INFO));
+    fn sensitive_transport_ceiling_blocks_http_debug_and_trace_but_preserves_companion_and_info() {
+        for target in [
+            "hyper",
+            "hyper::proto",
+            "hyper_util::client",
+            "h2::codec",
+            "reqwest::connect",
+        ] {
+            assert!(!sensitive_transport_ceiling_allows(
+                target,
+                &tracing::Level::TRACE
+            ));
+            assert!(!sensitive_transport_ceiling_allows(
+                target,
+                &tracing::Level::DEBUG
+            ));
+            assert!(sensitive_transport_ceiling_allows(
+                target,
+                &tracing::Level::INFO
+            ));
+            assert!(sensitive_transport_ceiling_allows(
+                target,
+                &tracing::Level::WARN
+            ));
+            assert!(sensitive_transport_ceiling_allows(
+                target,
+                &tracing::Level::ERROR
+            ));
+        }
 
         // Companion crates retain full debug/trace observability.
-        assert!(rmcp_ceiling_allows("companion_cli", &tracing::Level::TRACE));
-        assert!(rmcp_ceiling_allows(
+        assert!(sensitive_transport_ceiling_allows(
+            "companion_cli",
+            &tracing::Level::TRACE
+        ));
+        assert!(sensitive_transport_ceiling_allows(
             "companion_proxy::router",
             &tracing::Level::DEBUG
         ));
         // Unrelated target sharing only a prefix without `::` is not blocked.
-        assert!(rmcp_ceiling_allows("rmcp_other", &tracing::Level::DEBUG));
+        assert!(sensitive_transport_ceiling_allows(
+            "hyper_other",
+            &tracing::Level::DEBUG
+        ));
     }
 
     #[test]
-    fn composed_env_filter_and_rmcp_ceiling_drops_rmcp_debug_trace_even_under_rmcp_trace() {
+    fn composed_env_filter_and_ceiling_drops_transport_debug_trace_even_under_trace() {
         let buf = SharedBuf::default();
-        let env_filter = EnvFilter::new("companion_cli=trace,rmcp=trace");
-        let rmcp_ceiling = filter_fn(|meta| rmcp_ceiling_allows(meta.target(), meta.level()));
+        let env_filter = EnvFilter::new("companion_cli=trace,hyper=trace,reqwest=trace");
+        let ceiling =
+            filter_fn(|meta| sensitive_transport_ceiling_allows(meta.target(), meta.level()));
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_writer(buf.clone())
                 .with_ansi(false)
-                .with_filter(env_filter.and(rmcp_ceiling)),
+                .with_filter(env_filter.and(ceiling)),
         );
 
         tracing::subscriber::with_default(subscriber, || {
-            tracing::trace!(target: "rmcp", "LEAK_RMCP_ROOT_TRACE");
-            tracing::debug!(target: "rmcp::service", "LEAK_RMCP_SERVICE_DEBUG");
-            tracing::trace!(target: "rmcp::service", "LEAK_RMCP_SERVICE_TRACE");
-            tracing::info!(target: "rmcp::service", "ALLOW_RMCP_SERVICE_INFO");
+            tracing::trace!(target: "hyper", "LEAK_HYPER_ROOT_TRACE");
+            tracing::debug!(target: "reqwest::connect", "LEAK_REQWEST_DEBUG");
+            tracing::trace!(target: "h2::codec", "LEAK_H2_TRACE");
+            tracing::info!(target: "hyper::proto", "ALLOW_HYPER_INFO");
             tracing::debug!(target: "companion_cli", "ALLOW_COMPANION_DEBUG");
             tracing::trace!(target: "companion_cli", "ALLOW_COMPANION_TRACE");
         });
 
         let captured = String::from_utf8(buf.0.lock().expect("lock buf").clone()).expect("utf8");
-        assert!(!captured.contains("LEAK_RMCP_ROOT_TRACE"), "{captured}");
-        assert!(!captured.contains("LEAK_RMCP_SERVICE_DEBUG"), "{captured}");
-        assert!(!captured.contains("LEAK_RMCP_SERVICE_TRACE"), "{captured}");
-        assert!(captured.contains("ALLOW_RMCP_SERVICE_INFO"), "{captured}");
+        assert!(!captured.contains("LEAK_HYPER_ROOT_TRACE"), "{captured}");
+        assert!(!captured.contains("LEAK_REQWEST_DEBUG"), "{captured}");
+        assert!(!captured.contains("LEAK_H2_TRACE"), "{captured}");
+        assert!(captured.contains("ALLOW_HYPER_INFO"), "{captured}");
         assert!(captured.contains("ALLOW_COMPANION_DEBUG"), "{captured}");
         assert!(captured.contains("ALLOW_COMPANION_TRACE"), "{captured}");
     }

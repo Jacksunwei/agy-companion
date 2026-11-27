@@ -12,5 +12,3 @@ mod install_lifecycle;
 mod install_symlink_safety;
 #[path = "cli_integration/serve_doctor.rs"]
 mod serve_doctor;
-#[path = "cli_integration/ui_mcp.rs"]
-mod ui_mcp;

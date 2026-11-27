@@ -41,8 +41,8 @@ Deriving `auth_dir = config_path.parent().unwrap_or(Path::new(".")).join("auth")
 
 - Remove `api_key: Option<ApiKey>` from `GeminiConfig` and `RawGeminiConfig` in `crates/companion-core/src/config.rs`.
 - Because `RawGeminiConfig` uses standard serde deserialization (without `deny_unknown_fields`), any pre-existing developer `config.json` containing an old `"api_key"` field will simply ignore it on load and omit it on the next save—zero crash, zero migration code.
-- `Config::redacted_with_auth(&auth_snapshot)` (or `RedactedConfig::from_config_and_auth(&config, &auth_status)`) builds the redacted snapshot from non-secret `Config` plus `AuthStore` metadata so `companion-ui-mcp` and `ui/` keep their exact redacted wire contract (`providers.gemini.api_key_configured`, `providers.gemini.api_key_hint`) plus new redacted `providers.codex` auth status.
-- `save_settings` in `companion-ui-mcp` continues to accept `providers.gemini.api_key: Option<ApiKeyPatch>`, routing that patch directly to `AuthStore::save_gemini` / `clear_gemini` instead of `config.json`.
+- `Config::redacted_with_auth(&auth_snapshot)` (or `RedactedConfig::from_config_and_auth(&config, &auth_status)`) builds the redacted snapshot from non-secret `Config` plus `AuthStore` metadata so `companion-ui` and `ui/` keep their exact redacted wire contract (`providers.gemini.api_key_configured`, `providers.gemini.api_key_hint`) plus new redacted `providers.codex` auth status.
+- `save_settings` in `companion-ui` continues to accept `providers.gemini.api_key: Option<ApiKeyPatch>`, routing that patch directly to `AuthStore::save_gemini` / `clear_gemini` instead of `config.json`.
 
 ### 2.3 `AuthStore` Trait & Implementations (`crates/companion-core/src/auth.rs`)
 
@@ -60,7 +60,7 @@ pub struct GeminiCredentials {
 pub struct CodexCredentials {
     pub schema_version: u32,
     pub auth_mode: CodexAuthMode,         // ChatGptOAuth (future: ApiKey)
-    pub access_token: SecretString,       // redacted Debug, never logged or exposed in MCP/UI
+    pub access_token: SecretString,       // redacted Debug, never logged or exposed in Sidecar UI
     pub refresh_token: SecretString,      // redacted Debug
     pub id_token: Option<SecretString>,   // redacted Debug
     pub account_id: String,               // ChatGPT workspace/account ID for `chatgpt-account-id` header
@@ -95,7 +95,7 @@ pub trait AuthStore: Send + Sync {
   - Background Codex token refresh writes `auth/codex.json` without ever dirtying `config.json`.
 - **Test & future Keychain seams:**
   - `MemoryAuthStore` enables fast, hermetic unit tests with zero disk I/O.
-  - A future `KeychainAuthStore` (if binaries are later Apple/Windows code-signed) implements `AuthStore` without changing a single provider, proxy, MCP, or CLI caller.
+  - A future `KeychainAuthStore` (if binaries are later Apple/Windows code-signed) implements `AuthStore` without changing a single provider, proxy, Sidecar UI, or CLI caller.
 
 ---
 
@@ -161,36 +161,36 @@ No `access_token`, `refresh_token`, or `id_token` ever enters `RedactedConfig`, 
 sequenceDiagram
     participant User as User / Browser
     participant UI as Antigravity Aux Panel (Settings)
-    participant MCP as companion-ui-mcp (agy-companion_hub)
+    participant Sidecar as Sidecar Web UI (companion-ui /_api/*)
     participant Loopback as 127.0.0.1:1455 Callback
     participant OAI as auth.openai.com
     participant Store as FileAuthStore (auth/codex.json)
 
     User->>UI: Click "Sign in with ChatGPT ↗"
-    UI->>MCP: callServerTool("start_codex_login")
-    MCP->>Loopback: bind 127.0.0.1:1455 (5m TTL, replaces any prior pending session)
-    MCP-->>UI: { authorize_url, manual_fallback }
-    UI->>User: app.openLink({ url: authorize_url }) (opens browser directly)
+    UI->>Sidecar: POST /_api/start_codex_login
+    Sidecar->>Loopback: bind 127.0.0.1:1455 (5m TTL, replaces any prior pending session)
+    Sidecar-->>UI: { authorize_url, manual_fallback }
+    UI->>User: Open authorize_url in system browser (with inline copy/paste fallback)
     User->>OAI: Sign in with ChatGPT Plus/Pro & approve
     OAI-->>Loopback: 302 /auth/callback?code=...&state=...
-    Loopback->>MCP: verify state + exchange code + code_verifier
-    MCP->>OAI: POST /oauth/token (grant_type=authorization_code)
-    OAI-->>MCP: access_token, refresh_token, id_token, expires_in
-    MCP->>MCP: decode JWT payload (exp, chatgpt_account_id, chatgpt_plan_type, masked email)
-    MCP->>Store: atomic 0600 write auth/codex.json
+    Loopback->>Sidecar: verify state + exchange code + code_verifier
+    Sidecar->>OAI: POST /oauth/token (grant_type=authorization_code)
+    OAI-->>Sidecar: access_token, refresh_token, id_token, expires_in
+    Sidecar->>Sidecar: decode JWT payload (exp, chatgpt_account_id, chatgpt_plan_type, masked email)
+    Sidecar->>Store: atomic 0600 write auth/codex.json
     Loopback-->>User: static HTML "Signed in — return to Antigravity" & close listener
-    UI->>MCP: background poll get_settings (2s while pending)
-    MCP-->>UI: SettingsSnapshot (codex.authenticated = true, plan_type, account_hint)
+    UI->>Sidecar: background poll POST /_api/get_settings (2s while pending)
+    Sidecar-->>UI: SettingsSnapshot (codex.authenticated = true, plan_type, account_hint)
 ```
 
-- **Zero terminal, resilient to closing the pane:** `companion-ui-mcp` stays alive in Antigravity's MCP host even if the user closes/reopens the Aux Panel while signing in on their browser, so the callback still completes and persists `auth/codex.json` cleanly.
+- **Zero terminal, resilient to closing the pane:** The `agy-companion serve` sidecar (`companion-ui` + `sidecar_ui.rs`) stays alive in Antigravity's sidecar host even if the user closes/reopens the Aux Panel while signing in on their browser, so the callback still completes and persists `auth/codex.json` cleanly.
 - **Single bounded pending session:** Clicking **Sign in with ChatGPT ↗** again (or clicking **Cancel** → `cancel_codex_login`) aborts any previous pending listener and releases `127.0.0.1:1455` immediately. Pending listeners auto-expire after `5` minutes.
-- **Inline fallback (still zero terminal):** If `127.0.0.1:1455` is occupied or `app.openLink` is unavailable, the card reveals a copyable sign-in URL and a compact `"Paste redirect URL"` input wired to `complete_codex_login` right inside the Aux Panel.
+- **Inline fallback (still zero terminal):** If `127.0.0.1:1455` is occupied or browser launch is blocked, the card reveals a copyable sign-in URL and a compact `"Paste redirect URL"` input wired to `complete_codex_login` right inside the Aux Panel.
 - **Why native PKCE instead of sharing `~/.codex/auth.json`:** OpenAI refresh tokens rotate on use. Minting our own PKCE session via the Aux Panel gives `agy-companion` an independent refresh-token family that will never log out a user's separate Codex CLI session.
 
 ### 4.3 Rotating Refresh Token Concurrency (Cross-Process Lock)
 
-Because `agy-companion serve`, `agy-companion ui-mcp` (`test_connection`), and `agy-companion doctor` run as separate OS processes, **unserialized token refreshes would race and burn rotating single-use refresh tokens**.
+Because `agy-companion serve` (proxy + Sidecar Web UI `test_connection`) and `agy-companion doctor` can run across separate OS processes, **unserialized token refreshes would race and burn rotating single-use refresh tokens**.
 
 Refresh protocol inside `CodexAuthManager::valid_credentials()`:
 1. Fast path: load cached `CodexCredentials` (stat-checked against `auth/codex.json`); if `now_ms + 300_000 < expires_at_ms` (5-minute proactive margin), return immediately.
@@ -300,21 +300,21 @@ Because the translated stream emits standard Gemini `usageMetadata`, **`UsageTee
 
 ---
 
-## 7. Aux Panel UX, MCP Tools & Diagnostics
+## 7. Aux Panel UX, Sidecar Web UI APIs & Diagnostics
 
-### 7.1 MCP Tools (`companion-ui-mcp`)
+### 7.1 Sidecar Web UI APIs (`companion-ui` + `sidecar_ui.rs` `/_api/*`)
 - Extend `save_settings` with `providers.codex: Option<CodexSettingsPatch>` (`enabled_models`, `default_model`).
 - Extend `test_connection` with optional `provider: Option<"gemini" | "codex">` (defaults to `"gemini"` for backward compatibility).
-- Add OAuth lifecycle tools (strict `#[serde(deny_unknown_fields)]`):
-  - `start_codex_login` → starts (or replaces) the bounded loopback PKCE listener on `127.0.0.1:1455` (5-min TTL) and returns `{ authorize_url, callback_listening, manual_fallback }` so the Aux Panel opens it directly via CSP-safe `app.openLink({ url })` (S5).
+- Add OAuth lifecycle endpoints under `POST /_api/*` (authenticated with `X-Sidecar-Token` + `application/json`, strict `#[serde(deny_unknown_fields)]`):
+  - `start_codex_login` → starts (or replaces) the bounded loopback PKCE listener on `127.0.0.1:1455` (5-min TTL) and returns `{ authorize_url, callback_listening, manual_fallback }` so the Aux Panel opens `authorize_url` in the system browser (with inline copy/paste fallback).
   - `cancel_codex_login` → aborts any pending login listener and releases `127.0.0.1:1455`.
-  - `complete_codex_login` *(inline manual fallback)* → accepts a pasted redirect URL/code if port `1455` was busy or `openLink` wasn't available, exchanges PKCE tokens, writes `auth/codex.json`, and returns a fresh `SettingsSnapshot`.
+  - `complete_codex_login` *(inline manual fallback)* → accepts a pasted redirect URL/code if port `1455` was busy or browser launch was blocked, exchanges PKCE tokens, writes `auth/codex.json`, and returns a fresh `SettingsSnapshot`.
   - `disconnect_codex` → clears `auth/codex.json`, aborts any pending login, and returns a fresh `SettingsSnapshot`.
 - `SettingsSnapshot` adds `supported_codex_models: Vec<ModelPreset>` and `codex_login_pending: bool` alongside `config.providers.codex` (`RedactedCodexConfig`).
 
 ### 7.2 UX v2 Aux Panel Card (`ui/src/settings.ts`, stacked after PR C merges)
 - Plugs directly into UX v2's `.provider-stack` below **`Google AI Studio`**:
-  - **Signed-out state:** Header **`OpenAI Codex`** + muted `Not signed in` pill + primary **`Sign in with ChatGPT ↗`** button (calls `start_codex_login` → `app.openLink({ url })`).
+  - **Signed-out state:** Header **`OpenAI Codex`** + muted `Not signed in` pill + primary **`Sign in with ChatGPT ↗`** button (calls `/_api/start_codex_login` and opens `authorize_url` in the system browser).
   - **Pending sign-in state:** Inline `"Complete sign-in in your browser…"` indicator (2s `get_settings` poll) + **`Cancel`** + secondary **`Copy link`** / collapsible `"Having trouble? Paste callback URL"` fallback (still zero terminal).
   - **Signed-in state:** Status pill (`● Pro · j***@…` or `● Plus`), **`Test`** button, right-aligned **`Sign out`** (inline 2-click confirm, zero `window.confirm()`), and **`Enabled models`** checkbox chips (`6.2 Astra`, `6.2 Sol`, `6.1 Terra`, `6 Luna`) with clamped `"Best for ..."` tooltips.
 
@@ -329,10 +329,10 @@ Because the translated stream emits standard Gemini `usageMetadata`, **`UsageTee
 | Invariant | How Unified `auth/` + Codex Satisfies It |
 | --- | --- |
 | **S1 (Loopback only)** | Proxy remains `127.0.0.1` only; OAuth PKCE callback listener binds strictly to `127.0.0.1:1455` (never `0.0.0.0`). |
-| **S2 (Secret redaction & atomic `0600`)** | All secrets leave `config.json` and live in `0700` `auth/{gemini,codex}.json` (`0600` atomic writes, `RejectSymlinkAndTighten` / `RejectSymlinkAndNonRegular`). `SecretString` redacts `Debug`; `RedactedConfig` never includes plaintext keys or tokens; `rmcp` stays capped at `INFO`. |
+| **S2 (Secret redaction & atomic `0600`)** | All secrets leave `config.json` and live in `0700` `auth/{gemini,codex}.json` (`0600` atomic writes, `RejectSymlinkAndTighten` / `RejectSymlinkAndNonRegular`). `SecretString` redacts `Debug`; `RedactedConfig` never includes plaintext keys or tokens; `hyper`/`hyper_util`/`h2`/`reqwest` tracing stays capped at `INFO`. |
 | **S3 (SSRF & upstream auth)** | `auth.openai.com` and `chatgpt.com` require `https://` (`http://127.0.0.1`/`localhost` only for tests); `Policy::none()` on redirects; Bearer token only in `Authorization` header (never query string). |
 | **S4 (Zero compression & streaming)** | `reqwest` keeps zero compression features; Gemini fast-path stays byte-for-byte untouched; Codex SSE translates token-by-token without buffering full responses. |
-| **S5 (Pure DOM & strict CSP)** | Codex UI card uses `document.createElement` / `textContent` and `app.openLink({ url })` — zero `innerHTML`, zero `fetch()`, zero CSP relaxation, bundle stays `< 512 KiB`. |
+| **S5 (Pure DOM & strict CSP)** | Codex UI card uses `document.createElement` / `textContent` and safe external navigation — zero `innerHTML`, `fetch()` restricted to same-origin `/_api/*` in `ui/src/transport.ts`, zero CSP relaxation, bundle stays `< 512 KiB`. |
 | **S6 (XDG + Windows paths & fail-closed)** | `auth/` derives from resolved `config_path` parent (`--config` → `AGY_COMPANION_CONFIG` → `XDG_CONFIG_HOME` → platform default); `fs_safe` rejects symlinks, FIFOs, `..`, NUL bytes, and oversized files (`> 64 KiB`). |
 | **S7 (HTTP surface & limits)** | No new proxy HTTP methods or endpoints needed for inference (reuses `/v1beta/models/{*rest}` and `/v1internal:fetchAvailableModels` under existing `64 MiB` limit and headers). |
 | **S8 (Packaging & zero-prereq)** | Pure Rust using crates already in `Cargo.lock` (`sha2`, `base64`, `getrandom`, `reqwest`, `axum`); zero Node/Python/Codex CLI runtime requirement. |
@@ -346,7 +346,7 @@ Each slice is small, independently testable with hermetic Rust tests, and ordere
 | PR | Branch | Scope & Crates | Positive Verification Signal |
 | --- | --- | --- | --- |
 | **PR 0** *(now)* | `docs/openai-codex-provider-design` (or folded into PR 1) | `docs/design/openai-codex-provider.md` | `./scripts/agent_check.sh` 7/7 green |
-| **PR 1** | `feat/unified-auth-store` | `companion-core` (`auth.rs` `AuthStore` + `FileAuthStore` + `MemoryAuthStore`, remove `providers.gemini.api_key` from `config.rs`, update `redaction.rs`), wire `companion-providers`, `companion-proxy`, `companion-ui-mcp`, `companion-cli` to `AuthStore`. | `cargo test --workspace` green; `config.json` contains zero `"api_key"` fields; `auth/gemini.json` created at `0600` inside `0700` `auth/`; `./scripts/agent_check.sh` 7/7 green. |
+| **PR 1** | `feat/unified-auth-store` | `companion-core` (`auth.rs` `AuthStore` + `FileAuthStore` + `MemoryAuthStore`, remove `providers.gemini.api_key` from `config.rs`, update `redaction.rs`), wire `companion-providers`, `companion-proxy`, `companion-ui`, `companion-cli` to `AuthStore`. | `cargo test --workspace` green; `config.json` contains zero `"api_key"` fields; `auth/gemini.json` created at `0600` inside `0700` `auth/`; `./scripts/agent_check.sh` 7/7 green. |
 | **PR 2** | `feat/codex-core-and-oauth` | `companion-core` (`CodexConfig`, `CodexCredentials`, curated Codex models), `companion-providers::codex::auth` (PKCE S256, loopback `127.0.0.1:1455` callback manager with cancellation/TTL, manual paste fallback, JWT decode, cross-process locked refresh), `companion-cli` (`doctor` Codex check). | Hermetic mock OAuth server tests pass (happy path, state mismatch, cancel/replace pending session, concurrent refresh serialization, `invalid_grant`, symlink rejection); `./scripts/agent_check.sh` 7/7 green. |
 | **PR 3** | `feat/codex-responses-proxy` | `companion-providers::codex::{translate,provider}` (`Gemini ↔ Codex Responses` SSE & unary translator, tool-call correlation, schema normalization, reasoning summaries, usage mapping), `companion-proxy` (multi-provider dispatch in `routes/gemini.rs`, `M351..=M364` slot injection in `cloudcode/{slots,catalog}.rs`, `UsageOrigin::CodexProxy`). | Hermetic mock Codex SSE server tests pass (text streaming, reasoning summaries → `thought: true`, multi-turn tool calls without Gemini `id`, `cached_tokens` → `UsageSink`, `401` refresh-and-retry, `429` error mapping, 31-slot Gemini+Codex coexistence); `./scripts/agent_check.sh` 7/7 green. |
-| **PR 4** *(after PR C merges)* | `feat/codex-mcp-and-ui` | `companion-ui-mcp` (`start_codex_login`, `cancel_codex_login`, `complete_codex_login`, `disconnect_codex`, `CodexSettingsPatch`, provider-aware `test_connection`), `ui/` (one-click `Sign in with ChatGPT ↗` flow + `OpenAI Codex` card stacked in UX v2 `LIVE_PROVIDERS`), `docs/README.md` index update. | `npm --prefix ui run typecheck && npm --prefix ui run build`, S5 bundle `< 512 KiB` clean, `cargo test --workspace` green, `./scripts/agent_check.sh` 7/7 green. |
+| **PR 4** *(after PR C merges)* | `feat/codex-sidecar-ui` | `companion-ui` + `sidecar_ui.rs` (`start_codex_login`, `cancel_codex_login`, `complete_codex_login`, `disconnect_codex`, `CodexSettingsPatch`, provider-aware `test_connection`), `ui/` (one-click `Sign in with ChatGPT ↗` flow + `OpenAI Codex` card stacked in UX v2 `LIVE_PROVIDERS`), `docs/README.md` index update. | `npm --prefix ui run typecheck && npm --prefix ui run build`, S5 bundle `< 512 KiB` clean, `cargo test --workspace` green, `./scripts/agent_check.sh` 7/7 green. |

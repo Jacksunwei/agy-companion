@@ -301,7 +301,7 @@ describe("ui/src/style.css theme tokens & WCAG AA contrast", () => {
 });
 
 describe("UX v2 open-source copy hygiene across ui/src/ and ui/dist/index.html", () => {
-  // Exact 8 lowercase tokens mirrored from crates/companion-ui-mcp/src/tests.rs
+  // Exact 8 lowercase tokens mirrored from crates/companion-ui/src/tests.rs
   const FORBIDDEN_CI = [
     "cloudcode",
     "jetski",

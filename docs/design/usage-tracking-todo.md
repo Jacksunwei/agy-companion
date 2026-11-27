@@ -30,4 +30,4 @@ pub struct UsageEvent {
 1. `agy-companion usage` CLI subcommand (daily/monthly/model/provider SQL rollups, cache savings breakdown).
 2. Versioned pricing table (input, output, cached-input discount, thinking tokens) with offline defaults and optional refresh.
 3. Optional read-only adapter to inspect Antigravity's locally stored session/usage data (if documented and stable) alongside proxy SQLite records.
-4. Usage & Cost tab inside the `agy-companion` MCP App (`global` full-page view).
+4. Usage & Cost tab inside the `agy-companion` Sidecar Web UI (`global` full-page view).

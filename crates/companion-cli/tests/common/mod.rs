@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
-use std::io::{BufReader, Write};
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
+#[cfg(not(unix))]
+use std::net::TcpListener as StdTcpListener;
 use std::num::NonZeroU16;
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -13,7 +14,6 @@ use axum::Router;
 use axum::routing::get;
 use companion_core::Config;
 use companion_proxy::HealthResponse;
-use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_agy-companion");
@@ -304,8 +304,21 @@ pub fn free_loopback_port() -> u16 {
         if (24_140..=24_160).contains(&candidate) || state.claimed.contains(&candidate) {
             continue;
         }
-        if let Ok(listener) = StdTcpListener::bind((Ipv4Addr::LOCALHOST, candidate)) {
-            drop(listener);
+        // On Unix (notably macOS without SOCK_CLOEXEC), probing via bind()+drop
+        // can race with a sibling test's Command::spawn() between socket() and
+        // FIOCLEX, leaking a listening fd into the child. connect_timeout never
+        // binds or listens and returns ECONNREFUSED immediately on loopback.
+        #[cfg(unix)]
+        let port_is_free = {
+            let addr = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, candidate));
+            matches!(
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)),
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused
+            )
+        };
+        #[cfg(not(unix))]
+        let port_is_free = StdTcpListener::bind((Ipv4Addr::LOCALHOST, candidate)).is_ok();
+        if port_is_free {
             state.claimed.insert(candidate);
             return candidate;
         }
@@ -522,117 +535,4 @@ pub async fn spawn_mock_health(
     });
     tokio::task::yield_now().await;
     (port, handle)
-}
-
-pub fn run_ui_mcp_bounded_with_env(
-    home: &Path,
-    config_path: &Path,
-    data_dir: &Path,
-    extra_env: &[(&str, &OsStr)],
-    calls: Vec<Value>,
-    timeout: Duration,
-) -> (Option<i32>, String, String, bool) {
-    let mut cmd = isolated_cli_command(home);
-    cmd.arg("ui-mcp")
-        .arg(format!("--data-dir={}", data_dir.display()))
-        .arg("--config")
-        .arg(config_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    let mut guard = ChildGuard::new(cmd.spawn().expect("spawn ui-mcp"));
-
-    let stdin = guard.take_stdin().expect("stdin");
-    let stdout = guard.take_stdout().expect("stdout");
-    let stderr = guard.take_stderr().expect("stderr");
-
-    // Send initialize + requests on a helper thread so a hung FIFO open cannot block the test.
-    let writer_thread = std::thread::spawn(move || {
-        let mut stdin = stdin;
-        let init_req = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": { "name": "companion-cli-test", "version": "0.1.0" }
-            }
-        });
-        let initialized_notif = json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        });
-        let _ = writeln!(stdin, "{init_req}");
-        let _ = writeln!(stdin, "{initialized_notif}");
-        for req in calls {
-            let _ = writeln!(stdin, "{req}");
-        }
-        let _ = stdin.flush();
-    });
-
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = std::io::Read::read_to_string(&mut BufReader::new(stdout), &mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let exit_code = loop {
-        match guard.try_wait().expect("try_wait ui-mcp") {
-            Some(status) => break status.code(),
-            None if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            None => {
-                timed_out = true;
-                let status = guard.kill_and_wait().expect("wait killed ui-mcp");
-                break status.code();
-            }
-        }
-    };
-
-    let _ = writer_thread.join();
-    let stdout_str = stdout_thread.join().expect("join stdout");
-    let stderr_str = stderr_thread.join().expect("join stderr");
-    (exit_code, stdout_str, stderr_str, timed_out)
-}
-
-pub fn run_ui_mcp_bounded_with_calls(
-    home: &Path,
-    config_path: &Path,
-    data_dir: &Path,
-    calls: Vec<Value>,
-    timeout: Duration,
-) -> (Option<i32>, String, String, bool) {
-    run_ui_mcp_bounded_with_env(home, config_path, data_dir, &[], calls, timeout)
-}
-
-pub fn run_ui_mcp_bounded(
-    home: &Path,
-    config_path: &Path,
-    data_dir: &Path,
-    timeout: Duration,
-) -> (Option<i32>, String, String, bool) {
-    run_ui_mcp_bounded_with_calls(
-        home,
-        config_path,
-        data_dir,
-        vec![json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": { "name": "get_settings", "arguments": {} }
-        })],
-        timeout,
-    )
 }

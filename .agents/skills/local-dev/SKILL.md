@@ -1,17 +1,17 @@
 ---
 name: local-dev
-description: Build agy-companion locally, link ./plugin into Antigravity App with scripts/dev-install.sh, iterate on the MCP App UI via AGY_COMPANION_UI_HTML, live-reload MCP servers without restarting Antigravity, inspect sidecar logs, and run isolated live E2E tests with agy CLI.
+description: Build agy-companion locally, link ./plugin into Antigravity App with scripts/dev-install.sh, iterate on the Sidecar Web UI via AGY_COMPANION_UI_HTML, handle stale proxy sidecar takeover, inspect proxy/sidecar logs, and run isolated live E2E tests with agy CLI.
 ---
 
 # Local Antigravity App Development & Testing Runbook
 
-Use this skill when building `agy-companion` locally, linking `./plugin` into the Antigravity App, iterating rapidly on the embedded MCP App UI, reloading the MCP server without restarting Antigravity, inspecting proxy sidecar logs, or running isolated live E2E tests with `agy` CLI.
+Use this skill when building `agy-companion` locally, linking `./plugin` into the Antigravity App, iterating rapidly on the embedded Sidecar Web UI, replacing a stale proxy sidecar PID, inspecting proxy/sidecar logs, or running isolated live E2E tests with `agy` CLI.
 
 ## 1. Prerequisites & Local Build
 
 - Verified local toolchains: Rust (`cargo`, `rustc`, `clippy`, `rustfmt`), Node.js (`node`, `npm`), Python 3 (`python3`), and `agy` CLI.
 - `ui/.npmrc` pins `registry=https://registry.npmjs.org/` so `npm` commands inside `ui/` bypass corporate registry overrides automatically.
-- `companion-ui-mcp` embeds `ui/dist/index.html` at compile time via `include_str!("../../../ui/dist/index.html")`. Rebuild `ui/` before `cargo build` whenever baking UI changes into the Rust binary:
+- `companion-ui` embeds `ui/dist/index.html` at compile time via `include_str!("../../../ui/dist/index.html")`. Rebuild `ui/` before `cargo build` whenever baking UI changes into the Rust binary:
 
 ```bash
 cd ui && npm ci && npm run typecheck && npm run build && cd ..
@@ -41,43 +41,29 @@ Alternatively, `agy plugin install ./plugin` installs the plugin through the Ant
 
 1. **`AGY_COMPANION_BIN`** env var (highest precedence; fails hard if set to a non-executable/non-regular file or to the launcher script itself).
 2. **Linked dev checkout auto-detection** — follows symlinks on `$0` back to `<repo_root>` and checks `<repo_root>/target/debug/agy-companion` and `<repo_root>/target/release/agy-companion` (preferring whichever is newer via `-nt`). Because of this step, a linked dev checkout **never downloads from GitHub Releases**.
-3. **`command -v agy-companion`** on `$PATH` (with self-exec guard).
-4. **Cached binary** at `${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-${HOME}/.local/share/agy-companion}/bin/agy-companion` (verifying `.version` matches `plugin/plugin.json` when `.version` is present).
+3. **Version-matched cached binary** at `${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/agy-companion}/bin/agy-companion` (verifying `.version` matches `plugin/plugin.json`).
+4. **`command -v agy-companion`** on `$PATH` (with self-exec guard).
 5. **HTTPS + SHA-256 verified GitHub Releases download** (`sha256sum` or `shasum -a 256`, traversal-checked tarball extraction, atomic swap).
 
-## 3. Aux Panel Surfaces & Instant UI Iteration
+## 3. Aux Panel Surface & Instant UI Iteration
 
-Antigravity Companion exposes its Aux Panel UI through two surfaces (both serving the same built `ui/dist/index.html` bundle):
+Antigravity Companion exposes its Aux Panel UI via the native **Sidecar Web UI**:
 
-- **Sidecar Web UI (active when `enable-mcp-apps` is disabled by Mendel):** Configured in `plugin/sidecars/proxy/sidecar.json` (`"has_web_ui": true`, `SIDECAR_UI_ENTRYPOINT_AUX_PANE`) and served by the proxy sidecar. Open directly via `sidecar://agy-companion/proxy/`. UI changes baked into the binary take effect after rebuilding `ui/` + `companion-cli` and restarting the proxy sidecar (see Section 4b).
-- **MCP App UI (`agy-companion_hub`):** `companion-ui-mcp` checks `AGY_COMPANION_UI_HTML` on **every** `resources/read` request for `ui://companion/settings.html` (validated regular UTF-8 file, `<= 10 MiB`, no `..` traversal or NUL bytes). Export it from the repo root for zero-Rust-rebuild UI iteration:
+- Configured in `plugin/sidecars/proxy/sidecar.json` (`"has_web_ui": true`, `SIDECAR_UI_ENTRYPOINT_AUX_PANE`) and served by the proxy sidecar (`agy-companion serve` with `ANTIGRAVITY_SIDECAR_WEB_PORT` + `ANTIGRAVITY_SIDECAR_UI_TOKEN`). Open directly via `sidecar://agy-companion/proxy/`.
+- `companion-ui` checks `AGY_COMPANION_UI_HTML` on **every** `GET /` request (validated regular UTF-8 file, `<= 10 MiB`, no `..` traversal or NUL bytes). Export it from the repo root for zero-Rust-rebuild UI iteration:
 
 ```bash
 export AGY_COMPANION_UI_HTML="$(pwd)/ui/dist/index.html"
 npm --prefix ui run build
 ```
 
-Close and reopen the **Antigravity Companion** aux pane to load the rebuilt bundle immediately.
+Close and reopen the **Antigravity Companion** aux pane to load the rebuilt bundle immediately. UI changes baked into the binary take effect after rebuilding `ui/` + `companion-cli` and restarting the proxy sidecar (see Section 4).
 
-## 4. Live Reload MCP Server & Stale Proxy Sidecar Takeover
+## 4. Reloading Config & Replacing a Stale Proxy Sidecar PID
 
-### 4a. Reload MCP App Server Without Restarting Antigravity App
-
-The plugin `"agy-companion"` combined with server key `"hub"` in `plugin/mcp_config.json` registers in Antigravity App as MCP server **`agy-companion_hub`**.
-
-- **UI method (recommended):** Open **Settings > MCP Servers > `agy-companion_hub` > Restart**.
-- **RPC method:** Invoke the `RefreshMcpServers` RPC with payload:
-  ```json
-  {"serverName": "agy-companion_hub"}
-  ```
-- **What reloads when:**
-  - Rust binary changes take effect on MCP server restart (via `run-companion.sh` Step 2).
-  - `api_key`, `base_url`, and `default_model` hot-reload in the running proxy via config mtime without restarting the proxy.
-  - Proxy binary updates, Sidecar Web UI updates, or `listen_port` changes require restarting the `proxy` sidecar.
-
-### 4b. Replacing a Stale Proxy Sidecar PID
-
-When an older `agy-companion` proxy holds port `24141`, a newly spawned sidecar enters monitor mode (`detected running agy-companion proxy; monitoring until shutdown or takeover`) until the stale PID exits. Execute this directly during local debugging rather than asking the user to run `kill`:
+- `api_key` (persisted in sibling `0700`/`0600` `auth/gemini.json`), `base_url`, `default_model`, and `enabled_models` hot-reload in the running proxy via `config.json` and `auth/gemini.json` mtime without restarting the proxy.
+- Rust binary updates, baked Sidecar Web UI updates, or `listen_port` changes require restarting the `proxy` sidecar.
+- When an older `agy-companion` proxy holds port `24141`, a newly spawned sidecar enters monitor mode (`detected running agy-companion proxy; monitoring until shutdown or takeover`) until the stale PID exits. Execute this directly during local debugging rather than asking the user to run `kill`:
 
 ```bash
 # Inspect current running version and listening PID
@@ -101,7 +87,7 @@ curl -s http://127.0.0.1:24141/health
   ```bash
   ls -la ~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/
   ```
-- **Foreground standalone proxy** (logs strictly to stderr; `rmcp` tracing is hard-capped at `INFO` to protect secrets):
+- **Foreground standalone proxy** (logs strictly to stderr; `hyper`, `hyper_util`, `h2`, and `reqwest` tracing are hard-capped at `INFO` to protect secrets and tokens):
   ```bash
   cargo run -p companion-cli -- serve
 

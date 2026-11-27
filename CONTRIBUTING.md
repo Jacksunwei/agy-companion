@@ -5,7 +5,7 @@ Thank you for your interest in contributing to `agy-companion`. We value focused
 ## Prerequisites
 
 - **Rust toolchain:** stable Rust supporting `edition = "2024"` (`cargo`, `rustc`, `rustfmt`, `clippy`).
-- **Node.js:** `>= 18` (for building the embedded TypeScript MCP App UI in `ui/`).
+- **Node.js:** `>= 18` (for building the embedded TypeScript Sidecar Web UI in `ui/`).
 - **Python 3:** `>= 3.9` (for running the pure-stdlib opaque-box E2E suite in `e2e/`; no `pip` dependencies required).
 - **Antigravity CLI (`agy`):** optional, used for `agy plugin validate --strict ./plugin` and live end-to-end testing (skipped cleanly by `agent_check.sh` when absent).
 
@@ -16,10 +16,10 @@ Thank you for your interest in contributing to `agy-companion`. We value focused
 | [`crates/companion-core/`](crates/companion-core/README.md) | Config schema, atomic/TOCTOU-safe file I/O (`fs_safe`), validation, model catalog, redaction, SQLite WAL `UsageSink`, shell RC integration |
 | [`crates/companion-providers/`](crates/companion-providers/README.md) | `ProviderAdapter` trait, zero-compression `GeminiProvider`, shared loopback probe client |
 | [`crates/companion-proxy/`](crates/companion-proxy/README.md) | `127.0.0.1` Axum HTTP proxy, Hybrid Mode bridge, SSE usage tee, hot-reload, idle shutdown |
-| [`crates/companion-ui-mcp/`](crates/companion-ui-mcp/README.md) | Stdio MCP App server serving the embedded settings UI and configuration/health tools |
-| [`crates/companion-cli/`](crates/companion-cli/README.md) | Unified `agy-companion` binary (`install`, `uninstall`, `serve`, `ui-mcp`, `doctor`, `models`, `launch`, `hook-env`, `integration`) |
-| `ui/` | Vite + TypeScript MCP App frontend compiled to committed `ui/dist/index.html` |
-| [`plugin/`](plugin/README.md) | 7-file Antigravity plugin bundle embedded into `companion-cli` at compile time |
+| [`crates/companion-ui/`](crates/companion-ui/README.md) | Embedded Sidecar Web UI assets, `SettingsSnapshot` / `UsageSummary` DTOs, and configuration/health handlers |
+| [`crates/companion-cli/`](crates/companion-cli/README.md) | Unified `agy-companion` binary (`install`, `uninstall`, `serve`, `doctor`, `models`, `launch`, `hook-env`, `integration`) |
+| `ui/` | Vite + TypeScript Sidecar Web UI frontend compiled to committed `ui/dist/index.html` |
+| [`plugin/`](plugin/README.md) | 6-file Antigravity plugin bundle embedded into `companion-cli` at compile time |
 | `packages/` | Cross-platform npm and Python (`maturin`) binary distribution shims |
 | [`e2e/`](e2e/README.md) | Pure Python 3 stdlib 4-tier opaque-box E2E suite |
 | [`docs/`](docs/README.md) | Architecture and feature design specs |
@@ -44,7 +44,7 @@ See [`.agents/skills/local-dev/SKILL.md`](.agents/skills/local-dev/SKILL.md) for
 # Build UI + Rust debug binary and symlink ./plugin into ~/.gemini/config/plugins/agy-companion
 ./scripts/dev-install.sh
 
-# Instant MCP App UI iteration without rebuilding Rust:
+# Instant Sidecar Web UI iteration without rebuilding Rust:
 export AGY_COMPANION_UI_HTML="$(pwd)/ui/dist/index.html"
 npm --prefix ui run build
 # Then close and reopen the Antigravity Companion side panel.

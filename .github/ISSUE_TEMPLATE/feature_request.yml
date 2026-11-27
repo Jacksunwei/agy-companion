@@ -12,7 +12,7 @@ body:
     attributes:
       label: Target Surface
       options:
-        - MCP App UI (Monitor / Usage / Settings)
+        - Sidecar Web UI (Monitor / Usage / Settings)
         - Local Proxy (routing / caching / telemetry)
         - CLI (doctor / models / usage / upgrade)
         - Install / Uninstall / Dock & Launcher Integration

@@ -18,7 +18,7 @@ use companion_core::fs_safe;
 use companion_core::{Config, CoreError, FsError};
 use companion_providers::ProbeError;
 use companion_proxy::ProxyError;
-use companion_ui_mcp::UiMcpError;
+use companion_ui::UiError;
 use thiserror::Error;
 
 pub const BINARY_NAME: &str = "agy-companion";
@@ -37,7 +37,7 @@ pub enum CliError {
     #[error("{0}")]
     Proxy(#[from] ProxyError),
     #[error("{0}")]
-    UiMcp(#[from] UiMcpError),
+    Ui(#[from] UiError),
     #[error("invalid port {0}: port must be between 1 and 65535")]
     InvalidPort(u16),
     #[error("invalid config file '{path}': {reason}")]
@@ -162,48 +162,6 @@ pub fn load_config_checked(path: &Path) -> Result<Config, CliError> {
     Ok(Config::load_or_default(path)?)
 }
 
-pub fn validate_ui_mcp_paths(
-    config_override: Option<&Path>,
-    data_dir: Option<&Path>,
-) -> Result<(PathBuf, Option<PathBuf>), CoreError> {
-    let config_path = resolve_cli_config_path(config_override)?;
-    let validated_data_dir = match data_dir {
-        Some(dir) => {
-            companion_core::validate_path(dir)?;
-            Some(dir.to_path_buf())
-        }
-        None => None,
-    };
-    Ok((config_path, validated_data_dir))
-}
-
-pub async fn run_ui_mcp(
-    data_dir: Option<PathBuf>,
-    config_override: Option<PathBuf>,
-) -> Result<(), CliError> {
-    run_ui_mcp_with_options(data_dir, config_override, false).await
-}
-
-pub async fn run_ui_mcp_with_options(
-    data_dir: Option<PathBuf>,
-    config_override: Option<PathBuf>,
-    auto_enable_launcher: bool,
-) -> Result<(), CliError> {
-    let (config_path, validated_data_dir) =
-        validate_ui_mcp_paths(config_override.as_deref(), data_dir.as_deref())?;
-    precheck_existing_config_file(&config_path)?;
-    precheck_existing_auth_dir(&config_path)?;
-    if let Some(ref dir) = validated_data_dir {
-        precheck_existing_data_dir(dir)?;
-    }
-    let options = companion_ui_mcp::UiServerOptions {
-        auto_enable_launcher,
-        ..Default::default()
-    };
-    companion_ui_mcp::serve_stdio_with_options(config_path, options).await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -214,35 +172,16 @@ mod tests {
     use companion_core::{CoreError, FsError};
     use tempfile::TempDir;
 
-    use crate::{
-        CliError, precheck_existing_data_dir, resolve_cli_config_path, validate_ui_mcp_paths,
-    };
+    use crate::{CliError, precheck_existing_data_dir, resolve_cli_config_path};
 
     #[test]
-    fn cli_rejects_path_traversal_in_config_and_data_dir() {
+    fn cli_rejects_path_traversal_in_config() {
         let cfg_err = resolve_cli_config_path(Some(Path::new("../escape.json")))
             .expect_err("traversal in --config must fail");
         assert!(matches!(
             cfg_err,
             CoreError::Fs(FsError::ParentDirTraversal)
         ));
-
-        let data_err = validate_ui_mcp_paths(
-            Some(Path::new("/tmp/valid-config.json")),
-            Some(Path::new("../escape")),
-        )
-        .expect_err("traversal in --data-dir must fail");
-        assert!(matches!(
-            data_err,
-            CoreError::Fs(FsError::ParentDirTraversal)
-        ));
-
-        let empty_data_err = validate_ui_mcp_paths(
-            Some(Path::new("/tmp/valid-config.json")),
-            Some(Path::new("")),
-        )
-        .expect_err("empty --data-dir must fail");
-        assert!(matches!(empty_data_err, CoreError::Fs(FsError::EmptyPath)));
     }
 
     #[test]

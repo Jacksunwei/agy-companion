@@ -1,9 +1,9 @@
 """UX v2 cross-process opaque-box CUJs (`--suite cuj`).
 
-Exercises real multi-process UX v2 contracts across `serve`, `ui-mcp`,
+Exercises real multi-process UX v2 contracts across `serve` (proxy + Sidecar Web UI),
 `install`, `integration`, `doctor`, `models`, and SQLite `usage.db`:
 1. Day-0 built-in `/v1internal:*` passive `usageMetadata` tee + S4 gzip skip,
-   `proxy_rss_bytes` on `/api/stats` & `open_settings`, and `get_usage` rollups.
+   `proxy_rss_bytes` on `/api/stats` & `get_settings`, and `get_usage` rollups.
 2. `enabled_models` zero-debounce hot-reload filtering & `[]` pause mode.
 3. First-run `--auto-enable-launcher` cross-process race on `integration.lock`.
 4. Launcher opt-out parity (`install --no-launcher-hook`, `integration disable`)
@@ -27,6 +27,7 @@ from harness import (
     CompanionProcess,
     E2ETestCase,
     IsolatedEnv,
+    SidecarUiClient,
     extract_models_list,
     find_free_port,
     http_raw_request,
@@ -34,7 +35,6 @@ from harness import (
     poll_usage_events,
     run_cli,
 )
-from mcp_client import McpStdioClient
 from mock_gemini import (
     CapturedRequest,
     JsonAction,
@@ -130,7 +130,7 @@ class TestCujUxV2(E2ETestCase):
         return data
 
     def test_cuj_ux_day0_builtin_passive_usage_tee_and_s4_gzip_skip(self) -> None:
-        """Day-0 built-in `/v1internal:*` passive tee skips S4 gzip, records SQLite + `/api/stats` (`proxy_rss_bytes`), and feeds MCP `get_usage` + `open_settings`."""
+        """Day-0 built-in `/v1internal:*` passive tee skips S4 gzip, records SQLite + `/api/stats` (`proxy_rss_bytes`), and feeds Sidecar Web UI `get_usage` + `get_settings`."""
         env = self.make_env()
         mock = self.start_mock_gemini()
 
@@ -295,9 +295,9 @@ class TestCujUxV2(E2ETestCase):
             self.assertIsInstance(rss, int)
             self.assertGreater(rss, 0)
 
-        # MCP open_settings + get_usage(1d/7d/30d).
-        mcp = self.start_mcp(env, config_path=cfg)
-        snap = mcp.call_tool("open_settings", {})["structuredContent"]
+        # Sidecar Web UI get_settings + get_usage(1d/7d/30d).
+        ui = self.start_sidecar_ui(env, config_path=cfg)
+        snap = ui.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(snap["config"]["providers"]["gemini"]["api_key_configured"], False)
         self.assertIs(snap["launcher_integration"]["hybrid_active"], True)
         if sys.platform in ("darwin", "linux"):
@@ -306,7 +306,7 @@ class TestCujUxV2(E2ETestCase):
             self.assertGreater(snap_rss, 0)
 
         for rng in ("1d", "7d", "30d"):
-            usage = mcp.call_tool("get_usage", {"range": rng})["structuredContent"]
+            usage = ui.call_tool("get_usage", {"range": rng})["structuredContent"]
             self.assertEqual(usage["range"], rng)
             self.assertEqual(usage["totals"]["requests"], 2)
             self.assertEqual(usage["totals"]["input_tokens"], 20_000)
@@ -315,7 +315,6 @@ class TestCujUxV2(E2ETestCase):
                 {"antigravity"},
             )
             self.assertEqual(len(usage["by_model"]), 2)
-        mcp.assert_clean_stdout()
 
     def test_cuj_ux_enabled_models_hot_reload_and_empty_pause(self) -> None:
         """`save_settings(enabled_models=...)` hot-reloads proxy catalog slots (`11 -> 3 -> 17 -> 0`) with zero restart."""
@@ -333,14 +332,14 @@ class TestCujUxV2(E2ETestCase):
         )
         env.write_gemini_auth("test-uxv2-gemini-key-02", config_path=cfg)
         proxy = self.start_proxy(env, config_path=cfg, port=port)
-        mcp = self.start_mcp(env, config_path=cfg)
+        ui = self.start_sidecar_ui(env, config_path=cfg)
 
         # Default 3 models (carbon=3, neon=4, hydrogen=4) -> 11 companion slots.
         default_keys = _companion_model_keys(self._fetch_catalog(proxy.port, "ux2-def"))
         self.assertEqual(len(default_keys), 11, f"unexpected default keys: {default_keys}")
 
         # Single model ["gemini-4-argon"] -> 3 slots (default_model hydrogen NOT injected).
-        r1 = mcp.save_settings_smart(enabled_models=["gemini-4-argon"], raw=False)
+        r1 = ui.save_settings_smart(enabled_models=["gemini-4-argon"], raw=False)
         self.assertEqual(
             r1["structuredContent"]["config"]["providers"]["gemini"]["enabled_models"],
             ["gemini-4-argon"],
@@ -358,13 +357,13 @@ class TestCujUxV2(E2ETestCase):
             "gemini-4-argon",
             "gemini-3.8-flash",
         ]
-        mcp.save_settings_smart(enabled_models=all_five, raw=False)
+        ui.save_settings_smart(enabled_models=all_five, raw=False)
         env.bump_mtime(cfg, delta=2.0)
         five_keys = _companion_model_keys(self._fetch_catalog(proxy.port, "ux2-five"))
         self.assertEqual(len(five_keys), 17, f"unexpected 5-model keys: {five_keys}")
 
         # Empty pause [] -> 0 companion slots, upstream models untouched, stats flag false.
-        mcp.save_settings_smart(enabled_models=[], raw=False)
+        ui.save_settings_smart(enabled_models=[], raw=False)
         env.bump_mtime(cfg, delta=2.0)
         cat_empty = self._fetch_catalog(proxy.port, "ux2-empty")
         self.assertEqual(_companion_model_keys(cat_empty), [])
@@ -373,10 +372,9 @@ class TestCujUxV2(E2ETestCase):
 
         stats = http_raw_request("127.0.0.1", proxy.port, "GET", "/api/stats").json()
         self.assertIs(stats["cloudcode"]["last_catalog_included_proxy_models"], False)
-        mcp.assert_clean_stdout()
 
     def test_cuj_ux_first_run_auto_enable_and_concurrent_integration_lock(self) -> None:
-        """Concurrent `serve --auto-enable-launcher` and `ui-mcp --auto-enable-launcher` serialize cleanly on `integration.lock`."""
+        """Concurrent `serve --auto-enable-launcher` processes serialize cleanly on `integration.lock`."""
         if os.name == "nt":
             self.skipTest("Unix RC hook auto-enable requires POSIX")
 
@@ -387,6 +385,9 @@ class TestCujUxV2(E2ETestCase):
         zlogin.write_text("# user zlogin header\n", encoding="utf-8")
 
         port = find_free_port()
+        sidecar_port = find_free_port()
+        while sidecar_port == port:
+            sidecar_port = find_free_port()
         cfg = env.write_config(
             env.make_config_dict(
                 listen_port=port,
@@ -402,27 +403,34 @@ class TestCujUxV2(E2ETestCase):
             env=proc_env,
             port=port,
             config_path=cfg,
-            extra_args=("--auto-enable-launcher",),
+            extra_args=("--adopt-running", "--auto-enable-launcher"),
             ready_timeout=ready_timeout,
         )
         self.stack.callback(proxy.stop)
 
-        mcp = McpStdioClient(
+        token = "concurrent-lock-token"
+        sidecar_env = env.build_env(
+            extra={
+                **shell_extra,
+                "ANTIGRAVITY_SIDECAR_WEB_PORT": str(sidecar_port),
+                "ANTIGRAVITY_SIDECAR_UI_TOKEN": token,
+            }
+        )
+        ui = SidecarUiClient(
             [
                 str(binary),
-                "ui-mcp",
+                "serve",
+                "--adopt-running",
+                "--auto-enable-launcher",
                 "--config",
                 str(cfg),
-                "--data-dir",
-                str(env.data_dir),
-                "--auto-enable-launcher",
             ],
-            env=proc_env,
+            env=sidecar_env,
+            sidecar_port=sidecar_port,
+            token=token,
+            ready_timeout=ready_timeout,
         )
-        self.stack.callback(mcp.close)
-        mcp.start()
-        # `initialize` does not trigger auto-enable; `open_settings` does.
-        mcp.initialize(timeout=ready_timeout)
+        self.stack.callback(ui.close)
 
         barrier = threading.Barrier(2)
 
@@ -430,21 +438,20 @@ class TestCujUxV2(E2ETestCase):
             barrier.wait(timeout=5.0)
             return proxy.start()
 
-        def run_mcp_open() -> dict[str, Any]:
+        def run_sidecar_start() -> SidecarUiClient:
             barrier.wait(timeout=5.0)
-            return mcp.call_tool("open_settings", {})
+            return ui.start()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             fut_proxy = pool.submit(run_proxy_start)
-            fut_mcp = pool.submit(run_mcp_open)
+            fut_ui = pool.submit(run_sidecar_start)
             fut_proxy.result(timeout=15.0)
-            open_res = fut_mcp.result(timeout=15.0)
+            fut_ui.result(timeout=15.0)
 
         self.assertEqual(
             http_raw_request("127.0.0.1", proxy.port, "GET", "/health").status,
             200,
         )
-        self.assertFalse(McpStdioClient.is_tool_error(open_res))
 
         lock_path = env.data_dir / "integration.lock"
         self.assertTrue(lock_path.is_file())
@@ -462,10 +469,9 @@ class TestCujUxV2(E2ETestCase):
         self.assertTrue(env_sh.is_file())
         self.assertEqual(stat.S_IMODE(os.lstat(env_sh).st_mode), 0o600)
 
-        snap = mcp.call_tool("get_settings", {})["structuredContent"]
+        snap = ui.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(snap["launcher_integration"]["enabled"], True)
         self.assertIs(snap["proxy"]["reachable"], True)
-        mcp.assert_clean_stdout()
 
     def test_cuj_ux_launcher_opt_out_parity_and_symlink_rc_fail_closed(self) -> None:
         """`install --no-launcher-hook` & `integration disable` opt out of auto-enable; symlinked RC fails closed to `manual_required`."""
@@ -474,7 +480,7 @@ class TestCujUxV2(E2ETestCase):
 
         binary = self.require_binary()
 
-        # Part (a): Opt-out parity across install, serve, ui-mcp, and integration CLI.
+        # Part (a): Opt-out parity across install, serve, Sidecar Web UI, and integration CLI.
         env = self.make_env()
         self.register_pidfile_cleanup(env=env)
         shell_extra = _zsh_env(env)
@@ -515,27 +521,26 @@ class TestCujUxV2(E2ETestCase):
             extra_args=("--auto-enable-launcher",),
             extra_env=shell_extra,
         )
-        mcp1 = self.start_mcp(
+        ui1 = self.start_sidecar_ui(
             env,
             config_path=cfg,
             extra_args=("--auto-enable-launcher",),
             extra_env=shell_extra,
         )
-        open1 = mcp1.call_tool("open_settings", {})["structuredContent"]
+        open1 = ui1.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(open1["launcher_integration"]["enabled"], False)
         self.assertEqual(open1["launcher_integration"]["state"], "disabled")
         self.assertIs(json.loads(cfg.read_text(encoding="utf-8"))["launcher_auto_start"], False)
         self.assertEqual(_count_rc_markers(zlogin), (0, 0))
         self.assertFalse((env.data_dir / "env.sh").exists())
 
-        # Explicit MCP opt-in re-enables the hook.
-        on1 = mcp1.call_tool("set_launcher_integration", {"enabled": True})["structuredContent"]
+        # Explicit Sidecar Web UI opt-in re-enables the hook.
+        on1 = ui1.call_tool("set_launcher_integration", {"enabled": True})["structuredContent"]
         self.assertIs(on1["launcher_integration"]["enabled"], True)
         self.assertIs(json.loads(cfg.read_text(encoding="utf-8"))["launcher_auto_start"], True)
         self.assertEqual(_count_rc_markers(zlogin), (1, 1))
         self.assertTrue((env.data_dir / "env.sh").is_file())
-        mcp1.assert_clean_stdout()
-        mcp1.close()
+        ui1.close()
         p1.stop()
 
         # CLI `integration disable` opts back out and blocks subsequent `--auto-enable-launcher`.
@@ -549,17 +554,16 @@ class TestCujUxV2(E2ETestCase):
         self.assertEqual(_count_rc_markers(zlogin), (0, 0))
         self.assertFalse((env.data_dir / "env.sh").exists())
 
-        mcp2 = self.start_mcp(
+        ui2 = self.start_sidecar_ui(
             env,
             config_path=cfg,
             extra_args=("--auto-enable-launcher",),
             extra_env=shell_extra,
         )
-        open2 = mcp2.call_tool("open_settings", {})["structuredContent"]
+        open2 = ui2.call_tool("get_settings", {})["structuredContent"]
         self.assertIs(open2["launcher_integration"]["enabled"], False)
         self.assertEqual(_count_rc_markers(zlogin), (0, 0))
-        mcp2.assert_clean_stdout()
-        mcp2.close()
+        ui2.close()
 
         # CLI `integration enable` restores the hook cleanly.
         en = run_cli(
@@ -608,19 +612,18 @@ class TestCujUxV2(E2ETestCase):
             True,
         )
 
-        mcp_sym = self.start_mcp(
+        ui_sym = self.start_sidecar_ui(
             env_sym,
             config_path=cfg_sym,
             extra_args=("--auto-enable-launcher",),
             extra_env=sym_shell,
         )
-        li = mcp_sym.call_tool("open_settings", {})["structuredContent"]["launcher_integration"]
+        li = ui_sym.call_tool("get_settings", {})["structuredContent"]["launcher_integration"]
         self.assertEqual(li["state"], "manual_required")
         self.assertIs(li["enabled"], False)
         self.assertIsInstance(li.get("manual_snippet"), str)
         self.assertIn("env.sh", li["manual_snippet"])
         self.assertEqual(store_zlogin.read_text(encoding="utf-8"), sentinel)
-        mcp_sym.assert_clean_stdout()
 
     def test_cuj_ux_semantic_account_plan_persistence_and_cli_continuity(self) -> None:
         """`account_plan` persists across proxy restarts without leaking raw CloudCode URLs, and `doctor`/`models` remain green."""
@@ -636,29 +639,28 @@ class TestCujUxV2(E2ETestCase):
 
         # Save `personal` + `enabled_models`, and verify mutual exclusion with `cloudcode.upstream`.
         p1 = self.start_proxy(env, config_path=cfg, port=port)
-        mcp1 = self.start_mcp(env, config_path=cfg)
-        mcp1.save_settings_smart(
+        ui1 = self.start_sidecar_ui(env, config_path=cfg)
+        ui1.save_settings_smart(
             account_plan="personal",
             enabled_models=["gemini-4-carbon", "gemini-4-neon"],
             raw=False,
         )
-        conflict = mcp1.save_settings_smart(
+        conflict = ui1.save_settings_smart(
             account_plan="personal",
             cloudcode_upstream="auto",
             raw=True,
         )
         self.assertTrue(
-            McpStdioClient.is_tool_error(conflict),
+            SidecarUiClient.is_tool_error(conflict),
             f"expected mutual-exclusion error, got: {conflict}",
         )
-        mcp1.assert_clean_stdout()
-        mcp1.close()
+        ui1.close()
         p1.stop()
 
         # Restart and confirm `personal` persisted, then switch to `organization`.
         p2 = self.start_proxy(env, config_path=cfg, port=port)
-        mcp2 = self.start_mcp(env, config_path=cfg)
-        snap_p = mcp2.call_tool("get_settings", {})["structuredContent"]
+        ui2 = self.start_sidecar_ui(env, config_path=cfg)
+        snap_p = ui2.call_tool("get_settings", {})["structuredContent"]
         self.assertEqual(
             snap_p["account_plan"],
             {"mode": "personal", "resolved": "personal"},
@@ -671,15 +673,14 @@ class TestCujUxV2(E2ETestCase):
         self.assertNotIn("cloudcode-pa.googleapis.com", plan_p_json)
         self.assertNotIn("https://", plan_p_json)
 
-        mcp2.save_settings_smart(account_plan="organization", raw=False)
-        mcp2.assert_clean_stdout()
-        mcp2.close()
+        ui2.save_settings_smart(account_plan="organization", raw=False)
+        ui2.close()
         p2.stop()
 
         # Restart and confirm `organization`, then switch back to `auto`.
         p3 = self.start_proxy(env, config_path=cfg, port=port)
-        mcp3 = self.start_mcp(env, config_path=cfg)
-        snap_o = mcp3.call_tool("get_settings", {})["structuredContent"]
+        ui3 = self.start_sidecar_ui(env, config_path=cfg)
+        snap_o = ui3.call_tool("get_settings", {})["structuredContent"]
         self.assertEqual(
             snap_o["account_plan"],
             {"mode": "organization", "resolved": "organization"},
@@ -688,10 +689,9 @@ class TestCujUxV2(E2ETestCase):
         self.assertNotIn("cloudcode-pa.googleapis.com", plan_o_json)
         self.assertNotIn("https://", plan_o_json)
 
-        snap_a = mcp3.save_settings_smart(account_plan="auto", raw=False)["structuredContent"]
+        snap_a = ui3.save_settings_smart(account_plan="auto", raw=False)["structuredContent"]
         self.assertEqual(snap_a["account_plan"]["mode"], "auto")
         self.assertIsNone(snap_a["account_plan"]["resolved"])
-        mcp3.assert_clean_stdout()
 
         # CLI continuity: doctor & models with explicit hermetic env.
         doc = run_cli(

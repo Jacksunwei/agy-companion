@@ -36,7 +36,6 @@ import unittest
 from pathlib import Path
 from typing import Any, Iterator
 
-from mcp_client import McpStdioClient
 from mock_gemini import MockGeminiServer, MockHealthServer
 
 
@@ -1631,36 +1630,260 @@ class E2ETestCase(unittest.TestCase):
         )
         return self.stack.enter_context(proc)
 
-    def start_mcp(
+    def start_sidecar_ui(
         self,
         env_obj: IsolatedEnv,
         *,
         config_path: Path | None = None,
-        data_dir: Path | None = None,
         extra_env: dict[str, str | None] | None = None,
         extra_args: tuple[str, ...] | list[str] = (),
         pass_config_flag: bool = True,
-        pass_data_dir_flag: bool = True,
         set_config_env: bool = True,
-        auto_initialize: bool = True,
-    ) -> McpStdioClient:
-        """Start `agy-companion ui-mcp` over stdio.
-
-        Callers invoking `open_settings` or `get_settings` should seed
-        `env_obj.write_config(env_obj.make_config_dict())` first so `ui-mcp`
-        probes an isolated ephemeral port instead of falling back to defaults.
-        """
+        token: str = "e2e-sidecar-token",
+    ) -> SidecarUiClient:
+        """Start `agy-companion serve --adopt-running` with the Sidecar Web UI enabled."""
         binary = self.require_binary()
-        cmd = [str(binary), "ui-mcp"]
+        sidecar_port = find_free_port()
+        cmd = [str(binary), "serve", "--adopt-running"]
         if pass_config_flag:
             cfg = config_path if config_path is not None else env_obj.config_path
             cmd.extend(["--config", str(cfg)])
-        if pass_data_dir_flag:
-            ddir = data_dir if data_dir is not None else env_obj.data_dir
-            cmd.extend(["--data-dir", str(ddir)])
         cmd.extend(extra_args)
-        proc_env = env_obj.build_env(extra=extra_env, set_config_env=set_config_env)
-        client = self.stack.enter_context(McpStdioClient(cmd, env=proc_env))
-        if auto_initialize:
-            client.initialize(timeout=min(10.0, self.cfg.default_timeout))
-        return client
+        merged_extra: dict[str, str | None] = {
+            "ANTIGRAVITY_SIDECAR_WEB_PORT": str(sidecar_port),
+            "ANTIGRAVITY_SIDECAR_UI_TOKEN": token,
+        }
+        if extra_env:
+            merged_extra.update(extra_env)
+        proc_env = env_obj.build_env(extra=merged_extra, set_config_env=set_config_env)
+        client = SidecarUiClient(
+            cmd,
+            env=proc_env,
+            sidecar_port=sidecar_port,
+            token=token,
+            ready_timeout=min(10.0, self.cfg.default_timeout),
+        )
+        return self.stack.enter_context(client)
+
+
+class SidecarUiClient:
+    """Client managing a real `agy-companion serve` Sidecar Web UI HTTP process."""
+
+    def __init__(
+        self,
+        cmd: list[str],
+        *,
+        env: dict[str, str],
+        sidecar_port: int,
+        token: str,
+        ready_timeout: float = 10.0,
+    ) -> None:
+        self.cmd = list(cmd)
+        self.env = dict(env)
+        self.sidecar_port = int(sidecar_port)
+        self.token = token
+        self.ready_timeout = float(ready_timeout)
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._stderr_chunks: list[bytes] = []
+        self._stderr_thread: threading.Thread | None = None
+
+    @staticmethod
+    def is_tool_error(res: dict[str, Any]) -> bool:
+        return bool(res.get("isError"))
+
+    @property
+    def pid(self) -> int | None:
+        return self._proc.pid if self._proc is not None else None
+
+    @property
+    def stderr_text(self) -> str:
+        return b"".join(self._stderr_chunks).decode("utf-8", errors="replace")
+
+    def start(self) -> SidecarUiClient:
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+            "env": self.env,
+        }
+        if os.name != "nt":
+            kwargs["start_new_session"] = True
+        self._proc = subprocess.Popen(self.cmd, **kwargs)
+        stderr_pipe = self._proc.stderr
+        assert stderr_pipe is not None
+
+        def _drain_stderr() -> None:
+            if stderr_pipe is None:
+                return
+            try:
+                while True:
+                    chunk = stderr_pipe.read(4096)
+                    if not chunk:
+                        break
+                    self._stderr_chunks.append(chunk)
+            except (OSError, ValueError):
+                pass
+
+        self._stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+        deadline = time.monotonic() + self.ready_timeout
+        last_err: str = "not ready"
+        try:
+            while time.monotonic() < deadline:
+                if self._proc.poll() is not None:
+                    rc = self._proc.returncode
+                    self.close()
+                    raise RuntimeError(
+                        f"Sidecar UI process exited early ({rc}): {self.stderr_text}"
+                    )
+                try:
+                    resp = http_raw_request("127.0.0.1", self.sidecar_port, "GET", "/", timeout=1.0)
+                    if resp.status in (200, 500):
+                        return self
+                    last_err = f"HTTP {resp.status}"
+                except OSError as exc:
+                    last_err = str(exc)
+                time.sleep(0.02)
+            raise TimeoutError(
+                f"Sidecar UI on 127.0.0.1:{self.sidecar_port} not ready within {self.ready_timeout}s: {last_err}"
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def get_html(self, *, timeout: float = 5.0) -> HttpResponse:
+        return http_raw_request("127.0.0.1", self.sidecar_port, "GET", "/", timeout=timeout)
+
+    def call_api(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        token: str | None = None,
+        content_type: str = "application/json",
+        timeout: float = 10.0,
+    ) -> HttpResponse:
+        eff_token = self.token if token is None else token
+        headers: dict[str, str] = {"Content-Type": content_type}
+        if eff_token:
+            headers["X-Sidecar-Token"] = eff_token
+        body = json.dumps(arguments or {}).encode("utf-8")
+        return http_raw_request(
+            "127.0.0.1",
+            self.sidecar_port,
+            "POST",
+            f"/_api/{name}",
+            headers=headers,
+            body=body,
+            timeout=timeout,
+        )
+
+    def call_tool_raw(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        resp = self.call_api(name, arguments, timeout=timeout)
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"ok": False, "error": resp.text}
+        return {
+            "isError": resp.status >= 400,
+            "status": resp.status,
+            "structuredContent": payload,
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+        }
+
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        res = self.call_tool_raw(name, arguments, timeout=timeout)
+        if res["isError"]:
+            raise RuntimeError(f"Sidecar API /_api/{name} failed (HTTP {res['status']}): {res['structuredContent']}")
+        return res
+
+    def save_settings_smart(
+        self,
+        *,
+        listen_host: str | None = None,
+        listen_port: int | None = None,
+        base_url: str | None = None,
+        default_model: str | None = None,
+        api_key: str | None = None,
+        clear_api_key: bool = False,
+        cloudcode_upstream_url: str | None = None,
+        cloudcode_upstream: str | None = None,
+        enabled_models: list[str] | None = None,
+        account_plan: str | None = None,
+        raw: bool = False,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        proxy: dict[str, Any] = {}
+        if listen_host is not None:
+            proxy["host"] = listen_host
+        if listen_port is not None:
+            proxy["port"] = listen_port
+        if proxy:
+            payload["proxy"] = proxy
+        upstream = cloudcode_upstream if cloudcode_upstream is not None else cloudcode_upstream_url
+        if upstream is not None:
+            payload["cloudcode"] = {"upstream": upstream}
+        if account_plan is not None:
+            payload["account_plan"] = account_plan
+        gemini: dict[str, Any] = {}
+        if clear_api_key:
+            gemini["api_key"] = "clear"
+        elif api_key is not None:
+            gemini["api_key"] = {"set": api_key}
+        if base_url is not None:
+            gemini["base_url"] = base_url
+        if default_model is not None:
+            gemini["default_model"] = default_model
+        if enabled_models is not None:
+            gemini["enabled_models"] = list(enabled_models)
+        if gemini:
+            payload["providers"] = {"gemini": gemini}
+        if raw:
+            return self.call_tool_raw("save_settings", payload, timeout=timeout)
+        return self.call_tool("save_settings", payload, timeout=timeout)
+
+    def close(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is not None and proc.poll() is None:
+            if os.name != "nt":
+                with contextlib.suppress(OSError):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            with contextlib.suppress(OSError):
+                proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                if os.name != "nt":
+                    with contextlib.suppress(OSError):
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2.0)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1.0)
+            self._stderr_thread = None
+        if proc is not None and proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+    def __enter__(self) -> SidecarUiClient:
+        return self.start()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()

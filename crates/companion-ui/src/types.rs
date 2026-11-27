@@ -14,18 +14,15 @@ use companion_core::{
     curated_model_presets,
 };
 use companion_providers::DEFAULT_PROBE_TIMEOUT;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum UiMcpError {
+pub enum UiError {
     #[error("failed to initialize HTTP probe client: {0}")]
     HttpClient(String),
-    #[error("MCP server initialization failed: {0}")]
+    #[error("failed to initialize auth store: {0}")]
     Initialize(String),
-    #[error("MCP server task failed: {0}")]
-    Join(#[from] tokio::task::JoinError),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -43,7 +40,6 @@ pub struct UiServerOptions {
     pub integration_options_override: Option<IntegrationOptions>,
     pub hybrid_active_override: Option<bool>,
     pub probe_timeout: Duration,
-    pub auto_enable_launcher: bool,
     pub auth_store_override: Option<Arc<dyn AuthStore>>,
 }
 
@@ -62,7 +58,6 @@ impl fmt::Debug for UiServerOptions {
             )
             .field("hybrid_active_override", &self.hybrid_active_override)
             .field("probe_timeout", &self.probe_timeout)
-            .field("auto_enable_launcher", &self.auto_enable_launcher)
             .field(
                 "auth_store_override",
                 &self.auth_store_override.as_ref().map(|_| "<AuthStore>"),
@@ -80,7 +75,6 @@ impl Default for UiServerOptions {
             integration_options_override: None,
             hybrid_active_override: None,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
-            auto_enable_launcher: false,
             auth_store_override: None,
         }
     }
@@ -103,7 +97,7 @@ impl UiServerOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountPlan {
     Auto,
@@ -208,7 +202,7 @@ pub struct SettingsSnapshot {
     pub proxy_rss_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageRangeArg {
     #[serde(rename = "1d")]
     Today,
@@ -228,32 +222,26 @@ impl From<UsageRangeArg> for UsageRange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetUsageArgs {
     pub range: UsageRangeArg,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SetLauncherIntegrationArgs {
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxySettingsPatch {
     pub host: Option<String>,
     pub port: Option<u16>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CloudCodeSettingsPatch {
     pub upstream: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiKeyPatch {
     Clear,
@@ -272,7 +260,7 @@ impl fmt::Debug for ApiKeyPatch {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeminiSettingsPatch {
     pub api_key: Option<ApiKeyPatch>,
@@ -281,13 +269,13 @@ pub struct GeminiSettingsPatch {
     pub enabled_models: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProvidersSettingsPatch {
     pub gemini: Option<GeminiSettingsPatch>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SaveSettingsArgs {
     pub proxy: Option<ProxySettingsPatch>,
