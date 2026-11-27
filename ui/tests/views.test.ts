@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { buildBannerNode } from "../src/banners.ts";
-import { createTooltipController } from "../src/dom.ts";
+import { createBrandMarkSvg, createTooltipController } from "../src/dom.ts";
 import { createFooterController } from "../src/footer.ts";
 import { buildMonitorView } from "../src/monitor.ts";
 import { createSettingsView, formatCodexStatusBadge } from "../src/settings.ts";
@@ -1186,5 +1186,70 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     assert.equal(calls.at(-1), "codexRestoreDefaults");
 
     tooltip.destroy();
+  });
+});
+
+interface ParsedSvgNode {
+  tag: string;
+  attrs: Record<string, string>;
+  children: ParsedSvgNode[];
+}
+
+function parseSvgXml(xml: string): ParsedSvgNode {
+  const stack: ParsedSvgNode[] = [];
+  let root: ParsedSvgNode | null = null;
+  const tokenRe = /<\s*(\/?)([A-Za-z][A-Za-z0-9:-]*)([^>]*?)(\/?)\s*>/g;
+  const attrRe = /([A-Za-z_:][A-Za-z0-9_.:-]*)\s*=\s*"([^"]*)"/g;
+
+  for (const match of xml.matchAll(tokenRe)) {
+    const [, closing, tag, rawAttrs, selfClosing] = match;
+    if (closing) {
+      stack.pop();
+      continue;
+    }
+    const attrs: Record<string, string> = {};
+    for (const am of rawAttrs.matchAll(attrRe)) {
+      attrs[am[1]] = am[2];
+    }
+    const node: ParsedSvgNode = { tag, attrs, children: [] };
+    if (stack.length > 0) {
+      stack[stack.length - 1].children.push(node);
+    } else {
+      root = node;
+    }
+    if (!selfClosing) {
+      stack.push(node);
+    }
+  }
+  assert.ok(root !== null, "expected root <svg> element in plugin/assets/logo.svg");
+  return root;
+}
+
+function fakeSvgToTree(node: FakeElement): ParsedSvgNode {
+  const attrs: Record<string, string> = {};
+  for (const name of node.getAttributeNames()) {
+    const val = node.getAttribute(name);
+    if (val !== null) attrs[name] = val;
+  }
+  const children = node.children.map((child) => fakeSvgToTree(child));
+  return { tag: node.tagName, attrs, children };
+}
+
+describe("createBrandMarkSvg parity with plugin/assets/logo.svg", () => {
+  it("renders the exact twin-arch aurora SVG structure and attributes as plugin/assets/logo.svg", () => {
+    const logoUrl = new URL("../../plugin/assets/logo.svg", import.meta.url);
+    const expected = parseSvgXml(fs.readFileSync(logoUrl, "utf8"));
+    // Root <svg> in the UI is sized by CSS (.brand-mark svg) and decorative.
+    delete expected.attrs.xmlns;
+    delete expected.attrs.width;
+    delete expected.attrs.height;
+    expected.attrs["aria-hidden"] = "true";
+    expected.attrs.focusable = "false";
+
+    const actualEl = createBrandMarkSvg() as unknown as FakeElement;
+    assert.equal(actualEl.namespaceURI, "http://www.w3.org/2000/svg");
+    const actual = fakeSvgToTree(actualEl);
+
+    assert.deepEqual(actual, expected);
   });
 });

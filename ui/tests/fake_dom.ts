@@ -526,6 +526,10 @@ export class FakeElement extends FakeNode {
     return this.attrs.get(name) ?? null;
   }
 
+  getAttributeNames(): string[] {
+    return [...this.attrs.keys()];
+  }
+
   removeAttribute(name: string): void {
     this.attrs.delete(name);
   }
