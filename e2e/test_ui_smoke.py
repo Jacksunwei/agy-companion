@@ -3,7 +3,7 @@
 Renders the compiled `ui/dist/index.html` inside a pure-stdlib loopback mock
 Sidecar Web UI host and verifies:
 1. Multi-viewport (`360px`/`460px`/`760px`) × Dark/Light × 3-tab rendering,
-   single-column `.content-wrap` centering, zero horizontal overflow, zero
+   full-width single-column `.content-wrap` layout, zero horizontal overflow, zero
    legacy copy tokens, WCAG AA `>= 4.5:1` contrast (incl. Light `--brand`
    `#1558b0` on `.lnk` and enabled `button.btn-primary`), and zero console errors.
 2. Health-only `Live` footer popover (required vs forbidden rows), `Escape`
@@ -243,7 +243,7 @@ class TestUiSmoke(E2ETestCase):
         return dist_path.read_bytes()
 
     def test_ui_smoke_multi_viewport_dark_light_overflow_and_wcag(self) -> None:
-        """360/460/760px × Dark/Light × 3 tabs: zero overflow, centered <=560px column, WCAG AA >=4.5:1, zero legacy copy or console errors."""
+        """360/460/760px × Dark/Light × 3 tabs: zero overflow, full-width single column, WCAG AA >=4.5:1, zero legacy copy or console errors."""
         chrome_bin = require_chrome_or_skip(self)
         env = self.make_env()
         html = self._load_dist_html()
@@ -319,6 +319,7 @@ class TestUiSmoke(E2ETestCase):
                               return {{
                                 docOverflow: docEl.scrollWidth - docEl.clientWidth,
                                 scrollOverflow: scroll ? scroll.scrollWidth - scroll.clientWidth : 0,
+                                scrollClientWidth: scroll ? scroll.clientWidth : 0,
                                 wrapOverflow: wrap ? wrap.scrollWidth - wrap.clientWidth : 0,
                                 wrapRect: rect ? {{ left: rect.left, right: rect.right, width: rect.width }} : null,
                                 bodyText: document.body.innerText || '',
@@ -334,15 +335,18 @@ class TestUiSmoke(E2ETestCase):
                         self.assertLessEqual(metrics["scrollOverflow"], 1, f".pane-scroll overflow ({ctx})")
                         self.assertLessEqual(metrics["wrapOverflow"], 1, f".content-wrap overflow ({ctx})")
 
-                        if width == 760:
-                            rect = metrics["wrapRect"]
-                            self.assertIsNotNone(rect, f"missing .content-wrap ({ctx})")
-                            self.assertLessEqual(rect["width"], 560.5, f".content-wrap too wide ({ctx})")
-                            self.assertLessEqual(
-                                abs(rect["left"] - (760.0 - rect["right"])),
-                                4.0,
-                                f".content-wrap not centered ({ctx}): {rect}",
-                            )
+                        rect = metrics["wrapRect"]
+                        self.assertIsNotNone(rect, f"missing .content-wrap ({ctx})")
+                        self.assertLessEqual(
+                            abs(rect["width"] - metrics["scrollClientWidth"]),
+                            1.5,
+                            f".content-wrap not full width ({ctx}): rect={rect} scrollClientWidth={metrics['scrollClientWidth']}",
+                        )
+                        self.assertLessEqual(
+                            abs(rect["left"]),
+                            1.5,
+                            f".content-wrap not flush left ({ctx}): {rect}",
+                        )
 
                         for token in _FORBIDDEN_COPY_TOKENS:
                             self.assertNotIn(token, metrics["bodyText"], f"legacy copy {token!r} ({ctx})")
