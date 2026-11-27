@@ -1338,7 +1338,7 @@ fn decode_jwt_payload_claims(token: &str) -> Result<DecodedJwtClaims, ProviderEr
                 .and_then(|ns| ns.get("email"))
                 .and_then(serde_json::Value::as_str)
         });
-    let email_hint = raw_email.and_then(mask_email_hint);
+    let email_hint = raw_email.and_then(sanitize_email_hint);
 
     let exp_secs = obj.get("exp").and_then(serde_json::Value::as_u64);
 
@@ -1370,12 +1370,11 @@ fn sanitize_plan_type(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Masks an email address to a UTF-8-safe non-identifying hint:
-/// - `"jack@example.com"` → `Some("j***@example.com")`
-/// - `"a@example.com"` → `Some("***@example.com")`
-/// - `"élan@example.com"` → `Some("é***@example.com")`
+/// Validates and returns the full ChatGPT account email for UI display:
+/// - `"jack@example.com"` → `Some("jack@example.com")`
+/// - `"élan@example.com"` → `Some("élan@example.com")`
 /// - malformed / control / whitespace → `None`
-pub(crate) fn mask_email_hint(raw: &str) -> Option<String> {
+pub(crate) fn sanitize_email_hint(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
         || trimmed.len() > MAX_EMAIL_LEN
@@ -1387,13 +1386,7 @@ pub(crate) fn mask_email_hint(raw: &str) -> Option<String> {
     if local.is_empty() || domain.is_empty() || domain.contains('@') {
         return None;
     }
-    let mut chars = local.chars();
-    let first = chars.next()?;
-    if chars.next().is_none() {
-        Some(format!("***@{domain}"))
-    } else {
-        Some(format!("{first}***@{domain}"))
-    }
+    Some(trimmed.to_string())
 }
 
 fn build_credentials_from_token_response(
@@ -1703,19 +1696,19 @@ mod tests {
     }
 
     #[test]
-    fn jwt_decoder_and_mask_email_hint_table() {
-        // Masking table including UTF-8
+    fn jwt_decoder_and_sanitize_email_hint_table() {
+        // Full email validation table including UTF-8
         assert_eq!(
-            mask_email_hint("jack@example.com").as_deref(),
-            Some("j***@example.com")
+            sanitize_email_hint("jack@example.com").as_deref(),
+            Some("jack@example.com")
         );
         assert_eq!(
-            mask_email_hint("a@example.com").as_deref(),
-            Some("***@example.com")
+            sanitize_email_hint(" a@example.com ").as_deref(),
+            Some("a@example.com")
         );
         assert_eq!(
-            mask_email_hint("élan@example.com").as_deref(),
-            Some("é***@example.com")
+            sanitize_email_hint("élan@example.com").as_deref(),
+            Some("élan@example.com")
         );
         for bad in [
             "no-at",
@@ -1726,7 +1719,11 @@ mod tests {
             "a b@x.com",
             "",
         ] {
-            assert_eq!(mask_email_hint(bad), None, "expected None for '{bad:?}'");
+            assert_eq!(
+                sanitize_email_hint(bad),
+                None,
+                "expected None for '{bad:?}'"
+            );
         }
 
         // Nested OpenAI auth namespace + id_token email fallback
@@ -1753,7 +1750,7 @@ mod tests {
         .expect("build creds");
         assert_eq!(creds.account_id, "acct_nested_9988");
         assert_eq!(creds.plan_type.as_deref(), Some("pro"));
-        assert_eq!(creds.email_hint.as_deref(), Some("é***@example.com"));
+        assert_eq!(creds.email_hint.as_deref(), Some("élan@example.com"));
         assert_eq!(creds.expires_at_ms, 1_900_000_000_000);
 
         // Top-level fallback + expires_in fallback when JWT omits exp
@@ -1947,7 +1944,7 @@ mod tests {
         assert_eq!(saved.refresh_token.expose(), "rt_happy_secret_1");
         assert_eq!(saved.account_id, "acct_happy_1234");
         assert_eq!(saved.plan_type.as_deref(), Some("pro"));
-        assert_eq!(saved.email_hint.as_deref(), Some("j***@example.com"));
+        assert_eq!(saved.email_hint.as_deref(), Some("jack@example.com"));
 
         #[cfg(unix)]
         {

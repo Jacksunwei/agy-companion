@@ -157,6 +157,70 @@ impl GeminiCredentials {
     }
 }
 
+const MAX_JWT_PAYLOAD_B64_BYTES: usize = 32 * 1024;
+
+fn decode_base64url_no_pad(encoded: &str) -> Option<Vec<u8>> {
+    let bytes = encoded.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_JWT_PAYLOAD_B64_BYTES || bytes.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity((bytes.len() / 4) * 3 + 2);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for &b in bytes {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn extract_jwt_email_claim(jwt: &str) -> Option<String> {
+    let mut parts = jwt.split('.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let _sig = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let payload_bytes = decode_base64url_no_pad(payload_b64)?;
+    let parsed: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let obj = parsed.as_object()?;
+    let raw = obj
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            obj.get("https://api.openai.com/profile")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|ns| ns.get("email"))
+                .and_then(serde_json::Value::as_str)
+        })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_EMAIL_HINT_LEN
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return None;
+    }
+    let (local, domain) = trimmed.split_once('@')?;
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// Authentication mode persisted inside `<auth_dir>/codex.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -330,15 +394,30 @@ impl CodexCredentials {
         Self::from_json_str(raw, path)
     }
 
-    /// Returns a non-identifying UI display hint: trimmed `email_hint` if present, otherwise
-    /// a masked suffix of `account_id` (`...wxyz` or `"****"`). Never exposes full raw IDs or tokens.
+    /// Returns the UI display label for the signed-in Codex account: full email from `email_hint`
+    /// (upgrading legacy masked `***` hints from the stored `id_token`/`access_token` JWT `email`
+    /// claim when present), otherwise a masked suffix of `account_id` (`...wxyz` or `"****"`).
+    /// Never exposes raw account IDs or tokens.
     pub fn account_hint(&self) -> Option<String> {
-        if let Some(hint) = self
+        let stored = self
             .email_hint
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty());
+        if let Some(hint) = stored
+            && !hint.contains("***")
         {
+            return Some(hint.to_string());
+        }
+        if let Some(jwt_email) = self
+            .id_token
+            .as_ref()
+            .and_then(|tok| extract_jwt_email_claim(tok.expose()))
+            .or_else(|| extract_jwt_email_claim(self.access_token.expose()))
+        {
+            return Some(jwt_email);
+        }
+        if let Some(hint) = stored {
             return Some(hint.to_string());
         }
         let masked = mask_account_id(&self.account_id);
@@ -1234,6 +1313,25 @@ mod tests {
         let mut no_email = creds.clone();
         no_email.email_hint = None;
         assert_eq!(no_email.account_hint().as_deref(), Some("...wxyz"));
+
+        // Legacy masked email_hint upgrades automatically to full email from id_token / access_token JWT
+        let mut legacy_masked = creds.clone();
+        legacy_masked.email_hint = Some("j***@example.com".to_string());
+        // {"email":"jack@example.com"} -> eyJlbWFpbCI6ImphY2tAZXhhbXBsZS5jb20ifQ
+        legacy_masked.id_token = Some(SecretString::new(
+            "eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6ImphY2tAZXhhbXBsZS5jb20ifQ.sig",
+        ));
+        assert_eq!(
+            legacy_masked.account_hint().as_deref(),
+            Some("jack@example.com")
+        );
+
+        let mut full_email = creds.clone();
+        full_email.email_hint = Some("alice@example.com".to_string());
+        assert_eq!(
+            full_email.account_hint().as_deref(),
+            Some("alice@example.com")
+        );
 
         // Unsupported schema_version fails closed even if payload omits future fields
         for bad_ver in [0u32, 2, 99] {
