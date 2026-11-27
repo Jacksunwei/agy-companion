@@ -200,6 +200,8 @@ pub struct SettingsSnapshot {
     pub account_plan: AccountPlanStatus,
     #[serde(default)]
     pub proxy_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub ls_telemetry_active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

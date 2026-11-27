@@ -9,12 +9,15 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use companion_core::UsageRange;
-use companion_ui::{CompanionUiServer, GetUsageArgs, SaveSettingsArgs, UiServerOptions};
+use companion_ui::{
+    CompanionUiServer, GetUsageArgs, SaveSettingsArgs, SettingsSnapshot, UiServerOptions,
+};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
 use crate::CliError;
+use crate::ls_collector::LsCollectorHandle;
 
 pub const SIDECAR_WEB_PORT_ENV: &str = "ANTIGRAVITY_SIDECAR_WEB_PORT";
 pub const SIDECAR_UI_TOKEN_ENV: &str = "ANTIGRAVITY_SIDECAR_UI_TOKEN";
@@ -44,6 +47,29 @@ impl SidecarUiConfig {
 struct SidecarUiState {
     ui: Arc<CompanionUiServer>,
     token: Option<Arc<String>>,
+    ls_collector: Option<LsCollectorHandle>,
+}
+
+async fn apply_ls_telemetry_overlay(
+    state: &SidecarUiState,
+    mut snapshot: SettingsSnapshot,
+    conversation_id: Option<&str>,
+) -> SettingsSnapshot {
+    let Some(ref collector) = state.ls_collector else {
+        snapshot.ls_telemetry_active = false;
+        return snapshot;
+    };
+    if let Some(mut ls_stats) = collector.session_stats(conversation_id).await {
+        if let Some(proxy_stats) = snapshot.stats.as_ref() {
+            ls_stats.cloudcode = proxy_stats.cloudcode.clone();
+            ls_stats.proxy_rss_bytes = proxy_stats.proxy_rss_bytes;
+        }
+        snapshot.stats = Some(ls_stats);
+        snapshot.ls_telemetry_active = true;
+    } else {
+        snapshot.ls_telemetry_active = false;
+    }
+    snapshot
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,7 +228,11 @@ async fn get_settings_handler(
         .get_settings_snapshot(args.conversation_id.as_deref())
         .await
     {
-        Ok(snapshot) => api_ok(&snapshot),
+        Ok(snapshot) => {
+            let overlaid =
+                apply_ls_telemetry_overlay(&state, snapshot, args.conversation_id.as_deref()).await;
+            api_ok(&overlaid)
+        }
         Err(msg) => api_error(StatusCode::BAD_REQUEST, msg),
     }
 }
@@ -243,7 +273,11 @@ async fn save_settings_handler(
         .save_settings_snapshot(settings, conversation_id.as_deref())
         .await
     {
-        Ok(snapshot) => api_ok(&snapshot),
+        Ok(snapshot) => {
+            let overlaid =
+                apply_ls_telemetry_overlay(&state, snapshot, conversation_id.as_deref()).await;
+            api_ok(&overlaid)
+        }
         Err(msg) => api_error(StatusCode::BAD_REQUEST, msg),
     }
 }
@@ -278,15 +312,28 @@ async fn set_launcher_integration_handler(
         .set_launcher_integration_snapshot(args.enabled, args.conversation_id.as_deref())
         .await
     {
-        Ok(snapshot) => api_ok(&snapshot),
+        Ok(snapshot) => {
+            let overlaid =
+                apply_ls_telemetry_overlay(&state, snapshot, args.conversation_id.as_deref()).await;
+            api_ok(&overlaid)
+        }
         Err(msg) => api_error(StatusCode::BAD_REQUEST, msg),
     }
 }
 
 pub fn build_sidecar_ui_router(ui: Arc<CompanionUiServer>, token: Option<String>) -> Router {
+    build_sidecar_ui_router_with_ls(ui, token, None)
+}
+
+pub fn build_sidecar_ui_router_with_ls(
+    ui: Arc<CompanionUiServer>,
+    token: Option<String>,
+    ls_collector: Option<LsCollectorHandle>,
+) -> Router {
     let state = SidecarUiState {
         ui,
         token: token.map(Arc::new),
+        ls_collector,
     };
     Router::new()
         .route("/", get(index_handler))
@@ -310,6 +357,18 @@ pub async fn bind_and_spawn_sidecar_ui<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    bind_and_spawn_sidecar_ui_with_ls(config_path, sidecar_cfg, None, shutdown).await
+}
+
+pub async fn bind_and_spawn_sidecar_ui_with_ls<F>(
+    config_path: PathBuf,
+    sidecar_cfg: SidecarUiConfig,
+    ls_collector: Option<LsCollectorHandle>,
+    shutdown: F,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), CliError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let ui = Arc::new(CompanionUiServer::with_options(
         config_path,
         UiServerOptions::default(),
@@ -323,7 +382,7 @@ where
             "sidecar UI listener must bind to 127.0.0.1",
         )));
     }
-    let router = build_sidecar_ui_router(ui, sidecar_cfg.token);
+    let router = build_sidecar_ui_router_with_ls(ui, sidecar_cfg.token, ls_collector);
     tracing::info!(
         addr = %bound_addr,
         "agy-companion sidecar Web UI listening"
@@ -484,5 +543,166 @@ mod tests {
         assert_eq!(save_unknown.status(), StatusCode::BAD_REQUEST);
 
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_ui_overlays_ls_stats_preserving_proxy_cloudcode_and_rss_and_fails_open() {
+        use companion_core::{
+            CloudCodeStatsSnapshot, Config, CsrfToken, HealthResponse, LsEndpoint, SqliteUsageSink,
+            StatsSnapshot, UsageStatsSnapshot,
+        };
+        use companion_providers::LsClient;
+        use std::num::NonZeroU16;
+
+        // 1. Mock proxy serving /health and /api/stats with cloudcode + proxy_rss_bytes.
+        let mock_proxy_router = Router::new()
+            .route(
+                "/health",
+                get(|| async { axum::Json(HealthResponse::ok(env!("CARGO_PKG_VERSION"))) }),
+            )
+            .route(
+                "/api/stats",
+                get(|| async {
+                    axum::Json(StatsSnapshot {
+                        usage: UsageStatsSnapshot {
+                            requests: 99,
+                            prompt_tokens: 999,
+                            ..Default::default()
+                        },
+                        cloudcode: CloudCodeStatsSnapshot {
+                            mode: "auto".to_string(),
+                            resolved_upstream: Some(
+                                "https://cloudcode-pa.googleapis.com".to_string(),
+                            ),
+                            last_catalog_refresh_at_ms: Some(1_700_000_000_000),
+                            last_catalog_included_proxy_models: Some(true),
+                        },
+                        proxy_rss_bytes: Some(16_777_216),
+                        recent_calls: Vec::new(),
+                        by_model: Vec::new(),
+                    })
+                }),
+            );
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let proxy_port = proxy_listener.local_addr().expect("proxy addr").port();
+        let proxy_srv = tokio::spawn(async move {
+            let _ = axum::serve(proxy_listener, mock_proxy_router).await;
+        });
+
+        // 2. Mock LS serving model catalog + 1 Vertex Claude step for conv-overlay-01.
+        let mock_ls_router = Router::new()
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "clientModelConfigs": [{
+                            "label": "Claude Opus 5.5 (High)",
+                            "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M501" },
+                            "provider": "MODEL_PROVIDER_ANTHROPIC",
+                            "modelId": "claude-opus-5-5-high"
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "steps": [{
+                            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                            "status": "CORTEX_STEP_STATUS_DONE",
+                            "metadata": {
+                                "createdAt": "2026-11-26T10:00:00Z",
+                                "finishedGeneratingAt": "2026-11-26T10:00:01Z",
+                                "generatorModel": "MODEL_PLACEHOLDER_M501",
+                                "modelUsage": {
+                                    "inputTokens": "500",
+                                    "cacheReadTokens": "1500",
+                                    "outputTokens": "120",
+                                    "responseOutputTokens": "100",
+                                    "thinkingOutputTokens": "20",
+                                    "apiProvider": "API_PROVIDER_ANTHROPIC_VERTEX",
+                                    "responseHeader": { "sessionID": "sess-1" }
+                                }
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                post(|| async {
+                    let mut resp = Response::new(Body::from(vec![0u8, 0, 0, 0, 2, b'{', b'}']));
+                    *resp.status_mut() = StatusCode::OK;
+                    resp.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/connect+json"),
+                    );
+                    resp
+                }),
+            );
+        let ls_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ls");
+        let ls_port = ls_listener.local_addr().expect("ls addr").port();
+        let ls_srv = tokio::spawn(async move {
+            let _ = axum::serve(ls_listener, mock_ls_router).await;
+        });
+        tokio::task::yield_now().await;
+
+        let tmp = TempDir::new().expect("tmp");
+        let cfg_path = tmp.path().join("config.json");
+        let mut cfg = Config::default();
+        cfg.proxy.port = NonZeroU16::new(proxy_port).expect("non-zero");
+        cfg.save_secure(&cfg_path).expect("save cfg");
+
+        let ui = isolated_ui_server(&tmp);
+        let sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).expect("sink"));
+        let ls_client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{ls_port}")).expect("ep"),
+            CsrfToken::parse("csrf-sidecar-overlay-test-1234").expect("csrf"),
+        )
+        .expect("ls client");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = crate::ls_collector::spawn_ls_collector(
+            ls_client,
+            sink,
+            crate::ls_collector::LsCollectorConfig::default(),
+            shutdown_rx,
+        );
+
+        let router =
+            build_sidecar_ui_router_with_ls(ui, Some("tok-overlay".to_string()), Some(handle));
+        let ui_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ui");
+        let ui_addr = ui_listener.local_addr().expect("ui addr");
+        let ui_srv = tokio::spawn(async move {
+            let _ = axum::serve(ui_listener, router).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().expect("http");
+        let resp = client
+            .post(format!("http://{ui_addr}/_api/get_settings"))
+            .header(SIDECAR_TOKEN_HEADER, "tok-overlay")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"conversation_id":"conv-overlay-01"}"#)
+            .send()
+            .await
+            .expect("get_settings");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let snap: SettingsSnapshot = resp.json().await.expect("snapshot");
+        assert!(snap.ls_telemetry_active);
+        let stats = snap.stats.expect("overlaid stats");
+        assert_eq!(stats.usage.requests, 1);
+        assert_eq!(stats.usage.prompt_tokens, 2000);
+        assert_eq!(stats.usage.cached_tokens, 1500);
+        // Preserved :24141 proxy cloudcode & proxy_rss_bytes!
+        assert_eq!(stats.proxy_rss_bytes, Some(16_777_216));
+        assert_eq!(
+            stats.cloudcode.resolved_upstream.as_deref(),
+            Some("https://cloudcode-pa.googleapis.com")
+        );
+
+        let _ = shutdown_tx.send(true);
+        ui_srv.abort();
+        ls_srv.abort();
+        proxy_srv.abort();
     }
 }

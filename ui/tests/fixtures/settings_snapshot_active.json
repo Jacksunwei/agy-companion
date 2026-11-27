@@ -164,5 +164,6 @@
     "mode": "auto",
     "resolved": "organization"
   },
-  "proxy_rss_bytes": 25165824
+  "proxy_rss_bytes": 25165824,
+  "ls_telemetry_active": false
 }

@@ -96,5 +96,6 @@
     "mode": "auto",
     "resolved": null
   },
-  "proxy_rss_bytes": null
+  "proxy_rss_bytes": null,
+  "ls_telemetry_active": false
 }

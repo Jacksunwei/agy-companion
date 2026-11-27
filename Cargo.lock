@@ -300,11 +300,13 @@ name = "companion-cli"
 version = "0.0.3"
 dependencies = [
  "axum",
+ "chrono",
  "clap",
  "companion-core",
  "companion-providers",
  "companion-proxy",
  "companion-ui",
+ "futures-util",
  "http",
  "reqwest",
  "serde",
