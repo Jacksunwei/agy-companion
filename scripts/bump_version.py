@@ -9,12 +9,12 @@ Updates:
   - packages/python/pyproject.toml ([project].version)
 
 Usage:
-  python3 -B scripts/bump_version.py                     # daily dev bump (X.Y.Z -> X.(Y+1).0-dev.0; X.Y.Z-dev.N -> X.Y.Z-dev.(N+1))
+  python3 -B scripts/bump_version.py                     # daily dev bump (X.Y.Z -> X.Y.(Z+1)-dev.0; X.Y.Z-dev.N -> X.Y.Z-dev.(N+1))
   python3 -B scripts/bump_version.py --release           # promote X.Y.Z-dev.N -> X.Y.Z (fails if already final)
   python3 -B scripts/bump_version.py --part patch        # bump explicit final patch version
   python3 -B scripts/bump_version.py --part minor        # bump explicit final minor version
   python3 -B scripts/bump_version.py --part major        # bump explicit final major version
-  python3 -B scripts/bump_version.py --set 0.2.0-dev.0   # set explicit SemVer (X.Y.Z or X.Y.Z-dev.N)
+  python3 -B scripts/bump_version.py --set 0.1.1-dev.0   # set explicit SemVer (X.Y.Z or X.Y.Z-dev.N)
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def compute_next_version(
     if cur.is_dev:
         assert cur.dev is not None
         return f"{cur.major}.{cur.minor}.{cur.patch}-dev.{cur.dev + 1}"
-    return f"{cur.major}.{cur.minor + 1}.0-dev.0"
+    return f"{cur.major}.{cur.minor}.{cur.patch + 1}-dev.0"
 
 
 def _read_toml_section_version(text: str, section: str) -> str:

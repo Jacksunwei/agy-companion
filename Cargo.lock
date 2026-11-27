@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "companion-cli"
-version = "0.2.0-dev.2"
+version = "0.2.0-dev.3"
 dependencies = [
  "axum",
  "chrono",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "companion-core"
-version = "0.2.0-dev.2"
+version = "0.2.0-dev.3"
 dependencies = [
  "chrono",
  "dirs",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "companion-providers"
-version = "0.2.0-dev.2"
+version = "0.2.0-dev.3"
 dependencies = [
  "axum",
  "base64",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "companion-proxy"
-version = "0.2.0-dev.2"
+version = "0.2.0-dev.3"
 dependencies = [
  "axum",
  "bytes",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "companion-ui"
-version = "0.2.0-dev.2"
+version = "0.2.0-dev.3"
 dependencies = [
  "axum",
  "companion-core",
