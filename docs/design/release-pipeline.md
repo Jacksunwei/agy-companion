@@ -90,12 +90,13 @@ No `PYPI_API_TOKEN` secret is needed; PEP 740 attestations are uploaded automati
 
 ## Cutting a Release
 
-Daily development PRs advance the prerelease dev version (`X.Y.0-dev.N` via `python3 -B scripts/bump_version.py`) without triggering a live release. When ready to cut a public release (see [`.agents/skills/release/SKILL.md`](../../.agents/skills/release/SKILL.md) for the full preflight and post-release live verification runbook):
+Daily development PRs advance the prerelease dev version (`X.Y.Z-dev.N` via `python3 -B scripts/bump_version.py`, bumping **patch** only) without triggering a live release. When ready to cut a public release (see [`.agents/skills/release/SKILL.md`](../../.agents/skills/release/SKILL.md) for the full preflight and post-release live verification runbook):
 
-1. Open a release-prep PR promoting `X.Y.Z-dev.N` to final `X.Y.Z` and curating [`CHANGELOG.md`](../../CHANGELOG.md):
+1. Open a release-prep PR promoting `X.Y.Z-dev.N` to final `X.Y.Z` (or bumping minor) and curating [`CHANGELOG.md`](../../CHANGELOG.md):
    ```bash
    git checkout -b chore/release-vX.Y.Z
-   python3 -B scripts/bump_version.py --release
+   python3 -B scripts/bump_version.py --release      # patch release (e.g., 0.1.1-dev.N -> 0.1.1)
+   # or: python3 -B scripts/bump_version.py --part minor  # minor release (e.g., 0.1.1-dev.N -> 0.2.0)
    # Move [Unreleased] highlights in CHANGELOG.md under [X.Y.Z] - YYYY-MM-DD and update compare links
    ./scripts/agent_check.sh
    ```
@@ -109,4 +110,4 @@ Daily development PRs advance the prerelease dev version (`X.Y.0-dev.N` via `pyt
    git push origin "v${ver}"
    ```
 
-3. On the next development PR after tagging `vX.Y.Z`, running `python3 -B scripts/bump_version.py` automatically begins the next `X.(Y+1).0-dev.0` dev cycle.
+3. On the next development PR after tagging `vX.Y.Z`, running `python3 -B scripts/bump_version.py` automatically begins the next `X.Y.(Z+1)-dev.0` patch dev cycle.

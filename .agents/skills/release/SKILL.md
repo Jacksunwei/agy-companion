@@ -1,6 +1,6 @@
 ---
 name: release
-description: Manage agy-companion SemVer dev/release versioning (X.Y.0-dev.N vs final X.Y.Z), cut and tag public releases across GitHub Releases, PyPI, and npm, verify OIDC Trusted Publishing and GitHub Environments, monitor release.yml runs, and run post-release live verification. Use when preparing a release PR, curating CHANGELOG.md, promoting -dev.N to X.Y.Z, running dry-run release builds, tagging vX.Y.Z, troubleshooting release.yml failures, or verifying published artifacts. Do NOT use for local plugin linking or Sidecar UI dev (use local-dev) or writing automated tests (use cuj-testing).
+description: Manage agy-companion SemVer dev/release versioning (X.Y.Z-dev.N vs final X.Y.Z), cut and tag public releases across GitHub Releases, PyPI, and npm, verify OIDC Trusted Publishing and GitHub Environments, monitor release.yml runs, and run post-release live verification. Use when preparing a release PR, curating CHANGELOG.md, promoting -dev.N to X.Y.Z, running dry-run release builds, tagging vX.Y.Z, troubleshooting release.yml failures, or verifying published artifacts. Do NOT use for local plugin linking or Sidecar UI dev (use local-dev) or writing automated tests (use cuj-testing).
 ---
 
 # Release Lifecycle & Publishing Runbook
@@ -19,10 +19,11 @@ All four synced manifests (`Cargo.toml`, `plugin/plugin.json`, `packages/npm/agy
 
 | Scenario | Transition | Command |
 | --- | --- | --- |
-| First dev PR after a public release | `X.Y.Z` → `X.(Y+1).0-dev.0` (e.g., `0.1.0` → `0.2.0-dev.0`) | `python3 -B scripts/bump_version.py` |
-| Subsequent daily dev PR | `X.Y.Z-dev.N` → `X.Y.Z-dev.(N+1)` (e.g., `0.2.0-dev.0` → `0.2.0-dev.1`) | `python3 -B scripts/bump_version.py` |
-| Release-prep PR promotion | `X.Y.Z-dev.N` → `X.Y.Z` (fails closed if already final) | `python3 -B scripts/bump_version.py --release` |
-| Explicit manual overrides | Final SemVer component or explicit `X.Y.Z[-dev.N]` | `python3 -B scripts/bump_version.py --part patch\|minor\|major` or `--set <ver>` |
+| First dev PR after a public release | `X.Y.Z` → `X.Y.(Z+1)-dev.0` (bumps patch only, e.g., `0.1.0` → `0.1.1-dev.0`) | `python3 -B scripts/bump_version.py` |
+| Subsequent daily dev PR | `X.Y.Z-dev.N` → `X.Y.Z-dev.(N+1)` (e.g., `0.1.1-dev.0` → `0.1.1-dev.1`) | `python3 -B scripts/bump_version.py` |
+| Release-prep PR (patch release) | `X.Y.Z-dev.N` → `X.Y.Z` (fails closed if already final) | `python3 -B scripts/bump_version.py --release` |
+| Release-prep PR (minor / major release) | `X.Y.Z[-dev.N]` → `X.(Y+1).0` or `(X+1).0.0` | `python3 -B scripts/bump_version.py --part minor\|major` |
+| Explicit manual override | Explicit `X.Y.Z` or `X.Y.Z-dev.N` | `python3 -B scripts/bump_version.py --set <ver>` |
 
 Key invariants:
 - **PEP 440 wheel normalization:** `packages/python/pyproject.toml` keeps exact 4-way SemVer parity (e.g., `"0.2.0-dev.0"`). `maturin` normalizes `-dev.N` to PEP 440 `.devN` inside built wheel filenames, `METADATA`, and `.data/scripts/` paths (`agy_companion-0.2.0.dev0.data/scripts/agy-companion`), while the compiled Rust binary prints `agy-companion 0.2.0-dev.0`. `scripts/package_release_asset.py` uses `versioning.to_pep440()` for wheel extraction and raw SemVer for `--version` smoke tests and archive names.
@@ -52,7 +53,11 @@ Expected positive signal:
    ```
 2. Promote the prerelease dev version to the final release version:
    ```bash
+   # Patch release (e.g., 0.1.1-dev.N -> 0.1.1):
    python3 -B scripts/bump_version.py --release
+
+   # Or minor release (e.g., 0.1.1-dev.N -> 0.2.0):
+   python3 -B scripts/bump_version.py --part minor
    ```
    Confirm all 4 manifests (`Cargo.toml`, `plugin/plugin.json`, `packages/npm/agy-companion/package.json` + its 5 `optionalDependencies`, `packages/python/pyproject.toml`) and `Cargo.lock` moved cleanly from `X.Y.Z-dev.N` to `X.Y.Z`.
 3. Curate `CHANGELOG.md`:
@@ -171,4 +176,4 @@ No manual version-reset commit is required after tagging `vX.Y.Z`. On the very n
 python3 -B scripts/bump_version.py
 ```
 
-automatically transitions `X.Y.Z` → `X.(Y+1).0-dev.0` across all 4 synced manifests and `Cargo.lock`.
+automatically transitions `X.Y.Z` → `X.Y.(Z+1)-dev.0` (bumping patch only) across all 4 synced manifests and `Cargo.lock`.

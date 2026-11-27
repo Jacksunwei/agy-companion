@@ -183,9 +183,9 @@ class TestBumpVersion(unittest.TestCase):
             root = pathlib.Path(td)
             _write_minimal_repo(root, version="0.0.12")
 
-            # Final 0.0.12 -> 0.1.0-dev.0 -> 0.1.0-dev.1 -> --release -> 0.1.0 -> 0.2.0-dev.0 -> 0.2.0-dev.1
+            # Final 0.0.12 -> 0.0.13-dev.0 -> 0.0.13-dev.1 -> --release -> 0.0.13
             old, new, updated = bump_version.bump_repo_version(root)
-            self.assertEqual((old, new), ("0.0.12", "0.1.0-dev.0"))
+            self.assertEqual((old, new), ("0.0.12", "0.0.13-dev.0"))
             self.assertEqual(
                 updated,
                 [
@@ -196,32 +196,36 @@ class TestBumpVersion(unittest.TestCase):
                     "packages/python/pyproject.toml",
                 ],
             )
-            self.assertIn('version = "0.1.0-dev.0"', (root / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertIn('version = "0.0.13-dev.0"', (root / "Cargo.toml").read_text(encoding="utf-8"))
             lock_text = (root / "Cargo.lock").read_text(encoding="utf-8")
-            self.assertEqual(lock_text.count('version = "0.1.0-dev.0"'), 2)
+            self.assertEqual(lock_text.count('version = "0.0.13-dev.0"'), 2)
             self.assertIn('version = "1.0.219"', lock_text)
             self.assertEqual(
                 json.loads((root / "plugin" / "plugin.json").read_text(encoding="utf-8"))["version"],
-                "0.1.0-dev.0",
+                "0.0.13-dev.0",
             )
             npm_data = json.loads(
                 (root / "packages" / "npm" / "agy-companion" / "package.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(npm_data["version"], "0.1.0-dev.0")
+            self.assertEqual(npm_data["version"], "0.0.13-dev.0")
             for dep_ver in npm_data["optionalDependencies"].values():
-                self.assertEqual(dep_ver, "0.1.0-dev.0")
+                self.assertEqual(dep_ver, "0.0.13-dev.0")
             self.assertIn(
-                'version = "0.1.0-dev.0"',
+                'version = "0.0.13-dev.0"',
                 (root / "packages" / "python" / "pyproject.toml").read_text(encoding="utf-8"),
             )
 
-            self.assertEqual(bump_version.bump_repo_version(root)[:2], ("0.1.0-dev.0", "0.1.0-dev.1"))
+            self.assertEqual(bump_version.bump_repo_version(root)[:2], ("0.0.13-dev.0", "0.0.13-dev.1"))
             self.assertEqual(
                 bump_version.bump_repo_version(root, release=True)[:2],
-                ("0.1.0-dev.1", "0.1.0"),
+                ("0.0.13-dev.1", "0.0.13"),
             )
-            self.assertEqual(bump_version.bump_repo_version(root)[:2], ("0.1.0", "0.2.0-dev.0"))
-            self.assertEqual(bump_version.bump_repo_version(root)[:2], ("0.2.0-dev.0", "0.2.0-dev.1"))
+            # Final minor 0.1.0 -> 0.1.1-dev.0 -> 0.1.1-dev.1 -> --part minor -> 0.2.0 -> 0.2.1-dev.0
+            self.assertEqual(bump_version.bump_repo_version(root, part="minor")[:2], ("0.0.13", "0.1.0"))
+            self.assertEqual(bump_version.bump_repo_version(root)[:2], ("0.1.0", "0.1.1-dev.0"))
+            self.assertEqual(bump_version.bump_repo_version(root)[:2], ("0.1.1-dev.0", "0.1.1-dev.1"))
+            self.assertEqual(bump_version.bump_repo_version(root, part="minor")[:2], ("0.1.1-dev.1", "0.2.0"))
+            self.assertEqual(bump_version.bump_repo_version(root)[:2], ("0.2.0", "0.2.1-dev.0"))
 
     def test_release_fails_closed_when_already_final(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -281,16 +285,16 @@ class TestBumpVersion(unittest.TestCase):
             _write_minimal_repo(root, version="0.1.0")
 
             self.assertEqual(bump_version.main(["--repo-root", str(root)]), 0)
-            self.assertIn('version = "0.2.0-dev.0"', (root / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertIn('version = "0.1.1-dev.0"', (root / "Cargo.toml").read_text(encoding="utf-8"))
 
             self.assertEqual(bump_version.main(["--repo-root", str(root)]), 0)
-            self.assertIn('version = "0.2.0-dev.1"', (root / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertIn('version = "0.1.1-dev.1"', (root / "Cargo.toml").read_text(encoding="utf-8"))
 
             self.assertEqual(bump_version.main(["--release", "--repo-root", str(root)]), 0)
-            self.assertIn('version = "0.2.0"', (root / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertIn('version = "0.1.1"', (root / "Cargo.toml").read_text(encoding="utf-8"))
 
-            self.assertEqual(bump_version.main(["--set", "0.3.0-dev.0", "--repo-root", str(root)]), 0)
-            self.assertIn('version = "0.3.0-dev.0"', (root / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertEqual(bump_version.main(["--set", "0.2.1-dev.0", "--repo-root", str(root)]), 0)
+            self.assertIn('version = "0.2.1-dev.0"', (root / "Cargo.toml").read_text(encoding="utf-8"))
 
             self.assertEqual(bump_version.main(["--set", "bad-ver", "--repo-root", str(root)]), 1)
 
@@ -366,11 +370,12 @@ class TestCheckPrVersionBump(unittest.TestCase):
                 _git(root, "checkout", "-b", "feat/with-bump")
                 bump_version.bump_repo_version(root)
                 _git(root, "add", ".")
-                _git(root, "commit", "-m", "feat: start 0.2.0-dev.0 cycle")
+                _git(root, "commit", "-m", "feat: start 0.1.1-dev.0 cycle")
 
                 runner = check.CheckRunner(root, verify_ui_build=False, with_e2e=False)
-                self.assertIsNone(runner._check_pr_version_bump("0.2.0-dev.0"))
-                self.assertIsNone(runner._check_pr_version_bump("0.2.0-dev.1"))
+                self.assertIsNone(runner._check_pr_version_bump("0.1.1-dev.0"))
+                self.assertIsNone(runner._check_pr_version_bump("0.1.1-dev.1"))
+                self.assertIsNone(runner._check_pr_version_bump("0.1.1"))
                 self.assertIsNone(runner._check_pr_version_bump("0.2.0"))
         finally:
             self._restore_ci_env(saved)
