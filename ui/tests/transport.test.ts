@@ -4,6 +4,7 @@ import {
   callSidecarApi,
   detectSidecarContext,
   inferThemeFromCssVars,
+  isPluginHostProtocol,
   parseCssColorLuminance,
   sanitizeConversationId,
 } from "../src/transport.ts";
@@ -37,6 +38,35 @@ describe("sidecar transport helpers", () => {
       token: "tok-only",
       conversationId: null,
     });
+
+    // Antigravity Electron hosts Sidecar Web UIs on privileged `plugin://` origins.
+    assert.deepEqual(
+      detectSidecarContext(
+        "?token=tok-plugin&conversationId=a25ce165-c93a-42be-a648-ac6144c7acba",
+        "plugin:",
+      ),
+      {
+        token: "tok-plugin",
+        conversationId: "a25ce165-c93a-42be-a648-ac6144c7acba",
+      },
+    );
+    assert.deepEqual(detectSidecarContext("", "plugin:"), {
+      token: "",
+      conversationId: null,
+    });
+    assert.deepEqual(detectSidecarContext("", "http:"), {
+      token: "",
+      conversationId: null,
+    });
+    assert.equal(detectSidecarContext("?token=tok-file", "file:"), null);
+    assert.equal(detectSidecarContext("", "about:"), null);
+
+    assert.equal(isPluginHostProtocol("plugin:"), true);
+    assert.equal(isPluginHostProtocol("PLUGIN:"), true);
+    assert.equal(isPluginHostProtocol("http:"), false);
+    assert.equal(isPluginHostProtocol("https:"), false);
+    assert.equal(isPluginHostProtocol("file:"), false);
+    assert.equal(isPluginHostProtocol(""), false);
   });
 
   it("infers dark and light theme from host CSS background variables", () => {

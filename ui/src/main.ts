@@ -41,6 +41,7 @@ import {
   callSidecarApi,
   detectSidecarContext,
   inferThemeFromCssVars,
+  isPluginHostProtocol,
 } from "./transport.ts";
 import { buildUsageView } from "./usage.ts";
 
@@ -55,6 +56,7 @@ async function main(): Promise<void> {
   if (!root) return;
 
   const sidecarCtx = detectSidecarContext(window.location.search, window.location.protocol);
+  const isPluginHost = isPluginHostProtocol(window.location.protocol);
 
   const state: AppState = {
     connected: false,
@@ -517,7 +519,9 @@ async function main(): Promise<void> {
     if (state.connected && !state.standalone) {
       try {
         const popup = window.open(url, "_blank", "noopener,noreferrer");
-        if (popup !== null) {
+        // Antigravity's Electron plugin:// host opens external URLs via setWindowOpenHandler
+        // and returns `{ action: 'deny' }`, which makes `window.open` return `null` on success.
+        if (popup !== null || isPluginHost) {
           opened = true;
         }
       } catch {
@@ -683,7 +687,9 @@ async function main(): Promise<void> {
     if (!state.connected || state.standalone) return false;
     try {
       const popup = window.open(url, "_blank", "noopener,noreferrer");
-      return popup !== null;
+      // Antigravity's Electron plugin:// host delegates external URLs to the system browser
+      // in setWindowOpenHandler and returns `{ action: 'deny' }` (`popup === null`).
+      return popup !== null || isPluginHost;
     } catch {
       return false;
     }

@@ -46,15 +46,26 @@ export function sanitizeConversationId(raw: string | null | undefined): string |
   return trimmed;
 }
 
+const ALLOWED_SIDECAR_PROTOCOLS: ReadonlySet<string> = new Set([
+  "http:",
+  "https:",
+  "plugin:",
+]);
+
+export function isPluginHostProtocol(protocol: string | null | undefined): boolean {
+  return (protocol ?? "").trim().toLowerCase() === "plugin:";
+}
+
 export function detectSidecarContext(
   search: string,
   protocol?: string,
 ): SidecarContext | null {
-  if (protocol && protocol !== "http:" && protocol !== "https:") {
+  const normalizedProtocol = protocol ? protocol.trim().toLowerCase() : "";
+  if (normalizedProtocol && !ALLOWED_SIDECAR_PROTOCOLS.has(normalizedProtocol)) {
     return null;
   }
   const params = new URLSearchParams(search || "");
-  if (!protocol && !params.has("token") && !params.has("conversationId")) {
+  if (!normalizedProtocol && !params.has("token") && !params.has("conversationId")) {
     return null;
   }
   return {
