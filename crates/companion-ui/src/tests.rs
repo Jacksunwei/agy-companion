@@ -813,6 +813,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
             resolved: Some(ResolvedAccountPlan::Organization),
         },
         proxy_rss_bytes: Some(25_165_824),
+        ls_telemetry_active: false,
     };
     let expected_active: Value =
         serde_json::from_str(ACTIVE_FIXTURE).expect("parse active fixture");
@@ -861,6 +862,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         platform: HostPlatform::Macos,
         account_plan: AccountPlanStatus::from_config_and_stats(&CloudCodeUpstream::Auto, None),
         proxy_rss_bytes: None,
+        ls_telemetry_active: false,
     };
     let expected_day0: Value = serde_json::from_str(DAY0_FIXTURE).expect("parse day0 fixture");
     assert_eq!(

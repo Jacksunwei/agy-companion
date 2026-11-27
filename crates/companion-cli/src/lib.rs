@@ -7,6 +7,7 @@ pub mod hook_env;
 pub mod install;
 pub mod integration;
 pub mod launch;
+pub mod ls_collector;
 pub mod models;
 pub mod process;
 pub mod serve;

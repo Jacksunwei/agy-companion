@@ -118,7 +118,8 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         }
     }
 
-    let usage_sink: Arc<dyn UsageSink> = Arc::new(SqliteUsageSink::new(usage_dir)?);
+    let sqlite_sink = Arc::new(SqliteUsageSink::new(usage_dir)?);
+    let usage_sink: Arc<dyn UsageSink> = Arc::clone(&sqlite_sink) as Arc<dyn UsageSink>;
 
     // Pre-register SIGTERM and SIGHUP before binding so host-restart signals are never missed.
     #[cfg(unix)]
@@ -179,11 +180,16 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         }
     }
     let _sidecar_shutdown_guard = SidecarShutdownGuard(sidecar_shutdown_tx);
+    let ls_collector = crate::ls_collector::spawn_ls_collector_from_env(
+        Arc::clone(&sqlite_sink),
+        sidecar_shutdown_rx.clone(),
+    );
     let _sidecar_ui_handle =
         if let Some(sidecar_cfg) = crate::sidecar_ui::SidecarUiConfig::from_env() {
-            match crate::sidecar_ui::bind_and_spawn_sidecar_ui(
+            match crate::sidecar_ui::bind_and_spawn_sidecar_ui_with_ls(
                 config_path.clone(),
                 sidecar_cfg,
+                ls_collector.clone(),
                 async move {
                     let _ = sidecar_shutdown_rx.wait_for(|&stopped| stopped).await;
                 },

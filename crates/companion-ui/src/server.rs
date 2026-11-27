@@ -213,6 +213,7 @@ impl CompanionUiServer {
             platform: HostPlatform::current(),
             account_plan,
             proxy_rss_bytes,
+            ls_telemetry_active: false,
         }
     }
 }
