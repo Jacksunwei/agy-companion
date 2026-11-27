@@ -9,7 +9,7 @@
 
 1. **Zero-friction defaults:** Ship defaults that let a user paste an API key and start using models immediately without understanding proxy internals, ports, dotfiles, or account endpoints.
 2. **Every control earns its pixels:** No internal codenames, no raw backend URLs, no read-only/unusable fields, no fake "Coming Soon" placeholders, and no manual Refresh button for state the app can sync automatically.
-3. **Calm single-column instrument:** One centered single-column layout (`max-width: 560px`) across narrow Antigravity aux panes (`360px`–`460px`) and wide global settings pages (`760px+`), with 3 compact icon tabs (**Monitor** | **Usage** | **Settings**) and a minimal pinned status footer.
+3. **Calm single-column instrument:** One full-width single-column layout across narrow (`360px`–`460px`) and wide (`760px+`) Antigravity aux panes, with 3 compact icon tabs (**Monitor** | **Usage** | **Settings**) and a minimal pinned status footer.
 4. **Open-source clean:** Zero Google-internal codenames or raw `*-pa.googleapis.com` endpoints anywhere in user-facing UI strings.
 
 ---
@@ -29,13 +29,13 @@
 
 ## 3. Single-Column 3-Tab Architecture
 
-Every viewport renders the exact same single-column DOM structure centered at `max-width: 560px` — no 2-column breakpoint.
+Every viewport renders the exact same full-width single-column DOM structure — no 2-column breakpoint.
 
 ```text
 +---------------------------------------------------------------+
 | [mark] Antigravity Companion 0.1.0        [pulse][bars][gear] | <- Pinned Header (44px)
 +---------------------------------------------------------------+
-|                      max-width: 560px                         |
+|                       width: 100%                             |
 |  +---------------------------------------------------------+  |
 |  | [!] Quit (⌘Q) and reopen Antigravity                    |  | <- Conditional Top Banner
 |  |     The local proxy is enabled. Quit (⌘Q) and reopen    |  |    (at most 1 active;
@@ -78,10 +78,10 @@ Every viewport renders the exact same single-column DOM structure centered at `m
   3. **Settings** (gear icon) — providers + collapsed Advanced. Shows a subtle amber attention dot when not active and any action is needed (API key unset, proxy disabled, manual symlink step, or reopen required).
 - **CUJ-adaptive landing:** Opens on **Monitor** whenever `hybrid_active` is true (even without a Google AI Studio API key configured) or `api_key_configured` is true; opens on **Settings** on Day-0 before Hybrid Mode is active and no API key is configured (`!hybrid_active && !api_key_configured`).
 
-### Responsive Padding (`max-width: 560px` centered)
-- **Narrow aux pane (`320px–400px`):** `padding: 12px`; chips wrap naturally (`gap: 6px`); tooltips clamp within `[10px, width - tipWidth - 10px]`.
-- **Standard aux pane (`401px–600px`):** `padding: 14px 16px`.
-- **Wide global view (`> 600px`):** `max-width: 560px; margin: 0 auto; padding: 18px 16px` (matches Antigravity's native single-column Account settings page).
+### Responsive Padding (Full-Width Single Column)
+- **Narrow aux pane (`320px–400px`):** `padding: 12px 12px 18px`; chips wrap naturally (`gap: 6px`); tooltips clamp within `[10px, width - tipWidth - 10px]`.
+- **Standard aux pane (`401px–600px`):** `padding: 14px 14px 20px`.
+- **Wide aux pane (`> 600px`):** `width: 100%; padding: 16px 14px 24px` (aligned with the `14px` header insets).
 
 ---
 
