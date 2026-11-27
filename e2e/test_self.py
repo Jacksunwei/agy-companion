@@ -22,6 +22,7 @@ from harness import (
     E2ETestCase,
     IsolatedEnv,
     RESERVED_PORT_RANGE,
+    reap_env_daemons,
     reap_pidfile_daemon,
     register_pidfile_cleanup,
     run_cli,
@@ -162,3 +163,61 @@ class TestHarnessGuardrails(E2ETestCase):
             if sleeper2.poll() is None:
                 sleeper2.kill()
                 sleeper2.wait(timeout=2.0)
+
+    def test_self_03_isolated_env_reaps_detached_daemon_without_pidfile_on_close(self) -> None:
+        """IsolatedEnv.close() reaps detached env-scoped daemons writing files without ENOTEMPTY."""
+        if os.name == "nt":
+            self.skipTest("POSIX env-daemon reaper test")
+
+        unrelated_token = f"agy-self-unrelated-{os.getpid()}-{time.monotonic_ns()}"
+        unrelated = subprocess.Popen(
+            [sys.executable, "-B", "-c", "import time; time.sleep(30)", "agy-companion", "serve", unrelated_token],
+            start_new_session=True,
+        )
+        writer: subprocess.Popen[bytes] | None = None
+        try:
+            iso = IsolatedEnv()
+            root = iso.root
+            log_path = iso.data_dir / "proxy.log"
+            log_path.write_text("started\n", encoding="utf-8")
+            writer_code = (
+                "import pathlib, sys, time\n"
+                "d = pathlib.Path(sys.argv[1])\n"
+                "i = 0\n"
+                "while True:\n"
+                "    try:\n"
+                "        (d / f'churn-{i % 4}.tmp').write_text('x', encoding='utf-8')\n"
+                "    except OSError:\n"
+                "        pass\n"
+                "    i += 1\n"
+                "    time.sleep(0.005)\n"
+            )
+            # Simulate a detached `agy-companion serve --config <root>/skew/config.json`
+            # process actively creating files in `iso.data_dir` without a `proxy.pid`.
+            writer = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    writer_code,
+                    str(iso.data_dir),
+                    "agy-companion",
+                    "serve",
+                    "--config",
+                    str(root / "skew" / "config.json"),
+                ],
+                start_new_session=True,
+            )
+            time.sleep(0.05)
+            self.assertIsNone(writer.poll())
+
+            iso.close()
+            self.assertIsNotNone(writer.wait(timeout=2.0))
+            self.assertFalse(root.exists(), f"IsolatedEnv root should be cleanly removed: {root}")
+            self.assertIsNone(unrelated.poll(), "Unrelated process must not be signaled")
+            self.assertEqual(reap_env_daemons(root, expected_cmdline_substr=unrelated_token), 0)
+        finally:
+            for proc in (writer, unrelated):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
