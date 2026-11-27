@@ -380,6 +380,44 @@ class TestCheckPrVersionBump(unittest.TestCase):
         finally:
             self._restore_ci_env(saved)
 
+    def test_exempts_github_meta_only_prs_and_rejects_mixed_or_downgrade(self) -> None:
+        saved = self._clean_ci_env()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = pathlib.Path(td)
+                _init_git_repo_with_origin_main(root, version="0.2.0-dev.3")
+                _git(root, "checkout", "-b", "dependabot/github-actions")
+
+                # Committed .github/-only change passes without version bump
+                wf_dir = root / ".github" / "workflows"
+                wf_dir.mkdir(parents=True, exist_ok=True)
+                (wf_dir / "ci.yml").write_text("name: CI\n", encoding="utf-8")
+                _git(root, "add", ".github/workflows/ci.yml")
+                _git(root, "commit", "-m", "ci: bump github actions")
+
+                runner = check.CheckRunner(root, verify_ui_build=False, with_e2e=False)
+                self.assertIsNone(runner._check_pr_version_bump("0.2.0-dev.3"))
+
+                # Downgrade is still rejected even for .github/-only PRs
+                self.assertIsNotNone(runner._check_pr_version_bump("0.2.0-dev.2"))
+
+                # Uncommitted file outside .github/ alongside .github/ commit fails
+                (root / "notes.txt").write_text("oops\n", encoding="utf-8")
+                err = runner._check_pr_version_bump("0.2.0-dev.3")
+                self.assertIsNotNone(err)
+                assert err is not None
+                self.assertIn("PR version bump required", err)
+
+                # Committed mixed change (.github/ + non-.github/) fails
+                _git(root, "add", "notes.txt")
+                _git(root, "commit", "-m", "feat: also touch notes")
+                err = runner._check_pr_version_bump("0.2.0-dev.3")
+                self.assertIsNotNone(err)
+                assert err is not None
+                self.assertIn("PR version bump required", err)
+        finally:
+            self._restore_ci_env(saved)
+
     def test_dev_prerelease_transitions_and_downgrade_rejections(self) -> None:
         saved = self._clean_ci_env()
         try:
