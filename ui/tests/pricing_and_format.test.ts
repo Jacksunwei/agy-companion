@@ -40,31 +40,129 @@ function loadFixture(name: string): unknown {
 }
 
 describe("pricing.ts list prices, token cost math & rollups", () => {
-  it("resolves all 5 curated models with prefix/case normalization and 1M context window", () => {
-    const expectedIds = [
+  it("resolves Gemini, Vertex Claude, and Vertex OpenAI models with suffix stripping, family fallback, and accurate context windows", () => {
+    const geminiIds = [
       "gemini-4-carbon",
       "gemini-4-neon",
       "gemini-4-hydrogen",
       "gemini-4-argon",
+      "gemini-3.8-pro",
       "gemini-3.8-flash",
+      "gemini-3.1-pro",
+      "gemini-3.1-flash",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash",
     ];
-    assert.deepEqual(Object.keys(MODEL_LIST_PRICES), expectedIds);
-
-    for (const id of expectedIds) {
+    for (const id of geminiIds) {
       const rate = getModelListPrice(id);
-      assert.ok(rate !== null);
+      assert.ok(rate !== null, `expected list price for ${id}`);
       assert.equal(rate.contextWindow, 1_000_000);
       assert.equal(getModelContextWindow(id), 1_000_000);
     }
 
+    const claudeIds = [
+      "claude-opus-4-6",
+      "claude-opus-4-5",
+      "claude-opus-4",
+      "claude-sonnet-4-6",
+      "claude-sonnet-4-5",
+      "claude-sonnet-4",
+      "claude-haiku-4-5",
+      "claude-3-5-haiku",
+    ];
+    for (const id of claudeIds) {
+      const rate = getModelListPrice(id);
+      assert.ok(rate !== null, `expected list price for ${id}`);
+      assert.equal(rate.contextWindow, 200_000);
+      assert.equal(getModelContextWindow(id), 200_000);
+    }
+    assert.equal(MODEL_LIST_PRICES["claude-opus-4-6"].inputPerM, 5.0);
+    assert.equal(MODEL_LIST_PRICES["claude-opus-4-6"].cachedPerM, 0.5);
+    assert.equal(MODEL_LIST_PRICES["claude-opus-4-6"].outputPerM, 25.0);
+    assert.equal(MODEL_LIST_PRICES["claude-opus-4"].inputPerM, 15.0);
+    assert.equal(MODEL_LIST_PRICES["claude-sonnet-4-6"].inputPerM, 3.0);
+    assert.equal(MODEL_LIST_PRICES["claude-haiku-4-5"].inputPerM, 1.0);
+
+    const openaiExpectedCtx: ReadonlyArray<[string, number]> = [
+      ["gpt-5.4", 400_000],
+      ["gpt-5.3-codex", 400_000],
+      ["gpt-5", 400_000],
+      ["gpt-4.1", 1_000_000],
+      ["gpt-4o", 128_000],
+      ["o3", 200_000],
+      ["o4-mini", 200_000],
+    ];
+    for (const [id, ctx] of openaiExpectedCtx) {
+      const rate = getModelListPrice(id);
+      assert.ok(rate !== null, `expected list price for ${id}`);
+      assert.equal(rate.contextWindow, ctx);
+      assert.equal(getModelContextWindow(id), ctx);
+    }
+
+    // Prefix, case, effort-suffix (-low/-medium/-high/-max), date-stamp & preview normalization
     assert.deepEqual(
       getModelListPrice("  MODELS/Gemini-4-Carbon  "),
       MODEL_LIST_PRICES["gemini-4-carbon"],
     );
-    assert.equal(getModelListPrice("gemini-3.8-pro"), null);
+    assert.deepEqual(
+      getModelListPrice("companion/gemini-3.8-pro-high"),
+      MODEL_LIST_PRICES["gemini-3.8-pro"],
+    );
+    assert.deepEqual(
+      getModelListPrice("gemini-3.1-pro-preview"),
+      MODEL_LIST_PRICES["gemini-3.1-pro"],
+    );
+    assert.deepEqual(
+      getModelListPrice("claude-sonnet-4-6-medium"),
+      MODEL_LIST_PRICES["claude-sonnet-4-6"],
+    );
+    assert.deepEqual(
+      getModelListPrice("claude-sonnet-4-5@20250929"),
+      MODEL_LIST_PRICES["claude-sonnet-4-5"],
+    );
+    assert.deepEqual(
+      getModelListPrice("claude-opus-4-6-max"),
+      MODEL_LIST_PRICES["claude-opus-4-6"],
+    );
+    assert.deepEqual(
+      getModelListPrice("gpt-5.3-codex-high"),
+      MODEL_LIST_PRICES["gpt-5.3-codex"],
+    );
+    assert.deepEqual(
+      getModelListPrice("o4-mini-low"),
+      MODEL_LIST_PRICES["o4-mini"],
+    );
+
+    // Claude family fallback for future/versioned IDs (always 200K, never 1M)
+    assert.deepEqual(
+      getModelListPrice("claude-opus-5-5-high"),
+      MODEL_LIST_PRICES["claude-opus-4-6"],
+    );
+    assert.equal(getModelContextWindow("claude-opus-5-5-high"), 200_000);
+    assert.deepEqual(
+      getModelListPrice("claude-sonnet-5-0"),
+      MODEL_LIST_PRICES["claude-sonnet-4-6"],
+    );
+    assert.deepEqual(
+      getModelListPrice("claude-haiku-5-0-low"),
+      MODEL_LIST_PRICES["claude-haiku-4-5"],
+    );
+    assert.equal(getModelListPrice("claude-future-unknown"), null);
+    assert.equal(getModelContextWindow("claude-future-unknown"), 200_000);
+
+    // Non-Claude context window fallbacks & unpriced models
+    assert.equal(getModelContextWindow("gemini-5-future-pro"), 1_000_000);
+    assert.equal(getModelContextWindow("gpt-5.9-preview"), 400_000);
+    assert.equal(getModelContextWindow("gpt-4.1-mini"), 1_000_000);
+    assert.equal(getModelContextWindow("o3-pro"), 200_000);
+    assert.equal(getModelContextWindow("o4-mini-high"), 200_000);
+    assert.equal(getModelContextWindow("gpt-4o-mini"), 128_000);
+    assert.equal(getModelContextWindow("gpt-6.2-sol"), 500_000);
+    assert.equal(getModelContextWindow("gpt-6.2-astra"), 272_000);
     assert.equal(getModelListPrice("antigravity-builtin"), null);
     assert.equal(getModelListPrice("gpt-6.2-astra"), null);
     assert.equal(getModelListPrice("gpt-6.2-sol"), null);
+    assert.equal(getModelListPrice("gemini-unpriced-preview"), null);
     assert.equal(getModelListPrice(""), null);
     assert.equal(getModelContextWindow("gpt-6.2-astra"), 272_000);
     assert.equal(getModelContextWindow("gpt-6.2-sol"), 500_000);
@@ -86,6 +184,19 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     assert.ok(Math.abs(cost.outputUsd - 3.0) < 1e-12);
     assert.ok(Math.abs(cost.totalUsd - 4.72) < 1e-12);
     assert.ok(Math.abs(cost.cacheSavingsUsd - 2.28) < 1e-12);
+
+    // Vertex Claude cost math (Opus 4.6: $5 / $0.50 / $25 per 1M)
+    const claudeCost = estimateTokensCost("claude-opus-4-6-high", {
+      inputTokens: 200_000,
+      cachedTokens: 100_000,
+      outputTokens: 10_000,
+      reasoningTokens: 10_000,
+    });
+    assert.ok(claudeCost !== null);
+    assert.ok(Math.abs(claudeCost.cachedReadUsd - 0.05) < 1e-12);
+    assert.ok(Math.abs(claudeCost.newInputUsd - 0.5) < 1e-12);
+    assert.ok(Math.abs(claudeCost.outputUsd - 0.5) < 1e-12);
+    assert.ok(Math.abs(claudeCost.totalUsd - 1.05) < 1e-12);
 
     // cachedTokens > inputTokens clamps newInput to 0 (no negative cost)
     const clampedCache = estimateTokensCost("gemini-4-carbon", {
@@ -113,7 +224,7 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     });
 
     assert.equal(
-      estimateTokensCost("gemini-3.8-pro", {
+      estimateTokensCost("antigravity-builtin", {
         inputTokens: 1000,
         cachedTokens: 0,
         outputTokens: 100,
@@ -122,7 +233,7 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     );
   });
 
-  it("computes sessionModelKey and estimateSessionSummary on mixed priced + unpriced rows", () => {
+  it("computes sessionModelKey and estimateSessionSummary on priced, mixed, and unpriced rows", () => {
     assert.equal(
       sessionModelKey({ provider: "gemini", source: "proxy", model: "gemini-4-carbon" }),
       "gemini:proxy:gemini-4-carbon",
@@ -136,16 +247,25 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     const carbonCost = summary.byModelKey.get("gemini:proxy:gemini-4-carbon");
     const builtinCost = summary.byModelKey.get("antigravity:builtin:gemini-3.8-pro");
     assert.ok(carbonCost !== null && carbonCost !== undefined);
-    assert.equal(builtinCost, null);
-    assert.ok(Math.abs(summary.totalUsd - carbonCost.totalUsd) < 1e-12);
+    assert.ok(builtinCost !== null && builtinCost !== undefined);
+    assert.ok(Math.abs(summary.totalUsd - (carbonCost.totalUsd + builtinCost.totalUsd)) < 1e-12);
 
     const empty = estimateSessionSummary([]);
     assert.equal(empty.hasPricedModels, false);
     assert.equal(empty.totalUsd, 0);
 
-    const unpricedOnly = estimateSessionSummary([active.stats.by_model[1]]);
+    const unpricedRow = {
+      ...active.stats.by_model[1],
+      model: "antigravity-builtin",
+    };
+    const unpricedOnly = estimateSessionSummary([unpricedRow]);
     assert.equal(unpricedOnly.hasPricedModels, false);
     assert.equal(unpricedOnly.totalUsd, 0);
+
+    const mixed = estimateSessionSummary([active.stats.by_model[0], unpricedRow]);
+    assert.equal(mixed.hasPricedModels, true);
+    assert.equal(mixed.byModelKey.get("antigravity:builtin:antigravity-builtin"), null);
+    assert.ok(Math.abs(mixed.totalUsd - carbonCost.totalUsd) < 1e-12);
   });
 
   it("computes estimateUsageSummaryCosts on usage_summary_7d.json, all-unpriced, and mixed same-provider", () => {
@@ -160,12 +280,14 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     const builtin = costs.byModelKey.get("antigravity:builtin:gemini-3.8-pro");
     assert.ok(carbon !== null && carbon !== undefined);
     assert.ok(neon !== null && neon !== undefined);
-    assert.equal(builtin, null);
+    assert.ok(builtin !== null && builtin !== undefined);
 
     const geminiProv = costs.byProviderKey.get("gemini");
     assert.ok(typeof geminiProv === "number");
     assert.ok(Math.abs(geminiProv - (carbon.totalUsd + neon.totalUsd)) < 1e-12);
-    assert.equal(costs.byProviderKey.get("antigravity"), null);
+    const agyProv = costs.byProviderKey.get("antigravity");
+    assert.ok(typeof agyProv === "number");
+    assert.ok(Math.abs(agyProv - builtin.totalUsd) < 1e-12);
 
     assert.equal(costs.bucketCosts.length, 7);
     assert.equal(costs.bucketCosts[0]?.totalUsd, 0);
@@ -176,7 +298,7 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     // All-unpriced summary yields null bucketCosts and null provider totals
     const unpricedSummary: UsageSummary = {
       ...usage,
-      by_model: [usage.by_model[1]],
+      by_model: [{ ...usage.by_model[1], key: "antigravity-builtin" }],
       by_provider: [usage.by_provider[1]],
     };
     const unpricedCosts = estimateUsageSummaryCosts(unpricedSummary);
@@ -217,24 +339,41 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     assert.equal(formatModelLabel("  custom-model-v1  ", []), "custom-model-v1");
     assert.equal(formatModelLabel("   ", []), "Unknown model");
 
+    assert.equal(formatProviderBadge("vertex_claude", "builtin"), "Claude");
+    assert.equal(formatProviderBadge("vertex_claude", null), "Claude");
+    assert.equal(formatProviderBadge("vertex_openai", "builtin"), "OpenAI");
+    assert.equal(formatProviderBadge("vertex_openai", null), "OpenAI");
+    assert.equal(formatProviderBadge("gemini", "direct"), "Direct");
     assert.equal(formatProviderBadge("antigravity", null), "Antigravity");
     assert.equal(formatProviderBadge("gemini", "builtin"), "Antigravity");
     assert.equal(formatProviderBadge("", null), "Antigravity");
     assert.equal(formatProviderBadge("gemini", "proxy"), "Gemini");
     assert.equal(formatProviderBadge("openai-codex", "proxy"), "Codex");
+    assert.equal(formatProviderBadge("codex", "proxy"), "Codex");
     assert.equal(formatProviderBadge("openai", "proxy"), "Openai");
 
+    assert.equal(isBuiltinProvider("vertex_claude", "builtin"), true);
+    assert.equal(isBuiltinProvider("vertex_claude", null), true);
+    assert.equal(isBuiltinProvider("vertex_openai", "builtin"), true);
+    assert.equal(isBuiltinProvider("vertex_openai", null), true);
     assert.equal(isBuiltinProvider("antigravity", "proxy"), true);
     assert.equal(isBuiltinProvider(" Antigravity ", null), true);
     assert.equal(isBuiltinProvider("gemini", "BUILTIN"), true);
     assert.equal(isBuiltinProvider("gemini", "proxy"), false);
     assert.equal(isBuiltinProvider("openai-codex", "proxy"), false);
+    assert.equal(isBuiltinProvider("gemini", "direct"), false);
+    assert.equal(isBuiltinProvider("codex", "proxy"), false);
     assert.equal(isBuiltinProvider("", null), false);
 
+    assert.equal(formatProviderFullName("vertex_claude"), "Vertex Claude");
+    assert.equal(formatProviderFullName("vertex_openai"), "Vertex OpenAI");
+    assert.equal(formatProviderFullName("gemini", "direct"), "Google AI Studio (Direct)");
+    assert.equal(formatProviderFullName("gemini", "proxy"), "Google AI Studio");
     assert.equal(formatProviderFullName("antigravity"), "Antigravity");
     assert.equal(formatProviderFullName(""), "Antigravity");
     assert.equal(formatProviderFullName("gemini"), "Google AI Studio");
     assert.equal(formatProviderFullName("openai-codex"), "OpenAI Codex");
+    assert.equal(formatProviderFullName("codex"), "OpenAI Codex");
     assert.equal(formatProviderFullName("anthropic"), "Anthropic");
   });
 });

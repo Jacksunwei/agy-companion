@@ -52,11 +52,12 @@ export interface UsageCostSummary {
 }
 
 /**
- * Official Gemini Developer API Standard Paid Tier list prices (USD per 1M tokens).
- * Source: Gemini API pricing guide (verified Nov 2026). All UI figures are prefixed
- * with approximately and labeled "est. list price".
+ * Official list prices (USD per 1M tokens) for Gemini Developer API, Vertex Gemini,
+ * Vertex Claude, and Vertex OpenAI models. All UI figures are prefixed with
+ * approximately and labeled "est. list price".
  */
 export const MODEL_LIST_PRICES: Readonly<Record<string, ModelListPrice>> = {
+  // Gemini Developer API & Vertex Gemini (1M context window)
   "gemini-4-carbon": {
     inputPerM: 4.0,
     cachedPerM: 0.2,
@@ -81,11 +82,135 @@ export const MODEL_LIST_PRICES: Readonly<Record<string, ModelListPrice>> = {
     outputPerM: 20.0,
     contextWindow: 1_000_000,
   },
+  "gemini-3.8-pro": {
+    inputPerM: 2.0,
+    cachedPerM: 0.2,
+    outputPerM: 12.0,
+    contextWindow: 1_000_000,
+  },
   "gemini-3.8-flash": {
     inputPerM: 1.5,
     cachedPerM: 0.15,
     outputPerM: 7.5,
     contextWindow: 1_000_000,
+  },
+  "gemini-3.1-pro": {
+    inputPerM: 2.0,
+    cachedPerM: 0.2,
+    outputPerM: 12.0,
+    contextWindow: 1_000_000,
+  },
+  "gemini-3.1-flash": {
+    inputPerM: 0.5,
+    cachedPerM: 0.05,
+    outputPerM: 3.0,
+    contextWindow: 1_000_000,
+  },
+  "gemini-2.5-pro": {
+    inputPerM: 1.25,
+    cachedPerM: 0.125,
+    outputPerM: 10.0,
+    contextWindow: 1_000_000,
+  },
+  "gemini-2.5-flash": {
+    inputPerM: 0.3,
+    cachedPerM: 0.03,
+    outputPerM: 2.5,
+    contextWindow: 1_000_000,
+  },
+
+  // Vertex Claude (200K context window)
+  "claude-opus-4-6": {
+    inputPerM: 5.0,
+    cachedPerM: 0.5,
+    outputPerM: 25.0,
+    contextWindow: 200_000,
+  },
+  "claude-opus-4-5": {
+    inputPerM: 5.0,
+    cachedPerM: 0.5,
+    outputPerM: 25.0,
+    contextWindow: 200_000,
+  },
+  "claude-opus-4": {
+    inputPerM: 15.0,
+    cachedPerM: 1.5,
+    outputPerM: 75.0,
+    contextWindow: 200_000,
+  },
+  "claude-sonnet-4-6": {
+    inputPerM: 3.0,
+    cachedPerM: 0.3,
+    outputPerM: 15.0,
+    contextWindow: 200_000,
+  },
+  "claude-sonnet-4-5": {
+    inputPerM: 3.0,
+    cachedPerM: 0.3,
+    outputPerM: 15.0,
+    contextWindow: 200_000,
+  },
+  "claude-sonnet-4": {
+    inputPerM: 3.0,
+    cachedPerM: 0.3,
+    outputPerM: 15.0,
+    contextWindow: 200_000,
+  },
+  "claude-haiku-4-5": {
+    inputPerM: 1.0,
+    cachedPerM: 0.1,
+    outputPerM: 5.0,
+    contextWindow: 200_000,
+  },
+  "claude-3-5-haiku": {
+    inputPerM: 0.8,
+    cachedPerM: 0.08,
+    outputPerM: 4.0,
+    contextWindow: 200_000,
+  },
+
+  // Vertex OpenAI
+  "gpt-5.4": {
+    inputPerM: 2.5,
+    cachedPerM: 0.25,
+    outputPerM: 15.0,
+    contextWindow: 400_000,
+  },
+  "gpt-5.3-codex": {
+    inputPerM: 1.75,
+    cachedPerM: 0.175,
+    outputPerM: 14.0,
+    contextWindow: 400_000,
+  },
+  "gpt-5": {
+    inputPerM: 1.25,
+    cachedPerM: 0.125,
+    outputPerM: 10.0,
+    contextWindow: 400_000,
+  },
+  "gpt-4.1": {
+    inputPerM: 2.0,
+    cachedPerM: 0.5,
+    outputPerM: 8.0,
+    contextWindow: 1_000_000,
+  },
+  "gpt-4o": {
+    inputPerM: 2.5,
+    cachedPerM: 1.25,
+    outputPerM: 10.0,
+    contextWindow: 128_000,
+  },
+  o3: {
+    inputPerM: 2.0,
+    cachedPerM: 0.5,
+    outputPerM: 8.0,
+    contextWindow: 200_000,
+  },
+  "o4-mini": {
+    inputPerM: 1.1,
+    cachedPerM: 0.275,
+    outputPerM: 4.4,
+    contextWindow: 200_000,
   },
 };
 
@@ -97,17 +222,79 @@ export const CODEX_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
 };
 
 function normalizeModelId(modelId: string): string {
-  return modelId.trim().replace(/^models\//i, "").toLowerCase();
+  return modelId
+    .trim()
+    .replace(/^gemini-api:\/\//i, "")
+    .replace(/^companion\//i, "")
+    .replace(/^models\//i, "")
+    .toLowerCase();
+}
+
+function canonicalizeForPricing(norm: string): string {
+  let s = norm.replace(/@\d{8}$/, "");
+  s = s.replace(/-(?:low|medium|high|max|xhigh)$/, "");
+  s = s.replace(/-(?:\d{8}|\d{4}-\d{2}-\d{2})$/, "");
+  s = s.replace(/-(?:preview|latest|thinking)$/, "");
+  return s;
 }
 
 export function getModelListPrice(modelId: string): ModelListPrice | null {
   const norm = normalizeModelId(modelId);
-  return MODEL_LIST_PRICES[norm] ?? null;
+  if (!norm) return null;
+
+  const exact = MODEL_LIST_PRICES[norm];
+  if (exact) return exact;
+
+  const canonical = canonicalizeForPricing(norm);
+  const canonicalMatch = MODEL_LIST_PRICES[canonical];
+  if (canonicalMatch) return canonicalMatch;
+
+  // Claude family fallback for future/versioned Claude IDs (e.g. claude-opus-5-5-high)
+  if (canonical.startsWith("claude-")) {
+    if (canonical.includes("opus")) return MODEL_LIST_PRICES["claude-opus-4-6"];
+    if (canonical.includes("sonnet")) return MODEL_LIST_PRICES["claude-sonnet-4-6"];
+    if (canonical.includes("haiku")) return MODEL_LIST_PRICES["claude-haiku-4-5"];
+  }
+
+  return null;
 }
 
 export function getModelContextWindow(modelId: string): number {
+  const priced = getModelListPrice(modelId);
+  if (priced) return priced.contextWindow;
+
   const norm = normalizeModelId(modelId);
-  return MODEL_LIST_PRICES[norm]?.contextWindow ?? CODEX_CONTEXT_WINDOWS[norm] ?? 1_000_000;
+  const codexExact = CODEX_CONTEXT_WINDOWS[norm];
+  if (codexExact !== undefined) return codexExact;
+
+  const canonical = canonicalizeForPricing(norm);
+  const codexCanonical = CODEX_CONTEXT_WINDOWS[canonical];
+  if (codexCanonical !== undefined) return codexCanonical;
+
+  if (canonical.startsWith("claude-") || canonical === "claude") {
+    return 200_000;
+  }
+  if (canonical.startsWith("gemini-")) {
+    return 1_000_000;
+  }
+  if (canonical.startsWith("gpt-5")) {
+    return 400_000;
+  }
+  if (canonical.startsWith("gpt-4.1")) {
+    return 1_000_000;
+  }
+  if (
+    canonical === "o3" ||
+    canonical.startsWith("o3-") ||
+    canonical === "o4-mini" ||
+    canonical.startsWith("o4-")
+  ) {
+    return 200_000;
+  }
+  if (canonical.startsWith("gpt-4o") || canonical.startsWith("gpt-4")) {
+    return 128_000;
+  }
+  return 1_000_000;
 }
 
 export function estimateTokensCost(
@@ -286,6 +473,9 @@ export function formatModelLabel(
 export function formatProviderBadge(provider: string, source: string | null): string {
   const p = provider.trim().toLowerCase();
   const s = (source ?? "").trim().toLowerCase();
+  if (p === "vertex_claude") return "Claude";
+  if (p === "vertex_openai") return "OpenAI";
+  if (p === "gemini" && s === "direct") return "Direct";
   if (p === "antigravity" || s === "builtin") return "Antigravity";
   if (p === "gemini") return "Gemini";
   if (p === "openai-codex" || p === "codex") return "Codex";
@@ -296,11 +486,20 @@ export function formatProviderBadge(provider: string, source: string | null): st
 export function isBuiltinProvider(provider: string, source: string | null): boolean {
   const p = provider.trim().toLowerCase();
   const s = (source ?? "").trim().toLowerCase();
-  return p === "antigravity" || s === "builtin";
+  return (
+    s === "builtin" ||
+    p === "antigravity" ||
+    p === "vertex_claude" ||
+    p === "vertex_openai"
+  );
 }
 
-export function formatProviderFullName(provider: string): string {
+export function formatProviderFullName(provider: string, source?: string | null): string {
   const p = provider.trim().toLowerCase();
+  const s = (source ?? "").trim().toLowerCase();
+  if (p === "vertex_claude") return "Vertex Claude";
+  if (p === "vertex_openai") return "Vertex OpenAI";
+  if (p === "gemini" && s === "direct") return "Google AI Studio (Direct)";
   if (p === "antigravity") return "Antigravity";
   if (p === "gemini") return "Google AI Studio";
   if (p === "openai-codex" || p === "codex") return "OpenAI Codex";

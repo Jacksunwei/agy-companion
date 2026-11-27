@@ -30,7 +30,9 @@ export function buildMonitorView(state: AppState): DocumentFragment {
   const frag = document.createDocumentFragment();
   const snap = state.snapshot;
   const platform = snap?.platform ?? "macos";
+  const lsTelemetryActive = snap?.ls_telemetry_active === true;
   const hybridActive = snap?.launcher_integration?.hybrid_active === true;
+  const telemetryConnected = lsTelemetryActive || hybridActive;
   const stats = snap?.stats ?? null;
   const usage = stats?.usage ?? null;
   const requests = usage?.requests ?? 0;
@@ -38,10 +40,10 @@ export function buildMonitorView(state: AppState): DocumentFragment {
   if (!usage || requests <= 0) {
     const empty = el("section", "card empty-card");
     empty.setAttribute("aria-label", "Live session status");
-    const title = hybridActive
+    const title = telemetryConnected
       ? "Waiting for requests"
       : "Waiting for Antigravity to connect";
-    const body = hybridActive
+    const body = telemetryConnected
       ? "Send a message in Antigravity to see live context usage, cache hit health, and cost estimates \u2014 works for built-in models as well as your own API keys."
       : `${quitReopenCapitalized(platform)} so requests route through the local proxy. Live monitoring works for built-in Antigravity models even without an API key.`;
 

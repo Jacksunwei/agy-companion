@@ -5,6 +5,7 @@ import {
   quitReopenCapitalized,
   quitReopenSentence,
 } from "./dom.ts";
+import { hasConfiguredByomProvider } from "./state.ts";
 import type { AppState } from "./types.ts";
 
 export interface BannerActions {
@@ -133,6 +134,14 @@ export function buildBannerNode(
     );
     b.append(ic, txt);
     return b;
+  }
+
+  // When live Antigravity LS telemetry is active and no BYOM provider is configured,
+  // built-in monitoring works without proxy injection — avoid nagging about proxy
+  // opt-out or reopening Antigravity for custom models the user hasn't configured.
+  const byomConfigured = hasConfiguredByomProvider(snap);
+  if (snap.ls_telemetry_active && !byomConfigured) {
+    return null;
   }
 
   // Priority 3: Explicit Unix opt-out (local proxy hook disabled)
