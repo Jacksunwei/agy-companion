@@ -452,18 +452,20 @@ class TestCheckPrVersionBump(unittest.TestCase):
         finally:
             self._restore_ci_env(saved)
 
-    def test_dev_track_retarget_allows_new_dev0_above_latest_release_tag(self) -> None:
+    def test_dev_track_retarget_preserves_dev_counter_above_latest_release_tag(self) -> None:
         saved = self._clean_ci_env()
         try:
             cases = [
                 # (base_ver, head_ver, release_tags, expect_pass)
-                ("0.2.0-dev.5", "0.1.1-dev.0", ["v0.1.0"], True),
-                ("0.2.0-dev.5", "0.1.1-dev.0", [], True),
-                ("0.2.0-dev.5", "0.1.0-dev.0", ["v0.1.0"], False),
-                ("0.2.0-dev.5", "0.0.13-dev.0", ["v0.1.0"], False),
-                ("0.2.0-dev.5", "0.1.1-dev.1", ["v0.1.0"], False),
-                ("0.2.0-dev.5", "0.2.0-dev.0", ["v0.1.0"], False),
-                ("0.2.0", "0.1.1-dev.0", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.1.1-dev.5", ["v0.1.0"], True),
+                ("0.2.0-dev.5", "0.1.1-dev.6", ["v0.1.0"], True),
+                ("0.2.0-dev.5", "0.1.1-dev.5", [], True),
+                ("0.2.0-dev.5", "0.1.0-dev.5", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.0.13-dev.5", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.1.1-dev.0", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.1.1-dev.4", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.2.0-dev.5", ["v0.1.0"], False),
+                ("0.2.0", "0.1.1-dev.5", ["v0.1.0"], False),
                 ("0.2.0-dev.5", "0.1.1", ["v0.1.0"], False),
             ]
             for base_ver, head_ver, tags, expect_pass in cases:

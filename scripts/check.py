@@ -620,12 +620,14 @@ class CheckRunner:
         base_parsed: versioning.ParsedVersion,
         cur_parsed: versioning.ParsedVersion,
     ) -> bool:
-        """Allow retargeting an unpublished -dev.N track to a different X.Y.Z-dev.0
-        track strictly newer than the latest published vX.Y.Z git tag.
+        """Allow retargeting an unpublished -dev.N track to a different X.Y.Z
+        dev track strictly newer than the latest published vX.Y.Z git tag,
+        while preserving or incrementing the dev counter (dev.N or dev.(N+1)).
         """
         if not (base_parsed.is_dev and cur_parsed.is_dev):
             return False
-        if cur_parsed.dev != 0:
+        assert base_parsed.dev is not None and cur_parsed.dev is not None
+        if cur_parsed.dev not in (base_parsed.dev, base_parsed.dev + 1):
             return False
         if (cur_parsed.major, cur_parsed.minor, cur_parsed.patch) == (
             base_parsed.major,
