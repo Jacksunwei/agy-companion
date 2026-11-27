@@ -253,7 +253,7 @@ class TestCujCodex(E2ETestCase):
         codex_cfg = snap_authed["config"]["providers"]["codex"]
         self.assertTrue(codex_cfg["authenticated"])
         self.assertEqual(codex_cfg["plan_type"], "pro")
-        self.assertEqual(codex_cfg["account_hint"], "j***@example.com")
+        self.assertEqual(codex_cfg["account_hint"], "jack@example.com")
 
         # 3. Provider-aware test_connection verifies live Codex Responses connectivity.
         test_res = self._sidecar_post(

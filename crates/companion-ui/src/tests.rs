@@ -1855,7 +1855,7 @@ async fn codex_oauth_lifecycle_and_test_connection_via_ui_server() {
     );
     assert_eq!(
         completed.config.providers.codex.account_hint.as_deref(),
-        Some("j***@example.com")
+        Some("jack@example.com")
     );
     let completed_raw = serde_json::to_string(&completed).expect("serialize completed");
     assert!(!completed_raw.contains(&access_jwt));
