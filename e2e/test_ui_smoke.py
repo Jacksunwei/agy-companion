@@ -264,20 +264,99 @@ class TestUiSmoke(E2ETestCase):
             viewport=(360, 720),
             user_data_dir=env.root / "chrome-profile",
         ) as session:
-            # Verify exactly 3 tabs and zero visible Refresh button.
+            # Verify top-level landmarks, <nav> vs div[role="tablist"] wiring, 3 tabs, and zero Refresh button.
             header = session.eval_app(
                 """(() => {
-                  const tabs = [...document.querySelectorAll('[role="tablist"] [role="tab"]')].map(
-                    (el) => el.getAttribute('aria-label') || ''
-                  );
+                  const app = document.getElementById('app');
+                  const hdr = document.querySelector('header.hdr');
+                  const main = document.querySelector('main.pane-scroll');
+                  const footer = document.querySelector('footer.status-bar');
+                  const nav = document.querySelector('header.hdr nav');
+                  const tablist = nav ? nav.querySelector('div[role="tablist"]') : null;
+                  const tabEls = [...document.querySelectorAll('[role="tablist"] [role="tab"]')];
+                  const tabs = tabEls.map((el) => el.getAttribute('aria-label') || '');
+                  const tabWiring = tabEls.map((el) => {
+                    const controls = el.getAttribute('aria-controls');
+                    const panel = controls ? document.getElementById(controls) : null;
+                    return {
+                      id: el.id,
+                      controls,
+                      panelRole: panel ? panel.getAttribute('role') : null,
+                      panelLabelledBy: panel ? panel.getAttribute('aria-labelledby') : null,
+                    };
+                  });
                   const refreshBtns = [...document.querySelectorAll('button')].filter(
                     (b) => !b.hidden && /refresh/i.test((b.textContent || '') + ' ' + (b.getAttribute('aria-label') || ''))
                   ).length;
-                  return { tabs, refreshBtns };
+                  return {
+                    appTag: app ? app.tagName : null,
+                    hdrParentId: hdr && hdr.parentElement ? hdr.parentElement.id : null,
+                    mainParentId: main && main.parentElement ? main.parentElement.id : null,
+                    footerParentId: footer && footer.parentElement ? footer.parentElement.id : null,
+                    nestedInMain: Boolean(main && (main.querySelector('header') || main.querySelector('footer'))),
+                    navRole: nav ? nav.getAttribute('role') : null,
+                    hasDivTablist: Boolean(tablist),
+                    tabs,
+                    tabWiring,
+                    refreshBtns,
+                  };
                 })()"""
             )
+            self.assertEqual(header["appTag"], "DIV")
+            self.assertEqual(header["hdrParentId"], "app")
+            self.assertEqual(header["mainParentId"], "app")
+            self.assertEqual(header["footerParentId"], "app")
+            self.assertFalse(header["nestedInMain"])
+            self.assertIsNone(header["navRole"])
+            self.assertTrue(header["hasDivTablist"])
             self.assertEqual(header["tabs"], ["Monitor", "Usage & Costs", "Settings"])
+            self.assertEqual(
+                header["tabWiring"],
+                [
+                    {"id": "tab-monitor", "controls": "panel-monitor", "panelRole": "tabpanel", "panelLabelledBy": "tab-monitor"},
+                    {"id": "tab-usage", "controls": "panel-usage", "panelRole": "tabpanel", "panelLabelledBy": "tab-usage"},
+                    {"id": "tab-settings", "controls": "panel-settings", "panelRole": "tabpanel", "panelLabelledBy": "tab-settings"},
+                ],
+            )
             self.assertEqual(header["refreshBtns"], 0)
+
+            # Verify WAI-ARIA tablist keyboard navigation (ArrowRight/ArrowLeft/End/Home) + roving tabindex.
+            read_tab_state_js = """(() => {
+              const tabs = [...document.querySelectorAll('[role="tablist"] [role="tab"]')];
+              const panels = ['panel-monitor', 'panel-usage', 'panel-settings'].map((id) => ({
+                id,
+                hidden: Boolean(document.getElementById(id)?.hidden),
+              }));
+              return {
+                activeId: document.activeElement ? document.activeElement.id : null,
+                tabs: tabs.map((t) => ({
+                  id: t.id,
+                  selected: t.getAttribute('aria-selected'),
+                  tabindex: t.getAttribute('tabindex'),
+                })),
+                panels,
+              };
+            })()"""
+            session.eval_app("document.getElementById('tab-monitor').click(); document.getElementById('tab-monitor').focus();")
+            session._flush_frames()
+
+            for key, expected_tab, expected_panel in (
+                ("ArrowRight", "tab-usage", "panel-usage"),
+                ("ArrowRight", "tab-settings", "panel-settings"),
+                ("ArrowRight", "tab-monitor", "panel-monitor"),
+                ("ArrowLeft", "tab-settings", "panel-settings"),
+                ("Home", "tab-monitor", "panel-monitor"),
+                ("End", "tab-settings", "panel-settings"),
+            ):
+                session.press_key(key)
+                st = session.eval_app(read_tab_state_js)
+                self.assertEqual(st["activeId"], expected_tab, f"after {key}")
+                for t in st["tabs"]:
+                    is_exp = t["id"] == expected_tab
+                    self.assertEqual(t["selected"], "true" if is_exp else "false", f"{t['id']} after {key}")
+                    self.assertEqual(t["tabindex"], "0" if is_exp else "-1", f"{t['id']} tabindex after {key}")
+                for p in st["panels"]:
+                    self.assertEqual(p["hidden"], p["id"] != expected_panel, f"{p['id']} after {key}")
 
             usage_loaded = False
             checked_light_brand = False
@@ -300,7 +379,7 @@ class TestUiSmoke(E2ETestCase):
                         if tab_label == "Usage & Costs" and not usage_loaded:
                             session.wait_for(
                                 """(() => {
-                                  const panel = document.querySelector('[role="tabpanel"][aria-label="Usage"]');
+                                  const panel = document.querySelector('#panel-usage[role="tabpanel"][aria-labelledby="tab-usage"]');
                                   return Boolean(panel && !panel.hidden && !/Loading usage history/i.test(panel.textContent || ''));
                                 })()""",
                                 timeout=5.0,
@@ -374,7 +453,7 @@ class TestUiSmoke(E2ETestCase):
                         if theme == "light" and tab_label == "Settings" and not checked_light_brand:
                             session.eval_app(
                                 """(() => {
-                                  const geminiCard = document.querySelector('[aria-label="Google AI Studio provider"]');
+                                  const geminiCard = document.querySelector('[data-provider="gemini"]');
                                   const replaceBtn = [...geminiCard.querySelectorAll('button')].find(
                                     (b) => !b.hidden && (b.textContent || '').trim() === 'Replace'
                                   );
@@ -389,7 +468,7 @@ class TestUiSmoke(E2ETestCase):
                             # Allow .btn's 120ms background transition to settle on --brand (#1558b0).
                             session.wait_for(
                                 """(() => {
-                                  const btn = document.querySelector('[aria-label="Google AI Studio provider"] button.btn-primary');
+                                  const btn = document.querySelector('[data-provider="gemini"] button.btn-primary');
                                   return Boolean(btn && !btn.disabled && getComputedStyle(btn).backgroundColor === 'rgb(21, 88, 176)');
                                 })()""",
                                 timeout=3.0,
@@ -397,7 +476,7 @@ class TestUiSmoke(E2ETestCase):
                             brand_check = session.eval_app(
                                 f"""(() => {{
                                   {_OPAQUE_BG_HELPER_JS}
-                                  const geminiCard = document.querySelector('[aria-label="Google AI Studio provider"]');
+                                  const geminiCard = document.querySelector('[data-provider="gemini"]');
                                   const rootBrand = getComputedStyle(document.documentElement)
                                     .getPropertyValue('--brand').trim();
                                   const lnk = geminiCard.querySelector('button.lnk');
@@ -443,7 +522,7 @@ class TestUiSmoke(E2ETestCase):
             session.set_snapshot(both_authed)
             session.wait_for(
                 """(() => {
-                  const codexCard = document.querySelector('[aria-label="OpenAI Codex provider"]');
+                  const codexCard = document.querySelector('[data-provider="codex"]');
                   return Boolean(codexCard && /Plus.*j\\*\\*\\*@gmail\\.com/.test(codexCard.textContent || ''));
                 })()""",
                 timeout=5.0,
@@ -458,8 +537,8 @@ class TestUiSmoke(E2ETestCase):
                           const docEl = document.documentElement;
                           const scroll = document.querySelector('.pane-scroll');
                           const wrap = document.querySelector('.content-wrap');
-                          const geminiCard = document.querySelector('[aria-label="Google AI Studio provider"]');
-                          const codexCard = document.querySelector('[aria-label="OpenAI Codex provider"]');
+                          const geminiCard = document.querySelector('[data-provider="gemini"]');
+                          const codexCard = document.querySelector('[data-provider="codex"]');
                           const visibleTexts = (root) => [...root.querySelectorAll('.prov-actions button')]
                             .filter((b) => !b.hidden)
                             .map((b) => (b.textContent || '').trim());
@@ -757,7 +836,7 @@ class TestUiSmoke(E2ETestCase):
         )
         wait_expr(
             """(() => {
-              const panel = document.querySelector('[role="tabpanel"][aria-label="Usage"]');
+              const panel = document.querySelector('#panel-usage[role="tabpanel"][aria-labelledby="tab-usage"]');
               return Boolean(panel && !panel.hidden && /2 calls/i.test(panel.innerText || ''));
             })()"""
         )

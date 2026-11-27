@@ -1,19 +1,20 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { buildBannerNode } from "../src/banners.ts";
+import { buildBannerNode, computeBannerSignature } from "../src/banners.ts";
 import { createBrandMarkSvg, createTooltipController } from "../src/dom.ts";
 import { createFooterController } from "../src/footer.ts";
-import { buildMonitorView } from "../src/monitor.ts";
+import { buildMonitorView, computeMonitorSignature } from "../src/monitor.ts";
 import { createSettingsView, formatCodexStatusBadge } from "../src/settings.ts";
 import {
+  CURATED_MODEL_CATALOG,
   parseSettingsSnapshot,
   parseUsageSummary,
   type AppState,
   type SettingsSnapshot,
   type UsageSummary,
 } from "../src/types.ts";
-import { buildUsageView } from "../src/usage.ts";
+import { buildUsageView, computeUsageSignature } from "../src/usage.ts";
 import { FakeElement, FakeEvent, installFakeDom, type FakeDomEnv } from "./fake_dom.ts";
 
 function loadFixture<T>(name: string): T {
@@ -127,6 +128,9 @@ describe("buildBannerNode priority queue & interactions", () => {
 
     const standalone = buildBannerNode(makeState({ standalone: true }), actions) as unknown as FakeElement;
     assert.ok(standalone);
+    assert.equal(standalone.tagName, "ASIDE");
+    assert.equal(standalone.getAttribute("role"), null);
+    assert.equal(standalone.getAttribute("aria-label"), "Preview mode");
     assert.equal(standalone.className, "banner info");
     assert.ok(standalone.textContent.includes("Preview mode"));
 
@@ -135,6 +139,7 @@ describe("buildBannerNode priority queue & interactions", () => {
       actions,
     ) as unknown as FakeElement;
     assert.ok(errBanner);
+    assert.equal(errBanner.getAttribute("role"), "alert");
     assert.ok(errBanner.textContent.includes("Unable to load companion state"));
     assert.ok(errBanner.textContent.includes("Sidecar timeout"));
     const retryBtn = errBanner.querySelector("button");
@@ -162,6 +167,7 @@ describe("buildBannerNode priority queue & interactions", () => {
 
     const node = buildBannerNode(makeState({ snapshot: offline }), actions) as unknown as FakeElement;
     assert.ok(node);
+    assert.equal(node.getAttribute("role"), "status");
     assert.ok(node.textContent.includes("One manual step needed"));
     const code = node.querySelector("code");
     assert.ok(code && code.textContent.includes("env.sh"));
@@ -224,6 +230,7 @@ describe("buildBannerNode priority queue & interactions", () => {
         : null,
     };
     const p2 = buildBannerNode(makeState({ snapshot: offlineDisabled }), actions) as unknown as FakeElement;
+    assert.equal(p2.getAttribute("role"), "alert");
     assert.ok(p2.textContent.includes("Local proxy offline"));
     assert.ok(p2.textContent.includes("\u2318Q"));
 
@@ -235,6 +242,7 @@ describe("buildBannerNode priority queue & interactions", () => {
         : null,
     };
     const p3 = buildBannerNode(makeState({ snapshot: unixDisabled }), actions) as unknown as FakeElement;
+    assert.equal(p3.getAttribute("role"), "status");
     assert.ok(p3.textContent.includes("Local proxy is disabled"));
     const enableBtn = p3.querySelector("button");
     assert.ok(enableBtn);
@@ -258,6 +266,9 @@ describe("buildBannerNode priority queue & interactions", () => {
         : null,
     };
     const p4Win = buildBannerNode(makeState({ snapshot: winNotHybrid }), actions) as unknown as FakeElement;
+    assert.equal(p4Win.tagName, "ASIDE");
+    assert.equal(p4Win.getAttribute("role"), null);
+    assert.equal(p4Win.getAttribute("aria-label"), "Reopen Antigravity");
     assert.ok(p4Win.textContent.includes("Reopen Antigravity via Companion shortcut"));
 
     // Priority 4b: macOS enabled && !hybrid_active
@@ -269,6 +280,9 @@ describe("buildBannerNode priority queue & interactions", () => {
         : null,
     };
     const p4Mac = buildBannerNode(makeState({ snapshot: macNotHybrid }), actions) as unknown as FakeElement;
+    assert.equal(p4Mac.tagName, "ASIDE");
+    assert.equal(p4Mac.getAttribute("role"), null);
+    assert.equal(p4Mac.getAttribute("aria-label"), "Reopen Antigravity");
     assert.ok(p4Mac.textContent.includes("Quit (\u2318Q) and reopen Antigravity"));
 
     // Priority 4c: Linux enabled && !hybrid_active (no ⌘Q)
@@ -461,6 +475,38 @@ describe("buildBannerNode priority queue & interactions", () => {
     ) as unknown as FakeElement;
     assert.ok(p2Wins.textContent.includes("Local proxy offline"));
     assert.equal(p2Wins.textContent.includes("Model list updated"), false);
+  });
+
+  it("computeBannerSignature stays stable across unrelated poll updates and flips when banner state changes", () => {
+    const offline = loadOfflineSnapshot();
+    const s1 = makeState({ snapshot: offline, refreshing: false });
+    const s2 = makeState({
+      snapshot: {
+        ...offline,
+        proxy_rss_bytes: 99_999_999,
+      },
+      refreshing: false,
+    });
+    assert.equal(computeBannerSignature(s1, 1000), computeBannerSignature(s2, 1000));
+    assert.notEqual(
+      computeBannerSignature(s1, 1000),
+      computeBannerSignature(makeState({ snapshot: offline, refreshing: true }), 1000),
+    );
+
+    const active = loadActiveSnapshot();
+    const reminder = {
+      baselineCatalogRefreshAtMs: active.last_catalog_refresh_at_ms,
+      changedAtMs: 1_747_300_100_000,
+    };
+    const remState = makeState({ snapshot: active, catalogRefreshReminder: reminder });
+    const t0 = 1_747_299_990_000 + 120_000; // ~3m
+    const tSameBucket = t0 + 10_000; // still ~3m
+    const tLaterBucket = 1_747_299_990_000 + 250_000; // <1m
+    assert.equal(computeBannerSignature(remState, t0), computeBannerSignature(remState, tSameBucket));
+    assert.notEqual(
+      computeBannerSignature(remState, t0),
+      computeBannerSignature(remState, tLaterBucket),
+    );
   });
 });
 
@@ -755,8 +801,10 @@ describe("buildMonitorView empty states & active mixed session", () => {
 
     const cards = host.querySelectorAll(".card");
     assert.equal(cards.length, 2);
-    assert.equal(cards[0].getAttribute("aria-label"), "This session");
-    assert.equal(cards[1].getAttribute("aria-label"), "Usage by model");
+    assert.equal(cards[0].getAttribute("aria-label"), null);
+    assert.equal(cards[1].getAttribute("aria-label"), null);
+    assert.equal(cards[0].querySelector("h2.mon-model-name")?.textContent, "Gemini 4 Carbon");
+    assert.equal(cards[1].querySelector("h2.sec-t")?.textContent, "Usage by model");
 
     // Latest prompt hero & proportional bar widths
     assert.ok(cards[0].textContent.includes("Latest prompt"));
@@ -765,13 +813,42 @@ describe("buildMonitorView empty states & active mixed session", () => {
     assert.ok(segs.length >= 3);
     assert.ok(segs[0].style.width.endsWith("%"));
 
-    // Call strip dots: Cold prompt, Cache hit, Cache break -> 1 break
+    // Call strip dots: Cold prompt, Cache hit, Cache break -> 1 break + accessible summary
+    const dotsWrap = cards[0].querySelector(".call-dots")!;
+    assert.equal(dotsWrap.getAttribute("aria-hidden"), "true");
     const dots = cards[0].querySelectorAll(".cdot");
     assert.deepEqual(
       dots.map((d) => d.title),
       ["Cold prompt", "Cache hit", "Cache break"],
     );
+    const dotSummary = cards[0].querySelector(".call-strip-row .visually-hidden");
+    assert.equal(dotSummary?.textContent, "1 cache hit, 1 cache break, 1 cold prompt");
     assert.ok(cards[0].querySelector(".call-strip-row")?.textContent.includes("1 break"));
+
+    // computeMonitorSignature ignores proxy_rss_bytes-only poll ticks and reacts to real stats changes
+    const sigBase = computeMonitorSignature(makeState({ snapshot: snap }));
+    const sigRssOnly = computeMonitorSignature(
+      makeState({
+        snapshot: {
+          ...snap,
+          proxy_rss_bytes: 42_000_000,
+          stats: { ...snap.stats!, proxy_rss_bytes: 42_000_000 },
+        },
+      }),
+    );
+    const sigNewReq = computeMonitorSignature(
+      makeState({
+        snapshot: {
+          ...snap,
+          stats: {
+            ...snap.stats!,
+            usage: { ...snap.stats!.usage, requests: snap.stats!.usage.requests + 1 },
+          },
+        },
+      }),
+    );
+    assert.equal(sigBase, sigRssOnly);
+    assert.notEqual(sigBase, sigNewReq);
 
     // 3 tiles: Session cache, Input, Output
     const tiles = cards[0].querySelectorAll(".tile");
@@ -973,6 +1050,30 @@ describe("buildUsageView filters, states & breakdowns", () => {
     assert.ok(usdHost.querySelectorAll(".daily-axis span").length >= 2);
     assert.equal(usdHost.querySelectorAll(".breakdown-list .bk-row-top").length, 3);
 
+    // Semantic card headings (no redundant region aria-label), accessible chart table, and data-usage-ctrl tags
+    const usageCards = usdHost.querySelectorAll("section.card");
+    assert.equal(usageCards.length, 2);
+    assert.equal(usageCards[0].getAttribute("aria-label"), null);
+    assert.equal(usageCards[1].getAttribute("aria-label"), null);
+    assert.equal(usageCards[0].querySelector("h2.visually-hidden")?.textContent, "Usage summary");
+    assert.equal(usageCards[1].querySelector("h2.visually-hidden")?.textContent, "Usage breakdown");
+    const chartTable = usdHost.querySelector("table.visually-hidden");
+    assert.ok(chartTable, "Expected visually-hidden table alternative for .daily-bars");
+    assert.equal(chartTable.querySelector("caption")?.textContent, "Last 7 days usage");
+    assert.equal(chartTable.querySelectorAll("tbody tr").length, 7);
+    assert.deepEqual(
+      usdHost.querySelectorAll("button[data-usage-ctrl]").map((b) => b.getAttribute("data-usage-ctrl")),
+      ["range:1d", "range:7d", "range:30d", "unit:usd", "unit:tok", "group:model", "group:provider"],
+    );
+    assert.equal(
+      computeUsageSignature(makeState({ usageRange: "7d", usageUnit: "usd", usageGroup: "model", usageSummary: usage })),
+      computeUsageSignature(makeState({ usageRange: "7d", usageUnit: "usd", usageGroup: "model", usageSummary: usage })),
+    );
+    assert.notEqual(
+      computeUsageSignature(makeState({ usageRange: "7d", usageUnit: "usd", usageGroup: "model", usageSummary: usage })),
+      computeUsageSignature(makeState({ usageRange: "7d", usageUnit: "tok", usageGroup: "model", usageSummary: usage })),
+    );
+
     // Click Provider switcher
     const groupButtons = usdHost.querySelectorAll('[aria-label="Breakdown grouping"] button');
     assert.equal(groupButtons[0].getAttribute("aria-pressed"), "true");
@@ -1069,9 +1170,17 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
 
     // Unconfigured: "Not set", Get API key visible, Test/Replace/Clear hidden, inline key-row open, Enabled models hidden
     view.update(makeState({ snapshot: offline }));
-    const geminiCard = root.querySelector('[aria-label="Google AI Studio provider"]')!;
+    assert.equal(root.querySelector("h2.sec-kicker")?.textContent, "Model providers");
+    const geminiCard = root.querySelector('[data-provider="gemini"]')!;
+    assert.equal(geminiCard.getAttribute("aria-label"), null);
+    assert.equal(geminiCard.querySelector("h3.prov-title")?.textContent, "Google AI Studio");
+    assert.equal(geminiCard.querySelector("h4.sec-t")?.textContent, "Enabled models");
     const keyRow = geminiCard.querySelector(".key-row")!;
+    const keyLabel = keyRow.querySelector('label.visually-hidden[for="gemini-api-key"]');
+    assert.ok(keyLabel, "Expected programmatic visually-hidden <label for=gemini-api-key>");
+    assert.equal(keyLabel.textContent, "Google AI Studio API key");
     const keyInput = geminiCard.querySelector("#gemini-api-key")!;
+    assert.equal(keyInput.getAttribute("aria-label"), null);
     const headerBtns = geminiCard.querySelectorAll(".prov-actions button");
     const getKeyBtn = headerBtns.find((b) => b.textContent === "Get API key \u2197")!;
     const testBtn = headerBtns.find((b) => b.textContent === "Test")!;
@@ -1104,6 +1213,12 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
 
     view.update(makeState({ snapshot: offline, apiKeyDraft: "synthetic-draft-key" }));
     assert.equal(saveBtn.disabled, false);
+    // IME composition Enter must NOT submit
+    const callsBeforeIme = calls.length;
+    keyInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Enter", isComposing: true }));
+    keyInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Enter", keyCode: 229 }));
+    assert.equal(calls.length, callsBeforeIme);
+
     keyInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Enter" }));
     assert.equal(calls.at(-1), "saveKey");
 
@@ -1171,12 +1286,14 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
         modelFeedback: { tone: "ok", text: "Saved" },
       }),
     );
-    const geminiCard = root.querySelector('[aria-label="Google AI Studio provider"]')!;
+    const geminiCard = root.querySelector('[data-provider="gemini"]')!;
     const chips = geminiCard.querySelectorAll(".m-chip");
     assert.equal(chips.length, 5);
     assert.equal(chips[0].getAttribute("role"), "checkbox");
     assert.equal(chips[0].getAttribute("aria-checked"), "true");
+    assert.equal(chips[0].getAttribute("aria-describedby"), null);
     assert.equal(chips[3].getAttribute("aria-checked"), "false");
+    assert.equal(chips[3].getAttribute("aria-describedby"), null);
     chips[3].click();
     assert.equal(calls.at(-1), "toggleModel:gemini-4-argon");
 
@@ -1225,9 +1342,20 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     advDetails.dispatchEvent(new FakeEvent("toggle", { bubbles: false }));
     assert.equal(calls.at(-1), "advOpen:true");
 
-    // Antigravity plan radios: Auto selected with resolved "Organization" badge
+    // Antigravity plan radios: native <fieldset>/<legend>, explicit id/for, zero JS .sel class
+    const planFieldset = root.querySelector("fieldset.plan-fieldset")!;
+    assert.ok(planFieldset);
+    assert.equal(planFieldset.querySelector("legend.field-lbl")?.textContent, "Antigravity plan");
+    assert.equal(root.querySelector('[role="radiogroup"]'), null);
+    const planLabels = planFieldset.querySelectorAll("label.pr-row");
+    assert.equal(planLabels.length, 3);
+    for (const lbl of planLabels) {
+      assert.equal(lbl.classList.contains("sel"), false, "Must rely on CSS :has(:checked), not .sel");
+    }
     const planRadios = root.querySelectorAll('input[name="antigravity-plan"]');
     assert.equal(planRadios.length, 3);
+    assert.equal(planRadios[0].id, "antigravity-plan-auto");
+    assert.equal(planLabels[0].getAttribute("for"), "antigravity-plan-auto");
     assert.equal(planRadios[0].checked, true);
     const autoBadge = root.querySelector(".pr-row .tag-brand")!;
     assert.equal(autoBadge.hidden, false);
@@ -1238,8 +1366,9 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     planRadios[1].dispatchEvent(new FakeEvent("change", { bubbles: true }));
     assert.equal(calls.at(-1), "plan:personal");
 
-    // Unix Local proxy: Active -> 2-click Disable proxy -> Confirm / Cancel
+    // Unix Local proxy: semantic <h3>, Active -> 2-click Disable proxy -> Confirm / Cancel
     const proxyWrap = root.querySelector(".adv-sep")!;
+    assert.equal(proxyWrap.querySelector("h3.sec-t")?.textContent, "Local proxy");
     assert.equal(proxyWrap.hidden, false);
     assert.ok(proxyWrap.textContent.includes("Active"));
     const disableBtn = proxyWrap
@@ -1313,8 +1442,11 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
 
     const { view, root, calls, tooltip } = makeHarness();
     const base = loadActiveSnapshot();
-    const codexCard = root.querySelector('[aria-label="OpenAI Codex provider"]')!;
+    const codexCard = root.querySelector('[data-provider="codex"]')!;
     assert.ok(codexCard, "OpenAI Codex card must be stacked inside .provider-stack");
+    assert.equal(codexCard.getAttribute("aria-label"), null);
+    assert.equal(codexCard.querySelector("h3.prov-title")?.textContent, "OpenAI Codex");
+    assert.equal(codexCard.querySelector("h4.sec-t")?.textContent, "Enabled models");
 
     // 1. Signed-out state: header has Sign in with ChatGPT button, Test & Sign out hidden
     view.update(makeState({ snapshot: base }));
@@ -1361,7 +1493,10 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     cancelLoginBtn.click();
     assert.deepEqual(calls.slice(-3), ["codexOpenPending", "codexCopyPending", "codexCancel"]);
 
+    const manualLabel = codexCard.querySelector('label.visually-hidden[for="codex-callback-input"]');
+    assert.ok(manualLabel, "Expected programmatic visually-hidden <label for=codex-callback-input>");
     const manualInput = codexCard.querySelector("#codex-callback-input")!;
+    assert.equal(manualInput.getAttribute("aria-label"), null);
     manualInput.focus();
     manualInput.value = "http://localhost:1455/auth/callback?code=c1&state=s1";
     manualInput.dispatchEvent(new FakeEvent("input", { bubbles: true }));
@@ -1376,6 +1511,12 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
       }),
     );
     assert.equal(completeBtn.disabled, false);
+    // IME composition Enter must NOT complete login
+    const codexCallsBeforeIme = calls.length;
+    manualInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Enter", isComposing: true }));
+    manualInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Enter", keyCode: 229 }));
+    assert.equal(calls.length, codexCallsBeforeIme);
+
     manualInput.dispatchEvent(new FakeEvent("keydown", { bubbles: true, key: "Enter" }));
     assert.equal(calls.at(-1), "codexComplete");
     view.clearCodexManualInputDom();
@@ -1450,6 +1591,42 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     assert.equal(calls.at(-1), "codexRestoreDefaults");
 
     tooltip.destroy();
+  });
+
+  it("createTooltipController attaches aria-describedby dynamically only on the active chip", () => {
+    const container = env.document.createElement("div");
+    env.document.body.append(container);
+    const chipA = env.document.createElement("button");
+    const chipB = env.document.createElement("button");
+    container.append(chipA, chipB);
+
+    const tooltip = createTooltipController(container as unknown as HTMLElement);
+    assert.equal(chipA.getAttribute("aria-describedby"), null);
+    assert.equal(chipB.getAttribute("aria-describedby"), null);
+
+    tooltip.show(chipA as unknown as HTMLElement, CURATED_MODEL_CATALOG[0]);
+    assert.equal(chipA.getAttribute("aria-describedby"), "model-tooltip");
+    assert.equal(chipB.getAttribute("aria-describedby"), null);
+
+    // Moving to chipB clears chipA
+    tooltip.show(chipB as unknown as HTMLElement, CURATED_MODEL_CATALOG[1]);
+    assert.equal(chipA.getAttribute("aria-describedby"), null);
+    assert.equal(chipB.getAttribute("aria-describedby"), "model-tooltip");
+
+    // scheduleHide clears aria-describedby when timer fires
+    tooltip.scheduleHide();
+    assert.equal(chipB.getAttribute("aria-describedby"), "model-tooltip");
+    env.flushTimers();
+    assert.equal(chipB.getAttribute("aria-describedby"), null);
+
+    // hideNow & destroy clear aria-describedby immediately
+    tooltip.show(chipA as unknown as HTMLElement, CURATED_MODEL_CATALOG[0]);
+    tooltip.hideNow();
+    assert.equal(chipA.getAttribute("aria-describedby"), null);
+
+    tooltip.show(chipB as unknown as HTMLElement, CURATED_MODEL_CATALOG[1]);
+    tooltip.destroy();
+    assert.equal(chipB.getAttribute("aria-describedby"), null);
   });
 });
 

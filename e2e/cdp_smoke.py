@@ -67,6 +67,10 @@ _KEY_DEFAULTS: dict[str, tuple[str, int]] = {
     "Tab": ("Tab", 9),
     "Enter": ("Enter", 13),
     " ": ("Space", 32),
+    "ArrowLeft": ("ArrowLeft", 37),
+    "ArrowRight": ("ArrowRight", 39),
+    "Home": ("Home", 36),
+    "End": ("End", 35),
 }
 _STRIPPED_CHROME_ENV: tuple[str, ...] = (
     "HTTP_PROXY",

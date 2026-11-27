@@ -101,18 +101,18 @@ export function createSettingsView(
   const root = el("div", "settings-panel");
 
   // Section A: Model providers
-  root.append(el("div", "sec-kicker", "Model providers"));
+  root.append(el("h2", "sec-kicker", "Model providers"));
   const providerStack = el("div", "provider-stack");
 
   // Render live providers from typed registry (Google AI Studio today)
   const geminiProvider = LIVE_PROVIDERS[0];
 
   const card = el("section", "card prov-card");
-  card.setAttribute("aria-label", `${geminiProvider.title} provider`);
+  card.setAttribute("data-provider", "gemini");
 
   const hdr = el("div", "prov-hdr");
   const provId = el("div", "prov-id");
-  provId.append(el("span", "prov-title", geminiProvider.title));
+  provId.append(el("h3", "prov-title", geminiProvider.title));
 
   const statusTag = el("span", "tag");
   const statusDot = el("span", "sdot ok");
@@ -150,13 +150,14 @@ export function createSettingsView(
 
   // Compact write-only API key row (shown when unconfigured or when Replace is open)
   const keyRow = el("div", "key-row");
+  const keyLabel = el("label", "visually-hidden", "Google AI Studio API key");
+  keyLabel.setAttribute("for", "gemini-api-key");
   const keyInput = el("input", "inp mono");
   keyInput.id = "gemini-api-key";
   keyInput.type = "password";
   keyInput.autocomplete = "off";
   keyInput.spellcheck = false;
   keyInput.placeholder = "Paste Google AI Studio API key";
-  keyInput.setAttribute("aria-label", "Google AI Studio API key");
 
   const keyActRow = el("div", "act-row key-act-row");
   const saveBtn = el("button", "btn btn-primary btn-sm", "Save");
@@ -171,6 +172,7 @@ export function createSettingsView(
     actions.onDraftChange(keyInput.value);
   });
   keyInput.addEventListener("keydown", (event) => {
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter") {
       event.preventDefault();
       if (!saveBtn.disabled) {
@@ -189,7 +191,7 @@ export function createSettingsView(
   clearBtn.addEventListener("click", () => actions.onToggleClearConfirm());
 
   keyActRow.append(saveBtn, cancelKeyEditBtn);
-  keyRow.append(keyInput, keyActRow);
+  keyRow.append(keyLabel, keyInput, keyActRow);
   card.append(keyRow);
 
   // Inline 2-click Clear confirm row
@@ -214,7 +216,7 @@ export function createSettingsView(
   // Divider + Multi-select Enabled models
   const modSec = el("div", "divider");
   const mh = el("div", "sec-h");
-  mh.append(el("span", "sec-t", "Enabled models"));
+  mh.append(el("h4", "sec-t", "Enabled models"));
   const modelCountEl = el("span", "sec-right sec-count num", `${DEFAULT_ENABLED_MODELS.length} enabled`);
   mh.append(modelCountEl);
   modSec.append(mh);
@@ -229,7 +231,6 @@ export function createSettingsView(
     chip.type = "button";
     chip.setAttribute("role", "checkbox");
     chip.setAttribute("aria-checked", String(model.defaultOn));
-    chip.setAttribute("aria-describedby", "model-tooltip");
 
     const chk = el("span", "chk");
     chk.append(createIcon("check"));
@@ -271,11 +272,11 @@ export function createSettingsView(
 
   // Provider 2: OpenAI Codex (ChatGPT OAuth)
   const codexCard = el("section", "card prov-card");
-  codexCard.setAttribute("aria-label", "OpenAI Codex provider");
+  codexCard.setAttribute("data-provider", "codex");
 
   const codexHdr = el("div", "prov-hdr");
   const codexProvId = el("div", "prov-id");
-  codexProvId.append(el("span", "prov-title", "OpenAI Codex"));
+  codexProvId.append(el("h3", "prov-title", "OpenAI Codex"));
 
   const codexStatusTag = el("span", "tag codex-status-tag");
   const codexStatusDot = el("span", "sdot ok");
@@ -335,17 +336,23 @@ export function createSettingsView(
   codexFallbackDetails.append(codexFallbackSum);
 
   const codexFallbackBody = el("div", "codex-fallback-body key-row");
+  const codexManualLabel = el(
+    "label",
+    "visually-hidden",
+    "OpenAI Codex callback URL or authorization code",
+  );
+  codexManualLabel.setAttribute("for", "codex-callback-input");
   const codexManualInput = el("input", "inp mono");
   codexManualInput.id = "codex-callback-input";
   codexManualInput.type = "text";
   codexManualInput.autocomplete = "off";
   codexManualInput.spellcheck = false;
   codexManualInput.placeholder = "Paste http://localhost:1455/auth/callback?code=...";
-  codexManualInput.setAttribute("aria-label", "OpenAI Codex callback URL or authorization code");
   codexManualInput.addEventListener("input", () => {
     actions.onCodexManualInputChange(codexManualInput.value);
   });
   codexManualInput.addEventListener("keydown", (event) => {
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter") {
       event.preventDefault();
       if (!codexCompleteBtn.disabled) {
@@ -360,7 +367,7 @@ export function createSettingsView(
   codexCompleteBtn.disabled = true;
   codexCompleteBtn.addEventListener("click", () => actions.onCompleteCodexLogin());
   codexFallbackActRow.append(codexCompleteBtn);
-  codexFallbackBody.append(codexManualInput, codexFallbackActRow);
+  codexFallbackBody.append(codexManualLabel, codexManualInput, codexFallbackActRow);
   codexFallbackDetails.append(codexFallbackBody);
   codexPendingWrap.append(codexFallbackDetails);
   codexCard.append(codexPendingWrap);
@@ -388,7 +395,7 @@ export function createSettingsView(
   const codexModSec = el("div", "divider");
   codexModSec.hidden = true;
   const cmh = el("div", "sec-h");
-  cmh.append(el("span", "sec-t", "Enabled models"));
+  cmh.append(el("h4", "sec-t", "Enabled models"));
   const codexModelCountEl = el(
     "span",
     "sec-right sec-count num",
@@ -407,7 +414,6 @@ export function createSettingsView(
     chip.type = "button";
     chip.setAttribute("role", "checkbox");
     chip.setAttribute("aria-checked", String(model.defaultOn));
-    chip.setAttribute("aria-describedby", "model-tooltip");
 
     const chk = el("span", "chk");
     chk.append(createIcon("check"));
@@ -465,11 +471,9 @@ export function createSettingsView(
   const advBody = el("div", "adv-body");
 
   // 1. Antigravity plan radio cards
-  const planWrap = el("div");
-  planWrap.append(el("span", "field-lbl", "Antigravity plan"));
+  const planFieldset = el("fieldset", "plan-fieldset");
+  planFieldset.append(el("legend", "field-lbl", "Antigravity plan"));
   const prList = el("div", "pr");
-  prList.setAttribute("role", "radiogroup");
-  prList.setAttribute("aria-label", "Antigravity plan");
 
   const planRows = new Map<
     AccountPlanChoice,
@@ -481,9 +485,12 @@ export function createSettingsView(
   >();
 
   for (const opt of PLAN_OPTIONS) {
+    const radioId = `antigravity-plan-${opt.id}`;
     const row = el("label", "pr-row");
+    row.setAttribute("for", radioId);
     const rWrap = el("span", "pr-radio");
     const inp = el("input", "pr-inp");
+    inp.id = radioId;
     inp.type = "radio";
     inp.name = "antigravity-plan";
     inp.value = opt.id;
@@ -509,15 +516,15 @@ export function createSettingsView(
     prList.append(row);
     planRows.set(opt.id, { row, input: inp, resolvedBadge });
   }
-  planWrap.append(prList);
-  advBody.append(planWrap);
+  planFieldset.append(prList);
+  advBody.append(planFieldset);
 
   // 2. Local proxy (Unix only — hidden on Windows)
   const proxyWrap = el("div", "adv-sep");
   const proxyRow = el("div", "proxy-ctrl-row");
   const proxyInfo = el("div", "proxy-ctrl-info");
   const proxyHdr = el("div", "sec-h proxy-ctrl-hdr");
-  proxyHdr.append(el("span", "sec-t", "Local proxy"));
+  proxyHdr.append(el("h3", "sec-t", "Local proxy"));
   const proxyBadge = el("span", "tag tag-ok", "Active");
   proxyHdr.append(proxyBadge);
   const proxySub = el("div", "opt-sub");
@@ -767,7 +774,6 @@ export function createSettingsView(
     const resolvedLabel = formatResolvedPlanLabel(snap?.account_plan.resolved ?? null);
     for (const [id, entry] of planRows.entries()) {
       const selected = planMode === id;
-      entry.row.className = selected ? "pr-row sel" : "pr-row";
       entry.input.checked = selected;
       entry.input.disabled = !canCall || writeBusy;
       if (entry.resolvedBadge) {

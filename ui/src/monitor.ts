@@ -26,6 +26,26 @@ function setSegmentWidth(node: HTMLElement, value: number, total: number): void 
   node.style.width = `${pct.toFixed(1)}%`;
 }
 
+export function computeMonitorSignature(state: AppState): string {
+  const snap = state.snapshot;
+  const stats = snap?.stats ?? null;
+  return JSON.stringify([
+    snap?.platform ?? "macos",
+    snap?.ls_telemetry_active === true,
+    snap?.launcher_integration?.hybrid_active === true,
+    snap?.supported_models ?? null,
+    snap?.supported_codex_models ?? null,
+    stats
+      ? {
+          usage: stats.usage,
+          max_context_tokens: stats.max_context_tokens,
+          recent_calls: stats.recent_calls,
+          by_model: stats.by_model,
+        }
+      : null,
+  ]);
+}
+
 export function buildMonitorView(state: AppState): DocumentFragment {
   const frag = document.createDocumentFragment();
   const snap = state.snapshot;
@@ -39,7 +59,6 @@ export function buildMonitorView(state: AppState): DocumentFragment {
 
   if (!usage || requests <= 0) {
     const empty = el("section", "card empty-card");
-    empty.setAttribute("aria-label", "Live session status");
     const title = telemetryConnected
       ? "Waiting for requests"
       : "Waiting for Antigravity to connect";
@@ -47,7 +66,7 @@ export function buildMonitorView(state: AppState): DocumentFragment {
       ? "Send a message in Antigravity to see live context usage, cache hit health, and cost estimates \u2014 works for built-in models as well as your own API keys."
       : `${quitReopenCapitalized(platform)} so requests route through the local proxy. Live monitoring works for built-in Antigravity models even without an API key.`;
 
-    empty.append(el("div", "empty-title", title), el("div", "empty-sub", body));
+    empty.append(el("h2", "empty-title", title), el("div", "empty-sub", body));
     frag.append(empty);
     return frag;
   }
@@ -65,7 +84,6 @@ export function buildMonitorView(state: AppState): DocumentFragment {
 
   // 1. Live Session Card
   const card = el("section", "card");
-  card.setAttribute("aria-label", "This session");
 
   const activeProvider = latest?.provider ?? topModel?.provider ?? "antigravity";
   const activeSource = latest?.source ?? topModel?.source ?? "builtin";
@@ -79,7 +97,7 @@ export function buildMonitorView(state: AppState): DocumentFragment {
   const mHdr = el("div", "mon-model-hdr");
   mHdr.append(
     el("span", badgeClass, providerBadgeText),
-    el("span", "mon-model-name", activeModelLabel),
+    el("h2", "mon-model-name", activeModelLabel),
   );
   const latestTime = latest ? formatTimeHHMM(latest.timestamp_ms) : "";
   if (latestTime) {
@@ -146,20 +164,33 @@ export function buildMonitorView(state: AppState): DocumentFragment {
     stripRow.append(el("span", "num", callCountLabel));
 
     const dots = el("div", "call-dots");
+    dots.setAttribute("aria-hidden", "true");
+    let hitCount = 0;
     let breakCount = 0;
+    let coldCount = 0;
     for (const call of recentCalls) {
-      if (call.cache_break) breakCount += 1;
       const isAmber = call.cold_start || call.cache_break;
       const dot = el("span", isAmber ? "cdot break" : "cdot");
       if (call.cache_break) {
+        breakCount += 1;
         dot.title = "Cache break";
       } else if (call.cold_start) {
+        coldCount += 1;
         dot.title = "Cold prompt";
       } else {
+        hitCount += 1;
         dot.title = "Cache hit";
       }
       dots.append(dot);
     }
+
+    const fmtCount = (n: number, singular: string, plural: string) =>
+      `${n} ${n === 1 ? singular : plural}`;
+    const dotSummary = el(
+      "span",
+      "visually-hidden",
+      `${fmtCount(hitCount, "cache hit", "cache hits")}, ${fmtCount(breakCount, "cache break", "cache breaks")}, ${fmtCount(coldCount, "cold prompt", "cold prompts")}`,
+    );
 
     const breakText =
       breakCount === 0
@@ -167,7 +198,7 @@ export function buildMonitorView(state: AppState): DocumentFragment {
         : breakCount === 1
           ? "1 break"
           : `${breakCount} breaks`;
-    stripRow.append(dots, el("span", "num", breakText));
+    stripRow.append(dots, dotSummary, el("span", "num", breakText));
     card.append(stripRow);
   }
 
@@ -237,10 +268,9 @@ export function buildMonitorView(state: AppState): DocumentFragment {
   // 2. Usage by model card (current session)
   if (byModel.length > 0) {
     const byModelCard = el("section", "card");
-    byModelCard.setAttribute("aria-label", "Usage by model");
     const bmHdr = el("div", "sec-h");
     bmHdr.append(
-      el("span", "sec-t", "Usage by model"),
+      el("h2", "sec-t", "Usage by model"),
       el("span", "sec-right sec-count", "this session"),
     );
     byModelCard.append(bmHdr);
