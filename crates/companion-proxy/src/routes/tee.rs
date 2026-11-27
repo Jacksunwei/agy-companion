@@ -137,18 +137,18 @@ impl UsageCollector {
         }
     }
 
-    fn finish(&mut self) -> Option<GeminiUsageMetadata> {
+    fn finish(&mut self) -> (Option<GeminiUsageMetadata>, Option<String>) {
         match self {
-            Self::Sse(tracker) => tracker.finish(),
+            Self::Sse(tracker) => tracker.finish_with_response_id(),
             Self::UnaryJson {
                 buf, overflowed, ..
             } => {
                 if *overflowed || buf.is_empty() {
-                    return None;
+                    return (None, None);
                 }
-                let usage = GeminiUsageMetadata::parse_from_json(buf);
+                let parsed = GeminiUsageMetadata::parse_usage_and_response_id_from_json(buf);
                 *buf = Vec::new();
-                usage
+                parsed
             }
         }
     }
@@ -210,7 +210,8 @@ impl Stream for UsageTeeStream {
             Poll::Ready(None) => {
                 if !this.finalized && !this.errored {
                     this.finalized = true;
-                    if let Some(usage) = this.collector.finish() {
+                    let (usage, response_id) = this.collector.finish();
+                    if let Some(usage) = usage {
                         let latency_ms = u64::try_from(this.started_at.elapsed().as_millis())
                             .unwrap_or(u64::MAX);
                         this.stats.record_call_for_session(
@@ -232,7 +233,9 @@ impl Stream for UsageTeeStream {
                                     latency_ms,
                                 )
                             }
-                        };
+                        }
+                        .with_response_id(response_id)
+                        .with_conversation_id(this.conversation_id.clone());
                         this.usage_sink.record(event);
                     }
                 }

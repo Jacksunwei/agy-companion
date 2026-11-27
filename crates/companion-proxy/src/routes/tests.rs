@@ -3495,3 +3495,108 @@ async fn builtin_tee_preserves_split_content_encoding_and_fails_closed_on_non_as
 
     raw_server.abort();
 }
+
+#[tokio::test]
+async fn proxy_tee_propagates_response_id_and_conversation_id_for_sse_and_unary_json() {
+    use companion_core::TelemetrySource;
+
+    // 1. Streaming SSE response with top-level responseId and conversation header
+    let sse_chunks = vec![
+        Bytes::from_static(
+            b"data: {\"responseId\":\"G4EIa_sse_001\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n\n",
+        ),
+        Bytes::from_static(
+            b"data: {\"usageMetadata\":{\"promptTokenCount\":400,\"candidatesTokenCount\":55,\"cachedContentTokenCount\":300}}\n\n",
+        ),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    let expected_sse_bytes: Vec<u8> = sse_chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    let sse_provider = Arc::new(StubProvider::ok_stream(
+        Some("text/event-stream"),
+        sse_chunks,
+    ));
+    let sse_sink = Arc::new(RecordingSink::default());
+    let sse_app = build_router(test_proxy_state(sse_provider, sse_sink.clone(), true));
+
+    let sse_resp = sse_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse")
+                .header(X_GOOG_API_KEY_HEADER.clone(), "test-key")
+                .body(Body::from(
+                    r#"{"sessionId":"conv_sse_123456","contents":[{"parts":[{"text":"hi"}]}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let sse_body = sse_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        sse_body.as_ref(),
+        expected_sse_bytes.as_slice(),
+        "S4: SSE bytes must pass through byte-for-byte untouched"
+    );
+
+    let sse_events = sse_sink.snapshot();
+    assert_eq!(sse_events.len(), 1);
+    assert!(sse_events[0].request_id.starts_with("proxy:"));
+    assert_eq!(sse_events[0].telemetry_source, TelemetrySource::Proxy);
+    assert_eq!(sse_events[0].response_id.as_deref(), Some("G4EIa_sse_001"));
+    assert_eq!(
+        sse_events[0].conversation_id.as_deref(),
+        Some("conv_sse_123456")
+    );
+    assert_eq!(sse_events[0].input_tokens, 400);
+    assert_eq!(sse_events[0].output_tokens, 55);
+
+    // 2. Unary JSON response with wrapped response.responseId (CloudCode style)
+    let unary_payload = Bytes::from_static(
+        br#"{"response":{"responseId":"AJ8Ia_unary_002","usageMetadata":{"promptTokenCount":180,"candidatesTokenCount":25,"thoughtsTokenCount":7}}}"#,
+    );
+    let unary_provider = Arc::new(StubProvider::with_status(
+        200,
+        Some("application/json"),
+        unary_payload.clone(),
+    ));
+    let unary_sink = Arc::new(RecordingSink::default());
+    let unary_app = build_router(test_proxy_state(unary_provider, unary_sink.clone(), true));
+
+    let unary_resp = unary_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1beta/models/gemini-4-carbon:generateContent")
+                .header(X_GOOG_API_KEY_HEADER.clone(), "test-key")
+                .body(Body::from(
+                    r#"{"sessionId":"conv_unary_789","contents":[{"parts":[{"text":"hi"}]}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unary_resp.status(), StatusCode::OK);
+    let unary_body = unary_resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        unary_body.as_ref(),
+        unary_payload.as_ref(),
+        "S4: unary JSON bytes must pass through byte-for-byte untouched"
+    );
+
+    let unary_events = unary_sink.snapshot();
+    assert_eq!(unary_events.len(), 1);
+    assert!(unary_events[0].request_id.starts_with("proxy:"));
+    assert_eq!(unary_events[0].telemetry_source, TelemetrySource::Proxy);
+    assert_eq!(
+        unary_events[0].response_id.as_deref(),
+        Some("AJ8Ia_unary_002")
+    );
+    assert_eq!(
+        unary_events[0].conversation_id.as_deref(),
+        Some("conv_unary_789")
+    );
+    assert_eq!(unary_events[0].input_tokens, 180);
+    assert_eq!(unary_events[0].output_tokens, 25);
+    assert_eq!(unary_events[0].reasoning_tokens, 7);
+}

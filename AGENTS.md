@@ -10,7 +10,7 @@ This repository uses **Antigravity customization conventions** (`AGENTS.md` + `.
 | `README.md` | Project documentation | Overview, architecture, quickstarts, XDG/Windows paths, S1–S8, roadmap. |
 | `.agents/rules/` | Workspace rules | `workflow.md` (`always_on`: PR auto-merge, TDD, local-dev & doc invariants); `product-ux.md` (`model_decision`: UX, zero-AI-slop & model-catalog guardrails). |
 | `.agents/skills/` | On-demand skills | `local-dev/SKILL.md` (build, link, Sidecar Web UI, reload, stale-PID takeover, live E2E); `cuj-testing/SKILL.md` (CUJ-first Testing Trophy, Single-Owner layers, hermeticity). |
-| `Cargo.toml`, `Cargo.lock` | Rust workspace root | `edition = "2024"`, single version source of truth (`0.0.2`), Apache-2.0. |
+| `Cargo.toml`, `Cargo.lock` | Rust workspace root | `edition = "2024"`, single version source of truth (`0.0.3`), Apache-2.0. |
 | `crates/` | 5-crate Rust workspace (`#![forbid(unsafe_code)]`) | `companion-core`, `companion-providers`, `companion-proxy`, `companion-ui`, `companion-cli`. See each crate's `crates/*/README.md` for module boundaries and public APIs. |
 | `ui/` | Build-time Aux Panel UI | Zero-runtime-dependency Vite 8 + TypeScript + `vite-plugin-singlefile` (`ui/.npmrc` pins `registry.npmjs.org`). Tests in `ui/tests/*.test.ts` + Rust↔TS golden fixtures in `ui/tests/fixtures/*.json`; builds committed `ui/dist/index.html` (`< 512,000` bytes, embedded via `include_str!`). |
 | `plugin/` | Antigravity plugin bundle | 6 files: `plugin.json`, `assets/logo.svg`, `sidecars/proxy/sidecar.json` (`has_web_ui: true`), `scripts/run-companion.sh`, `skills/companion/SKILL.md`, `README.md`; validated with `agy plugin validate --strict ./plugin` and embedded into `companion-cli`. |

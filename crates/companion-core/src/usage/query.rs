@@ -308,7 +308,7 @@ mod tests {
 
     use super::*;
     use crate::fs_safe::FsError;
-    use crate::usage::{SqliteUsageSink, UsageEvent};
+    use crate::usage::{SqliteUsageSink, TelemetrySource, UsageEvent};
 
     fn parse_utc(ts: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(ts)
@@ -340,6 +340,15 @@ mod tests {
             reasoning_tokens: reasoning,
             latency_ms: latency,
             source: source.to_string(),
+            response_id: None,
+            conversation_id: None,
+            root_conversation_id: None,
+            parent_conversation_id: None,
+            cache_write_tokens: 0,
+            ttft_ms: None,
+            model_display_name: None,
+            telemetry_source: TelemetrySource::Proxy,
+            cascade_step_index: None,
         }
     }
 
@@ -382,16 +391,16 @@ mod tests {
         assert_eq!(s0.totals.requests, 0);
         assert!(s0.buckets.is_empty());
 
-        // user_version == 2 fails closed
-        let v2_dir = tmp.path().join("v2");
-        fs::create_dir_all(&v2_dir).expect("mkdir");
+        // user_version == 3 fails closed
+        let v3_dir = tmp.path().join("v3");
+        fs::create_dir_all(&v3_dir).expect("mkdir");
         {
-            let conn = Connection::open(v2_dir.join(USAGE_DB_FILENAME)).expect("create v2 db");
-            conn.execute_batch("PRAGMA user_version = 2;").expect("v2");
+            let conn = Connection::open(v3_dir.join(USAGE_DB_FILENAME)).expect("create v3 db");
+            conn.execute_batch("PRAGMA user_version = 3;").expect("v3");
         }
-        let err_v2 = query_usage_summary_at(&v2_dir, UsageRange::Days7, now)
-            .expect_err("v2 must fail closed");
-        assert!(matches!(err_v2, CoreError::UsageDatabase { .. }));
+        let err_v3 = query_usage_summary_at(&v3_dir, UsageRange::Days7, now)
+            .expect_err("v3 must fail closed");
+        assert!(matches!(err_v3, CoreError::UsageDatabase { .. }));
 
         // negative user_version fails closed
         let neg_dir = tmp.path().join("neg");
@@ -776,5 +785,83 @@ mod tests {
             assert_eq!(summary.totals.requests, model_requests, "{range:?}");
             assert_eq!(summary.totals.requests, provider_requests, "{range:?}");
         }
+    }
+
+    #[test]
+    fn v2_reconciled_and_normalized_utc_rows_aggregate_without_double_counting() {
+        let tmp = TempDir::new().expect("tempdir");
+        let sink = SqliteUsageSink::new(tmp.path()).expect("sink");
+        let now = parse_utc("2026-05-15T20:00:00Z");
+
+        // 1. Proxy row followed by matching LS row -> reconciles to 1 row (no double-count).
+        let mut proxy_ev = make_event(
+            "2026-05-15T10:15:30.999Z",
+            "proxy:resp-1",
+            "gemini",
+            "proxy",
+            "gemini-4-carbon",
+            1000,
+            600,
+            200,
+            50,
+            400,
+        );
+        proxy_ev.response_id = Some("G4EIa-q1".to_string());
+        proxy_ev.telemetry_source = TelemetrySource::Proxy;
+
+        let mut ls_match = make_event(
+            "2026-05-15T10:15:31.123Z",
+            "ls:conv_q1:1:0",
+            "antigravity",
+            "builtin",
+            "gemini-4-carbon",
+            1000,
+            600,
+            200,
+            50,
+            420,
+        );
+        ls_match.response_id = Some("G4EIa-q1".to_string());
+        ls_match.conversation_id = Some("conv_q1".to_string());
+        ls_match.telemetry_source = TelemetrySource::Ls;
+
+        // 2. LS-only row with non-UTC offset (-07:00) -> normalized to 2026-05-15T18:00:00Z.
+        let mut ls_offset = make_event(
+            "2026-05-15T11:00:00.456-07:00",
+            "ls:conv_q2:2:0",
+            "vertex_claude",
+            "builtin",
+            "claude-sonnet-4-6",
+            2000,
+            1000,
+            300,
+            0,
+            600,
+        );
+        ls_offset.response_id = Some("AJ8Ia-q2".to_string());
+        ls_offset.conversation_id = Some("conv_q2".to_string());
+        ls_offset.telemetry_source = TelemetrySource::Ls;
+
+        // 3. SIDE_QUESTION clone of ls_offset -> must not double-count.
+        let mut side_q = ls_offset.clone();
+        side_q.request_id = "ls:conv_sideq:2:0".to_string();
+        side_q.conversation_id = Some("conv_sideq".to_string());
+
+        sink.record_batch_checked(&[proxy_ev, ls_match, ls_offset, side_q], None)
+            .expect("record v2 batch");
+
+        let s1d = query_usage_summary_at(tmp.path(), UsageRange::Today, now).expect("1d");
+        assert_eq!(s1d.totals.requests, 2);
+        assert_eq!(s1d.totals.input_tokens, 3000);
+        assert_eq!(s1d.totals.cached_tokens, 1600);
+        assert_eq!(s1d.buckets[10].label, "10:00");
+        assert_eq!(s1d.buckets[10].requests, 1);
+        assert_eq!(s1d.buckets[18].label, "18:00");
+        assert_eq!(s1d.buckets[18].requests, 1);
+
+        let s7d = query_usage_summary_at(tmp.path(), UsageRange::Days7, now).expect("7d");
+        assert_eq!(s7d.totals.requests, 2);
+        let s30d = query_usage_summary_at(tmp.path(), UsageRange::Days30, now).expect("30d");
+        assert_eq!(s30d.totals.requests, 2);
     }
 }

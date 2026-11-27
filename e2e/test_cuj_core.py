@@ -287,7 +287,7 @@ class TestCujGeminiProxy(E2ETestCase):
         with open_usage_db_readonly(files[0]) as conn:
             user_ver = conn.execute("PRAGMA user_version").fetchone()[0]
             jmode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-        self.assertEqual(user_ver, 1)
+        self.assertEqual(user_ver, 2)
         self.assertEqual(jmode, "wal")
         if os.name != "nt":
             for sf in usage_storage_files(env.usage_dir):
@@ -654,7 +654,7 @@ class TestCujCliSubcommands(E2ETestCase):
         # (a) --version, --help, unknown subcommand.
         r_ver = run_cli([str(binary), "--version"], env=base_env)
         self.assertEqual(r_ver.returncode, 0, r_ver.stderr)
-        self.assertEqual(r_ver.stdout.strip(), "agy-companion 0.0.2")
+        self.assertEqual(r_ver.stdout.strip(), "agy-companion 0.0.3")
 
         r_help = run_cli([str(binary), "--help"], env=base_env)
         self.assertEqual(r_help.returncode, 0, r_help.stderr)

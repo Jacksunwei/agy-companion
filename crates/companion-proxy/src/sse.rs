@@ -15,6 +15,7 @@ pub struct SseUsageTracker {
     line_discarded: bool,
     event_discarded: bool,
     last_usage: Option<GeminiUsageMetadata>,
+    last_response_id: Option<String>,
 }
 
 impl Default for SseUsageTracker {
@@ -39,6 +40,7 @@ impl SseUsageTracker {
             line_discarded: false,
             event_discarded: false,
             last_usage: None,
+            last_response_id: None,
         }
     }
 
@@ -75,7 +77,15 @@ impl SseUsageTracker {
         self.last_usage
     }
 
+    pub fn last_response_id(&self) -> Option<&str> {
+        self.last_response_id.as_deref()
+    }
+
     pub fn finish(&mut self) -> Option<GeminiUsageMetadata> {
+        self.finish_with_response_id().0
+    }
+
+    pub fn finish_with_response_id(&mut self) -> (Option<GeminiUsageMetadata>, Option<String>) {
         self.pending_cr = false;
         if self.line_discarded {
             self.first_line_seen = true;
@@ -85,7 +95,7 @@ impl SseUsageTracker {
             self.process_line(&line);
         }
         self.flush_event();
-        self.last_usage
+        (self.last_usage, self.last_response_id.clone())
     }
 
     fn append_line_bytes(&mut self, segment: &[u8]) {
@@ -184,12 +194,15 @@ impl SseUsageTracker {
     }
 
     fn flush_event(&mut self) {
-        if self.has_data_field
-            && !self.event_discarded
-            && !self.event_data.is_empty()
-            && let Some(usage) = GeminiUsageMetadata::parse_from_json(&self.event_data)
-        {
-            self.last_usage = Some(usage);
+        if self.has_data_field && !self.event_discarded && !self.event_data.is_empty() {
+            let (usage, response_id) =
+                GeminiUsageMetadata::parse_usage_and_response_id_from_json(&self.event_data);
+            if let Some(usage) = usage {
+                self.last_usage = Some(usage);
+            }
+            if let Some(response_id) = response_id {
+                self.last_response_id = Some(response_id);
+            }
         }
 
         if self.event_data.capacity() > RETAIN_BUFFER_CAPACITY_LIMIT {
@@ -395,5 +408,42 @@ mod tests {
                 thoughts_token_count: 0,
             })
         );
+    }
+
+    #[test]
+    fn extracts_top_level_and_wrapped_response_id_across_chunks_without_mutation() {
+        // 1. Early chunk carries responseId without usageMetadata; final chunk carries usageMetadata
+        //    without responseId; trailing [DONE] must preserve both.
+        let sse_bytes = concat!(
+            "data: {\"responseId\":\"G4EIa_early_123\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
+            "data: {\"usageMetadata\":{\"promptTokenCount\":250,\"candidatesTokenCount\":40,\"cachedContentTokenCount\":100}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes();
+
+        let mut tracker = SseUsageTracker::new();
+        let mut forwarded = Vec::with_capacity(sse_bytes.len());
+        for chunk in sse_bytes.chunks(7) {
+            forwarded.extend_from_slice(chunk);
+            tracker.push_chunk(chunk);
+        }
+        assert_eq!(forwarded.as_slice(), sse_bytes);
+        assert_eq!(tracker.last_response_id(), Some("G4EIa_early_123"));
+        let (usage, response_id) = tracker.finish_with_response_id();
+        assert_eq!(usage.map(|u| u.prompt_token_count), Some(250));
+        assert_eq!(response_id.as_deref(), Some("G4EIa_early_123"));
+
+        // 2. Wrapped CloudCode response.responseId, later chunk with invalid whitespace responseId
+        //    must not clobber the valid responseId.
+        let mut wrapped = SseUsageTracker::new();
+        wrapped.push_chunk(
+            b"data: {\"response\":{\"responseId\":\"AJ8Ia-wrapped-9\",\"usageMetadata\":{\"promptTokenCount\":10}}}\n\n",
+        );
+        wrapped.push_chunk(
+            b"data: {\"response\":{\"responseId\":\"   \",\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5}}}\n\n",
+        );
+        let (w_usage, w_rid) = wrapped.finish_with_response_id();
+        assert_eq!(w_usage.map(|u| u.candidates_token_count), Some(5));
+        assert_eq!(w_rid.as_deref(), Some("AJ8Ia-wrapped-9"));
     }
 }
