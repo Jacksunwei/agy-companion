@@ -52,6 +52,8 @@ async fn main() -> ExitCode {
             adopt_running,
             auto_enable_launcher,
             idle_shutdown_secs,
+            watch_pid,
+            replace_stale,
         } => {
             let log_target = ServeLogTarget::default();
             init_tracing("info", log_target.clone());
@@ -61,6 +63,8 @@ async fn main() -> ExitCode {
                 adopt_running,
                 auto_enable_launcher,
                 idle_shutdown_secs,
+                watch_pid,
+                replace_stale,
                 log_target: Some(log_target),
             })
             .await

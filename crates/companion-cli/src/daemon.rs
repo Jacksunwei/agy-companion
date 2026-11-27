@@ -62,6 +62,10 @@ pub struct ProxyPidInfo {
 
 impl ProxyPidInfo {
     pub fn for_current_process(port: u16) -> Self {
+        Self::for_current_process_with_version(port, env!("CARGO_PKG_VERSION").to_string())
+    }
+
+    pub fn for_current_process_with_version(port: u16, version: String) -> Self {
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -73,7 +77,7 @@ impl ProxyPidInfo {
         Self {
             pid: std::process::id(),
             port,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
             started_at_ms,
             binary_path,
         }
@@ -405,6 +409,14 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ServeLogTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetachedDaemonOptions {
+    pub port: u16,
+    pub idle_shutdown_secs: u64,
+    pub watch_pid: Option<u32>,
+    pub replace_stale: bool,
+}
+
 /// Spawns a detached Managed On-Demand `agy-companion serve` daemon.
 ///
 /// The child runs in its own process group (`process_group(0)` on Unix;
@@ -417,8 +429,23 @@ pub fn spawn_detached_proxy_daemon(
     config_path: &Path,
     idle_shutdown_secs: u64,
 ) -> Result<std::process::Child, CliError> {
+    spawn_detached_proxy_daemon_configured(
+        config_path,
+        DetachedDaemonOptions {
+            port,
+            idle_shutdown_secs,
+            watch_pid: None,
+            replace_stale: false,
+        },
+    )
+}
+
+pub fn spawn_detached_proxy_daemon_configured(
+    config_path: &Path,
+    opts: DetachedDaemonOptions,
+) -> Result<std::process::Child, CliError> {
     let exe = std::env::current_exe()?;
-    spawn_detached_proxy_daemon_with_exe(&exe, port, config_path, idle_shutdown_secs)
+    spawn_detached_proxy_daemon_with_exe_configured(&exe, config_path, opts)
 }
 
 pub(crate) fn spawn_detached_proxy_daemon_with_exe(
@@ -427,29 +454,63 @@ pub(crate) fn spawn_detached_proxy_daemon_with_exe(
     config_path: &Path,
     idle_shutdown_secs: u64,
 ) -> Result<std::process::Child, CliError> {
+    spawn_detached_proxy_daemon_with_exe_configured(
+        exe,
+        config_path,
+        DetachedDaemonOptions {
+            port,
+            idle_shutdown_secs,
+            watch_pid: None,
+            replace_stale: false,
+        },
+    )
+}
+
+pub(crate) fn build_detached_proxy_daemon_command(
+    exe: &Path,
+    config_path: &Path,
+    opts: DetachedDaemonOptions,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     // Detached daemons intentionally omit `--adopt-running` so bind-race losers exit
     // immediately on AddrInUse instead of parking as unsupervised standbys (`--adopt-running`
     // is reserved for SidecarManager-supervised sidecar processes).
     cmd.arg("serve")
         .arg("--idle-shutdown-secs")
-        .arg(idle_shutdown_secs.to_string())
+        .arg(opts.idle_shutdown_secs.to_string())
         .arg("--port")
-        .arg(port.to_string())
+        .arg(opts.port.to_string())
         .arg("--config")
-        .arg(config_path)
-        .stdin(std::process::Stdio::null())
+        .arg(config_path);
+    if let Some(watch_pid) = opts.watch_pid {
+        cmd.arg("--watch-pid").arg(watch_pid.to_string());
+    }
+    if opts.replace_stale {
+        cmd.arg("--replace-stale");
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    // Defensively scrub injected proxy routing vars so the daemon inherits clean
-    // HTTPS_PROXY / XDG_* / real GEMINI_API_KEY without echoing placeholder/loopback vars.
+    // Defensively scrub injected proxy routing vars, sidecar UI vars, LS collector vars,
+    // and debug test-version overrides so detached daemons never bind the Aux Panel UI port,
+    // contend for LS collector locks, or inherit stale test versions.
     cmd.env_remove("CLOUD_CODE_URL")
         .env_remove("GOOGLE_GEMINI_BASE_URL")
         .env_remove("AGY_COMPANION_HOOK_ACTIVE")
         .env_remove("AGY_COMPANION_INJECTED_URL")
         .env_remove("JETSKI_MCP_ENV_RESTORE_PREFIX")
-        .env_remove("JETSKI_MCP_ENV_RESTORE_VARS");
+        .env_remove("JETSKI_MCP_ENV_RESTORE_VARS")
+        .env_remove(crate::sidecar_ui::SIDECAR_WEB_PORT_ENV)
+        .env_remove(crate::sidecar_ui::SIDECAR_UI_TOKEN_ENV)
+        .env_remove(companion_providers::ANTIGRAVITY_LS_ADDRESS_ENV_VAR)
+        .env_remove(companion_providers::ANTIGRAVITY_CSRF_TOKEN_ENV_VAR)
+        .env_remove(crate::plugin_upgrade::PLUGIN_DIR_ENV);
+    #[cfg(debug_assertions)]
+    {
+        cmd.env_remove(crate::serve::TEST_HEALTH_VERSION_ENV)
+            .env_remove(crate::plugin_upgrade::TEST_PLUGIN_POLL_MS_ENV);
+    }
     if std::env::var("GEMINI_API_KEY")
         .ok()
         .is_some_and(|v| companion_core::is_placeholder_api_key(&v))
@@ -470,6 +531,15 @@ pub(crate) fn spawn_detached_proxy_daemon_with_exe(
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
+    cmd
+}
+
+pub(crate) fn spawn_detached_proxy_daemon_with_exe_configured(
+    exe: &Path,
+    config_path: &Path,
+    opts: DetachedDaemonOptions,
+) -> Result<std::process::Child, CliError> {
+    let mut cmd = build_detached_proxy_daemon_command(exe, config_path, opts);
     Ok(cmd.spawn()?)
 }
 
@@ -693,6 +763,105 @@ mod tests {
         );
         drop(guard_new);
         assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn proxy_pid_guard_drop_preserves_version_skew_replacement_when_dropped_out_of_order() {
+        let temp = TempDir::new().expect("tempdir");
+        let pid_path = temp.path().join("proxy.pid");
+
+        let stale = ProxyPidInfo {
+            pid: 40_001,
+            port: 31_415,
+            version: "0.0.1-stale".to_string(),
+            started_at_ms: 1_000,
+            binary_path: "/old/agy-companion".to_string(),
+        };
+        let replacement = ProxyPidInfo {
+            pid: 40_002,
+            port: 31_415,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at_ms: 2_000,
+            binary_path: "/new/agy-companion".to_string(),
+        };
+
+        let stale_guard = write_proxy_pid(&pid_path, &stale).expect("write stale pid");
+        let replacement_guard =
+            write_proxy_pid(&pid_path, &replacement).expect("overwrite with replacement pid");
+
+        // Old daemon finishes draining SSE and drops its guard AFTER new daemon wrote proxy.pid.
+        drop(stale_guard);
+        let after_stale_drop = read_proxy_pid(&pid_path)
+            .expect("read proxy.pid")
+            .expect("replacement proxy.pid must remain intact");
+        assert_eq!(after_stale_drop, replacement);
+
+        // New daemon's guard still cleans up its own proxy.pid on exit.
+        drop(replacement_guard);
+        assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn detached_daemon_command_builds_flags_and_scrubs_sidecar_and_ls_env() {
+        let cmd = build_detached_proxy_daemon_command(
+            Path::new("/usr/local/bin/agy-companion"),
+            Path::new("/tmp/cfg.json"),
+            DetachedDaemonOptions {
+                port: 31_415,
+                idle_shutdown_secs: 1800,
+                watch_pid: Some(4242),
+                replace_stale: true,
+            },
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "--idle-shutdown-secs",
+                "1800",
+                "--port",
+                "31415",
+                "--config",
+                "/tmp/cfg.json",
+                "--watch-pid",
+                "4242",
+                "--replace-stale",
+            ]
+        );
+
+        let removed_envs: Vec<String> = cmd
+            .get_envs()
+            .filter(|&(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for key in [
+            crate::sidecar_ui::SIDECAR_WEB_PORT_ENV,
+            crate::sidecar_ui::SIDECAR_UI_TOKEN_ENV,
+            companion_providers::ANTIGRAVITY_LS_ADDRESS_ENV_VAR,
+            companion_providers::ANTIGRAVITY_CSRF_TOKEN_ENV_VAR,
+            crate::plugin_upgrade::PLUGIN_DIR_ENV,
+            "CLOUD_CODE_URL",
+            "GOOGLE_GEMINI_BASE_URL",
+        ] {
+            assert!(
+                removed_envs.iter().any(|k| k == key),
+                "expected detached daemon command to scrub {key}, got {removed_envs:?}"
+            );
+        }
+        #[cfg(debug_assertions)]
+        for key in [
+            crate::serve::TEST_HEALTH_VERSION_ENV,
+            crate::plugin_upgrade::TEST_PLUGIN_POLL_MS_ENV,
+        ] {
+            assert!(
+                removed_envs.iter().any(|k| k == key),
+                "expected detached daemon command to scrub {key}, got {removed_envs:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

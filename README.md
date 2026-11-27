@@ -216,7 +216,7 @@ See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and [`AGENT
 | `agy-companion uninstall` | `[--config <CONFIG>]` `[--plugins-dir <DIR>]` `[--purge]` `[--dry-run]` `[--json]` — removes shell hooks, plugin directory, and verified proxy daemon; preserves `config.json`, `auth/`, and `usage/` unless `--purge` is passed. |
 | `agy-companion integration` | `enable\|disable\|status [--shell <zsh\|bash\|fish>] [--rc-file <PATH>] [--binary <PATH>] [--follow-rc-symlink] [--json]` — manages Dock/Launcher login-shell integration (`--binary` on `enable`; `--follow-rc-symlink` on `enable`/`disable`). |
 | `agy-companion hook-env` | `[--ensure-running]` `[--print-port]` `[--port <PORT>]` `[--config <CONFIG>]` `[--plugins-dir <DIR>]` — fail-open login-shell helper that wakes the managed daemon and prints its validated port. |
-| `agy-companion serve` | `[--port <PORT>]` (`1–65535`, default `24141`) `[--config <CONFIG>]` `[--adopt-running]` `[--auto-enable-launcher]` `[--idle-shutdown-secs <SECS>]` — runs the loopback proxy strictly on `127.0.0.1` (no `--host` flag) and optional Sidecar Web UI (`ANTIGRAVITY_SIDECAR_WEB_PORT`). |
+| `agy-companion serve` | `[--port <PORT>]` (`1–65535`, default `24141`) `[--config <CONFIG>]` `[--adopt-running]` `[--auto-enable-launcher]` `[--idle-shutdown-secs <SECS>]` `[--watch-pid <PID>]` `[--replace-stale]` — runs the loopback proxy strictly on `127.0.0.1` (no `--host` flag) and optional Sidecar Web UI (`ANTIGRAVITY_SIDECAR_WEB_PORT`). |
 | `agy-companion launch` | `[--port <PORT>]` `[--config <CONFIG>]` `[--app <PATH>]` `[--print-env]` — launches Antigravity App directly in Hybrid Mode for a single session. |
 | `agy-companion doctor` | `[--config <CONFIG>]` `[--port <PORT>]` `[--json]` — verifies config permissions, schema, proxy `/health`, version match, and env setup. |
 | `agy-companion models` | `[--json]` `[--port <PORT>]` `[--config <CONFIG>]` — prints `customModelsConfig` JSON for `agy` CLI. |
@@ -226,7 +226,7 @@ See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and [`AGENT
 
 | Method & Route | Behavior |
 | --- | --- |
-| `GET /health` | `200 OK` JSON `{status, version, protocol_version}` (`nosniff`, `no-store`). |
+| `GET /health` | `200 OK` JSON `{status, version, protocol_version, role?}` (`nosniff`, `no-store`). |
 | `GET /api/stats` | `200 OK` JSON with live session request, token, implicit cache hit-ratio, process RAM RSS (`proxy_rss_bytes`), and Hybrid Mode catalog telemetry (`nosniff`, `no-store`). |
 | `GET /v1beta/models` | Filtered Gemini 3.8+ & 4+ chat model catalog (`default_model` first) with curated fallback. |
 | `POST /v1beta/models/{*rest}` | `:generateContent` and `:streamGenerateContent?alt=sse`; 64 MiB cap, byte-for-byte streaming pass-through, zero-buffer `usageMetadata` tee. |

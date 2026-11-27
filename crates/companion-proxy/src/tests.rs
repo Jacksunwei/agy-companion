@@ -98,6 +98,7 @@ async fn rejects_non_loopback_hosts_ports_and_listeners() {
             config_path: None,
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -132,6 +133,7 @@ async fn serve_on_listener_end_to_end_over_real_tcp_with_graceful_shutdown() {
             config_path: None,
             auth_store: Some(auth_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -285,6 +287,7 @@ async fn hot_reloads_key_rotation_revocation_base_url_and_file_deletion() {
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -412,6 +415,7 @@ async fn hot_reload_survives_corrupt_and_invalid_config_and_recovers_without_lea
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -567,6 +571,7 @@ async fn hot_reload_rejects_post_startup_symlink_dangling_symlink_and_fifo_witho
                 config_path: Some(initial_sym),
                 auth_store: None,
                 env_fallback: false,
+                ..Default::default()
             },
         ),
         Err(ProxyError::Core(CoreError::Fs(
@@ -586,6 +591,7 @@ async fn hot_reload_rejects_post_startup_symlink_dangling_symlink_and_fifo_witho
                 config_path: Some(sym_auth_cfg_path),
                 auth_store: None,
                 env_fallback: false,
+                ..Default::default()
             },
         ),
         Err(ProxyError::Core(CoreError::Fs(
@@ -600,6 +606,7 @@ async fn hot_reload_rejects_post_startup_symlink_dangling_symlink_and_fifo_witho
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -769,6 +776,7 @@ async fn hot_reload_preserves_cloudcode_routing_cache_when_upstream_and_timeout_
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -894,6 +902,7 @@ async fn activity_tracker_keeps_in_flight_active_across_long_sse_stream_and_rese
             config_path: None,
             auth_store: Some(auth_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -980,6 +989,7 @@ async fn passive_health_and_stats_probes_do_not_reset_idle_duration() {
             config_path: None,
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1096,6 +1106,7 @@ async fn hot_reload_concurrent_readers_see_immediate_rotation_with_zero_sleep() 
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1214,6 +1225,7 @@ async fn hot_reload_detects_same_second_in_place_edit_with_identical_length() {
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1286,6 +1298,7 @@ async fn hot_reload_retains_active_provider_on_oversized_config_and_recovers() {
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1345,6 +1358,7 @@ async fn hot_reload_updates_enabled_models_immediately_and_preserves_cloudcode_r
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1398,6 +1412,7 @@ async fn hot_reload_watches_codex_auth_sign_in_refresh_corrupt_and_sign_out() {
             config_path: Some(config_path.clone()),
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();

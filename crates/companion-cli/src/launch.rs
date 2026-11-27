@@ -635,6 +635,7 @@ mod tests {
                     status: "ok".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     protocol_version: 1,
+                    role: None,
                 })
             }),
         );
@@ -671,6 +672,7 @@ mod tests {
                     status: "ok".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     protocol_version: 1,
+                    role: None,
                 })
             }),
         );

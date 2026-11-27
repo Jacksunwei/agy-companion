@@ -17,8 +17,11 @@ pub(super) struct StatsQuery {
     pub(super) conversation_id: Option<String>,
 }
 
-pub(super) async fn health_handler() -> Json<HealthResponse> {
-    Json(HealthResponse::ok(env!("CARGO_PKG_VERSION")))
+pub(super) async fn health_handler(State(state): State<ProxyState>) -> Json<HealthResponse> {
+    Json(
+        HealthResponse::ok(state.health_version())
+            .with_optional_role(state.role().map(str::to_string)),
+    )
 }
 
 pub(super) async fn stats_handler(

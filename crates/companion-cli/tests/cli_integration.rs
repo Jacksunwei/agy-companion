@@ -10,5 +10,7 @@ mod daemon_integration;
 mod install_lifecycle;
 #[path = "cli_integration/install_symlink_safety.rs"]
 mod install_symlink_safety;
+#[path = "cli_integration/proxy_lifecycle.rs"]
+mod proxy_lifecycle;
 #[path = "cli_integration/serve_doctor.rs"]
 mod serve_doctor;

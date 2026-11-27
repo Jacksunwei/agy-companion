@@ -207,6 +207,40 @@ async fn health_returns_version_and_protocol_version() {
     assert_eq!(health.status, "ok");
     assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(health.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(health.role, None);
+    let raw_json = std::str::from_utf8(&body).unwrap();
+    assert!(!raw_json.contains("\"role\""));
+}
+
+#[tokio::test]
+async fn health_includes_configured_role_when_set_in_options() {
+    let state = ProxyState::from_config_with_options(
+        companion_core::Config::default(),
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            env_fallback: false,
+            role: Some("bootstrap".to_string()),
+            ..ProxyStateOptions::default()
+        },
+    )
+    .expect("build ProxyState with role");
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(health.role.as_deref(), Some("bootstrap"));
 }
 
 #[tokio::test]
@@ -1535,6 +1569,7 @@ async fn get_v1beta_models_returns_curated_fallback_and_live_filtered_catalog_wi
             config_path: None,
             auth_store: Some(auth_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1672,6 +1707,7 @@ async fn cloudcode_fetch_available_models_merges_and_v1internal_streams_passthro
             config_path: None,
             auth_store: Some(auth_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -1899,6 +1935,7 @@ async fn cloudcode_fetch_available_models_day0_returns_upstream_untouched_preser
                 config_path: Some(cfg_path),
                 auth_store: None,
                 env_fallback: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1995,6 +2032,7 @@ async fn cloudcode_fetch_available_models_preserves_content_encoding_on_merge_er
             config_path: None,
             auth_store: Some(auth_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -2319,6 +2357,7 @@ async fn cloudcode_fallback_maps_client_disconnect_to_400_and_streaming_overflow
             config_path: None,
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -2769,6 +2808,7 @@ async fn cloudcode_fetch_available_models_empty_enabled_models_returns_upstream_
             config_path: None,
             auth_store: Some(auth_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -2878,6 +2918,7 @@ async fn cloudcode_fetch_available_models_injects_strictly_enabled_models_only()
             config_path: None,
             auth_store: Some(auth_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -2982,6 +3023,7 @@ async fn builtin_antigravity_passive_tee_tracks_sse_unary_path_fallback_and_rss(
             config_path: None,
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -3168,6 +3210,7 @@ async fn builtin_antigravity_passive_tee_skips_compressed_errors_and_non_generat
             config_path: None,
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -3423,6 +3466,7 @@ async fn builtin_tee_preserves_split_content_encoding_and_fails_closed_on_non_as
             config_path: None,
             auth_store: None,
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -3683,6 +3727,7 @@ async fn codex_proxy_dispatches_sse_and_unary_records_codex_usage_and_conversati
             config_path: None,
             auth_store: Some(auth_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .expect("proxy state");
@@ -3869,6 +3914,7 @@ async fn cloudcode_fetch_available_models_gates_day0_codex_only_and_both_provide
             config_path: None,
             auth_store: Some(Arc::new(MemoryAuthStore::new())),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -3897,6 +3943,7 @@ async fn cloudcode_fetch_available_models_gates_day0_codex_only_and_both_provide
                 sample_codex_creds_for_route_test("tok_only"),
             ))),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -3940,6 +3987,7 @@ async fn cloudcode_fetch_available_models_gates_day0_codex_only_and_both_provide
             config_path: None,
             auth_store: Some(both_store),
             env_fallback: false,
+            ..Default::default()
         },
     )
     .unwrap();

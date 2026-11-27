@@ -1090,6 +1090,7 @@ mod tests {
                     status: "ok".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     protocol_version: PROTOCOL_VERSION,
+                    role: None,
                 })
             }),
         )
@@ -1104,6 +1105,7 @@ mod tests {
                     status: "ok".to_string(),
                     version: "9.9.9".to_string(),
                     protocol_version: PROTOCOL_VERSION,
+                    role: None,
                 })
             }),
         );
@@ -1147,6 +1149,7 @@ mod tests {
                 status: "ok".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol_version: 99,
+                role: None,
             },
             env!("CARGO_PKG_VERSION"),
             PROTOCOL_VERSION,
@@ -1162,6 +1165,7 @@ mod tests {
                 status: "degraded".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                role: None,
             },
             env!("CARGO_PKG_VERSION"),
             PROTOCOL_VERSION,
@@ -1175,6 +1179,7 @@ mod tests {
                 status: "ok".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                role: None,
             },
             env!("CARGO_PKG_VERSION"),
             PROTOCOL_VERSION,
