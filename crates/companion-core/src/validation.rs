@@ -7,6 +7,184 @@ use url::{Host, Url};
 use crate::config::{CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL, LoopbackHost};
 
 pub const PROXY_PLACEHOLDER_API_KEY: &str = "agy-companion-local";
+pub const MAX_CSRF_TOKEN_BYTES: usize = 512;
+
+/// Validated, non-empty, header-safe Antigravity Language Server CSRF token.
+///
+/// - `Debug` always emits `CsrfToken("<redacted>")` (never even a partial hint).
+/// - Intentionally omits `Display`, `Deref`, `AsRef<str>`, and `Serialize` to prevent accidental
+///   logging, formatting, or persistence of per-invocation LS credentials.
+/// - Callers must explicitly invoke `.expose()` when building sensitive outbound headers.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CsrfToken(String);
+
+impl CsrfToken {
+    /// Parses a raw CSRF token string, rejecting empty input, inputs longer than
+    /// `MAX_CSRF_TOKEN_BYTES` (512 bytes), and any byte outside printable ASCII `0x21..=0x7E`
+    /// (blocks whitespace, control chars, NUL, DEL, and non-ASCII).
+    pub fn parse(raw: &str) -> Result<Self, CoreError> {
+        if raw.is_empty()
+            || raw.len() > MAX_CSRF_TOKEN_BYTES
+            || !raw.bytes().all(|b| (0x21..=0x7E).contains(&b))
+        {
+            return Err(CoreError::InvalidCsrfToken);
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    /// Returns the validated plaintext token for sensitive outbound header construction.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CsrfToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CsrfToken(\"<redacted>\")")
+    }
+}
+
+/// Loopback-only host classification for the local Antigravity Language Server (`S1`/`S3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsHost {
+    Ipv4,
+    Ipv6,
+    Localhost,
+}
+
+/// Strictly validated, plaintext HTTP-only loopback endpoint for the local Antigravity Language
+/// Server (`ANTIGRAVITY_LS_ADDRESS`).
+///
+/// Never reuses `validate_upstream_url` (which allows remote `https://` hosts). Enforces S1/S3 by
+/// accepting only literal `127.0.0.1:<port>`, `[::1]:<port>`, or `localhost:<port>` (with an
+/// optional `http://` prefix) and building literal IP URLs so zero OS DNS lookup occurs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsEndpoint {
+    host: LsHost,
+    port: u16,
+}
+
+impl LsEndpoint {
+    /// Parses a raw `ANTIGRAVITY_LS_ADDRESS` value into a validated loopback-only endpoint.
+    pub fn parse(raw: &str) -> Result<Self, CoreError> {
+        if raw.is_empty() {
+            return Err(CoreError::InvalidLsEndpoint {
+                reason: "endpoint must not be empty".to_string(),
+            });
+        }
+        if !raw.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+            return Err(CoreError::InvalidLsEndpoint {
+                reason: "endpoint must contain only printable ASCII without whitespace or control characters"
+                    .to_string(),
+            });
+        }
+        if raw.contains(['\\', '@', '?', '#']) {
+            return Err(CoreError::InvalidLsEndpoint {
+                reason: "endpoint must not contain userinfo, query, fragment, or backslashes"
+                    .to_string(),
+            });
+        }
+
+        let authority = if let Some((scheme, rest)) = raw.split_once("://") {
+            if !scheme.eq_ignore_ascii_case("http") {
+                return Err(CoreError::InvalidLsEndpoint {
+                    reason: "only plaintext http:// or bare host:port is permitted".to_string(),
+                });
+            }
+            rest
+        } else {
+            raw
+        };
+
+        if authority.contains('/') {
+            return Err(CoreError::InvalidLsEndpoint {
+                reason: "endpoint must not include a URL path".to_string(),
+            });
+        }
+
+        let (host, port_str) = if authority.starts_with('[') {
+            let Some(port_str) = authority.strip_prefix("[::1]:") else {
+                return Err(CoreError::InvalidLsEndpoint {
+                    reason: "IPv6 endpoint must be literal [::1]:<port>".to_string(),
+                });
+            };
+            (LsHost::Ipv6, port_str)
+        } else {
+            if authority.contains(['[', ']']) {
+                return Err(CoreError::InvalidLsEndpoint {
+                    reason: "malformed host/port authority".to_string(),
+                });
+            }
+            let Some((host_str, port_str)) = authority.split_once(':') else {
+                return Err(CoreError::InvalidLsEndpoint {
+                    reason: "endpoint must include an explicit :<port>".to_string(),
+                });
+            };
+            if port_str.contains(':') {
+                return Err(CoreError::InvalidLsEndpoint {
+                    reason: "malformed host/port authority".to_string(),
+                });
+            }
+            let host = if host_str == "127.0.0.1" {
+                LsHost::Ipv4
+            } else if host_str.eq_ignore_ascii_case("localhost") {
+                LsHost::Localhost
+            } else {
+                return Err(CoreError::InvalidLsEndpoint {
+                    reason: "endpoint host must be literal 127.0.0.1, [::1], or localhost"
+                        .to_string(),
+                });
+            };
+            (host, port_str)
+        };
+
+        if port_str.is_empty()
+            || port_str.starts_with('0')
+            || !port_str.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(CoreError::InvalidLsEndpoint {
+                reason: "endpoint port must be a valid integer between 1 and 65535".to_string(),
+            });
+        }
+        let port = port_str
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p > 0)
+            .ok_or_else(|| CoreError::InvalidLsEndpoint {
+                reason: "endpoint port must be a valid integer between 1 and 65535".to_string(),
+            })?;
+
+        Ok(Self { host, port })
+    }
+
+    pub const fn host(&self) -> LsHost {
+        self.host
+    }
+
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Builds a zero-DNS literal IPv4 loopback URL (`http://127.0.0.1:<port><path>`).
+    pub fn ipv4_url(&self, path: &str) -> String {
+        format_loopback_url("127.0.0.1", self.port, path)
+    }
+
+    /// Builds a zero-DNS literal IPv6 loopback URL (`http://[::1]:<port><path>`).
+    pub fn ipv6_url(&self, path: &str) -> String {
+        format_loopback_url("[::1]", self.port, path)
+    }
+}
+
+fn format_loopback_url(host: &str, port: u16, path: &str) -> String {
+    if path.is_empty() {
+        format!("http://{host}:{port}")
+    } else if path.starts_with('/') {
+        format!("http://{host}:{port}{path}")
+    } else {
+        format!("http://{host}:{port}/{path}")
+    }
+}
 
 /// Returns `true` when `key` (ignoring surrounding whitespace) equals the
 /// internal local-proxy placeholder sentinel (`"agy-companion-local"`).
@@ -1058,6 +1236,197 @@ mod tests {
             assert!(
                 matches!(err, CoreError::InvalidBaseUrl { .. }),
                 "unexpected error for '{bad}': {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn csrf_token_validates_ascii_length_and_redacts_debug() {
+        let secret = "01234567-89ab-cdef-0123-456789abcdef";
+        let token = CsrfToken::parse(secret).expect("valid UUID-shaped CSRF token");
+        assert_eq!(token.expose(), secret);
+        let debug = format!("{token:?}");
+        assert_eq!(debug, "CsrfToken(\"<redacted>\")");
+        assert!(!debug.contains("01234567"));
+        assert!(!debug.contains(secret));
+
+        // Exact boundary: 512 printable ASCII bytes accepted, 513 rejected
+        let max_valid = "A".repeat(MAX_CSRF_TOKEN_BYTES);
+        assert_eq!(
+            CsrfToken::parse(&max_valid)
+                .expect("512 bytes valid")
+                .expose()
+                .len(),
+            MAX_CSRF_TOKEN_BYTES
+        );
+        let too_long = "A".repeat(MAX_CSRF_TOKEN_BYTES + 1);
+        assert!(matches!(
+            CsrfToken::parse(&too_long),
+            Err(CoreError::InvalidCsrfToken)
+        ));
+
+        // Printable ASCII extremes (0x21 '!' and 0x7E '~') accepted
+        assert_eq!(CsrfToken::parse("!~").expect("0x21..=0x7E").expose(), "!~");
+
+        // Reject empty, whitespace, control chars, NUL, DEL, and non-ASCII without echoing secret
+        for bad in [
+            "",
+            " ",
+            " secret-token",
+            "secret-token ",
+            "secret token",
+            "secret\ttoken",
+            "secret\rtoken",
+            "secret\ntoken",
+            "secret\r\nX-Injected: 1",
+            "secret\0token",
+            "secret\u{001F}token",
+            "secret\u{007F}token",
+            "secret\u{0080}token",
+            "secret\u{00A0}token",
+            "secret\u{1F511}token",
+        ] {
+            let err = CsrfToken::parse(bad).expect_err(&format!("expected reject for {bad:?}"));
+            assert!(matches!(err, CoreError::InvalidCsrfToken));
+            assert!(!err.to_string().contains("secret"));
+            assert!(!format!("{err:?}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn ls_endpoint_accepts_valid_loopback_forms_and_formats_literal_urls() {
+        let cases = [
+            ("localhost:64482", LsHost::Localhost, 64482),
+            ("LOCALHOST:64482", LsHost::Localhost, 64482),
+            ("127.0.0.1:64482", LsHost::Ipv4, 64482),
+            ("[::1]:64482", LsHost::Ipv6, 64482),
+            ("http://localhost:1", LsHost::Localhost, 1),
+            ("HTTP://LocalHost:65535", LsHost::Localhost, 65535),
+            ("http://127.0.0.1:8080", LsHost::Ipv4, 8080),
+            ("http://[::1]:8080", LsHost::Ipv6, 8080),
+        ];
+
+        for (raw, expected_host, expected_port) in cases {
+            let ep = LsEndpoint::parse(raw)
+                .unwrap_or_else(|err| panic!("expected valid for '{raw}': {err:?}"));
+            assert_eq!(ep.host(), expected_host, "host mismatch for '{raw}'");
+            assert_eq!(ep.port(), expected_port, "port mismatch for '{raw}'");
+            assert_eq!(
+                ep.ipv4_url("/exa.language_server_pb.LanguageServerService/Ping"),
+                format!(
+                    "http://127.0.0.1:{expected_port}/exa.language_server_pb.LanguageServerService/Ping"
+                )
+            );
+            assert_eq!(
+                ep.ipv6_url("/exa.language_server_pb.LanguageServerService/Ping"),
+                format!(
+                    "http://[::1]:{expected_port}/exa.language_server_pb.LanguageServerService/Ping"
+                )
+            );
+            assert_eq!(
+                ep.ipv4_url("rpc/Ping"),
+                format!("http://127.0.0.1:{expected_port}/rpc/Ping")
+            );
+            assert_eq!(ep.ipv4_url(""), format!("http://127.0.0.1:{expected_port}"));
+        }
+    }
+
+    #[test]
+    fn ls_endpoint_rejects_s1_s3_ssrf_and_malformed_matrix() {
+        let bad_endpoints = [
+            // Empty & whitespace / control / non-ASCII
+            "",
+            " ",
+            " localhost:64482",
+            "localhost:64482 ",
+            "local host:64482",
+            "localhost:64482\t",
+            "localhost:64482\r\n",
+            "localhost:64482\nX-Injected: 1",
+            "localhost:64482\0",
+            "localhost:64482\u{007F}",
+            "localhost:64482\u{00A0}",
+            "http://loc\u{00E1}lhost:64482",
+            // Disallowed schemes (plaintext HTTP only)
+            "https://localhost:64482",
+            "https://127.0.0.1:64482",
+            "https://[::1]:64482",
+            "HTTPS://localhost:64482",
+            "ftp://localhost:64482",
+            "file:///etc/passwd",
+            "unix:///tmp/ls.sock",
+            "ws://localhost:64482",
+            "://localhost:64482",
+            "http:localhost:64482",
+            "https:localhost:64482",
+            // Userinfo / path / query / fragment / backslash
+            "http://user@localhost:64482",
+            "http://user:pass@127.0.0.1:64482",
+            "localhost@evil.com:64482",
+            "127.0.0.1:64482@evil.com",
+            "localhost:64482/",
+            "http://localhost:64482/",
+            "http://localhost:64482/v1",
+            "http://127.0.0.1:64482/path",
+            "http://localhost:64482?foo=bar",
+            "localhost:64482?foo=bar",
+            "http://localhost:64482#frag",
+            "localhost:64482#frag",
+            "http://localhost\\@evil.com:64482",
+            "localhost:64482\\evil",
+            "http://http://localhost:64482",
+            // Non-loopback, wildcard, ambiguous, or trailing-dot hosts
+            "0.0.0.0:64482",
+            "http://0.0.0.0:64482",
+            "[::]:64482",
+            "http://[::]:64482",
+            "127.0.0.2:64482",
+            "http://127.0.0.2:64482",
+            "127.1:64482",
+            "http://127.1:64482",
+            "0x7f000001:64482",
+            "2130706433:64482",
+            "localhost.:64482",
+            "http://localhost.:64482",
+            "localhost.evil.com:64482",
+            "example.com:64482",
+            "169.254.169.254:80",
+            "[0:0:0:0:0:0:0:1]:64482",
+            "[::ffff:127.0.0.1]:64482",
+            "::1:64482",
+            // Missing, zero, leading-zero, non-numeric, or overflow ports
+            "localhost",
+            "127.0.0.1",
+            "[::1]",
+            "http://localhost",
+            "http://127.0.0.1",
+            "http://[::1]",
+            "localhost:",
+            "127.0.0.1:",
+            "[::1]:",
+            "localhost:0",
+            "127.0.0.1:0",
+            "[::1]:0",
+            "localhost:080",
+            "127.0.0.1:0000",
+            "[::1]:064482",
+            "localhost:65536",
+            "127.0.0.1:99999",
+            "localhost:999999999999999999",
+            "localhost:-1",
+            "localhost:+80",
+            "localhost:abc",
+            "localhost:80:90",
+            "[::1]:80:90",
+            "[::1]foo:80",
+            ":64482",
+        ];
+
+        for bad in bad_endpoints {
+            let err = LsEndpoint::parse(bad).expect_err(&format!("expected reject for {bad:?}"));
+            assert!(
+                matches!(err, CoreError::InvalidLsEndpoint { .. }),
+                "unexpected error for {bad:?}: {err:?}"
             );
         }
     }

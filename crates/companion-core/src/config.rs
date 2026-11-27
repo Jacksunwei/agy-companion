@@ -54,6 +54,12 @@ pub enum CoreError {
     )]
     InvalidApiKey,
     #[error(
+        "invalid Antigravity CSRF token: must be 1..=512 printable ASCII bytes without whitespace or control characters"
+    )]
+    InvalidCsrfToken,
+    #[error("invalid Antigravity LS endpoint: {reason}")]
+    InvalidLsEndpoint { reason: String },
+    #[error(
         "api_key cannot be set to the internal proxy placeholder ('agy-companion-local'); enter a real Gemini API key"
     )]
     PlaceholderApiKey,
