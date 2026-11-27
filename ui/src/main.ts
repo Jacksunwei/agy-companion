@@ -3,6 +3,8 @@ import {
   copyTextWithFallback,
   createBrandMarkSvg,
   createIcon,
+  createThemeController,
+  createToastController,
   createTooltipController,
   el,
   quitReopenSentence,
@@ -113,7 +115,6 @@ async function main(): Promise<void> {
   };
 
   let pollTimer: number | null = null;
-  let toastTimer: number | null = null;
   const keyFeedbackTimer = createAutoDismissTimer();
   const codexFeedbackTimer = createAutoDismissTimer();
   let lastPollCompletedAt = 0;
@@ -210,6 +211,7 @@ async function main(): Promise<void> {
     tablist.append(btn);
   }
   tablist.addEventListener("keydown", (event: KeyboardEvent) => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
     const focusedTab =
       tabSpecs.find((spec) => tabBtns.get(spec.id) === document.activeElement)?.id ??
       state.activeTab;
@@ -233,10 +235,6 @@ async function main(): Promise<void> {
   usagePanel.id = "panel-usage";
   usagePanel.setAttribute("role", "tabpanel");
   usagePanel.setAttribute("aria-labelledby", "tab-usage");
-
-  const toastEl = el("div", "host-toast");
-  toastEl.setAttribute("role", "status");
-  toastEl.hidden = true;
 
   root.replaceChildren(hdr, scroll);
 
@@ -364,23 +362,23 @@ async function main(): Promise<void> {
   scroll.append(contentWrap);
 
   const footerCtrl = createFooterController(root);
-  root.append(toastEl);
+  const toastCtrl = createToastController(root);
+  const themeCtrl = createThemeController(
+    document.documentElement,
+    root,
+    typeof window.matchMedia === "function" ? (q) => window.matchMedia(q) : null,
+  );
 
   /* =========================================================================
    * RENDERERS (IN-PLACE FOR HEADER, SETTINGS & FOOTER; REBUILD MONITOR/USAGE)
    * ========================================================================= */
   function showToast(message: string): void {
     state.toastMessage = message;
-    toastEl.textContent = message;
-    toastEl.hidden = false;
-    if (toastTimer !== null) {
-      window.clearTimeout(toastTimer);
-    }
-    toastTimer = window.setTimeout(() => {
-      toastTimer = null;
-      state.toastMessage = null;
-      toastEl.hidden = true;
-    }, 3200);
+    toastCtrl.show(message, 3200, () => {
+      if (state.toastMessage === message) {
+        state.toastMessage = null;
+      }
+    });
   }
 
   function renderHeader(): void {
@@ -546,12 +544,6 @@ async function main(): Promise<void> {
     }
 
     renderAll();
-  }
-
-  function applyTheme(theme: "dark" | "light"): void {
-    document.documentElement.dataset.theme = theme;
-    document.documentElement.style.colorScheme = theme;
-    root?.setAttribute("data-theme", theme);
   }
 
   /* =========================================================================
@@ -1210,10 +1202,8 @@ async function main(): Promise<void> {
     clearPollTimer();
     keyFeedbackTimer.cancel();
     codexFeedbackTimer.cancel();
-    if (toastTimer !== null) {
-      window.clearTimeout(toastTimer);
-      toastTimer = null;
-    }
+    toastCtrl.destroy();
+    themeCtrl.destroy();
     tooltip.destroy();
     footerCtrl.destroy();
   });
@@ -1253,19 +1243,12 @@ async function main(): Promise<void> {
       }
       const theme = inferThemeFromCssVars(vars);
       if (theme) {
-        applyTheme(theme);
+        themeCtrl.applyHostTheme(theme);
       }
     } else if (msg.type === "companion-refresh") {
       void refreshSettings(false);
     }
   });
-
-  if (
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-color-scheme: light)").matches
-  ) {
-    applyTheme("light");
-  }
 
   state.connected = true;
   state.standalone = false;

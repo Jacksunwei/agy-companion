@@ -20,7 +20,12 @@ import {
   shouldApplyRefresh,
   toggleEnabledModel,
 } from "../src/state.ts";
-import { formatCatalogRefreshCopy } from "../src/dom.ts";
+import {
+  createThemeController,
+  formatCatalogRefreshCopy,
+  type ThemeMediaQueryListLike,
+} from "../src/dom.ts";
+import { installFakeDom } from "./fake_dom.ts";
 import {
   CURATED_MODEL_CATALOG,
   parseSettingsSnapshot,
@@ -59,13 +64,19 @@ function contrastRatio(hexA: string, hexB: string): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
-function extractCssHexTokens(block: string): Map<string, string> {
-  const map = new Map<string, string>();
-  const re = /(--[a-z0-9-]+)\s*:\s*[^;]*?(#[0-9a-fA-F]{6})\b/g;
+function extractLightDarkTokens(block: string): {
+  light: Map<string, string>;
+  dark: Map<string, string>;
+} {
+  const light = new Map<string, string>();
+  const dark = new Map<string, string>();
+  const re =
+    /(--[a-z0-9-]+)\s*:\s*[^;]*?light-dark\(\s*(#[0-9a-fA-F]{6})\s*,\s*(#[0-9a-fA-F]{6})\s*\)/g;
   for (const m of block.matchAll(re)) {
-    map.set(m[1], m[2].toLowerCase());
+    light.set(m[1], m[2].toLowerCase());
+    dark.set(m[1], m[3].toLowerCase());
   }
-  return map;
+  return { light, dark };
 }
 
 function listFilesRecursive(dir: string): string[] {
@@ -533,38 +544,70 @@ describe("ui/src/state.ts pure state helpers", () => {
 describe("ui/src/style.css theme tokens & WCAG AA contrast", () => {
   const css = fs.readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 
-  const darkMatch = /:root\s*\{([\s\S]*?)\n\}/.exec(css);
-  const lightAttrMatch =
+  const rootMatch = /:root\s*\{([\s\S]*?)\n\}/.exec(css);
+  const lightSwitchMatch =
     /:root\[data-theme="light"\],\s*\.companion-root\[data-theme="light"\]\s*\{([\s\S]*?)\n\}/.exec(
       css,
     );
-  const lightMediaMatch =
-    /@media\s*\(prefers-color-scheme:\s*light\)\s*\{\s*:root:not\(\[data-theme="dark"\]\)\s*\{([\s\S]*?)\n\s*\}\s*\}/.exec(
+  const darkSwitchMatch =
+    /:root\[data-theme="dark"\],\s*\.companion-root\[data-theme="dark"\]\s*\{([\s\S]*?)\n\}/.exec(
       css,
     );
 
-  it("defines Light --brand: #1558b0 and matching WCAG AA tokens in both data-theme=light and prefers-color-scheme: light", () => {
-    assert.ok(darkMatch, "Expected dark :root block in style.css");
-    assert.ok(lightAttrMatch, 'Expected :root[data-theme="light"] block in style.css');
-    assert.ok(lightMediaMatch, "Expected @media (prefers-color-scheme: light) block in style.css");
+  it("unifies Light & Dark tokens with light-dark() in :root, switches color-scheme via [data-theme], and meets WCAG AA >= 4.5:1", () => {
+    assert.ok(rootMatch, "Expected unified :root block in style.css");
+    assert.ok(
+      /color-scheme\s*:\s*dark\s+light\s*;/.test(rootMatch[1]),
+      "Expected :root to declare color-scheme: dark light;",
+    );
+    assert.equal(
+      /@media\s*\(\s*prefers-color-scheme\s*:\s*light\s*\)/.test(css),
+      false,
+      "Duplicated @media (prefers-color-scheme: light) block must be removed in favor of light-dark()",
+    );
 
-    const dark = extractCssHexTokens(darkMatch[1]);
-    const lightAttr = extractCssHexTokens(lightAttrMatch[1]);
-    const lightMedia = extractCssHexTokens(lightMediaMatch[1]);
+    assert.ok(lightSwitchMatch, 'Expected :root[data-theme="light"] color-scheme switch');
+    assert.ok(/color-scheme\s*:\s*light\s*;/.test(lightSwitchMatch[1]));
+    assert.equal(
+      /--[a-z0-9-]+\s*:/.test(lightSwitchMatch[1]),
+      false,
+      '[data-theme="light"] must switch color-scheme only with zero duplicated -- tokens',
+    );
+
+    assert.ok(darkSwitchMatch, 'Expected :root[data-theme="dark"] color-scheme switch');
+    assert.ok(/color-scheme\s*:\s*dark\s*;/.test(darkSwitchMatch[1]));
+    assert.equal(
+      /--[a-z0-9-]+\s*:/.test(darkSwitchMatch[1]),
+      false,
+      '[data-theme="dark"] must switch color-scheme only with zero duplicated -- tokens',
+    );
+
+    const { light, dark } = extractLightDarkTokens(rootMatch[1]);
+    assert.equal(light.size, 18, `Expected 18 light-dark() hex color tokens, found ${light.size}`);
+    assert.equal(dark.size, 18, `Expected 18 light-dark() hex color tokens, found ${dark.size}`);
+
+    // Exact Light palette pins & WCAG AA contrast
+    assert.equal(light.get("--bg"), "#ffffff");
+    assert.equal(light.get("--surface"), "#f7f8fa");
+    assert.equal(light.get("--brand"), "#1558b0");
+    assert.equal(light.get("--brand-fg"), "#ffffff");
+
+    // Exact Dark palette pins & WCAG AA contrast
+    assert.equal(dark.get("--bg"), "#1b1c1f");
+    assert.equal(dark.get("--surface"), "#232428");
+    assert.equal(dark.get("--brand"), "#8ab4f8");
+    assert.equal(dark.get("--brand-fg"), "#0f1b2e");
 
     for (const [label, tokens] of [
-      [':root[data-theme="light"]', lightAttr],
-      ["@media (prefers-color-scheme: light)", lightMedia],
+      ["Light (light-dark())", light],
+      ["Dark (light-dark())", dark],
     ] as const) {
-      assert.equal(tokens.get("--bg"), "#ffffff", `${label} --bg`);
-      assert.equal(tokens.get("--surface"), "#f7f8fa", `${label} --surface`);
-      assert.equal(tokens.get("--brand"), "#1558b0", `${label} --brand`);
-      assert.equal(tokens.get("--brand-fg"), "#ffffff", `${label} --brand-fg`);
-
       const bg = tokens.get("--bg")!;
       const surface = tokens.get("--surface")!;
       const brand = tokens.get("--brand")!;
       const brandFg = tokens.get("--brand-fg")!;
+      const err = tokens.get("--err")!;
+      const errFg = tokens.get("--err-fg")!;
 
       assert.ok(
         contrastRatio(brand, bg) >= 4.5,
@@ -578,6 +621,10 @@ describe("ui/src/style.css theme tokens & WCAG AA contrast", () => {
         contrastRatio(brand, surface) >= 4.5,
         `${label} --brand vs --surface contrast must be >= 4.5:1`,
       );
+      assert.ok(
+        contrastRatio(err, errFg) >= 4.5,
+        `${label} --err vs --err-fg contrast must be >= 4.5:1`,
+      );
 
       for (const key of ["--fg", "--fg-2", "--fg-3", "--ok", "--warn", "--err"] as const) {
         const val = tokens.get(key);
@@ -588,16 +635,9 @@ describe("ui/src/style.css theme tokens & WCAG AA contrast", () => {
         );
       }
     }
-
-    const darkBg = dark.get("--bg");
-    const darkBrand = dark.get("--brand");
-    const darkBrandFg = dark.get("--brand-fg");
-    assert.ok(darkBg && darkBrand && darkBrandFg);
-    assert.ok(contrastRatio(darkBrand, darkBg) >= 4.5);
-    assert.ok(contrastRatio(darkBrand, darkBrandFg) >= 4.5);
   });
 
-  it("uses native :has(:checked), reduced-motion, contrast scrollbar, single-edge gutter, and progressive smooth details", () => {
+  it("uses native :has(:checked), reduced-motion, contrast scrollbar, single-edge gutter, smooth details, and top-layer popover animations", () => {
     assert.ok(css.includes(".pr-row:has(.pr-inp:checked)"));
     assert.equal(css.includes(".pr-row.sel"), false, "Legacy JS .pr-row.sel class must be removed");
 
@@ -618,10 +658,179 @@ describe("ui/src/style.css theme tokens & WCAG AA contrast", () => {
       false,
       "prefers-reduced-motion must not touch .host-toast translateX(-50%) centering",
     );
+    assert.ok(
+      reducedBlock[1].includes("[popover]"),
+      "prefers-reduced-motion must disable [popover] transitions and translate",
+    );
+    assert.ok(
+      reducedBlock[1].includes(".model-tooltip.visible"),
+      "prefers-reduced-motion must match .model-tooltip.visible specificity",
+    );
 
     assert.ok(css.includes("interpolate-size: allow-keywords"));
     assert.ok(css.includes("details.adv-details::details-content"));
     assert.ok(css.includes("details.codex-fallback::details-content"));
+
+    // Native top-layer popover + @starting-style + overlay + allow-discrete
+    assert.ok(css.includes("@supports selector(:popover-open)"));
+    assert.ok(css.includes(":popover-open"));
+    assert.ok(css.includes("@starting-style"));
+    assert.ok(css.includes("allow-discrete"));
+    assert.ok(/\boverlay\b/.test(css));
+    assert.ok(
+      /\.footer-popover\s*\{[^}]*\bcolor\s*:\s*var\(--fg\)\s*;/.test(css),
+      ".footer-popover must declare color: var(--fg) to override UA [popover] CanvasText",
+    );
+  });
+
+  it("uses relative rem typography with 1rem === 16px root and zero px font-size declarations", () => {
+    const stripped = css.replace(/\/\*[\s\S]*?\*\//g, "");
+
+    assert.deepEqual(
+      stripped.match(/\bfont-size\s*:\s*[^;]*\b\d+(?:\.\d+)?px\b/gi) ?? [],
+      [],
+      "Expected zero px font-size declarations in style.css",
+    );
+    assert.deepEqual(
+      stripped.match(/\bfont\s*:\s*[^;]*\b\d+(?:\.\d+)?px\b/gi) ?? [],
+      [],
+      "Expected zero px font shorthand declarations in style.css",
+    );
+
+    for (const m of stripped.matchAll(/(?:^|\})\s*html(?:\s*,\s*body)?\s*\{([^}]*)\}/g)) {
+      assert.equal(
+        /\bfont(?:-size)?\s*:/.test(m[1]),
+        false,
+        "html rule must not declare font or font-size so 1rem stays 16px",
+      );
+    }
+
+    const bodyMatch = /(?:^|\})\s*body\s*\{([^}]*)\}/.exec(stripped);
+    assert.ok(bodyMatch, "Expected standalone body rule in style.css");
+    assert.ok(
+      /\bfont\s*:\s*0\.8125rem\/1\.45\s+var\(--font-ui\)\s*;/.test(bodyMatch[1]),
+      "Expected body to set font: 0.8125rem/1.45 var(--font-ui);",
+    );
+
+    const remFontSizes = stripped.match(/\bfont-size\s*:\s*\d+(?:\.\d+)?rem\b/g) ?? [];
+    assert.ok(
+      remFontSizes.length >= 50,
+      `Expected >= 50 rem font-size declarations, found ${remFontSizes.length}`,
+    );
+  });
+});
+
+describe("createThemeController live OS matchMedia & host precedence", () => {
+  function createMockMql(initialMatches: boolean): ThemeMediaQueryListLike & {
+    emit: (next: boolean) => void;
+    listenerCount: () => number;
+  } {
+    let matches = initialMatches;
+    const listeners = new Set<(event: { matches: boolean }) => void>();
+    return {
+      get matches() {
+        return matches;
+      },
+      addEventListener: (_type, fn) => {
+        listeners.add(fn);
+      },
+      removeEventListener: (_type, fn) => {
+        listeners.delete(fn);
+      },
+      emit: (next: boolean) => {
+        matches = next;
+        for (const fn of [...listeners]) {
+          fn({ matches });
+        }
+      },
+      listenerCount: () => listeners.size,
+    };
+  }
+
+  it("syncs initial OS theme, follows live matchMedia flips, honors explicit host override, and cleans up on destroy", () => {
+    const env = installFakeDom();
+    try {
+      const root = env.document.createElement("div");
+      const mql = createMockMql(false);
+      let queried = "";
+
+      const ctrl = createThemeController(
+        env.document.documentElement as unknown as HTMLElement,
+        root as unknown as HTMLElement,
+        (q) => {
+          queried = q;
+          return mql;
+        },
+      );
+
+      assert.equal(queried, "(prefers-color-scheme: light)");
+      assert.equal(ctrl.currentTheme(), "dark");
+      assert.equal(ctrl.isHostExplicit(), false);
+      assert.equal(env.document.documentElement.dataset.theme, "dark");
+      assert.equal(env.document.documentElement.style.colorScheme, "dark");
+      assert.equal(root.getAttribute("data-theme"), "dark");
+      assert.equal(mql.listenerCount(), 1);
+
+      // Live OS flip: dark -> light -> dark
+      mql.emit(true);
+      assert.equal(ctrl.currentTheme(), "light");
+      assert.equal(env.document.documentElement.dataset.theme, "light");
+      assert.equal(env.document.documentElement.style.colorScheme, "light");
+      assert.equal(root.getAttribute("data-theme"), "light");
+
+      mql.emit(false);
+      assert.equal(ctrl.currentTheme(), "dark");
+      assert.equal(root.getAttribute("data-theme"), "dark");
+
+      // Explicit host theme-change locks precedence over subsequent OS flips
+      ctrl.applyHostTheme("dark");
+      assert.equal(ctrl.isHostExplicit(), true);
+      mql.emit(true);
+      assert.equal(ctrl.currentTheme(), "dark");
+      assert.equal(env.document.documentElement.dataset.theme, "dark");
+
+      // Subsequent explicit host change still applies
+      ctrl.applyHostTheme("light");
+      assert.equal(ctrl.currentTheme(), "light");
+      assert.equal(env.document.documentElement.style.colorScheme, "light");
+      assert.equal(root.getAttribute("data-theme"), "light");
+
+      // destroy() removes listener cleanly
+      ctrl.destroy();
+      assert.equal(mql.listenerCount(), 0);
+      mql.emit(false);
+      assert.equal(ctrl.currentTheme(), "light");
+    } finally {
+      env.teardown();
+    }
+  });
+
+  it("handles initial OS light preference and missing matchMedia gracefully", () => {
+    const env = installFakeDom();
+    try {
+      const root = env.document.createElement("div");
+      const lightMql = createMockMql(true);
+      const ctrl1 = createThemeController(
+        env.document.documentElement as unknown as HTMLElement,
+        root as unknown as HTMLElement,
+        () => lightMql,
+      );
+      assert.equal(ctrl1.currentTheme(), "light");
+      assert.equal(env.document.documentElement.dataset.theme, "light");
+      ctrl1.destroy();
+
+      const ctrl2 = createThemeController(
+        env.document.documentElement as unknown as HTMLElement,
+        root as unknown as HTMLElement,
+        null,
+      );
+      assert.equal(ctrl2.currentTheme(), "dark");
+      ctrl2.applyHostTheme("light");
+      assert.equal(ctrl2.currentTheme(), "light");
+      ctrl2.destroy();
+    } finally {
+      env.teardown();
+    }
   });
 });
 

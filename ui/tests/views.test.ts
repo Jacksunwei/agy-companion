@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { buildBannerNode, computeBannerSignature } from "../src/banners.ts";
-import { createBrandMarkSvg, createTooltipController } from "../src/dom.ts";
+import {
+  createBrandMarkSvg,
+  createToastController,
+  createTooltipController,
+} from "../src/dom.ts";
 import { createFooterController } from "../src/footer.ts";
 import { buildMonitorView, computeMonitorSignature } from "../src/monitor.ts";
 import { createSettingsView, formatCodexStatusBadge } from "../src/settings.ts";
@@ -620,6 +624,7 @@ describe("createFooterController health-only popover, RAM indicator & interactio
   });
 
   it("supports trigger click toggle, outside-click dismissal, inside-click retention, hover & closePopover/destroy", () => {
+    assert.equal("popover" in HTMLElement.prototype, false);
     const container = env.document.createElement("div");
     const outside = env.document.createElement("div");
     env.document.body.append(container, outside);
@@ -629,6 +634,7 @@ describe("createFooterController health-only popover, RAM indicator & interactio
     const trigger = (ctrl.footer as unknown as FakeElement).querySelector(".status-trigger")!;
     const popover = ctrl.popover as unknown as FakeElement;
 
+    assert.equal(popover.getAttribute("popover"), "auto");
     assert.equal(ctrl.isPopoverOpen(), false);
     assert.equal(popover.hidden, true);
 
@@ -662,6 +668,146 @@ describe("createFooterController health-only popover, RAM indicator & interactio
     assert.equal(ctrl.isPopoverOpen(), false);
 
     ctrl.destroy();
+    assert.equal(container.children.length, 0);
+  });
+
+  it("uses native Popover API (popover=auto, popovertarget, toggle sync) when supported without setting hidden=true", () => {
+    env.enableNativePopover();
+    assert.equal("popover" in HTMLElement.prototype, true);
+
+    const container = env.document.createElement("div");
+    env.document.body.append(container);
+
+    const ctrl = createFooterController(container as unknown as HTMLElement);
+    ctrl.update(makeState());
+    const trigger = (ctrl.footer as unknown as FakeElement).querySelector(".status-trigger")!;
+    const popover = ctrl.popover as unknown as FakeElement;
+
+    assert.equal(popover.getAttribute("popover"), "auto");
+    assert.equal(trigger.getAttribute("popovertarget"), "status-popover");
+    assert.equal(popover.hidden, false, "Native popover must NOT set hidden=true");
+    assert.equal(ctrl.isPopoverOpen(), false);
+    assert.equal(popover.matches(":popover-open"), false);
+    assert.equal(trigger.getAttribute("aria-expanded"), "false");
+
+    // Simulated pointer sequence (mouseenter -> mousedown -> focus -> click) opens cleanly without double-toggling
+    trigger.dispatchEvent(new FakeEvent("mouseenter", { bubbles: false }));
+    trigger.dispatchEvent(new FakeEvent("mousedown", { bubbles: true }));
+    trigger.focus();
+    trigger.click();
+    assert.equal(popover.matches(":popover-open"), true);
+    assert.equal(ctrl.isPopoverOpen(), true);
+    assert.equal(trigger.getAttribute("aria-expanded"), "true");
+
+    // Second click on trigger immediately toggles closed via popovertarget
+    trigger.dispatchEvent(new FakeEvent("mousedown", { bubbles: true }));
+    trigger.click();
+    assert.equal(popover.matches(":popover-open"), false);
+    assert.equal(ctrl.isPopoverOpen(), false);
+    assert.equal(trigger.getAttribute("aria-expanded"), "false");
+
+    // Third click on trigger while hovered re-opens via popovertarget
+    trigger.dispatchEvent(new FakeEvent("mousedown", { bubbles: true }));
+    trigger.click();
+    assert.equal(popover.matches(":popover-open"), true);
+    assert.equal(trigger.getAttribute("aria-expanded"), "true");
+    ctrl.closePopover();
+
+    // Hover opens via showPopover(), native light-dismiss (hidePopover) syncs aria-expanded via toggle event
+    trigger.dispatchEvent(new FakeEvent("mouseleave", { bubbles: false }));
+    trigger.dispatchEvent(new FakeEvent("mouseenter", { bubbles: false }));
+    assert.equal(popover.matches(":popover-open"), true);
+    assert.equal(trigger.getAttribute("aria-expanded"), "true");
+
+    (popover as unknown as { hidePopover: () => void }).hidePopover();
+    assert.equal(ctrl.isPopoverOpen(), false);
+    assert.equal(popover.matches(":popover-open"), false);
+    assert.equal(trigger.getAttribute("aria-expanded"), "false");
+
+    // Hover open -> mouseleave timer closes via hidePopover()
+    trigger.dispatchEvent(new FakeEvent("mouseenter", { bubbles: false }));
+    assert.equal(ctrl.isPopoverOpen(), true);
+    trigger.dispatchEvent(new FakeEvent("mouseleave", { bubbles: false }));
+    env.flushTimers();
+    assert.equal(ctrl.isPopoverOpen(), false);
+    assert.equal(trigger.getAttribute("aria-expanded"), "false");
+
+    // closePopover() and destroy() clean up without throwing
+    trigger.click();
+    assert.equal(ctrl.isPopoverOpen(), true);
+    ctrl.closePopover();
+    assert.equal(ctrl.isPopoverOpen(), false);
+
+    ctrl.destroy();
+    assert.equal(container.children.length, 0);
+  });
+});
+
+describe("createToastController fallback & native popover=manual paths", () => {
+  it("toggles hidden on fallback path, resets timer on rapid re-show, and cleans up on destroy", () => {
+    assert.equal("popover" in HTMLElement.prototype, false);
+    const container = env.document.createElement("div");
+    env.document.body.append(container);
+
+    const toast = createToastController(container as unknown as HTMLElement);
+    const el = toast.element as unknown as FakeElement;
+    assert.equal(el.getAttribute("popover"), "manual");
+    assert.equal(el.getAttribute("role"), "status");
+    assert.equal(el.hidden, true);
+    assert.equal(toast.isOpen(), false);
+
+    let hiddenCount = 0;
+    toast.show("Copied", 1000, () => {
+      hiddenCount += 1;
+    });
+    assert.equal(el.textContent, "Copied");
+    assert.equal(el.hidden, false);
+    assert.equal(toast.isOpen(), true);
+    assert.equal(env.pendingTimerCount(), 1);
+
+    toast.show("Updated", 1000, () => {
+      hiddenCount += 1;
+    });
+    assert.equal(el.textContent, "Updated");
+    assert.equal(env.pendingTimerCount(), 1);
+
+    env.flushTimers();
+    assert.equal(el.hidden, true);
+    assert.equal(toast.isOpen(), false);
+    assert.equal(hiddenCount, 1);
+
+    toast.show("Closing");
+    toast.destroy();
+    assert.equal(env.pendingTimerCount(), 0);
+    assert.equal(container.children.length, 0);
+  });
+
+  it("uses native showPopover()/hidePopover() with popover=manual and hidden=false when supported", () => {
+    env.enableNativePopover();
+    const container = env.document.createElement("div");
+    env.document.body.append(container);
+
+    const toast = createToastController(container as unknown as HTMLElement);
+    const el = toast.element as unknown as FakeElement;
+    assert.equal(el.getAttribute("popover"), "manual");
+    assert.equal(el.getAttribute("role"), "status");
+    assert.equal(el.hidden, false, "Native popover=manual toast must NOT set hidden=true");
+    assert.equal(toast.isOpen(), false);
+    assert.equal(el.matches(":popover-open"), false);
+
+    toast.show("Saved", 2000);
+    assert.equal(el.textContent, "Saved");
+    assert.equal(el.matches(":popover-open"), true);
+    assert.equal(toast.isOpen(), true);
+
+    env.flushTimers();
+    assert.equal(el.matches(":popover-open"), false);
+    assert.equal(toast.isOpen(), false);
+
+    toast.show("Still open");
+    assert.equal(el.matches(":popover-open"), true);
+    toast.destroy();
+    assert.equal(el.matches(":popover-open"), false);
     assert.equal(container.children.length, 0);
   });
 });

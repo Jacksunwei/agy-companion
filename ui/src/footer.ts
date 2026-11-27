@@ -3,6 +3,7 @@ import {
   formatAccountPlanSummary,
   formatRamMb,
   quitReopenSentence,
+  supportsNativePopover,
 } from "./dom.ts";
 import { DEFAULT_CONFIG, type AppState } from "./types.ts";
 
@@ -23,6 +24,7 @@ export function createFooterController(container: HTMLElement): FooterController
   trigger.type = "button";
   trigger.setAttribute("aria-expanded", "false");
   trigger.setAttribute("aria-controls", "status-popover");
+  trigger.setAttribute("popovertarget", "status-popover");
 
   const statusDot = el("span", "sdot ok");
   const statusLabel = el("span", null, "Live");
@@ -37,9 +39,14 @@ export function createFooterController(container: HTMLElement): FooterController
   // Anchored upward health popover (strictly proxy health rows ONLY)
   const popover = el("div", "footer-popover pop-left");
   popover.id = "status-popover";
+  popover.setAttribute("popover", "auto");
   popover.setAttribute("role", "region");
   popover.setAttribute("aria-label", "Proxy health");
-  popover.hidden = true;
+
+  const supportsPopover = supportsNativePopover(popover);
+  if (!supportsPopover) {
+    popover.hidden = true;
+  }
 
   const popHdr = el("div", "pop-hdr");
   const popTitle = el("span", null, "Local proxy live");
@@ -70,6 +77,11 @@ export function createFooterController(container: HTMLElement): FooterController
   let hoverTimer: number | null = null;
   let hoverDismissed = false;
   let openedByMouseDown = false;
+  let pointerDownOnTrigger = false;
+  let openedByHoverAt = 0;
+
+  const isNativeOpen = (): boolean =>
+    typeof popover.matches === "function" ? popover.matches(":popover-open") : open;
 
   const cancelHoverTimer = () => {
     if (hoverTimer !== null) {
@@ -79,6 +91,27 @@ export function createFooterController(container: HTMLElement): FooterController
   };
 
   const setOpen = (next: boolean) => {
+    if (supportsPopover) {
+      const currentlyOpen = isNativeOpen();
+      if (next) {
+        if (!currentlyOpen) {
+          try {
+            popover.showPopover({ source: trigger });
+          } catch {
+            // Guard against disconnected node or unsupported invocation state
+          }
+        }
+      } else if (currentlyOpen) {
+        try {
+          popover.hidePopover();
+        } catch {
+          // Guard against disconnected node or unsupported invocation state
+        }
+      }
+      open = next;
+      trigger.setAttribute("aria-expanded", String(open));
+      return;
+    }
     open = next;
     popover.hidden = !open;
     trigger.setAttribute("aria-expanded", String(open));
@@ -86,19 +119,19 @@ export function createFooterController(container: HTMLElement): FooterController
 
   const openPopover = () => {
     cancelHoverTimer();
-    if (!open) setOpen(true);
+    if (!open || (supportsPopover && !isNativeOpen())) setOpen(true);
   };
 
   const closePopover = () => {
     cancelHoverTimer();
-    if (open) setOpen(false);
+    if (open || (supportsPopover && isNativeOpen())) setOpen(false);
   };
 
   const scheduleClose = () => {
     cancelHoverTimer();
     hoverTimer = window.setTimeout(() => {
       hoverTimer = null;
-      if (open) setOpen(false);
+      if (open || (supportsPopover && isNativeOpen())) setOpen(false);
     }, 160);
   };
 
@@ -108,29 +141,53 @@ export function createFooterController(container: HTMLElement): FooterController
       if (next === trigger || popover.contains(next)) return;
     }
     cancelHoverTimer();
-    if (open) setOpen(false);
+    if (open || (supportsPopover && isNativeOpen())) setOpen(false);
   };
 
   trigger.addEventListener("mouseenter", () => {
     if (hoverDismissed) return;
+    const wasOpen = supportsPopover ? isNativeOpen() : open;
     openPopover();
+    if (supportsPopover && !wasOpen) {
+      openedByHoverAt = Date.now();
+    }
   });
   trigger.addEventListener("mouseleave", () => {
+    pointerDownOnTrigger = false;
     if (hoverDismissed) hoverDismissed = false;
     scheduleClose();
   });
   trigger.addEventListener("mousedown", () => {
-    openedByMouseDown = !open;
+    if (supportsPopover) {
+      pointerDownOnTrigger = true;
+    } else {
+      openedByMouseDown = !open;
+    }
   });
   trigger.addEventListener("focus", () => {
+    if (supportsPopover && pointerDownOnTrigger) return;
     openPopover();
   });
   trigger.addEventListener("blur", (e) => {
+    pointerDownOnTrigger = false;
     handleBlur(e);
   });
   trigger.addEventListener("click", (e) => {
-    e.stopPropagation();
     cancelHoverTimer();
+    if (supportsPopover) {
+      pointerDownOnTrigger = false;
+      const currentlyOpen = isNativeOpen();
+      if (currentlyOpen && openedByHoverAt > 0 && Date.now() - openedByHoverAt < 250) {
+        openedByHoverAt = 0;
+        hoverDismissed = false;
+        e.preventDefault();
+        return;
+      }
+      openedByHoverAt = 0;
+      hoverDismissed = currentlyOpen;
+      return;
+    }
+    e.stopPropagation();
     if (openedByMouseDown) {
       openedByMouseDown = false;
       hoverDismissed = false;
@@ -150,6 +207,20 @@ export function createFooterController(container: HTMLElement): FooterController
   popover.addEventListener("mouseleave", scheduleClose);
   popover.addEventListener("focusout", (e) => handleBlur(e));
 
+  const onPopoverToggle = (e: Event) => {
+    const toggleEvent = e as ToggleEvent;
+    const nextOpen =
+      typeof toggleEvent.newState === "string"
+        ? toggleEvent.newState === "open"
+        : isNativeOpen();
+    open = nextOpen;
+    trigger.setAttribute("aria-expanded", String(open));
+    if (!open) {
+      openedByHoverAt = 0;
+      cancelHoverTimer();
+    }
+  };
+
   const onDocumentClick = (e: MouseEvent) => {
     if (!open) return;
     const target = e.target;
@@ -158,7 +229,12 @@ export function createFooterController(container: HTMLElement): FooterController
     }
     closePopover();
   };
-  document.addEventListener("click", onDocumentClick);
+
+  if (supportsPopover) {
+    popover.addEventListener("toggle", onPopoverToggle);
+  } else {
+    document.addEventListener("click", onDocumentClick);
+  }
 
   container.append(footer, popover);
 
@@ -279,7 +355,18 @@ export function createFooterController(container: HTMLElement): FooterController
 
   const destroy = () => {
     cancelHoverTimer();
-    document.removeEventListener("click", onDocumentClick);
+    if (supportsPopover) {
+      popover.removeEventListener("toggle", onPopoverToggle);
+      if (isNativeOpen()) {
+        try {
+          popover.hidePopover();
+        } catch {
+          // Ignore if already detached
+        }
+      }
+    } else {
+      document.removeEventListener("click", onDocumentClick);
+    }
     footer.remove();
     popover.remove();
   };
@@ -289,7 +376,7 @@ export function createFooterController(container: HTMLElement): FooterController
     popover,
     update,
     closePopover,
-    isPopoverOpen: () => open,
+    isPopoverOpen: () => (supportsPopover ? isNativeOpen() : open),
     destroy,
   };
 }
