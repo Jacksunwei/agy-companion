@@ -874,6 +874,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let snap: SettingsSnapshot = resp.json().await.expect("snapshot");
         assert!(snap.ls_telemetry_active);
+        assert_eq!(snap.last_catalog_refresh_at_ms, Some(1_700_000_000_000));
         let stats = snap.stats.expect("overlaid stats");
         assert_eq!(stats.usage.requests, 1);
         assert_eq!(stats.usage.prompt_tokens, 2000);

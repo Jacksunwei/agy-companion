@@ -140,6 +140,7 @@ export interface SettingsSnapshot {
   account_plan: AccountPlanStatus;
   proxy_rss_bytes: number | null;
   ls_telemetry_active: boolean;
+  last_catalog_refresh_at_ms: number | null;
 }
 
 export interface UsageBucket {
@@ -216,6 +217,11 @@ export interface InlineFeedback {
   text: string;
 }
 
+export interface CatalogRefreshReminder {
+  baselineCatalogRefreshAtMs: number | null;
+  changedAtMs: number;
+}
+
 export interface CuratedModelInfo {
   id: string;
   label: string;
@@ -252,12 +258,14 @@ export interface AppState {
   unhealthyStreak: number;
 
   apiKeyDraft: string;
+  geminiKeyEditOpen: boolean;
   clearConfirmOpen: boolean;
   disableProxyConfirmOpen: boolean;
   advOpen: boolean;
   keyFeedback: InlineFeedback | null;
   modelFeedback: InlineFeedback | null;
   advFeedback: InlineFeedback | null;
+  catalogRefreshReminder: CatalogRefreshReminder | null;
 
   codexBusy: boolean;
   codexTesting: boolean;
@@ -856,6 +864,7 @@ export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
   const topRss = asOptionalNullableNumber(raw.proxy_rss_bytes);
   const proxyRssBytes = topRss !== null ? topRss : (stats?.proxy_rss_bytes ?? null);
   const lsTelemetryActive = asBoolean(raw.ls_telemetry_active) ?? false;
+  const lastCatalogRefreshAtMs = asOptionalNullableNumber(raw.last_catalog_refresh_at_ms);
 
   return {
     config,
@@ -871,6 +880,7 @@ export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
     account_plan: accountPlan,
     proxy_rss_bytes: proxyRssBytes,
     ls_telemetry_active: lsTelemetryActive,
+    last_catalog_refresh_at_ms: lastCatalogRefreshAtMs,
   };
 }
 

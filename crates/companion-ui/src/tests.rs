@@ -478,6 +478,7 @@ async fn get_settings_detects_proxy_health_version_skew_stats_and_rss() {
     assert!(snap.proxy.reachable);
     assert!(snap.version_skew);
     assert_eq!(snap.proxy_rss_bytes, Some(26_214_400));
+    assert_eq!(snap.last_catalog_refresh_at_ms, Some(1_700_000_000_000));
     assert_eq!(snap.account_plan.mode, AccountPlanMode::Auto);
     assert_eq!(
         snap.account_plan.resolved,
@@ -533,6 +534,8 @@ async fn test_connection_handles_ok_invalid_key_missing_key_and_corrupt_config()
         .await
         .expect("ok payload");
     assert!(ok.ok);
+    assert_eq!(ok.message, "Connected \u{00b7} Google AI Studio");
+    assert!(!ok.message.contains("http://") && !ok.message.contains("https://"));
     assert!(!ok.message.contains(secret));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
@@ -854,6 +857,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         },
         proxy_rss_bytes: Some(25_165_824),
         ls_telemetry_active: false,
+        last_catalog_refresh_at_ms: Some(1_747_299_990_000),
     };
     let expected_active: Value =
         serde_json::from_str(ACTIVE_FIXTURE).expect("parse active fixture");
@@ -905,6 +909,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         account_plan: AccountPlanStatus::from_config_and_stats(&CloudCodeUpstream::Auto, None),
         proxy_rss_bytes: None,
         ls_telemetry_active: false,
+        last_catalog_refresh_at_ms: None,
     };
     let expected_day0: Value = serde_json::from_str(DAY0_FIXTURE).expect("parse day0 fixture");
     assert_eq!(
@@ -1036,9 +1041,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         include_str!("../../../ui/tests/fixtures/test_connection_ok.json");
     let test_conn = TestConnectionPayload {
         ok: true,
-        message:
-            "Connected to Gemini upstream (https://generativelanguage.googleapis.com) successfully."
-                .to_string(),
+        message: "Connected \u{00b7} Google AI Studio".to_string(),
     };
     let expected_conn: Value =
         serde_json::from_str(TEST_CONN_FIXTURE).expect("parse test_connection fixture");
@@ -1864,6 +1867,8 @@ async fn codex_oauth_lifecycle_and_test_connection_via_ui_server() {
         .await
         .expect("authed codex test");
     assert!(ok.ok, "expected ok, got: {}", ok.message);
+    assert_eq!(ok.message, "Connected \u{00b7} OpenAI Codex");
+    assert!(!ok.message.contains("http://") && !ok.message.contains("https://"));
     assert!(!ok.message.contains(&access_jwt));
     assert!(!ok.message.contains(refresh_secret));
     assert_eq!(codex_hits.load(Ordering::SeqCst), 1);

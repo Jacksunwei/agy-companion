@@ -120,5 +120,6 @@
     "resolved": null
   },
   "proxy_rss_bytes": null,
-  "ls_telemetry_active": false
+  "ls_telemetry_active": false,
+  "last_catalog_refresh_at_ms": null
 }

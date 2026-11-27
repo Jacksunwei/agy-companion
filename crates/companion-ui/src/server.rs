@@ -205,14 +205,13 @@ impl CompanionUiServer {
             stats.as_ref().map(|s| &s.cloudcode),
         );
         let proxy_rss_bytes = stats.as_ref().and_then(|s| s.proxy_rss_bytes);
+        let last_catalog_refresh_at_ms = stats
+            .as_ref()
+            .and_then(|s| s.cloudcode.last_catalog_refresh_at_ms);
 
         // Sidecar launcher scripts scrub CLOUD_CODE_URL to prevent self-looping, so a recorded
         // fetchAvailableModels refresh on our local proxy is authoritative proof of live Hybrid Mode.
-        if stats
-            .as_ref()
-            .and_then(|s| s.cloudcode.last_catalog_refresh_at_ms)
-            .is_some()
-        {
+        if last_catalog_refresh_at_ms.is_some() {
             launcher_integration.mark_hybrid_active();
         }
 
@@ -231,6 +230,7 @@ impl CompanionUiServer {
             account_plan,
             proxy_rss_bytes,
             ls_telemetry_active: false,
+            last_catalog_refresh_at_ms,
         }
     }
 }

@@ -189,5 +189,6 @@
     "resolved": "organization"
   },
   "proxy_rss_bytes": 25165824,
-  "ls_telemetry_active": false
+  "ls_telemetry_active": false,
+  "last_catalog_refresh_at_ms": 1747299990000
 }

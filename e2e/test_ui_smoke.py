@@ -57,6 +57,9 @@ def _make_snapshot(
     reachable: bool = True,
     rss_bytes: int | None = 25_165_824,
     error: str | None = None,
+    codex_authenticated: bool = False,
+    codex_plan_type: str | None = None,
+    codex_account_hint: str | None = None,
 ) -> dict[str, Any]:
     stats: dict[str, Any] | None = None
     if reachable:
@@ -148,9 +151,9 @@ def _make_snapshot(
                     "default_model": "gpt-6.2-sol",
                     "enabled_models": ["gpt-6.2-astra", "gpt-6.2-sol"],
                     "timeout_secs": 900,
-                    "authenticated": False,
-                    "account_hint": None,
-                    "plan_type": None,
+                    "authenticated": codex_authenticated,
+                    "account_hint": codex_account_hint,
+                    "plan_type": codex_plan_type,
                     "expires_at_ms": None,
                 },
             },
@@ -189,6 +192,7 @@ def _make_snapshot(
         "platform": "macos",
         "account_plan": {"mode": "auto", "resolved": "organization"},
         "proxy_rss_bytes": rss_bytes,
+        "last_catalog_refresh_at_ms": 1_747_299_990_000 if reachable else None,
     }
 
 
@@ -370,6 +374,12 @@ class TestUiSmoke(E2ETestCase):
                         if theme == "light" and tab_label == "Settings" and not checked_light_brand:
                             session.eval_app(
                                 """(() => {
+                                  const geminiCard = document.querySelector('[aria-label="Google AI Studio provider"]');
+                                  const replaceBtn = [...geminiCard.querySelectorAll('button')].find(
+                                    (b) => !b.hidden && (b.textContent || '').trim() === 'Replace'
+                                  );
+                                  if (!replaceBtn) throw new Error('Replace button missing on configured Google AI Studio card');
+                                  replaceBtn.click();
                                   const input = document.getElementById('gemini-api-key');
                                   input.value = 'test-smoke-draft-key';
                                   input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -379,7 +389,7 @@ class TestUiSmoke(E2ETestCase):
                             # Allow .btn's 120ms background transition to settle on --brand (#1558b0).
                             session.wait_for(
                                 """(() => {
-                                  const btn = document.querySelector('button.btn-primary');
+                                  const btn = document.querySelector('[aria-label="Google AI Studio provider"] button.btn-primary');
                                   return Boolean(btn && !btn.disabled && getComputedStyle(btn).backgroundColor === 'rgb(21, 88, 176)');
                                 })()""",
                                 timeout=3.0,
@@ -387,18 +397,23 @@ class TestUiSmoke(E2ETestCase):
                             brand_check = session.eval_app(
                                 f"""(() => {{
                                   {_OPAQUE_BG_HELPER_JS}
+                                  const geminiCard = document.querySelector('[aria-label="Google AI Studio provider"]');
                                   const rootBrand = getComputedStyle(document.documentElement)
                                     .getPropertyValue('--brand').trim();
-                                  const lnk = document.querySelector('button.lnk');
+                                  const lnk = geminiCard.querySelector('button.lnk');
                                   const lnkFg = lnk ? getComputedStyle(lnk).color : null;
                                   const lnkBg = lnk ? opaqueBg(lnk) : null;
                                   const input = document.getElementById('gemini-api-key');
-                                  const saveBtn = document.querySelector('button.btn-primary');
+                                  const saveBtn = geminiCard.querySelector('button.btn-primary');
                                   const btnDisabled = saveBtn.disabled;
                                   const btnFg = getComputedStyle(saveBtn).color;
                                   const btnBg = opaqueBg(saveBtn);
                                   input.value = '';
                                   input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                  const cancelBtn = [...geminiCard.querySelectorAll('.key-row button')].find(
+                                    (b) => !b.hidden && (b.textContent || '').trim() === 'Cancel'
+                                  );
+                                  if (cancelBtn) cancelBtn.click();
                                   return {{ rootBrand, lnkFg, lnkBg, btnDisabled, btnFg, btnBg }};
                                 }})()"""
                             )
@@ -416,6 +431,61 @@ class TestUiSmoke(E2ETestCase):
                             checked_light_brand = True
 
             self.assertTrue(checked_light_brand)
+
+            # Verify compact symmetric cards when BOTH Google AI Studio is configured and OpenAI Codex is signed in.
+            both_authed = _make_snapshot(
+                reachable=True,
+                rss_bytes=25_165_824,
+                codex_authenticated=True,
+                codex_plan_type="plus",
+                codex_account_hint="j***@gmail.com",
+            )
+            session.set_snapshot(both_authed)
+            session.wait_for(
+                """(() => {
+                  const codexCard = document.querySelector('[aria-label="OpenAI Codex provider"]');
+                  return Boolean(codexCard && /Plus.*j\\*\\*\\*@gmail\\.com/.test(codexCard.textContent || ''));
+                })()""",
+                timeout=5.0,
+            )
+            for width, height in ((360, 720), (460, 760), (760, 760)):
+                session.set_viewport(width, height)
+                for theme in ("dark", "light"):
+                    session.set_theme(theme)
+                    session._flush_frames()
+                    compact = session.eval_app(
+                        """(() => {
+                          const docEl = document.documentElement;
+                          const scroll = document.querySelector('.pane-scroll');
+                          const wrap = document.querySelector('.content-wrap');
+                          const geminiCard = document.querySelector('[aria-label="Google AI Studio provider"]');
+                          const codexCard = document.querySelector('[aria-label="OpenAI Codex provider"]');
+                          const visibleTexts = (root) => [...root.querySelectorAll('.prov-actions button')]
+                            .filter((b) => !b.hidden)
+                            .map((b) => (b.textContent || '').trim());
+                          const refreshBtns = [...document.querySelectorAll('button')].filter(
+                            (b) => !b.hidden && /refresh/i.test((b.textContent || '') + ' ' + (b.getAttribute('aria-label') || ''))
+                          ).length;
+                          return {
+                            docOverflow: docEl.scrollWidth - docEl.clientWidth,
+                            scrollOverflow: scroll ? scroll.scrollWidth - scroll.clientWidth : 0,
+                            wrapOverflow: wrap ? wrap.scrollWidth - wrap.clientWidth : 0,
+                            geminiActions: visibleTexts(geminiCard),
+                            codexActions: visibleTexts(codexCard),
+                            geminiKeyHidden: Boolean(geminiCard.querySelector('.key-row')?.hidden),
+                            refreshBtns,
+                          };
+                        })()"""
+                    )
+                    ctx = f"both_authed viewport={width}x{height} theme={theme}"
+                    self.assertLessEqual(compact["docOverflow"], 1, f"documentElement overflow ({ctx})")
+                    self.assertLessEqual(compact["scrollOverflow"], 1, f".pane-scroll overflow ({ctx})")
+                    self.assertLessEqual(compact["wrapOverflow"], 1, f".content-wrap overflow ({ctx})")
+                    self.assertEqual(compact["geminiActions"], ["Test", "Replace", "Clear"], ctx)
+                    self.assertEqual(compact["codexActions"], ["Test", "Sign out"], ctx)
+                    self.assertTrue(compact["geminiKeyHidden"], ctx)
+                    self.assertEqual(compact["refreshBtns"], 0, ctx)
+
             session.assert_no_console_errors()
 
     def test_ui_smoke_footer_health_popover_and_ram_telemetry(self) -> None:

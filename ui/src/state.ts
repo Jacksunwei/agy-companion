@@ -1,6 +1,7 @@
 import {
   CURATED_MODEL_CATALOG,
   type ActiveTab,
+  type CatalogRefreshReminder,
   type CuratedModelInfo,
   type SettingsSnapshot,
 } from "./types.ts";
@@ -8,6 +9,8 @@ import {
 export const HEALTHY_POLL_MS = 10_000;
 export const CODEX_PENDING_POLL_MS = 2_000;
 export const UNHEALTHY_BACKOFF_MS: ReadonlyArray<number> = [3_000, 5_000, 10_000];
+export const CATALOG_POLL_INTERVAL_MS = 300_000;
+const CATALOG_OVERDUE_GRACE_MS = 60_000;
 
 export function hasConfiguredByomProvider(snapshot: SettingsSnapshot): boolean {
   return (
@@ -91,4 +94,69 @@ export function needsSettingsAttention(snapshot: SettingsSnapshot | null): boole
     li?.state === "manual_required" ||
     li?.hybrid_active !== true
   );
+}
+
+export function createCatalogRefreshReminder(
+  prevSnap: SettingsSnapshot | null,
+  nextSnap: SettingsSnapshot,
+  nowMs: number,
+): CatalogRefreshReminder | null {
+  if (!nextSnap.proxy.reachable || nextSnap.launcher_integration?.hybrid_active !== true) {
+    return null;
+  }
+  const baselineCatalogRefreshAtMs =
+    nextSnap.last_catalog_refresh_at_ms ?? prevSnap?.last_catalog_refresh_at_ms ?? null;
+  return {
+    baselineCatalogRefreshAtMs,
+    changedAtMs: nowMs,
+  };
+}
+
+export function reconcileCatalogRefreshReminder(
+  reminder: CatalogRefreshReminder | null,
+  snap: SettingsSnapshot,
+): CatalogRefreshReminder | null {
+  if (reminder === null) return null;
+  if (!snap.proxy.reachable || snap.launcher_integration?.hybrid_active !== true) {
+    return null;
+  }
+  const current = snap.last_catalog_refresh_at_ms;
+  if (reminder.baselineCatalogRefreshAtMs !== null) {
+    if (current !== null && current > reminder.baselineCatalogRefreshAtMs) {
+      return null;
+    }
+  } else if (current !== null) {
+    return null;
+  }
+  return reminder;
+}
+
+export function formatCatalogRefreshWaitHint(
+  lastRefreshAtMs: number | null,
+  nowMs: number,
+): string {
+  if (
+    lastRefreshAtMs === null ||
+    !Number.isFinite(lastRefreshAtMs) ||
+    lastRefreshAtMs <= 0 ||
+    !Number.isFinite(nowMs)
+  ) {
+    return "up to ~5m";
+  }
+  const elapsed = nowMs - lastRefreshAtMs;
+  if (elapsed < 0) {
+    return "up to ~5m";
+  }
+  if (elapsed < CATALOG_POLL_INTERVAL_MS) {
+    const remaining = CATALOG_POLL_INTERVAL_MS - elapsed;
+    if (remaining <= 60_000) {
+      return "<1m";
+    }
+    const mins = Math.min(5, Math.max(1, Math.round(remaining / 60_000)));
+    return `~${mins}m`;
+  }
+  if (elapsed <= CATALOG_POLL_INTERVAL_MS + CATALOG_OVERDUE_GRACE_MS) {
+    return "<1m";
+  }
+  return "up to ~5m";
 }

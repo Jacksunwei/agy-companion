@@ -13,8 +13,10 @@ import { createSettingsView } from "./settings.ts";
 import {
   UNHEALTHY_BACKOFF_MS,
   chooseInitialTab,
+  createCatalogRefreshReminder,
   needsSettingsAttention,
   nextPollDelayMs,
+  reconcileCatalogRefreshReminder,
   shouldApplyRefresh,
   toggleEnabledModel,
 } from "./state.ts";
@@ -77,12 +79,14 @@ async function main(): Promise<void> {
     unhealthyStreak: 0,
 
     apiKeyDraft: "",
+    geminiKeyEditOpen: false,
     clearConfirmOpen: false,
     disableProxyConfirmOpen: false,
     advOpen: false,
     keyFeedback: null,
     modelFeedback: null,
     advFeedback: null,
+    catalogRefreshReminder: null,
 
     codexBusy: false,
     codexTesting: false,
@@ -191,6 +195,18 @@ async function main(): Promise<void> {
         state.apiKeyDraft = draft;
         settingsView.update(state);
       },
+      onOpenGeminiKeyEdit: () => {
+        state.geminiKeyEditOpen = true;
+        state.clearConfirmOpen = false;
+        settingsView.update(state);
+        settingsView.focusKeyInput();
+      },
+      onCancelGeminiKeyEdit: () => {
+        state.geminiKeyEditOpen = false;
+        state.apiKeyDraft = "";
+        settingsView.clearKeyInputDom();
+        settingsView.update(state);
+      },
       onSaveKey: () => {
         void handleSaveKey();
       },
@@ -199,6 +215,9 @@ async function main(): Promise<void> {
       },
       onToggleClearConfirm: () => {
         state.clearConfirmOpen = !state.clearConfirmOpen;
+        if (state.clearConfirmOpen) {
+          state.geminiKeyEditOpen = false;
+        }
         settingsView.update(state);
       },
       onCancelClear: () => {
@@ -327,6 +346,10 @@ async function main(): Promise<void> {
       onEnableProxy: () => {
         void handleSetLauncherIntegration(true);
       },
+      onDismissCatalogReminder: () => {
+        state.catalogRefreshReminder = null;
+        renderBanner();
+      },
       onToast: showToast,
     });
     if (node) {
@@ -392,17 +415,26 @@ async function main(): Promise<void> {
   }
 
   function applySnapshot(snap: SettingsSnapshot): void {
-    const wasCodexAuthed = state.snapshot?.config.providers.codex.authenticated === true;
+    const prevSnap = state.snapshot;
+    const wasCodexAuthed = prevSnap?.config.providers.codex.authenticated === true;
     const wasCodexPending =
-      state.snapshot?.codex_login_pending === true || state.codexAuthorizeUrl !== null;
+      prevSnap?.codex_login_pending === true || state.codexAuthorizeUrl !== null;
 
     state.snapshot = snap;
     state.loadError = null;
+    if (!snap.config.providers.gemini.api_key_configured) {
+      state.geminiKeyEditOpen = false;
+    }
     if (snap.proxy.reachable) {
       state.unhealthyStreak = 0;
     } else {
       state.unhealthyStreak = Math.min(state.unhealthyStreak + 1, UNHEALTHY_BACKOFF_MS.length);
     }
+
+    state.catalogRefreshReminder = reconcileCatalogRefreshReminder(
+      state.catalogRefreshReminder,
+      snap,
+    );
 
     if (!snap.codex_login_pending) {
       if (state.codexAuthorizeUrl !== null) {
@@ -412,7 +444,12 @@ async function main(): Promise<void> {
         settingsView.clearCodexManualInputDom();
       }
       if (!wasCodexAuthed && snap.config.providers.codex.authenticated && wasCodexPending) {
-        state.codexFeedback = { tone: "ok", text: "Signed in to OpenAI Codex" };
+        state.codexFeedback = { tone: "ok", text: "Signed in" };
+        state.catalogRefreshReminder = createCatalogRefreshReminder(
+          prevSnap,
+          snap,
+          Date.now(),
+        );
       }
     }
 
@@ -566,9 +603,15 @@ async function main(): Promise<void> {
     if (outcome.ok) {
       state.snapshotEpoch += 1;
       state.apiKeyDraft = "";
+      state.geminiKeyEditOpen = false;
       state.clearConfirmOpen = false;
       settingsView.clearKeyInputDom();
-      state.keyFeedback = { tone: "ok", text: "API key saved securely (masked)" };
+      state.keyFeedback = { tone: "ok", text: "Key saved" };
+      state.catalogRefreshReminder = createCatalogRefreshReminder(
+        state.snapshot,
+        outcome.data,
+        Date.now(),
+      );
       applySnapshot(outcome.data);
     } else {
       state.keyFeedback = { tone: "err", text: outcome.error };
@@ -599,8 +642,14 @@ async function main(): Promise<void> {
 
     if (outcome.ok) {
       state.snapshotEpoch += 1;
+      state.geminiKeyEditOpen = false;
       state.clearConfirmOpen = false;
-      state.keyFeedback = { tone: "warn", text: "API key cleared" };
+      state.keyFeedback = { tone: "warn", text: "Key cleared" };
+      state.catalogRefreshReminder = createCatalogRefreshReminder(
+        state.snapshot,
+        outcome.data,
+        Date.now(),
+      );
       applySnapshot(outcome.data);
     } else {
       state.keyFeedback = { tone: "err", text: outcome.error };
@@ -611,7 +660,7 @@ async function main(): Promise<void> {
   async function handleTestConnection(): Promise<void> {
     if (!state.connected || state.standalone || state.testing || isWriteInFlight()) return;
     state.testing = true;
-    state.keyFeedback = { tone: "info", text: "Testing Google AI Studio connection\u2026" };
+    state.keyFeedback = { tone: "info", text: "Testing connection\u2026" };
     settingsView.update(state);
 
     const outcome = await callTool("test_connection", {}, parseTestConnectionPayload);
@@ -663,6 +712,13 @@ async function main(): Promise<void> {
                 `Saved \u00b7 ${count} ${count === 1 ? "model" : "models"} active`,
             }
           : null;
+      if (outcome.data.config.providers.gemini.api_key_configured) {
+        state.catalogRefreshReminder = createCatalogRefreshReminder(
+          state.snapshot,
+          outcome.data,
+          Date.now(),
+        );
+      }
       applySnapshot(outcome.data);
     } else {
       state.modelFeedback = { tone: "err", text: outcome.error };
@@ -812,7 +868,12 @@ async function main(): Promise<void> {
       state.codexManualFallbackOpen = false;
       state.codexManualInputDraft = "";
       settingsView.clearCodexManualInputDom();
-      state.codexFeedback = { tone: "ok", text: "Signed in to OpenAI Codex" };
+      state.codexFeedback = { tone: "ok", text: "Signed in" };
+      state.catalogRefreshReminder = createCatalogRefreshReminder(
+        state.snapshot,
+        outcome.data,
+        Date.now(),
+      );
       applySnapshot(outcome.data);
       scheduleNextPoll();
     } else {
@@ -824,7 +885,7 @@ async function main(): Promise<void> {
   async function handleTestCodexConnection(): Promise<void> {
     if (!state.connected || state.standalone || state.codexTesting || isWriteInFlight()) return;
     state.codexTesting = true;
-    state.codexFeedback = { tone: "info", text: "Testing OpenAI Codex connection\u2026" };
+    state.codexFeedback = { tone: "info", text: "Testing connection\u2026" };
     settingsView.update(state);
 
     const outcome = await callTool(
@@ -862,7 +923,12 @@ async function main(): Promise<void> {
       state.codexManualFallbackOpen = false;
       state.codexManualInputDraft = "";
       settingsView.clearCodexManualInputDom();
-      state.codexFeedback = { tone: "warn", text: "Signed out of OpenAI Codex" };
+      state.codexFeedback = { tone: "warn", text: "Signed out" };
+      state.catalogRefreshReminder = createCatalogRefreshReminder(
+        state.snapshot,
+        outcome.data,
+        Date.now(),
+      );
       applySnapshot(outcome.data);
       scheduleNextPoll();
     } else {
@@ -906,6 +972,13 @@ async function main(): Promise<void> {
                 `Saved \u00b7 ${count} ${count === 1 ? "model" : "models"} active`,
             }
           : null;
+      if (outcome.data.config.providers.codex.authenticated) {
+        state.catalogRefreshReminder = createCatalogRefreshReminder(
+          state.snapshot,
+          outcome.data,
+          Date.now(),
+        );
+      }
       applySnapshot(outcome.data);
     } else {
       state.codexModelFeedback = { tone: "err", text: outcome.error };

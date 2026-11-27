@@ -9,6 +9,7 @@ export type IconKind =
   | "err"
   | "check"
   | "chev"
+  | "close"
   | "pulse"
   | "bars"
   | "gear";
@@ -85,6 +86,8 @@ export function createIcon(kind: IconKind): SVGElement {
     svg.append(svgEl("path", { d: "M3 8.5 L6.4 11.8 L13 4.5" }));
   } else if (kind === "chev") {
     svg.append(svgEl("path", { d: "M6 3.5 L10.5 8 L6 12.5" }));
+  } else if (kind === "close") {
+    svg.append(svgEl("path", { d: "M4.5 4.5 L11.5 11.5 M11.5 4.5 L4.5 11.5" }));
   } else if (kind === "pulse") {
     svg.append(svgEl("path", { d: "M1.5 8.5 H4.4 L6.2 3.2 L9.3 12.8 L11.4 8.5 H14.5" }));
   } else if (kind === "bars") {
@@ -199,6 +202,16 @@ export function quitReopenCapitalized(platform: HostPlatform): string {
     return 'Close Antigravity and launch it from the "Antigravity (Companion)" Start Menu shortcut';
   }
   return "Quit and reopen Antigravity";
+}
+
+export function formatCatalogRefreshCopy(
+  platform: HostPlatform,
+  waitHint: string,
+): string {
+  if (platform === "macos") {
+    return `Quit (\u2318Q) & reopen Antigravity, or wait ${waitHint} for the model list to update.`;
+  }
+  return `Quit & reopen Antigravity, or wait ${waitHint} for the model list to update.`;
 }
 
 export function formatAccountPlanSummary(plan: AccountPlanStatus): string {
