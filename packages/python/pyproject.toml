@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "agy-companion"
-version = "0.0.7"
+version = "0.0.8"
 description = "Bring your own models (BYOM) and track token usage and costs in Google Antigravity (agy) via a local Rust Gemini proxy sidecar and native Sidecar Web UI."
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"

@@ -82,6 +82,17 @@ fn codex_auth_options_from_env() -> Result<CodexAuthOptions, CliError> {
     Ok(opts)
 }
 
+#[cfg(unix)]
+fn exec_self_upgrade(target_exe: &std::path::Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = std::process::Command::new(target_exe);
+    cmd.args(std::env::args_os().skip(1));
+    #[cfg(debug_assertions)]
+    cmd.env_remove(TEST_HEALTH_VERSION_ENV);
+    cmd.exec()
+}
+
 struct AdoptUpgradeController {
     config_path: PathBuf,
     listen_port: u16,
@@ -96,6 +107,8 @@ struct AdoptUpgradeController {
     probe_cache: Arc<Mutex<BinaryVersionProbeCache>>,
     last_replace_attempt: Option<Instant>,
     replacement_children: Vec<std::process::Child>,
+    #[cfg(unix)]
+    pending_self_exec: Option<(String, PathBuf)>,
 }
 
 impl AdoptUpgradeController {
@@ -119,6 +132,8 @@ impl AdoptUpgradeController {
             probe_cache: Arc::new(Mutex::new(BinaryVersionProbeCache::new())),
             last_replace_attempt: None,
             replacement_children: Vec::new(),
+            #[cfg(unix)]
+            pending_self_exec: None,
         }
     }
 
@@ -142,7 +157,25 @@ impl AdoptUpgradeController {
         }
     }
 
-    async fn tick(&mut self, active_health_version: &str) {
+    async fn find_matching_exe(&self, desired_version: &str) -> Option<PathBuf> {
+        let plugin_dir = self.plugin_dir.clone();
+        let startup_exe = self.startup_exe.clone();
+        let desired_for_probe = desired_version.to_string();
+        let probe_cache = Arc::clone(&self.probe_cache);
+        tokio::task::spawn_blocking(move || {
+            let candidates =
+                collect_candidate_binaries(plugin_dir.as_deref(), startup_exe.as_deref());
+            probe_cache
+                .lock()
+                .ok()?
+                .find_matching_binary(&candidates, &desired_for_probe)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn tick(&mut self, active_health_version: &str) -> Option<PathBuf> {
         self.reap_children();
 
         let plugin_poll_due = self
@@ -179,23 +212,34 @@ impl AdoptUpgradeController {
             }
         }
 
-        let Some(desired_version) = resolve_desired_version(
+        let desired_version = resolve_desired_version(
             &self.cached_manifest,
             self.has_seen_valid_manifest,
             &self.running_version,
         )
-        .map(str::to_string) else {
-            return;
-        };
+        .map(str::to_string)?;
 
         if active_health_version == desired_version {
-            return;
+            #[cfg(unix)]
+            if desired_version != self.running_version {
+                if let Some((ref pending_ver, ref pending_exe)) = self.pending_self_exec
+                    && pending_ver == &desired_version
+                {
+                    return Some(pending_exe.clone());
+                }
+                if plugin_poll_due
+                    && let Some(target_exe) = self.find_matching_exe(&desired_version).await
+                {
+                    return Some(target_exe);
+                }
+            }
+            return None;
         }
         if self
             .last_replace_attempt
             .is_some_and(|last| last.elapsed() < ADOPT_REPLACE_COOLDOWN)
         {
-            return;
+            return None;
         }
 
         let target_exe = if desired_version == self.running_version {
@@ -204,28 +248,10 @@ impl AdoptUpgradeController {
                 .or_else(|| std::env::current_exe().ok())
         } else {
             if !plugin_poll_due {
-                return;
+                return None;
             }
-            let plugin_dir = self.plugin_dir.clone();
-            let startup_exe = self.startup_exe.clone();
-            let desired_for_probe = desired_version.clone();
-            let probe_cache = Arc::clone(&self.probe_cache);
-            tokio::task::spawn_blocking(move || {
-                let candidates =
-                    collect_candidate_binaries(plugin_dir.as_deref(), startup_exe.as_deref());
-                probe_cache
-                    .lock()
-                    .ok()?
-                    .find_matching_binary(&candidates, &desired_for_probe)
-            })
-            .await
-            .ok()
-            .flatten()
-        };
-
-        let Some(target_exe) = target_exe else {
-            return;
-        };
+            self.find_matching_exe(&desired_version).await
+        }?;
 
         let watch_pid = self.resolve_watch_pid().await;
         match spawn_detached_proxy_daemon_with_exe_configured(
@@ -247,6 +273,10 @@ impl AdoptUpgradeController {
                     ?watch_pid,
                     "detected proxy version mismatch; spawned detached replacement daemon"
                 );
+                #[cfg(unix)]
+                if desired_version != self.running_version {
+                    self.pending_self_exec = Some((desired_version, target_exe));
+                }
                 self.replacement_children.push(child);
                 self.last_replace_attempt = Some(Instant::now());
             }
@@ -261,6 +291,7 @@ impl AdoptUpgradeController {
                 self.last_replace_attempt = Some(Instant::now());
             }
         }
+        None
     }
 }
 
@@ -449,13 +480,14 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
             let _ = self.0.send(true);
         }
     }
-    let _sidecar_shutdown_guard = SidecarShutdownGuard(sidecar_shutdown_tx);
+    let sidecar_shutdown_guard = SidecarShutdownGuard(sidecar_shutdown_tx);
     let plugin_upgrade_shutdown_rx = sidecar_shutdown_rx.clone();
     let ls_collector = crate::ls_collector::spawn_ls_collector_from_env(
         Arc::clone(&sqlite_sink),
         sidecar_shutdown_rx.clone(),
     );
-    let _sidecar_ui_handle =
+    #[allow(unused_mut)]
+    let mut sidecar_ui_handle =
         if let Some(sidecar_cfg) = crate::sidecar_ui::SidecarUiConfig::from_env() {
             match crate::sidecar_ui::bind_and_spawn_sidecar_ui_with_auth_and_ls(
                 config_path.clone(),
@@ -565,8 +597,31 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
                         );
                         logged_adopt = true;
                     }
-                    if let Some(controller) = adopt_controller.as_mut() {
-                        controller.tick(&health.version).await;
+                    if let Some(controller) = adopt_controller.as_mut()
+                        && let Some(target_exe) = controller.tick(&health.version).await
+                    {
+                        #[cfg(unix)]
+                        {
+                            tracing::info!(
+                                running_version = %expected_version,
+                                active_version = %health.version,
+                                target_exe = %target_exe.display(),
+                                "bootstrap converged to upgraded version; self-execing upgraded sidecar binary"
+                            );
+                            drop(sidecar_shutdown_guard);
+                            if let Some(handle) = sidecar_ui_handle.take() {
+                                let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+                            }
+                            let err = exec_self_upgrade(&target_exe);
+                            tracing::warn!(
+                                error = %err,
+                                target_exe = %target_exe.display(),
+                                "self-exec of upgraded sidecar binary failed"
+                            );
+                            return Err(CliError::Io(err));
+                        }
+                        #[cfg(not(unix))]
+                        let _ = target_exe;
                     }
                     tokio::select! {
                         _ = &mut signal_shutdown_fut => {
@@ -602,6 +657,21 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
                         return Ok(());
                     }
                     Some(stale_health) => {
+                        if let Some(ref state) = prebuilt_state
+                            && let Ok(stale_stats) = probe
+                                .probe_stats(listen_port, Some(REPLACE_STALE_PROBE_TIMEOUT))
+                                .await
+                            && let Some(ts) = stale_stats.cloudcode.last_catalog_refresh_at_ms
+                        {
+                            state.stats().record_catalog_refresh(
+                                ts,
+                                stale_stats
+                                    .cloudcode
+                                    .last_catalog_included_proxy_models
+                                    .unwrap_or(false),
+                            );
+                        }
+
                         let pid_path = runtime_data_dir.join(PROXY_PID_FILENAME);
                         let mut signal_needed = true;
                         let mut immediate_health_recheck = false;
@@ -852,7 +922,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         .log_target
         .as_ref()
         .map(|target| target.attach(log_writer));
-    let _pid_guard = write_proxy_pid(
+    let pid_guard = write_proxy_pid(
         &runtime_data_dir.join(PROXY_PID_FILENAME),
         &ProxyPidInfo::for_current_process_with_version(
             bound_addr.port(),
@@ -947,13 +1017,23 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         }
     };
 
-    let _plugin_upgrade_watcher = if let Some(mut controller) = adopt_controller {
+    #[cfg(unix)]
+    let pending_active_exec: Arc<Mutex<Option<(String, PathBuf)>>> = Arc::new(Mutex::new(None));
+    let plugin_upgrade_watcher = if let Some(mut controller) = adopt_controller {
         let mut shutdown_rx = plugin_upgrade_shutdown_rx;
+        #[cfg(unix)]
+        let pending_exec_slot = Arc::clone(&pending_active_exec);
         Some(tokio::spawn(async move {
             let interval = controller.plugin_poll_interval;
             loop {
                 let active_version = controller.running_version.clone();
-                controller.tick(&active_version).await;
+                let _ = controller.tick(&active_version).await;
+                #[cfg(unix)]
+                if let Some(pending) = controller.pending_self_exec.clone()
+                    && let Ok(mut guard) = pending_exec_slot.lock()
+                {
+                    *guard = Some(pending);
+                }
                 tokio::select! {
                     _ = shutdown_rx.wait_for(|&stopped| stopped) => break,
                     _ = tokio::time::sleep(interval) => {}
@@ -965,5 +1045,52 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
     };
 
     companion_proxy::serve_on_listener(listener, state, graceful_shutdown).await?;
+    drop(pid_guard);
+    if let Some(watcher) = plugin_upgrade_watcher {
+        watcher.abort();
+    }
+
+    #[cfg(unix)]
+    if let Some((desired_version, target_exe)) =
+        pending_active_exec.lock().ok().and_then(|mut g| g.take())
+        && let Some(probe) = probe_client.as_ref()
+    {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut converged = false;
+        while Instant::now() < deadline {
+            if let Some(health) = probe
+                .probe_healthy_companion(listen_port, Some(REPLACE_STALE_PROBE_TIMEOUT))
+                .await
+                && health.version == desired_version
+            {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if converged {
+            tracing::info!(
+                running_version = %expected_version,
+                active_version = %desired_version,
+                target_exe = %target_exe.display(),
+                "active-listener handoff converged; self-execing upgraded sidecar binary"
+            );
+            drop(sidecar_shutdown_guard);
+            if let Some(handle) = sidecar_ui_handle.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            }
+            let err = exec_self_upgrade(&target_exe);
+            tracing::warn!(
+                error = %err,
+                target_exe = %target_exe.display(),
+                "self-exec of upgraded sidecar binary failed"
+            );
+            return Err(CliError::Io(err));
+        }
+    }
+
+    #[cfg(not(unix))]
+    drop(sidecar_shutdown_guard);
+
     Ok(())
 }
