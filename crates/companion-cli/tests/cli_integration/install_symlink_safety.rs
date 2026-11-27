@@ -503,6 +503,8 @@ mod symlink_matrix {
             "config",
             "auth_dir",
             "auth_gemini",
+            "auth_codex",
+            "auth_codex_lock",
             "usage_dir",
             "proxy_pid",
             "proxy_log",
@@ -541,6 +543,18 @@ mod symlink_matrix {
                         symlink(&victim, auth_dir.join("gemini.json"))
                             .expect("symlink auth/gemini.json");
                     }
+                    "auth_codex" => {
+                        let auth_dir = temp.path().join("auth");
+                        fs::create_dir_all(&auth_dir).expect("mkdir auth");
+                        symlink(&victim, auth_dir.join("codex.json"))
+                            .expect("symlink auth/codex.json");
+                    }
+                    "auth_codex_lock" => {
+                        let auth_dir = temp.path().join("auth");
+                        fs::create_dir_all(&auth_dir).expect("mkdir auth");
+                        symlink(&victim, auth_dir.join(".codex-refresh.lock"))
+                            .expect("symlink auth/.codex-refresh.lock");
+                    }
                     "usage_dir" => {
                         let victim_dir = temp.path().join("victim_usage_dir");
                         let victim_dir_sentinel = victim_dir.join("DO_NOT_DELETE");
@@ -565,7 +579,12 @@ mod symlink_matrix {
             assert_victim_intact(&check_victim, case);
             if matches!(
                 case,
-                "auth_dir" | "auth_gemini" | "proxy_pid" | "proxy_log_rotated"
+                "auth_dir"
+                    | "auth_gemini"
+                    | "auth_codex"
+                    | "auth_codex_lock"
+                    | "proxy_pid"
+                    | "proxy_log_rotated"
             ) {
                 assert!(
                     !runtime_dir.join("proxy.log").exists(),
@@ -709,16 +728,19 @@ mod symlink_matrix {
         let victim_auth_file = victim_dir.join("gemini.json");
         write_victim(&victim_auth_file);
 
-        for case in ["sym_auth_dir", "sym_auth_file"] {
+        for case in ["sym_auth_dir", "sym_auth_file", "sym_auth_codex"] {
             let root = temp.path().join(case);
             let cfg_path = root.join("config.json");
             config_with_port(port).save_secure(&cfg_path).unwrap();
             let auth_dir = root.join("auth");
             if case == "sym_auth_dir" {
                 symlink(&victim_dir, &auth_dir).expect("sym auth dir");
-            } else {
+            } else if case == "sym_auth_file" {
                 fs::create_dir_all(&auth_dir).expect("mkdir auth");
                 symlink(&victim_auth_file, auth_dir.join("gemini.json")).expect("sym auth file");
+            } else {
+                fs::create_dir_all(&auth_dir).expect("mkdir auth");
+                symlink(&victim_auth_file, auth_dir.join("codex.json")).expect("sym auth codex");
             }
             let out = isolated_cli_command(&home)
                 .args(["doctor", "--config"])

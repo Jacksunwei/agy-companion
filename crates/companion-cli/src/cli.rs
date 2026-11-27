@@ -396,4 +396,10 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn rejects_nonexistent_auth_codex_cli_subcommand() {
+        assert!(Cli::try_parse_from(["agy-companion", "auth", "codex"]).is_err());
+        assert!(Cli::try_parse_from(["agy-companion", "auth"]).is_err());
+    }
 }

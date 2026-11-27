@@ -11,18 +11,20 @@ pub mod usage;
 pub mod validation;
 
 pub use auth::{
-    AUTH_DIR_NAME, AUTH_SCHEMA_VERSION, AuthStore, FileAuthStore, GEMINI_AUTH_FILENAME,
-    GeminiCredentials, MAX_AUTH_FILE_BYTES, MemoryAuthStore, SecretString,
+    AUTH_DIR_NAME, AUTH_SCHEMA_VERSION, AuthStore, CODEX_AUTH_FILENAME,
+    CODEX_REFRESH_LOCK_FILENAME, CodexAuthMode, CodexCredentials, CodexRefreshLock, FileAuthStore,
+    GEMINI_AUTH_FILENAME, GeminiCredentials, MAX_AUTH_FILE_BYTES, MemoryAuthStore, SecretString,
     auth_dir_for_config_path, inspect_auth_file_stamp, read_verified_auth_bytes_for_stamp,
 };
 pub use config::{
     ApiKeyPatch, CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CONFIG_PATH_ENV_VAR,
-    CURRENT_SCHEMA_VERSION, CloudCodeConfig, CloudCodeConfigPatch, CloudCodeUpstream, Config,
-    ConfigPatch, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL, DEFAULT_GEMINI_BASE_URL,
-    DEFAULT_LISTEN_HOST, DEFAULT_LISTEN_PORT, DEFAULT_LISTEN_PORT_NONZERO, DEFAULT_TIMEOUT_SECS,
-    GeminiConfig, GeminiConfigPatch, LoopbackHost, MAX_CONFIG_FILE_BYTES, ProvidersConfig,
-    ProvidersConfigPatch, ProxyConfig, ProxyConfigPatch, default_config_path, default_data_dir,
-    default_plugins_dir, default_usage_dir,
+    CURRENT_SCHEMA_VERSION, CloudCodeConfig, CloudCodeConfigPatch, CloudCodeUpstream, CodexConfig,
+    CodexConfigPatch, Config, ConfigPatch, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL,
+    DEFAULT_CODEX_BASE_URL, DEFAULT_GEMINI_BASE_URL, DEFAULT_LISTEN_HOST, DEFAULT_LISTEN_PORT,
+    DEFAULT_LISTEN_PORT_NONZERO, DEFAULT_TIMEOUT_SECS, GeminiConfig, GeminiConfigPatch,
+    LoopbackHost, MAX_CONFIG_FILE_BYTES, ProvidersConfig, ProvidersConfigPatch, ProxyConfig,
+    ProxyConfigPatch, default_config_path, default_data_dir, default_plugins_dir,
+    default_usage_dir,
 };
 pub use fs_safe::{
     AtomicWriteOptions, BoundedReadResult, DirChainStatus, FileStamp, FsError, OpenRegularMode,
@@ -39,10 +41,14 @@ pub use integration::{
     status_with_hybrid_active,
 };
 pub use models::{
-    CURATED_GEMINI_MODELS, CuratedGeminiModel, DEFAULT_ENABLED_GEMINI_MODELS, DEFAULT_GEMINI_MODEL,
-    MAX_GEMINI_MODEL_LEN, ModelPreset, curated_model_presets, default_enabled_gemini_models,
+    CURATED_CODEX_MODELS, CURATED_GEMINI_MODELS, CuratedCodexModel, CuratedGeminiModel,
+    DEFAULT_CODEX_MODEL, DEFAULT_ENABLED_CODEX_MODELS, DEFAULT_ENABLED_GEMINI_MODELS,
+    DEFAULT_GEMINI_MODEL, MAX_CODEX_MODEL_LEN, MAX_GEMINI_MODEL_LEN, ModelPreset,
+    curated_codex_model_presets, curated_model_presets, default_enabled_codex_models,
+    default_enabled_gemini_models, find_curated_codex_model, is_codex_model,
     is_discoverable_chat_model, is_supported_gemini_model, model_capability_sort_key,
-    normalize_enabled_gemini_models, parse_gemini_version_pair, validate_gemini_model,
+    normalize_enabled_codex_models, normalize_enabled_gemini_models, parse_gemini_version_pair,
+    validate_codex_model, validate_gemini_model,
 };
 pub use protocol::{
     CloudCodeStatsSnapshot, CloudCodeStatus, HealthResponse, HostPlatform, MAX_RECENT_CALLS,
@@ -50,7 +56,8 @@ pub use protocol::{
     RecentCallSnapshot, StatsSnapshot, UsageStatsSnapshot,
 };
 pub use redaction::{
-    RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig, api_key_hint, mask_api_key,
+    RedactedCodexConfig, RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig,
+    api_key_hint, mask_account_id, mask_api_key,
 };
 pub use usage::{
     GeminiUsageMetadata, NoopUsageSink, USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION,

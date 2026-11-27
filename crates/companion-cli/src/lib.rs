@@ -133,27 +133,40 @@ pub fn precheck_existing_auth_dir(config_path: &Path) -> Result<(), CliError> {
         Err(err) => return Err(CliError::from(err)),
     }
 
-    let gemini_auth = auth_dir.join(companion_core::GEMINI_AUTH_FILENAME);
-    match fs_safe::inspect_regular_file_if_exists(
-        &gemini_auth,
-        Some(companion_core::MAX_AUTH_FILE_BYTES),
-    ) {
-        Ok(None) | Ok(Some(_)) => Ok(()),
-        Err(FsError::SymlinkRejected { .. }) => Err(CliError::InvalidAuthPath {
-            path: gemini_auth,
-            reason: "symbolic links are not allowed for auth files".to_string(),
-        }),
-        Err(FsError::NotRegularFile { .. }) => Err(CliError::InvalidAuthPath {
-            path: gemini_auth,
-            reason: "auth file path must be a regular file".to_string(),
-        }),
-        Err(FsError::SizeLimitExceeded { max_bytes, .. }) => Err(CliError::InvalidAuthPath {
-            path: gemini_auth,
-            reason: format!("auth file exceeds maximum allowed size of {max_bytes} bytes"),
-        }),
-        Err(FsError::Io { source, .. }) => Err(CliError::Io(source)),
-        Err(err) => Err(CliError::from(err)),
+    for filename in [
+        companion_core::GEMINI_AUTH_FILENAME,
+        companion_core::CODEX_AUTH_FILENAME,
+        companion_core::CODEX_REFRESH_LOCK_FILENAME,
+    ] {
+        let candidate = auth_dir.join(filename);
+        match fs_safe::inspect_regular_file_if_exists(
+            &candidate,
+            Some(companion_core::MAX_AUTH_FILE_BYTES),
+        ) {
+            Ok(None) | Ok(Some(_)) => {}
+            Err(FsError::SymlinkRejected { .. }) => {
+                return Err(CliError::InvalidAuthPath {
+                    path: candidate,
+                    reason: "symbolic links are not allowed for auth files".to_string(),
+                });
+            }
+            Err(FsError::NotRegularFile { .. }) => {
+                return Err(CliError::InvalidAuthPath {
+                    path: candidate,
+                    reason: "auth file path must be a regular file".to_string(),
+                });
+            }
+            Err(FsError::SizeLimitExceeded { max_bytes, .. }) => {
+                return Err(CliError::InvalidAuthPath {
+                    path: candidate,
+                    reason: format!("auth file exceeds maximum allowed size of {max_bytes} bytes"),
+                });
+            }
+            Err(FsError::Io { source, .. }) => return Err(CliError::Io(source)),
+            Err(err) => return Err(CliError::from(err)),
+        }
     }
+    Ok(())
 }
 
 pub fn load_config_checked(path: &Path) -> Result<Config, CliError> {

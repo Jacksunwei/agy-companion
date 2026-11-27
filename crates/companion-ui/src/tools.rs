@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use companion_core::{ApiKey, Config, CoreError, GeminiCredentials, UsageRange, UsageSummary};
+use companion_core::{
+    ApiKey, CodexCredentials, Config, CoreError, GeminiCredentials, UsageRange, UsageSummary,
+};
 use companion_providers::{GeminiProvider, ProviderAdapter};
 
 use crate::server::CompanionUiServer;
@@ -14,9 +16,15 @@ impl CompanionUiServer {
         &self,
         conversation_id: Option<&str>,
     ) -> Result<SettingsSnapshot, String> {
-        let (cfg, gemini_creds) = self.load_config_and_auth_blocking().await?;
+        let (cfg, gemini_creds, codex_creds) = self.load_config_and_auth_blocking().await?;
         Ok(self
-            .build_snapshot_with_session(&cfg, gemini_creds.as_ref(), None, conversation_id)
+            .build_snapshot_with_session(
+                &cfg,
+                gemini_creds.as_ref(),
+                codex_creds.as_ref(),
+                None,
+                conversation_id,
+            )
             .await)
     }
 
@@ -44,11 +52,14 @@ impl CompanionUiServer {
         let config_path = self.config_path.clone();
         let auth_store = Arc::clone(&self.auth_store);
         let save_outcome = tokio::task::spawn_blocking(
-            move || -> Result<(Config, Option<GeminiCredentials>), String> {
+            move || -> Result<(Config, Option<GeminiCredentials>, Option<CodexCredentials>), String> {
                 let mut cfg =
                     Config::load_or_default(&config_path).map_err(|err| err.to_string())?;
                 cfg.apply_patch(config_patch)
                     .map_err(|err| err.to_string())?;
+                // Validate codex auth file upfront before mutating disk so corrupt/symlinked
+                // auth/codex.json fails closed atomically.
+                let codex_creds = auth_store.load_codex().map_err(|err| err.to_string())?;
 
                 let prev_creds: Option<Option<GeminiCredentials>> =
                     if has_config_changes && key_op.is_some() {
@@ -84,21 +95,27 @@ impl CompanionUiServer {
                     }
                     return Err(err.to_string());
                 }
-                Ok((cfg, gemini_creds))
+                Ok((cfg, gemini_creds, codex_creds))
             },
         )
         .await
         .map_err(|err| format!("save_settings task failed: {err}"))?;
         drop(write_guard);
 
-        let (cfg, gemini_creds) = save_outcome?;
+        let (cfg, gemini_creds, codex_creds) = save_outcome?;
         Ok(self
-            .build_snapshot_with_session(&cfg, gemini_creds.as_ref(), None, conversation_id)
+            .build_snapshot_with_session(
+                &cfg,
+                gemini_creds.as_ref(),
+                codex_creds.as_ref(),
+                None,
+                conversation_id,
+            )
             .await)
     }
 
     pub async fn test_connection_payload(&self) -> Result<TestConnectionPayload, String> {
-        let (cfg, gemini_creds) = self.load_config_and_auth_blocking().await?;
+        let (cfg, gemini_creds, _codex_creds) = self.load_config_and_auth_blocking().await?;
 
         let timeout = self
             .options
@@ -157,11 +174,12 @@ impl CompanionUiServer {
         opts.follow_rc_symlink = false;
         let hybrid_override = self.options.hybrid_active_override;
         let outcome = tokio::task::spawn_blocking(
-            move || -> Result<(Config, Option<GeminiCredentials>, _), CoreError> {
+            move || -> Result<(Config, Option<GeminiCredentials>, Option<CodexCredentials>, _), CoreError> {
                 // Fail closed on corrupt/symlinked config on ALL platforms (including Windows where
                 // enable_and_persist / disable_and_persist return Unsupported before reading config).
                 let _ = Config::load_or_default(&config_path)?;
                 let gemini_creds = auth_store.load_gemini()?;
+                let codex_creds = auth_store.load_codex()?;
                 let status = if enabled {
                     companion_core::integration::enable_and_persist_with_hybrid_active(
                         &config_path,
@@ -176,7 +194,7 @@ impl CompanionUiServer {
                     )?
                 };
                 let updated_cfg = Config::load_or_default(&config_path)?;
-                Ok((updated_cfg, gemini_creds, status))
+                Ok((updated_cfg, gemini_creds, codex_creds, status))
             },
         )
         .await
@@ -184,9 +202,15 @@ impl CompanionUiServer {
         drop(config_guard);
         drop(integration_guard);
 
-        let (cfg, gemini_creds, status) = outcome.map_err(|err| err.to_string())?;
+        let (cfg, gemini_creds, codex_creds, status) = outcome.map_err(|err| err.to_string())?;
         Ok(self
-            .build_snapshot_with_session(&cfg, gemini_creds.as_ref(), Some(status), conversation_id)
+            .build_snapshot_with_session(
+                &cfg,
+                gemini_creds.as_ref(),
+                codex_creds.as_ref(),
+                Some(status),
+                conversation_id,
+            )
             .await)
     }
 

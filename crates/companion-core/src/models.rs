@@ -230,6 +230,152 @@ pub fn is_discoverable_chat_model(model_id: &str) -> bool {
     !NON_CHAT_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-6.2-sol";
+pub const MAX_CODEX_MODEL_LEN: usize = 128;
+
+/// Default enabled OpenAI Codex models injected into Antigravity's model picker (8/32 placeholder slots).
+pub const DEFAULT_ENABLED_CODEX_MODELS: &[&str] = &["gpt-6.2-astra", "gpt-6.2-sol"];
+
+pub fn default_enabled_codex_models() -> Vec<String> {
+    DEFAULT_ENABLED_CODEX_MODELS
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CuratedCodexModel {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub short_label: &'static str,
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+    pub reasoning_efforts: &'static [&'static str],
+    pub default_enabled: bool,
+}
+
+/// Canonical capability-ordered curated GPT-6.x Codex catalog (matches native Antigravity picker & UI pills).
+pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
+    CuratedCodexModel {
+        id: "gpt-6.2-astra",
+        display_name: "GPT-6.2 Astra",
+        short_label: "6.2 Astra",
+        context_window: 272_000,
+        max_output_tokens: 128_000,
+        reasoning_efforts: &["low", "medium", "high", "xhigh"],
+        default_enabled: true,
+    },
+    CuratedCodexModel {
+        id: "gpt-6.2-sol",
+        display_name: "GPT-6.2 Sol",
+        short_label: "6.2 Sol",
+        context_window: 500_000,
+        max_output_tokens: 128_000,
+        reasoning_efforts: &["low", "medium", "high", "xhigh"],
+        default_enabled: true,
+    },
+    CuratedCodexModel {
+        id: "gpt-6.1-terra",
+        display_name: "GPT-6.1 Terra",
+        short_label: "6.1 Terra",
+        context_window: 500_000,
+        max_output_tokens: 128_000,
+        reasoning_efforts: &["low", "medium", "high"],
+        default_enabled: false,
+    },
+    CuratedCodexModel {
+        id: "gpt-6-luna",
+        display_name: "GPT-6 Luna",
+        short_label: "6 Luna",
+        context_window: 272_000,
+        max_output_tokens: 128_000,
+        reasoning_efforts: &["low", "medium", "high"],
+        default_enabled: false,
+    },
+];
+
+pub fn curated_codex_model_presets() -> Vec<ModelPreset> {
+    CURATED_CODEX_MODELS
+        .iter()
+        .map(|m| ModelPreset {
+            id: m.id.to_string(),
+            display_name: m.display_name.to_string(),
+            short_label: m.short_label.to_string(),
+        })
+        .collect()
+}
+
+pub fn find_curated_codex_model(id: &str) -> Option<&'static CuratedCodexModel> {
+    CURATED_CODEX_MODELS.iter().find(|m| m.id == id)
+}
+
+/// Validates an OpenAI Codex model identifier for strict ASCII slug safety and non-collision
+/// with Gemini model IDs.
+pub fn validate_codex_model(model: &str) -> Result<(), CoreError> {
+    if model.len() > MAX_CODEX_MODEL_LEN {
+        return Err(CoreError::InvalidModel {
+            reason: format!(
+                "codex model ID exceeds maximum length of {MAX_CODEX_MODEL_LEN} characters"
+            ),
+        });
+    }
+    let bytes = model.as_bytes();
+    if bytes.is_empty()
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'_' | b'-'))
+        || model.contains("..")
+    {
+        return Err(CoreError::InvalidModel {
+            reason:
+                "codex model ID must be non-empty ASCII matching [a-zA-Z0-9._-] starting with an alphanumeric character and free of '..'"
+                    .to_string(),
+        });
+    }
+    let lower = model.to_ascii_lowercase();
+    if lower == "gemini" || lower.starts_with("gemini-") || lower.starts_with("gemini.") {
+        return Err(CoreError::InvalidModel {
+            reason: "codex model ID must not collide with Gemini model prefixes".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Returns `true` when `model` is a valid Codex model ID suitable for proxy dispatch to OpenAI
+/// Codex (curated GPT-6.x model or `gpt-*` / `codex-*` slug).
+pub fn is_codex_model(model: &str) -> bool {
+    if validate_codex_model(model).is_err() {
+        return false;
+    }
+    if find_curated_codex_model(model).is_some() {
+        return true;
+    }
+    let lower = model.to_ascii_lowercase();
+    lower
+        .strip_prefix("gpt-")
+        .or_else(|| lower.strip_prefix("codex-"))
+        .is_some_and(|rest| {
+            rest.as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+        })
+}
+
+/// Validates every model ID in `models` via [`validate_codex_model`] and deduplicates entries
+/// while preserving first-seen order. An empty list is valid (non-destructive pause).
+pub fn normalize_enabled_codex_models(models: Vec<String>) -> Result<Vec<String>, CoreError> {
+    let mut seen = HashSet::with_capacity(models.len());
+    let mut normalized = Vec::with_capacity(models.len());
+    for model in models {
+        validate_codex_model(&model)?;
+        if seen.insert(model.clone()) {
+            normalized.push(model);
+        }
+    }
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +777,171 @@ mod tests {
             validate_gemini_model(&huge),
             Err(CoreError::InvalidModel { .. })
         ));
+    }
+
+    #[test]
+    fn curated_codex_catalog_order_labels_metadata_and_presets_roundtrip() {
+        assert_eq!(CURATED_CODEX_MODELS.len(), 4);
+        let ids: Vec<&str> = CURATED_CODEX_MODELS.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "gpt-6.2-astra",
+                "gpt-6.2-sol",
+                "gpt-6.1-terra",
+                "gpt-6-luna",
+            ]
+        );
+        let labels: Vec<&str> = CURATED_CODEX_MODELS.iter().map(|m| m.short_label).collect();
+        assert_eq!(labels, vec!["6.2 Astra", "6.2 Sol", "6.1 Terra", "6 Luna"]);
+        assert_eq!(DEFAULT_CODEX_MODEL, "gpt-6.2-sol");
+        assert_eq!(
+            DEFAULT_ENABLED_CODEX_MODELS,
+            &["gpt-6.2-astra", "gpt-6.2-sol"]
+        );
+        assert_eq!(
+            default_enabled_codex_models(),
+            vec!["gpt-6.2-astra".to_string(), "gpt-6.2-sol".to_string()]
+        );
+
+        let astra = find_curated_codex_model("gpt-6.2-astra").expect("astra");
+        assert_eq!(astra.context_window, 272_000);
+        assert_eq!(astra.max_output_tokens, 128_000);
+        assert_eq!(astra.reasoning_efforts, &["low", "medium", "high", "xhigh"]);
+        assert!(astra.default_enabled);
+
+        let sol = find_curated_codex_model("gpt-6.2-sol").expect("sol");
+        assert_eq!(sol.context_window, 500_000);
+        assert!(sol.default_enabled);
+
+        let terra = find_curated_codex_model("gpt-6.1-terra").expect("terra");
+        assert_eq!(terra.context_window, 500_000);
+        assert_eq!(terra.reasoning_efforts, &["low", "medium", "high"]);
+        assert!(!terra.default_enabled);
+
+        let luna = find_curated_codex_model("gpt-6-luna").expect("luna");
+        assert_eq!(luna.context_window, 272_000);
+        assert!(!luna.default_enabled);
+        assert!(find_curated_codex_model("gpt-5.4").is_none());
+
+        let presets = curated_codex_model_presets();
+        assert_eq!(presets.len(), 4);
+        let json = serde_json::to_string(&presets).expect("serialize presets");
+        let parsed: Vec<ModelPreset> = serde_json::from_str(&json).expect("deserialize presets");
+        assert_eq!(parsed, presets);
+    }
+
+    #[test]
+    fn validate_and_classify_codex_models_enforce_slug_bounds_and_reject_gemini_collision() {
+        for ok in [
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6.1-terra",
+            "gpt-6-luna",
+            "gpt-7.0-nova_1",
+            "codex-mini-latest",
+            "custom_model.v2",
+        ] {
+            assert!(validate_codex_model(ok).is_ok(), "expected valid: '{ok}'");
+        }
+
+        // Exact 128-char boundary accepted; 129+ rejected.
+        let at_limit = format!("gpt-6-{}", "a".repeat(MAX_CODEX_MODEL_LEN - "gpt-6-".len()));
+        assert_eq!(at_limit.len(), MAX_CODEX_MODEL_LEN);
+        assert!(validate_codex_model(&at_limit).is_ok());
+        assert!(is_codex_model(&at_limit));
+
+        let over_limit = format!(
+            "gpt-6-{}",
+            "a".repeat(MAX_CODEX_MODEL_LEN + 1 - "gpt-6-".len())
+        );
+        assert!(matches!(
+            validate_codex_model(&over_limit),
+            Err(CoreError::InvalidModel { .. })
+        ));
+        assert!(!is_codex_model(&over_limit));
+
+        // Invalid syntax and Gemini prefix collisions rejected.
+        for bad in [
+            "",
+            " ",
+            ".hidden",
+            "-leading-dash",
+            "_leading_underscore",
+            "gpt-6..astra",
+            "../evil",
+            "gpt-6.2-sol/foo",
+            "gpt-6.2-sol?k=v",
+            "gpt-6.2-sol#frag",
+            "gpt-6.2-sol%2f",
+            "gpt-6.2-sol;x",
+            "gpt-6.2-sol\n",
+            "gpt-6.2-sol\0",
+            " gpt-6.2-sol",
+            "gpt-6.2-sol ",
+            "gemini",
+            "GEMINI",
+            "gemini-4-hydrogen",
+            "Gemini-4-Carbon",
+            "gemini.custom",
+        ] {
+            assert!(
+                matches!(
+                    validate_codex_model(bad),
+                    Err(CoreError::InvalidModel { .. })
+                ),
+                "expected InvalidModel for '{bad:?}'"
+            );
+            assert!(
+                !is_codex_model(bad),
+                "expected !is_codex_model for '{bad:?}'"
+            );
+        }
+
+        // Non-Gemini arbitrary slugs validate in config but are not auto-dispatched as Codex.
+        assert!(validate_codex_model("claude-4-opus").is_ok());
+        assert!(!is_codex_model("claude-4-opus"));
+        assert!(!is_codex_model("gpt-"));
+        assert!(!is_codex_model("codex-"));
+        assert!(!is_codex_model("GPT-"));
+        assert!(!is_codex_model("CODEX-"));
+        assert!(!is_codex_model("gpt--"));
+        assert!(!is_codex_model("gpt-."));
+        assert!(!is_codex_model("gpt-_"));
+        assert!(!is_codex_model("codex--"));
+        assert!(is_codex_model("gpt-6.2-astra"));
+        assert!(is_codex_model("GPT-6.3-Preview"));
+        assert!(is_codex_model("codex-next"));
+    }
+
+    #[test]
+    fn normalize_enabled_codex_models_supports_empty_pause_dedup_and_fail_closed() {
+        assert_eq!(
+            normalize_enabled_codex_models(Vec::new()).unwrap(),
+            Vec::<String>::new()
+        );
+
+        let deduped = normalize_enabled_codex_models(vec![
+            "gpt-6.2-sol".to_string(),
+            "gpt-6.2-astra".to_string(),
+            "gpt-6.2-sol".to_string(),
+            "gpt-6-luna".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            deduped,
+            vec![
+                "gpt-6.2-sol".to_string(),
+                "gpt-6.2-astra".to_string(),
+                "gpt-6-luna".to_string(),
+            ]
+        );
+
+        for bad in ["gemini-4-hydrogen", "../evil", "", "gpt-6..bad"] {
+            assert!(matches!(
+                normalize_enabled_codex_models(vec!["gpt-6.2-sol".to_string(), bad.to_string()]),
+                Err(CoreError::InvalidModel { .. })
+            ));
+        }
     }
 }

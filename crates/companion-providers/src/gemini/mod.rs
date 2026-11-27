@@ -11,7 +11,7 @@ use crate::{
     ProviderError, filter_and_order_models,
 };
 
-mod url;
+pub(crate) mod url;
 
 #[cfg(test)]
 mod tests;

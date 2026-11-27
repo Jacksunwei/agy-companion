@@ -6,14 +6,16 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::auth::GeminiCredentials;
+use crate::auth::{CodexCredentials, GeminiCredentials};
 use crate::fs_safe::{self, FsError, SymlinkPolicy};
 use crate::models::{
-    DEFAULT_GEMINI_MODEL, default_enabled_gemini_models, normalize_enabled_gemini_models,
-    validate_gemini_model,
+    DEFAULT_CODEX_MODEL, DEFAULT_GEMINI_MODEL, default_enabled_codex_models,
+    default_enabled_gemini_models, normalize_enabled_codex_models, normalize_enabled_gemini_models,
+    validate_codex_model, validate_gemini_model,
 };
 use crate::redaction::{
-    RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig, api_key_hint,
+    RedactedCodexConfig, RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig,
+    api_key_hint,
 };
 use crate::validation::{validate_trimmed_ascii_field, validate_upstream_url};
 
@@ -23,6 +25,7 @@ pub const DEFAULT_LISTEN_PORT: u16 = 24141;
 pub const DEFAULT_LISTEN_PORT_NONZERO: NonZeroU16 =
     NonZeroU16::new(DEFAULT_LISTEN_PORT).expect("DEFAULT_LISTEN_PORT is non-zero");
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CLOUDCODE_DAILY_UPSTREAM_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const CLOUDCODE_PROD_UPSTREAM_URL: &str = "https://cloudcode-pa.googleapis.com";
 pub const DEFAULT_CLOUDCODE_UPSTREAM_URL: &str = "auto";
@@ -78,6 +81,8 @@ pub enum CoreError {
         line: usize,
         column: usize,
     },
+    #[error("invalid auth credentials: {reason}")]
+    InvalidAuthCredentials { reason: String },
     #[error("failed to serialize auth credentials: {reason}")]
     SerializeAuth { reason: String },
     #[error("usage database error at '{path}': {reason}")]
@@ -255,10 +260,32 @@ impl Default for GeminiConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodexConfig {
+    pub base_url: String,
+    pub default_model: String,
+    #[serde(default = "default_enabled_codex_models")]
+    pub enabled_models: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_CODEX_BASE_URL.to_string(),
+            default_model: DEFAULT_CODEX_MODEL.to_string(),
+            enabled_models: default_enabled_codex_models(),
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProvidersConfig {
     pub gemini: GeminiConfig,
+    pub codex: CodexConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,8 +352,17 @@ pub struct GeminiConfigPatch {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexConfigPatch {
+    pub base_url: Option<String>,
+    pub default_model: Option<String>,
+    pub enabled_models: Option<Vec<String>>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProvidersConfigPatch {
     pub gemini: Option<GeminiConfigPatch>,
+    pub codex: Option<CodexConfigPatch>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -387,10 +423,31 @@ impl Default for RawGeminiConfig {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawCodexConfig {
+    base_url: String,
+    default_model: String,
+    enabled_models: Vec<String>,
+    timeout_secs: u64,
+}
+
+impl Default for RawCodexConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_CODEX_BASE_URL.to_string(),
+            default_model: DEFAULT_CODEX_MODEL.to_string(),
+            enabled_models: default_enabled_codex_models(),
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawProvidersConfig {
     gemini: RawGeminiConfig,
+    codex: RawCodexConfig,
 }
 
 #[derive(Deserialize)]
@@ -737,7 +794,7 @@ impl Config {
                 supported: CURRENT_SCHEMA_VERSION,
             });
         }
-        if self.providers.gemini.timeout_secs == 0 {
+        if self.providers.gemini.timeout_secs == 0 || self.providers.codex.timeout_secs == 0 {
             return Err(CoreError::InvalidTimeout);
         }
 
@@ -746,6 +803,13 @@ impl Config {
             validate_gemini_model(model)?;
         }
         validate_upstream_url(&self.providers.gemini.base_url)?;
+
+        validate_codex_model(&self.providers.codex.default_model)?;
+        for model in &self.providers.codex.enabled_models {
+            validate_codex_model(model)?;
+        }
+        validate_upstream_url(&self.providers.codex.base_url)?;
+
         if let CloudCodeUpstream::Fixed(ref url) = self.cloudcode.upstream {
             validate_upstream_url(url)?;
         }
@@ -765,8 +829,22 @@ impl Config {
         }
     }
 
-    pub fn redacted_with_auth(&self, gemini_creds: Option<&GeminiCredentials>) -> RedactedConfig {
+    pub fn redacted_with_auth(
+        &self,
+        gemini_creds: Option<&GeminiCredentials>,
+        codex_creds: Option<&CodexCredentials>,
+    ) -> RedactedConfig {
         let hint = gemini_creds.map(|creds| creds.api_key.hint());
+        let (codex_authenticated, codex_account_hint, codex_plan_type, codex_expires_at_ms) =
+            match codex_creds {
+                Some(creds) => (
+                    true,
+                    creds.account_hint(),
+                    creds.plan_type.clone(),
+                    Some(creds.expires_at_ms),
+                ),
+                None => (false, None, None, None),
+            };
         RedactedConfig {
             schema_version: self.schema_version,
             proxy: self.proxy,
@@ -779,6 +857,16 @@ impl Config {
                     timeout_secs: self.providers.gemini.timeout_secs,
                     api_key_configured: hint.is_some(),
                     api_key_hint: hint,
+                },
+                codex: RedactedCodexConfig {
+                    base_url: self.providers.codex.base_url.clone(),
+                    default_model: self.providers.codex.default_model.clone(),
+                    enabled_models: self.providers.codex.enabled_models.clone(),
+                    timeout_secs: self.providers.codex.timeout_secs,
+                    authenticated: codex_authenticated,
+                    account_hint: codex_account_hint,
+                    plan_type: codex_plan_type,
+                    expires_at_ms: codex_expires_at_ms,
                 },
             },
             launcher_auto_start: self.launcher_auto_start,
@@ -808,6 +896,8 @@ impl Config {
         let upstream = CloudCodeUpstream::parse(&raw_cfg.cloudcode.upstream)?;
         let enabled_models =
             normalize_enabled_gemini_models(raw_cfg.providers.gemini.enabled_models)?;
+        let codex_enabled_models =
+            normalize_enabled_codex_models(raw_cfg.providers.codex.enabled_models)?;
 
         let config = Config {
             schema_version: raw_cfg.schema_version,
@@ -819,6 +909,12 @@ impl Config {
                     default_model: raw_cfg.providers.gemini.default_model,
                     enabled_models,
                     timeout_secs: raw_cfg.providers.gemini.timeout_secs,
+                },
+                codex: CodexConfig {
+                    base_url: raw_cfg.providers.codex.base_url,
+                    default_model: raw_cfg.providers.codex.default_model,
+                    enabled_models: codex_enabled_models,
+                    timeout_secs: raw_cfg.providers.codex.timeout_secs,
                 },
             },
             usage_dir: raw_cfg.usage_dir,
@@ -867,33 +963,61 @@ impl Config {
     pub fn apply_patch(&mut self, patch: ConfigPatch) -> Result<(), CoreError> {
         let mut next = self.clone();
 
-        if let Some(providers) = patch.providers
-            && let Some(gemini) = providers.gemini
-        {
-            if let Some(raw_model) = gemini.default_model {
-                let trimmed = validate_trimmed_ascii_field(&raw_model, "default_model")?;
-                validate_gemini_model(&trimmed)?;
-                next.providers.gemini.default_model = trimmed;
-            }
-            if let Some(raw_models) = gemini.enabled_models {
-                let mut trimmed_models = Vec::with_capacity(raw_models.len());
-                for raw_model in raw_models {
-                    let trimmed = validate_trimmed_ascii_field(&raw_model, "enabled_models")?;
-                    trimmed_models.push(trimmed);
+        if let Some(providers) = patch.providers {
+            if let Some(gemini) = providers.gemini {
+                if let Some(raw_model) = gemini.default_model {
+                    let trimmed = validate_trimmed_ascii_field(&raw_model, "default_model")?;
+                    validate_gemini_model(&trimmed)?;
+                    next.providers.gemini.default_model = trimmed;
                 }
-                next.providers.gemini.enabled_models =
-                    normalize_enabled_gemini_models(trimmed_models)?;
-            }
-            if let Some(raw_base_url) = gemini.base_url {
-                let trimmed = validate_trimmed_ascii_field(&raw_base_url, "base_url")?;
-                validate_upstream_url(&trimmed)?;
-                next.providers.gemini.base_url = trimmed;
-            }
-            if let Some(secs) = gemini.timeout_secs {
-                if secs == 0 {
-                    return Err(CoreError::InvalidTimeout);
+                if let Some(raw_models) = gemini.enabled_models {
+                    let mut trimmed_models = Vec::with_capacity(raw_models.len());
+                    for raw_model in raw_models {
+                        let trimmed = validate_trimmed_ascii_field(&raw_model, "enabled_models")?;
+                        trimmed_models.push(trimmed);
+                    }
+                    next.providers.gemini.enabled_models =
+                        normalize_enabled_gemini_models(trimmed_models)?;
                 }
-                next.providers.gemini.timeout_secs = secs;
+                if let Some(raw_base_url) = gemini.base_url {
+                    let trimmed = validate_trimmed_ascii_field(&raw_base_url, "base_url")?;
+                    validate_upstream_url(&trimmed)?;
+                    next.providers.gemini.base_url = trimmed;
+                }
+                if let Some(secs) = gemini.timeout_secs {
+                    if secs == 0 {
+                        return Err(CoreError::InvalidTimeout);
+                    }
+                    next.providers.gemini.timeout_secs = secs;
+                }
+            }
+            if let Some(codex) = providers.codex {
+                if let Some(raw_model) = codex.default_model {
+                    let trimmed = validate_trimmed_ascii_field(&raw_model, "codex.default_model")?;
+                    validate_codex_model(&trimmed)?;
+                    next.providers.codex.default_model = trimmed;
+                }
+                if let Some(raw_models) = codex.enabled_models {
+                    let mut trimmed_models = Vec::with_capacity(raw_models.len());
+                    for raw_model in raw_models {
+                        let trimmed =
+                            validate_trimmed_ascii_field(&raw_model, "codex.enabled_models")?;
+                        trimmed_models.push(trimmed);
+                    }
+                    next.providers.codex.enabled_models =
+                        normalize_enabled_codex_models(trimmed_models)?;
+                }
+                if let Some(raw_base_url) = codex.base_url {
+                    let trimmed = validate_trimmed_ascii_field(&raw_base_url, "codex.base_url")?;
+                    validate_upstream_url(&trimmed)?;
+                    next.providers.codex.base_url = trimmed;
+                }
+                if let Some(secs) = codex.timeout_secs {
+                    if secs == 0 {
+                        return Err(CoreError::InvalidTimeout);
+                    }
+                    next.providers.codex.timeout_secs = secs;
+                }
             }
         }
 
@@ -1069,6 +1193,7 @@ mod tests {
                     default_model: "gemini-4-neon".to_string(),
                     ..Default::default()
                 },
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1159,7 +1284,7 @@ mod tests {
         .expect("write legacy config");
         let loaded = Config::load_or_default(&legacy_path).expect("legacy api_key field ignored");
         assert_eq!(loaded.providers.gemini.default_model, "gemini-4-neon");
-        let redacted = loaded.redacted_with_auth(None);
+        let redacted = loaded.redacted_with_auth(None, None);
         assert!(!redacted.providers.gemini.api_key_configured);
         assert_eq!(redacted.providers.gemini.api_key_hint, None);
 
@@ -1225,6 +1350,7 @@ mod tests {
                     enabled_models: None,
                     timeout_secs: Some(600),
                 }),
+                codex: None,
             }),
             launcher_auto_start: None,
         })
@@ -1253,6 +1379,7 @@ mod tests {
                         timeout_secs: Some(0),
                         ..Default::default()
                     }),
+                    codex: None,
                 }),
                 launcher_auto_start: None,
             })
@@ -1430,7 +1557,7 @@ mod tests {
             DEFAULT_CLOUDCODE_UPSTREAM_URL
         );
         assert_eq!(
-            cfg.redacted_with_auth(None).cloudcode.upstream,
+            cfg.redacted_with_auth(None, None).cloudcode.upstream,
             CloudCodeUpstream::Auto
         );
 
@@ -2391,7 +2518,7 @@ mod tests {
             default_enabled_gemini_models()
         );
         assert_eq!(legacy.launcher_auto_start, None);
-        let redacted = legacy.redacted_with_auth(None);
+        let redacted = legacy.redacted_with_auth(None, None);
         assert_eq!(
             redacted.providers.gemini.enabled_models,
             default_enabled_gemini_models()
@@ -2415,7 +2542,7 @@ mod tests {
         );
         assert_eq!(dedup_cfg.launcher_auto_start, Some(false));
         assert_eq!(
-            dedup_cfg.redacted_with_auth(None).launcher_auto_start,
+            dedup_cfg.redacted_with_auth(None, None).launcher_auto_start,
             Some(false)
         );
 
@@ -2467,6 +2594,7 @@ mod tests {
                     ]),
                     ..Default::default()
                 }),
+                codex: None,
             }),
             launcher_auto_start: Some(Some(false)),
             ..Default::default()
@@ -2485,6 +2613,7 @@ mod tests {
                     enabled_models: Some(Vec::new()),
                     ..Default::default()
                 }),
+                codex: None,
             }),
             launcher_auto_start: None,
             ..Default::default()
@@ -2502,6 +2631,7 @@ mod tests {
                         enabled_models: Some(vec!["gemini-2.5-pro".to_string()]),
                         ..Default::default()
                     }),
+                    codex: None,
                 }),
                 launcher_auto_start: Some(Some(true)),
                 ..Default::default()
@@ -2509,5 +2639,116 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CoreError::InvalidModel { .. }));
         assert_eq!(cfg, before);
+    }
+
+    #[test]
+    fn codex_config_defaults_additive_v1_load_validation_and_transactional_patch() {
+        let def = Config::default();
+        assert_eq!(def.providers.codex.base_url, DEFAULT_CODEX_BASE_URL);
+        assert_eq!(def.providers.codex.default_model, DEFAULT_CODEX_MODEL);
+        assert_eq!(
+            def.providers.codex.enabled_models,
+            default_enabled_codex_models()
+        );
+        assert_eq!(def.providers.codex.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        def.validate().expect("default codex config validates");
+
+        // Existing v1 JSON omitting `providers.codex` loads Codex defaults seamlessly.
+        let v1_without_codex = r#"{
+            "schema_version": 1,
+            "proxy": { "host": "127.0.0.1", "port": 24141 },
+            "providers": { "gemini": { "default_model": "gemini-4-hydrogen" } }
+        }"#;
+        let loaded =
+            Config::from_json_str(v1_without_codex, Path::new("v1-no-codex.json")).unwrap();
+        assert_eq!(loaded.providers.codex, CodexConfig::default());
+
+        // Deduplicates codex enabled_models and supports empty pause.
+        let with_codex = r#"{
+            "schema_version": 1,
+            "providers": {
+                "codex": {
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "default_model": "gpt-6.2-astra",
+                    "enabled_models": ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.2-sol"],
+                    "timeout_secs": 300
+                }
+            }
+        }"#;
+        let parsed = Config::from_json_str(with_codex, Path::new("codex.json")).unwrap();
+        assert_eq!(parsed.providers.codex.default_model, "gpt-6.2-astra");
+        assert_eq!(
+            parsed.providers.codex.enabled_models,
+            vec!["gpt-6.2-sol".to_string(), "gpt-6.2-astra".to_string()]
+        );
+        assert_eq!(parsed.providers.codex.timeout_secs, 300);
+
+        // Validation rejects zero timeout, non-HTTPS remote base_url (S3), and Gemini collision.
+        let mut bad_timeout = Config::default();
+        bad_timeout.providers.codex.timeout_secs = 0;
+        assert!(matches!(
+            bad_timeout.validate(),
+            Err(CoreError::InvalidTimeout)
+        ));
+
+        let mut bad_url = Config::default();
+        bad_url.providers.codex.base_url = "http://chatgpt.com/backend-api/codex".to_string();
+        assert!(matches!(
+            bad_url.validate(),
+            Err(CoreError::InvalidBaseUrl { .. })
+        ));
+
+        let mut gemini_collision = Config::default();
+        gemini_collision.providers.codex.default_model = "gemini-4-hydrogen".to_string();
+        assert!(matches!(
+            gemini_collision.validate(),
+            Err(CoreError::InvalidModel { .. })
+        ));
+
+        // Transactional Codex patch applies cleanly and rolls back on failure.
+        let mut cfg = Config::default();
+        cfg.apply_patch(ConfigPatch {
+            providers: Some(ProvidersConfigPatch {
+                gemini: None,
+                codex: Some(CodexConfigPatch {
+                    base_url: Some("  http://127.0.0.1:18080/codex  ".to_string()),
+                    default_model: Some("  gpt-6.2-astra  ".to_string()),
+                    enabled_models: Some(vec![
+                        "  gpt-6-luna  ".to_string(),
+                        "gpt-6.2-astra".to_string(),
+                        "gpt-6-luna".to_string(),
+                    ]),
+                    timeout_secs: Some(120),
+                }),
+            }),
+            ..Default::default()
+        })
+        .expect("valid codex patch succeeds");
+        assert_eq!(cfg.providers.codex.base_url, "http://127.0.0.1:18080/codex");
+        assert_eq!(cfg.providers.codex.default_model, "gpt-6.2-astra");
+        assert_eq!(
+            cfg.providers.codex.enabled_models,
+            vec!["gpt-6-luna".to_string(), "gpt-6.2-astra".to_string()]
+        );
+        assert_eq!(cfg.providers.codex.timeout_secs, 120);
+
+        let before = cfg.clone();
+        let err = cfg
+            .apply_patch(ConfigPatch {
+                providers: Some(ProvidersConfigPatch {
+                    gemini: Some(GeminiConfigPatch {
+                        timeout_secs: Some(300),
+                        ..Default::default()
+                    }),
+                    codex: Some(CodexConfigPatch {
+                        enabled_models: Some(vec!["gemini-4-carbon".to_string()]),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            })
+            .expect_err("gemini collision in codex patch must fail");
+        assert!(matches!(err, CoreError::InvalidModel { .. }));
+        assert_eq!(cfg, before, "failed codex patch must roll back completely");
     }
 }

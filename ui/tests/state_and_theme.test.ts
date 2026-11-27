@@ -92,6 +92,7 @@ describe("ui/src/state.ts pure state helpers", () => {
       config: {
         ...day0.config,
         providers: {
+          ...day0.config.providers,
           gemini: { ...day0.config.providers.gemini, api_key_configured: true },
         },
       },
@@ -194,6 +195,7 @@ describe("ui/src/state.ts pure state helpers", () => {
       config: {
         ...active.config,
         providers: {
+          ...active.config.providers,
           gemini: { ...active.config.providers.gemini, api_key_configured: false },
         },
       },

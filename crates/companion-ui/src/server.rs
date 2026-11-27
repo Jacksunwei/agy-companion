@@ -4,8 +4,8 @@ use std::sync::Arc;
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::protocol::PROTOCOL_VERSION;
 use companion_core::{
-    AuthStore, CloudCodeStatus, Config, CoreError, FileAuthStore, GeminiCredentials, HostPlatform,
-    ProxyHealthSummary, StatsSnapshot, curated_model_presets,
+    AuthStore, CloudCodeStatus, CodexCredentials, Config, CoreError, FileAuthStore,
+    GeminiCredentials, HostPlatform, ProxyHealthSummary, StatsSnapshot, curated_model_presets,
 };
 use companion_providers::{DEFAULT_PROBE_TIMEOUT, LoopbackProxyClient, evaluate_health};
 
@@ -72,13 +72,14 @@ impl CompanionUiServer {
 
     pub(crate) async fn load_config_and_auth_blocking(
         &self,
-    ) -> Result<(Config, Option<GeminiCredentials>), String> {
+    ) -> Result<(Config, Option<GeminiCredentials>, Option<CodexCredentials>), String> {
         let config_path = self.config_path.clone();
         let auth_store = Arc::clone(&self.auth_store);
         tokio::task::spawn_blocking(move || {
             let cfg = Config::load_or_default(&config_path)?;
             let gemini_creds = auth_store.load_gemini()?;
-            Ok::<_, CoreError>((cfg, gemini_creds))
+            let codex_creds = auth_store.load_codex()?;
+            Ok::<_, CoreError>((cfg, gemini_creds, codex_creds))
         })
         .await
         .map_err(|err| format!("config/auth load task failed: {err}"))?
@@ -143,6 +144,7 @@ impl CompanionUiServer {
         &self,
         cfg: &Config,
         gemini_creds: Option<&GeminiCredentials>,
+        codex_creds: Option<&CodexCredentials>,
         integration_override: Option<IntegrationStatus>,
         conversation_id: Option<&str>,
     ) -> SettingsSnapshot {
@@ -200,7 +202,7 @@ impl CompanionUiServer {
         }
 
         SettingsSnapshot {
-            config: cfg.redacted_with_auth(gemini_creds),
+            config: cfg.redacted_with_auth(gemini_creds, codex_creds),
             binary_version,
             proxy,
             version_skew,

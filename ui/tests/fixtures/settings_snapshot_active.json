@@ -20,6 +20,19 @@
         "timeout_secs": 900,
         "api_key_configured": true,
         "api_key_hint": "AIza...1234"
+      },
+      "codex": {
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "default_model": "gpt-6.2-sol",
+        "enabled_models": [
+          "gpt-6.2-astra",
+          "gpt-6.2-sol"
+        ],
+        "timeout_secs": 900,
+        "authenticated": false,
+        "account_hint": null,
+        "plan_type": null,
+        "expires_at_ms": null
       }
     },
     "launcher_auto_start": true

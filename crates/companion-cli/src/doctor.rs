@@ -1,13 +1,13 @@
 use std::fmt::Write as _;
 use std::io::Write;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use companion_core::fs_safe::{self, FsError};
 use companion_core::{
-    AuthStore, Config, DEFAULT_LISTEN_PORT, FileAuthStore, GEMINI_AUTH_FILENAME,
-    MAX_AUTH_FILE_BYTES, PROTOCOL_VERSION, ProxyHealthSummary, auth_dir_for_config_path,
-    is_placeholder_api_key, sanitize_base_url,
+    AuthStore, CODEX_AUTH_FILENAME, CODEX_REFRESH_LOCK_FILENAME, Config, DEFAULT_LISTEN_PORT,
+    FileAuthStore, GEMINI_AUTH_FILENAME, MAX_AUTH_FILE_BYTES, PROTOCOL_VERSION, ProxyHealthSummary,
+    auth_dir_for_config_path, is_placeholder_api_key, sanitize_base_url,
 };
 use companion_providers::LoopbackProxyClient;
 use serde::{Deserialize, Serialize};
@@ -163,6 +163,80 @@ impl Default for DoctorOptions {
             health_connect_timeout: Duration::from_secs(DEFAULT_HEALTH_CONNECT_TIMEOUT_SECS),
         }
     }
+}
+
+enum AuthFileInspection {
+    Missing,
+    Present {
+        #[cfg(unix)]
+        mode: u32,
+        perm_err: Option<String>,
+    },
+    Rejected {
+        perm_err: String,
+        file_err: String,
+    },
+}
+
+fn inspect_auth_file(auth_dir: &Path, filename: &str, rel_label: &str) -> AuthFileInspection {
+    let path = auth_dir.join(filename);
+    match fs_safe::inspect_regular_file_if_exists(&path, Some(MAX_AUTH_FILE_BYTES)) {
+        Ok(None) => AuthFileInspection::Missing,
+        Ok(Some(file_meta)) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mode = file_meta.permissions().mode() & 0o7777;
+                let perm_err = if (mode & 0o077) == 0 && (mode & 0o7000) == 0 {
+                    None
+                } else {
+                    Some(format!(
+                        "insecure {rel_label} permissions {mode:04o}; run `chmod 600` on {rel_label}"
+                    ))
+                };
+                AuthFileInspection::Present { mode, perm_err }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = file_meta;
+                AuthFileInspection::Present { perm_err: None }
+            }
+        }
+        Err(FsError::SymlinkRejected { .. }) => AuthFileInspection::Rejected {
+            perm_err: format!(
+                "{rel_label} is a symlink (rejected for security); use a regular file with chmod 600"
+            ),
+            file_err: format!("refused to load symlinked {rel_label}"),
+        },
+        Err(FsError::NotRegularFile { .. }) => AuthFileInspection::Rejected {
+            perm_err: format!("{rel_label} is not a regular file"),
+            file_err: format!("refused to load non-regular {rel_label}"),
+        },
+        Err(FsError::SizeLimitExceeded { max_bytes, .. }) => AuthFileInspection::Rejected {
+            perm_err: format!("{rel_label} exceeds maximum allowed size ({max_bytes} bytes)"),
+            file_err: format!("refused to load oversized {rel_label}"),
+        },
+        Err(FsError::Io { source, .. }) => AuthFileInspection::Rejected {
+            perm_err: format!("unable to inspect {rel_label} metadata: {}", source.kind()),
+            file_err: format!("{rel_label} metadata unreadable"),
+        },
+        Err(err) => {
+            let msg = err.to_string();
+            AuthFileInspection::Rejected {
+                perm_err: msg.clone(),
+                file_err: msg,
+            }
+        }
+    }
+}
+
+fn current_utc_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<DoctorReport, CliError> {
@@ -351,6 +425,7 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
     };
 
     let mut has_stored_gemini_key = false;
+    let mut has_valid_codex_auth = false;
     match resolved_config_path.as_deref() {
         None => {
             checks.push(DoctorCheck {
@@ -361,6 +436,12 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
             });
             checks.push(DoctorCheck {
                 name: "auth_gemini".to_string(),
+                status: CheckStatus::Skip,
+                critical: true,
+                message: "skipped because config path is invalid".to_string(),
+            });
+            checks.push(DoctorCheck {
+                name: "auth_codex".to_string(),
                 status: CheckStatus::Skip,
                 critical: true,
                 message: "skipped because config path is invalid".to_string(),
@@ -377,6 +458,12 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                 });
                 checks.push(DoctorCheck {
                     name: "auth_gemini".to_string(),
+                    status: CheckStatus::Fail,
+                    critical: true,
+                    message: msg.clone(),
+                });
+                checks.push(DoctorCheck {
+                    name: "auth_codex".to_string(),
                     status: CheckStatus::Fail,
                     critical: true,
                     message: msg,
@@ -397,6 +484,12 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                         critical: true,
                         message: "Gemini credentials file not present".to_string(),
                     });
+                    checks.push(DoctorCheck {
+                        name: "auth_codex".to_string(),
+                        status: CheckStatus::Pass,
+                        critical: true,
+                        message: "OpenAI Codex credentials file not present".to_string(),
+                    });
                 }
                 Err(FsError::SymlinkRejected { .. }) => {
                     checks.push(DoctorCheck {
@@ -412,6 +505,14 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                         message: "refused to load Gemini credentials from symlinked auth directory"
                             .to_string(),
                     });
+                    checks.push(DoctorCheck {
+                        name: "auth_codex".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message:
+                            "refused to load OpenAI Codex credentials from symlinked auth directory"
+                                .to_string(),
+                    });
                 }
                 Err(FsError::NotDirectory { .. }) => {
                     checks.push(DoctorCheck {
@@ -425,6 +526,12 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                         status: CheckStatus::Fail,
                         critical: true,
                         message: "refused to load Gemini credentials because auth path is not a directory".to_string(),
+                    });
+                    checks.push(DoctorCheck {
+                        name: "auth_codex".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: "refused to load OpenAI Codex credentials because auth path is not a directory".to_string(),
                     });
                 }
                 Err(FsError::Io { source, .. }) => {
@@ -443,6 +550,12 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                         critical: true,
                         message: "auth directory metadata unreadable".to_string(),
                     });
+                    checks.push(DoctorCheck {
+                        name: "auth_codex".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
+                        message: "auth directory metadata unreadable".to_string(),
+                    });
                 }
                 Err(err) => {
                     let msg = err.to_string();
@@ -456,143 +569,97 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                         name: "auth_gemini".to_string(),
                         status: CheckStatus::Fail,
                         critical: true,
+                        message: msg.clone(),
+                    });
+                    checks.push(DoctorCheck {
+                        name: "auth_codex".to_string(),
+                        status: CheckStatus::Fail,
+                        critical: true,
                         message: msg,
                     });
                 }
                 Ok(Some(dir_meta)) => {
+                    let mut perm_errors: Vec<String> = Vec::new();
                     #[cfg(unix)]
-                    let (dir_mode, dir_perm_err) = {
+                    let dir_mode = {
                         use std::os::unix::fs::PermissionsExt;
 
                         let mode = dir_meta.permissions().mode() & 0o7777;
-                        let err = if (mode & 0o077) == 0 && (mode & 0o7000) == 0 {
-                            None
-                        } else {
-                            Some(format!(
+                        if (mode & 0o077) != 0 || (mode & 0o7000) != 0 {
+                            perm_errors.push(format!(
                                 "insecure auth directory permissions {mode:04o}; run `chmod 700` on the auth directory"
-                            ))
-                        };
-                        (mode, err)
+                            ));
+                        }
+                        mode
                     };
                     #[cfg(not(unix))]
                     let _ = dir_meta;
 
-                    let gemini_auth_path = auth_dir.join(GEMINI_AUTH_FILENAME);
-                    match fs_safe::inspect_regular_file_if_exists(
-                        &gemini_auth_path,
-                        Some(MAX_AUTH_FILE_BYTES),
-                    ) {
-                        Err(FsError::SymlinkRejected { .. }) => {
-                            checks.push(DoctorCheck {
-                                name: "auth_permissions".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: "auth/gemini.json is a symlink (rejected for security); use a regular file with chmod 600".to_string(),
-                            });
-                            checks.push(DoctorCheck {
-                                name: "auth_gemini".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: "refused to load symlinked Gemini credentials file"
-                                    .to_string(),
-                            });
-                        }
-                        Err(FsError::NotRegularFile { .. }) => {
-                            checks.push(DoctorCheck {
-                                name: "auth_permissions".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: "auth/gemini.json is not a regular file".to_string(),
-                            });
-                            checks.push(DoctorCheck {
-                                name: "auth_gemini".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: "refused to load non-regular Gemini credentials file"
-                                    .to_string(),
-                            });
-                        }
-                        Err(FsError::SizeLimitExceeded { max_bytes, .. }) => {
-                            checks.push(DoctorCheck {
-                                name: "auth_permissions".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: format!(
-                                    "auth/gemini.json exceeds maximum allowed size ({max_bytes} bytes)"
-                                ),
-                            });
-                            checks.push(DoctorCheck {
-                                name: "auth_gemini".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: "refused to load oversized Gemini credentials file"
-                                    .to_string(),
-                            });
-                        }
-                        Err(FsError::Io { source, .. }) => {
-                            checks.push(DoctorCheck {
-                                name: "auth_permissions".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: format!(
-                                    "unable to inspect auth/gemini.json metadata: {}",
-                                    source.kind()
-                                ),
-                            });
-                            checks.push(DoctorCheck {
-                                name: "auth_gemini".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: "auth/gemini.json metadata unreadable".to_string(),
-                            });
-                        }
-                        Err(err) => {
-                            let msg = err.to_string();
-                            checks.push(DoctorCheck {
-                                name: "auth_permissions".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: msg.clone(),
-                            });
-                            checks.push(DoctorCheck {
-                                name: "auth_gemini".to_string(),
-                                status: CheckStatus::Fail,
-                                critical: true,
-                                message: msg,
-                            });
-                        }
-                        Ok(None) => {
-                            #[cfg(unix)]
-                            {
-                                if let Some(err_msg) = dir_perm_err {
-                                    checks.push(DoctorCheck {
-                                        name: "auth_permissions".to_string(),
-                                        status: CheckStatus::Fail,
-                                        critical: true,
-                                        message: err_msg,
-                                    });
+                    let gemini_insp =
+                        inspect_auth_file(&auth_dir, GEMINI_AUTH_FILENAME, "auth/gemini.json");
+                    let codex_insp =
+                        inspect_auth_file(&auth_dir, CODEX_AUTH_FILENAME, "auth/codex.json");
+                    let lock_insp = inspect_auth_file(
+                        &auth_dir,
+                        CODEX_REFRESH_LOCK_FILENAME,
+                        "auth/.codex-refresh.lock",
+                    );
+
+                    #[cfg(unix)]
+                    let mut ok_parts: Vec<String> =
+                        vec![format!("auth directory ({dir_mode:04o})")];
+
+                    for (label, insp) in [
+                        ("auth/gemini.json", &gemini_insp),
+                        ("auth/codex.json", &codex_insp),
+                        ("auth/.codex-refresh.lock", &lock_insp),
+                    ] {
+                        match insp {
+                            AuthFileInspection::Missing => {}
+                            AuthFileInspection::Present {
+                                #[cfg(unix)]
+                                mode,
+                                perm_err,
+                            } => {
+                                if let Some(err) = perm_err {
+                                    perm_errors.push(err.clone());
                                 } else {
-                                    checks.push(DoctorCheck {
-                                        name: "auth_permissions".to_string(),
-                                        status: CheckStatus::Pass,
-                                        critical: true,
-                                        message: format!(
-                                            "auth directory permissions {dir_mode:04o} are owner-only"
-                                        ),
-                                    });
+                                    #[cfg(unix)]
+                                    ok_parts.push(format!("{label} ({mode:04o})"));
+                                    #[cfg(not(unix))]
+                                    let _ = label;
                                 }
                             }
-                            #[cfg(not(unix))]
-                            {
-                                checks.push(DoctorCheck {
-                                    name: "auth_permissions".to_string(),
-                                    status: CheckStatus::Pass,
-                                    critical: true,
-                                    message:
-                                        "Unix permission check not applicable on this platform"
-                                            .to_string(),
-                                });
+                            AuthFileInspection::Rejected { perm_err, .. } => {
+                                perm_errors.push(perm_err.clone());
                             }
+                        }
+                    }
+
+                    if !perm_errors.is_empty() {
+                        checks.push(DoctorCheck {
+                            name: "auth_permissions".to_string(),
+                            status: CheckStatus::Fail,
+                            critical: true,
+                            message: perm_errors.join("; "),
+                        });
+                    } else {
+                        #[cfg(unix)]
+                        let msg = format!("{} permissions are owner-only", ok_parts.join(" and "));
+                        #[cfg(not(unix))]
+                        let msg =
+                            "Unix permission check not applicable on this platform".to_string();
+                        checks.push(DoctorCheck {
+                            name: "auth_permissions".to_string(),
+                            status: CheckStatus::Pass,
+                            critical: true,
+                            message: msg,
+                        });
+                    }
+
+                    // Gemini credentials check
+                    match gemini_insp {
+                        AuthFileInspection::Missing => {
                             checks.push(DoctorCheck {
                                 name: "auth_gemini".to_string(),
                                 status: CheckStatus::Pass,
@@ -600,63 +667,15 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                                 message: "Gemini credentials file not present".to_string(),
                             });
                         }
-                        Ok(Some(file_meta)) => {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-
-                                let file_mode = file_meta.permissions().mode() & 0o7777;
-                                let file_perm_err = if (file_mode & 0o077) == 0
-                                    && (file_mode & 0o7000) == 0
-                                {
-                                    None
-                                } else {
-                                    Some(format!(
-                                        "insecure auth/gemini.json permissions {file_mode:04o}; run `chmod 600` on auth/gemini.json"
-                                    ))
-                                };
-                                match (dir_perm_err, file_perm_err) {
-                                    (None, None) => {
-                                        checks.push(DoctorCheck {
-                                            name: "auth_permissions".to_string(),
-                                            status: CheckStatus::Pass,
-                                            critical: true,
-                                            message: format!(
-                                                "auth directory ({dir_mode:04o}) and auth/gemini.json ({file_mode:04o}) permissions are owner-only"
-                                            ),
-                                        });
-                                    }
-                                    (Some(d), Some(f)) => {
-                                        checks.push(DoctorCheck {
-                                            name: "auth_permissions".to_string(),
-                                            status: CheckStatus::Fail,
-                                            critical: true,
-                                            message: format!("{d}; {f}"),
-                                        });
-                                    }
-                                    (Some(err_msg), None) | (None, Some(err_msg)) => {
-                                        checks.push(DoctorCheck {
-                                            name: "auth_permissions".to_string(),
-                                            status: CheckStatus::Fail,
-                                            critical: true,
-                                            message: err_msg,
-                                        });
-                                    }
-                                }
-                            }
-                            #[cfg(not(unix))]
-                            {
-                                let _ = file_meta;
-                                checks.push(DoctorCheck {
-                                    name: "auth_permissions".to_string(),
-                                    status: CheckStatus::Pass,
-                                    critical: true,
-                                    message:
-                                        "Unix permission check not applicable on this platform"
-                                            .to_string(),
-                                });
-                            }
-
+                        AuthFileInspection::Rejected { file_err, .. } => {
+                            checks.push(DoctorCheck {
+                                name: "auth_gemini".to_string(),
+                                status: CheckStatus::Fail,
+                                critical: true,
+                                message: file_err,
+                            });
+                        }
+                        AuthFileInspection::Present { .. } => {
                             match FileAuthStore::for_config_path(config_path)
                                 .and_then(|store| store.load_gemini())
                             {
@@ -684,6 +703,85 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
                                 Err(err) => {
                                     checks.push(DoctorCheck {
                                         name: "auth_gemini".to_string(),
+                                        status: CheckStatus::Fail,
+                                        critical: true,
+                                        message: err.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // OpenAI Codex credentials check
+                    match codex_insp {
+                        AuthFileInspection::Missing => {
+                            checks.push(DoctorCheck {
+                                name: "auth_codex".to_string(),
+                                status: CheckStatus::Pass,
+                                critical: true,
+                                message: "OpenAI Codex credentials file not present".to_string(),
+                            });
+                        }
+                        AuthFileInspection::Rejected { file_err, .. } => {
+                            checks.push(DoctorCheck {
+                                name: "auth_codex".to_string(),
+                                status: CheckStatus::Fail,
+                                critical: true,
+                                message: file_err,
+                            });
+                        }
+                        AuthFileInspection::Present { .. } => {
+                            match FileAuthStore::for_config_path(config_path)
+                                .and_then(|store| store.load_codex())
+                            {
+                                Ok(None) => {
+                                    checks.push(DoctorCheck {
+                                        name: "auth_codex".to_string(),
+                                        status: CheckStatus::Pass,
+                                        critical: true,
+                                        message: "OpenAI Codex credentials file not present"
+                                            .to_string(),
+                                    });
+                                }
+                                Ok(Some(creds)) => {
+                                    let now_ms = current_utc_epoch_ms();
+                                    if creds.expires_at_ms > now_ms {
+                                        has_valid_codex_auth = true;
+                                        let mut details: Vec<String> = Vec::new();
+                                        if let Some(ref plan) = creds.plan_type {
+                                            details.push(format!("plan: {plan}"));
+                                        }
+                                        if let Some(hint) = creds.account_hint() {
+                                            details.push(format!("account: {hint}"));
+                                        }
+                                        if let Some(exp) = creds.expires_at_rfc3339() {
+                                            details.push(format!("expires: {exp}"));
+                                        }
+                                        let suffix = if details.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" ({})", details.join(", "))
+                                        };
+                                        checks.push(DoctorCheck {
+                                            name: "auth_codex".to_string(),
+                                            status: CheckStatus::Pass,
+                                            critical: true,
+                                            message: format!(
+                                                "OpenAI Codex credentials valid in auth/codex.json{suffix}"
+                                            ),
+                                        });
+                                    } else {
+                                        checks.push(DoctorCheck {
+                                            name: "auth_codex".to_string(),
+                                            status: CheckStatus::Warn,
+                                            critical: false,
+                                            message: "OpenAI Codex session expired (auth/codex.json) — will refresh on next request or sign in again in Antigravity Companion".to_string(),
+                                        });
+                                    }
+                                }
+                                Err(err) => {
+                                    checks.push(DoctorCheck {
+                                        name: "auth_codex".to_string(),
                                         status: CheckStatus::Fail,
                                         critical: true,
                                         message: err.to_string(),
@@ -764,6 +862,9 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
         env.gemini_api_key,
         EnvKeyState::Set | EnvKeyState::SetInvalidUtf8
     );
+    let has_gemini_configured =
+        has_stored_gemini_key || matches!(env.gemini_api_key, EnvKeyState::Set);
+    let has_codex_configured = has_valid_codex_auth;
     let (api_key_status, api_key_message) = match env.gemini_api_key {
         EnvKeyState::Set => (CheckStatus::Pass, "GEMINI_API_KEY is set".to_string()),
         EnvKeyState::SetInvalidUtf8 => (
@@ -775,6 +876,11 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
             "GEMINI_API_KEY is set to the local proxy placeholder (using API key saved in auth/gemini.json)"
                 .to_string(),
         ),
+        EnvKeyState::Placeholder if has_codex_configured => (
+            CheckStatus::Info,
+            "GEMINI_API_KEY is set to the local proxy placeholder (OpenAI Codex is configured in auth/codex.json)"
+                .to_string(),
+        ),
         EnvKeyState::Placeholder => (
             CheckStatus::Warn,
             "GEMINI_API_KEY is set to the local proxy placeholder and no API key is saved in auth/gemini.json"
@@ -783,6 +889,10 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
         EnvKeyState::Unset if has_stored_gemini_key => (
             CheckStatus::Pass,
             "GEMINI_API_KEY is unset (using API key saved in auth/gemini.json)".to_string(),
+        ),
+        EnvKeyState::Unset if has_codex_configured => (
+            CheckStatus::Info,
+            "GEMINI_API_KEY is unset (OpenAI Codex is configured in auth/codex.json)".to_string(),
         ),
         EnvKeyState::Unset => (
             CheckStatus::Warn,
@@ -794,6 +904,33 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
         status: api_key_status,
         critical: false,
         message: api_key_message,
+    });
+
+    let (provider_auth_status, provider_auth_message) =
+        match (has_gemini_configured, has_codex_configured) {
+            (true, true) => (
+                CheckStatus::Pass,
+                "configured providers: Google AI Studio (Gemini), OpenAI Codex".to_string(),
+            ),
+            (true, false) => (
+                CheckStatus::Pass,
+                "configured providers: Google AI Studio (Gemini)".to_string(),
+            ),
+            (false, true) => (
+                CheckStatus::Pass,
+                "configured providers: OpenAI Codex".to_string(),
+            ),
+            (false, false) => (
+                CheckStatus::Warn,
+                "no active provider credentials configured (configure Google AI Studio or sign in with OpenAI Codex in Antigravity Companion)"
+                    .to_string(),
+            ),
+        };
+    checks.push(DoctorCheck {
+        name: "provider_auth".to_string(),
+        status: provider_auth_status,
+        critical: false,
+        message: provider_auth_message,
     });
 
     let (base_url_set, base_url_matches_proxy, base_url_status, base_url_message) = match env
@@ -2005,6 +2142,305 @@ mod tests {
                     "{case}: auth_gemini must fail"
                 );
             }
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doctor_checks_codex_auth_valid_expired_multi_provider_corrupt_oversized_and_unix_guards()
+     {
+        use super::current_utc_epoch_ms;
+        use companion_core::{
+            AUTH_SCHEMA_VERSION, CODEX_AUTH_FILENAME, CodexAuthMode, CodexCredentials,
+            GeminiCredentials, SecretString,
+        };
+
+        let (port, handle) = spawn_mock_health_router(healthy_router()).await;
+        let temp = TempDir::new().expect("tempdir");
+
+        let make_codex = |expires_at_ms: u64| CodexCredentials {
+            schema_version: AUTH_SCHEMA_VERSION,
+            auth_mode: CodexAuthMode::ChatGptOAuth,
+            access_token: SecretString::new("eyJhbGciOiJSUzI1NiJ9.doctor_codex_access_secret.sig"),
+            refresh_token: SecretString::new("rt_doctor_codex_refresh_secret"),
+            id_token: Some(SecretString::new(
+                "eyJhbGciOiJSUzI1NiJ9.doctor_codex_id_secret.sig",
+            )),
+            account_id: "acct_doctor_99887766wxyz".to_string(),
+            expires_at_ms,
+            plan_type: Some("pro".to_string()),
+            email_hint: Some("j***@example.com".to_string()),
+            last_refresh_utc: "2026-11-26T22:00:00Z".to_string(),
+        };
+
+        // 1. Codex-only valid auth -> ok == true, auth_codex == Pass, provider_auth == Pass,
+        //    env_gemini_api_key == Info, zero raw token/account_id leak.
+        let codex_only_cfg = temp.path().join("codex_only").join("config.json");
+        Config::default().save_secure(&codex_only_cfg).unwrap();
+        let store = FileAuthStore::for_config_path(&codex_only_cfg).unwrap();
+        store
+            .save_codex(&make_codex(current_utc_epoch_ms() + 3_600_000))
+            .unwrap();
+        let rep_codex = run_doctor(
+            DoctorOptions {
+                config_override: Some(codex_only_cfg.clone()),
+                port_override: Some(port),
+                ..DoctorOptions::default()
+            },
+            DoctorEnv::from_raw_values(None, None),
+        )
+        .await
+        .unwrap();
+        assert!(rep_codex.ok);
+        assert_eq!(
+            rep_codex
+                .checks
+                .iter()
+                .find(|c| c.name == "auth_codex")
+                .unwrap()
+                .status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            rep_codex
+                .checks
+                .iter()
+                .find(|c| c.name == "provider_auth")
+                .unwrap()
+                .status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            rep_codex
+                .checks
+                .iter()
+                .find(|c| c.name == "env_gemini_api_key")
+                .unwrap()
+                .status,
+            CheckStatus::Info
+        );
+        let json = format_doctor_json(&rep_codex).unwrap();
+        let human = format_doctor_human(&rep_codex);
+        for forbidden in [
+            "doctor_codex_access_secret",
+            "rt_doctor_codex_refresh_secret",
+            "doctor_codex_id_secret",
+            "acct_doctor_99887766wxyz",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "doctor JSON leaked '{forbidden}'"
+            );
+            assert!(
+                !human.contains(forbidden),
+                "doctor human output leaked '{forbidden}'"
+            );
+        }
+
+        // 2. Both Gemini and Codex configured -> Pass on auth_gemini, auth_codex, provider_auth.
+        store
+            .save_gemini(&GeminiCredentials::new(
+                ApiKey::parse_strict("AIzaSyDocBothKey0001").unwrap(),
+            ))
+            .unwrap();
+        let rep_both = run_doctor(
+            DoctorOptions {
+                config_override: Some(codex_only_cfg),
+                port_override: Some(port),
+                ..DoctorOptions::default()
+            },
+            DoctorEnv::from_raw_values(None, None),
+        )
+        .await
+        .unwrap();
+        assert!(rep_both.ok);
+        assert_eq!(
+            rep_both
+                .checks
+                .iter()
+                .find(|c| c.name == "auth_gemini")
+                .unwrap()
+                .status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            rep_both
+                .checks
+                .iter()
+                .find(|c| c.name == "auth_codex")
+                .unwrap()
+                .status,
+            CheckStatus::Pass
+        );
+        let both_pa = rep_both
+            .checks
+            .iter()
+            .find(|c| c.name == "provider_auth")
+            .unwrap();
+        assert_eq!(both_pa.status, CheckStatus::Pass);
+        assert!(both_pa.message.contains("Gemini") && both_pa.message.contains("OpenAI Codex"));
+
+        // 3. Expired Codex credentials (no Gemini) -> ok == true, auth_codex == Warn, provider_auth == Warn.
+        let expired_cfg = temp.path().join("expired").join("config.json");
+        Config::default().save_secure(&expired_cfg).unwrap();
+        FileAuthStore::for_config_path(&expired_cfg)
+            .unwrap()
+            .save_codex(&make_codex(1_000))
+            .unwrap();
+        let rep_exp = run_doctor(
+            DoctorOptions {
+                config_override: Some(expired_cfg),
+                port_override: Some(port),
+                ..DoctorOptions::default()
+            },
+            DoctorEnv::from_raw_values(None, None),
+        )
+        .await
+        .unwrap();
+        assert!(rep_exp.ok);
+        assert_eq!(
+            rep_exp
+                .checks
+                .iter()
+                .find(|c| c.name == "auth_codex")
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            rep_exp
+                .checks
+                .iter()
+                .find(|c| c.name == "provider_auth")
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
+
+        // 4. Corrupt and oversized auth/codex.json -> ok == false, auth_codex == Fail, zero secret leak.
+        for (case, bytes) in [
+            (
+                "corrupt",
+                br#"{"schema_version":1,"access_token":"tok_never_leak_doc", broken"#.to_vec(),
+            ),
+            ("oversized", vec![b' '; (MAX_AUTH_FILE_BYTES as usize) + 1]),
+        ] {
+            let cfg = temp
+                .path()
+                .join(format!("codex_{case}"))
+                .join("config.json");
+            Config::default().save_secure(&cfg).unwrap();
+            let adir = auth_dir_for_config_path(&cfg).unwrap();
+            fs::create_dir_all(&adir).unwrap();
+            let cfile = adir.join(CODEX_AUTH_FILENAME);
+            fs::write(&cfile, bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&adir, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::set_permissions(&cfile, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let rep = run_doctor(
+                DoctorOptions {
+                    config_override: Some(cfg),
+                    port_override: Some(port),
+                    ..DoctorOptions::default()
+                },
+                DoctorEnv::from_raw_values(None, None),
+            )
+            .await
+            .unwrap();
+            assert!(!rep.ok, "{case}: doctor must fail");
+            assert_eq!(
+                rep.checks
+                    .iter()
+                    .find(|c| c.name == "auth_codex")
+                    .unwrap()
+                    .status,
+                CheckStatus::Fail,
+                "{case}: auth_codex must fail"
+            );
+            assert!(
+                !format_doctor_json(&rep)
+                    .unwrap()
+                    .contains("tok_never_leak_doc")
+            );
+        }
+
+        // 5. Unix 0644 permissions + symlink + dangling symlink on auth/codex.json
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+
+            let perm_cfg = temp.path().join("codex_0644").join("config.json");
+            Config::default().save_secure(&perm_cfg).unwrap();
+            let perm_store = FileAuthStore::for_config_path(&perm_cfg).unwrap();
+            perm_store
+                .save_codex(&make_codex(current_utc_epoch_ms() + 3_600_000))
+                .unwrap();
+            fs::set_permissions(perm_store.codex_path(), fs::Permissions::from_mode(0o644))
+                .unwrap();
+            let rep_perm = run_doctor(
+                DoctorOptions {
+                    config_override: Some(perm_cfg),
+                    port_override: Some(port),
+                    ..DoctorOptions::default()
+                },
+                DoctorEnv::from_raw_values(None, None),
+            )
+            .await
+            .unwrap();
+            assert!(!rep_perm.ok);
+            let perm_chk = rep_perm
+                .checks
+                .iter()
+                .find(|c| c.name == "auth_permissions")
+                .unwrap();
+            assert_eq!(perm_chk.status, CheckStatus::Fail);
+            assert!(perm_chk.message.contains("chmod 600"));
+
+            let victim = temp.path().join("codex_victim.json");
+            fs::write(&victim, "keep-victim").unwrap();
+            for (case, target) in [
+                ("sym_codex", victim.clone()),
+                ("dangling_codex", temp.path().join("does-not-exist")),
+            ] {
+                let cfg = temp.path().join(case).join("config.json");
+                Config::default().save_secure(&cfg).unwrap();
+                let adir = auth_dir_for_config_path(&cfg).unwrap();
+                fs::create_dir_all(&adir).unwrap();
+                fs::set_permissions(&adir, fs::Permissions::from_mode(0o700)).unwrap();
+                symlink(&target, adir.join(CODEX_AUTH_FILENAME)).unwrap();
+                let rep = run_doctor(
+                    DoctorOptions {
+                        config_override: Some(cfg),
+                        port_override: Some(port),
+                        ..DoctorOptions::default()
+                    },
+                    DoctorEnv::from_raw_values(None, None),
+                )
+                .await
+                .unwrap();
+                assert!(!rep.ok, "{case}: doctor must fail");
+                assert_eq!(
+                    rep.checks
+                        .iter()
+                        .find(|c| c.name == "auth_permissions")
+                        .unwrap()
+                        .status,
+                    CheckStatus::Fail
+                );
+                assert_eq!(
+                    rep.checks
+                        .iter()
+                        .find(|c| c.name == "auth_codex")
+                        .unwrap()
+                        .status,
+                    CheckStatus::Fail
+                );
+            }
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "keep-victim");
         }
 
         handle.abort();

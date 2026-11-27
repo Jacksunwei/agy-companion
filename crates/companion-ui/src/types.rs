@@ -348,6 +348,7 @@ impl From<ProvidersSettingsPatch> for ProvidersConfigPatch {
     fn from(patch: ProvidersSettingsPatch) -> Self {
         Self {
             gemini: patch.gemini.map(Into::into),
+            codex: None,
         }
     }
 }

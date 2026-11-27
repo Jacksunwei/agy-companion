@@ -35,7 +35,7 @@ impl EnvKeySource {
     }
 }
 
-pub(super) fn is_loopback_url(url: &Url) -> bool {
+pub(crate) fn is_loopback_url(url: &Url) -> bool {
     match url.host() {
         Some(Host::Ipv4(ip)) => ip.is_loopback(),
         Some(Host::Ipv6(ip)) => ip.is_loopback(),
