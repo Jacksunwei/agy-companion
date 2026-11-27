@@ -305,6 +305,127 @@ def reap_pidfile_daemon(
     return not _is_pid_alive(pid)
 
 
+def _list_posix_processes() -> list[tuple[int, str]]:
+    """Return `(pid, cmdline)` pairs for visible POSIX processes without raising."""
+    if os.name == "nt":
+        return []
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        results: list[tuple[int, str]] = []
+        try:
+            entries = list(proc_root.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                raw = (entry / "cmdline").read_bytes()
+            except OSError:
+                continue
+            text = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+            if text:
+                results.append((pid, text))
+        if results:
+            return results
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    results = []
+    for line in completed.stdout.decode("utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        results.append((int(parts[0]), parts[1].strip()))
+    return results
+
+
+def reap_env_daemons(
+    env_root: Path,
+    *,
+    expected_binary: str | Path | None = None,
+    expected_cmdline_substr: str | None = None,
+    timeout: float = 3.0,
+) -> int:
+    """Safely terminate detached daemons whose command line references `env_root` (POSIX only).
+
+    Catches detached replacement daemons (e.g., `serve --adopt-running` spawning
+    `serve --replace-stale --config <env_root>/...`) even before they write `proxy.pid`.
+    """
+    if os.name == "nt":
+        return 0
+    raw_root = str(env_root)
+    real_root = os.path.realpath(raw_root)
+    root_tokens = tuple(dict.fromkeys(tok for tok in (raw_root, real_root) if len(tok) >= 8))
+    if not root_tokens:
+        return 0
+
+    self_pid = os.getpid()
+    parent_pid = os.getppid()
+    exp_bin = Path(expected_binary) if expected_binary is not None else None
+    matched_pids: list[int] = []
+    for pid, cmdline in _list_posix_processes():
+        if pid <= 1 or pid > 0x7FFFFFFF or pid == self_pid or pid == parent_pid:
+            continue
+        if not any(tok in cmdline for tok in root_tokens):
+            continue
+        if not _matches_expected_daemon(
+            cmdline,
+            expected_binary=exp_bin,
+            expected_cmdline_substr=expected_cmdline_substr,
+        ):
+            continue
+        matched_pids.append(pid)
+
+    if not matched_pids:
+        return 0
+
+    for pid in matched_pids:
+        _signal_pid_safely(pid, signal.SIGTERM)
+
+    deadline = time.monotonic() + max(0.05, timeout)
+    remaining = list(matched_pids)
+    while remaining and time.monotonic() < deadline:
+        remaining = [pid for pid in remaining if _is_pid_alive(pid)]
+        if remaining:
+            time.sleep(0.015)
+
+    for pid in remaining:
+        recheck_cmdline = _read_process_cmdline(pid)
+        if (
+            recheck_cmdline
+            and any(tok in recheck_cmdline for tok in root_tokens)
+            and _matches_expected_daemon(
+                recheck_cmdline,
+                expected_binary=exp_bin,
+                expected_cmdline_substr=expected_cmdline_substr,
+            )
+        ):
+            _signal_pid_safely(pid, signal.SIGKILL)
+
+    if remaining:
+        kill_deadline = time.monotonic() + 1.0
+        while remaining and time.monotonic() < kill_deadline:
+            remaining = [pid for pid in remaining if _is_pid_alive(pid)]
+            if remaining:
+                time.sleep(0.015)
+
+    return sum(1 for pid in matched_pids if not _is_pid_alive(pid))
+
+
 def _cleanup_watched_pidfiles() -> None:
     with _WATCHED_PIDFILES_LOCK:
         entries = list(_WATCHED_PIDFILES.values())
@@ -695,7 +816,27 @@ class IsolatedEnv:
                         shutil.rmtree(self._tempdir.name, ignore_errors=True)
                         return
                     time.sleep(0.05)
-        self._tempdir.cleanup()
+            return
+
+        pid_file = self.data_dir / "proxy.pid"
+        log_file = self.data_dir / "proxy.log"
+        has_pid = pid_file.exists() or pid_file.is_symlink()
+        has_log = log_file.exists() or log_file.is_symlink()
+        if has_pid:
+            reap_pidfile_daemon(pid_file, timeout=2.0)
+        if has_pid or has_log:
+            reap_env_daemons(self.root, timeout=2.0)
+
+        for attempt in range(10):
+            try:
+                self._tempdir.cleanup()
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.ENOTEMPTY, errno.EBUSY) or attempt == 9:
+                    raise
+                reap_pidfile_daemon(pid_file, timeout=1.0)
+                reap_env_daemons(self.root, timeout=1.0)
+                time.sleep(0.05)
 
     def __enter__(self) -> IsolatedEnv:
         return self
