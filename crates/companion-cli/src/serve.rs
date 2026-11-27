@@ -486,7 +486,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         Arc::clone(&sqlite_sink),
         sidecar_shutdown_rx.clone(),
     );
-    #[allow(unused_mut)]
+    #[allow(unused_mut, unused_variables)]
     let mut sidecar_ui_handle =
         if let Some(sidecar_cfg) = crate::sidecar_ui::SidecarUiConfig::from_env() {
             match crate::sidecar_ui::bind_and_spawn_sidecar_ui_with_auth_and_ls(
