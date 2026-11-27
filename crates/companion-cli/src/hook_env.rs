@@ -6,8 +6,8 @@ use std::time::Duration;
 use companion_providers::LoopbackProxyClient;
 
 use crate::daemon::{
-    DEFAULT_IDLE_SHUTDOWN_SECS, WaitHealthyOptions, WaitHealthyOutcome,
-    spawn_detached_proxy_daemon, wait_for_daemon_healthy,
+    DEFAULT_IDLE_SHUTDOWN_SECS, DetachedDaemonOptions, WaitHealthyOptions, WaitHealthyOutcome,
+    spawn_detached_proxy_daemon_configured, wait_for_daemon_healthy,
 };
 use crate::{CliError, load_config_checked, resolve_cli_config_path};
 
@@ -93,8 +93,25 @@ async fn try_hook_env(opts: &HookEnvOptions) -> Result<Option<u16>, String> {
         return Ok(None);
     }
 
-    let mut child = spawn_detached_proxy_daemon(port, &config_path, DEFAULT_IDLE_SHUTDOWN_SECS)
-        .map_err(|e| e.to_string())?;
+    let watch_pid = if std::env::var("ANTIGRAVITY_RESOLVING_ENVIRONMENT").as_deref() == Ok("1") {
+        tokio::task::spawn_blocking(crate::process::find_antigravity_ancestor_pid)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    let mut child = spawn_detached_proxy_daemon_configured(
+        &config_path,
+        DetachedDaemonOptions {
+            port,
+            idle_shutdown_secs: DEFAULT_IDLE_SHUTDOWN_SECS,
+            watch_pid,
+            replace_stale: false,
+        },
+    )
+    .map_err(|e| e.to_string())?;
 
     match wait_for_daemon_healthy(
         &probe,
@@ -204,6 +221,7 @@ mod tests {
                     status: "ok".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     protocol_version: 1,
+                    role: None,
                 })
             }),
         );

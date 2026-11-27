@@ -523,6 +523,7 @@ pub async fn spawn_mock_health(
                 status: status.to_string(),
                 version: version.to_string(),
                 protocol_version,
+                role: None,
             })
         }),
     );

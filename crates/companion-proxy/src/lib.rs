@@ -94,18 +94,24 @@ pub struct ProxyStateOptions {
     pub config_path: Option<PathBuf>,
     pub auth_store: Option<Arc<dyn AuthStore>>,
     pub env_fallback: bool,
+    pub role: Option<String>,
+    #[cfg(debug_assertions)]
+    pub health_version_override: Option<String>,
 }
 
 impl fmt::Debug for ProxyStateOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProxyStateOptions")
-            .field("config_path", &self.config_path)
+        let mut s = f.debug_struct("ProxyStateOptions");
+        s.field("config_path", &self.config_path)
             .field(
                 "auth_store_dir",
                 &self.auth_store.as_ref().and_then(|s| s.auth_dir()),
             )
             .field("env_fallback", &self.env_fallback)
-            .finish()
+            .field("role", &self.role);
+        #[cfg(debug_assertions)]
+        s.field("health_version_override", &self.health_version_override);
+        s.finish()
     }
 }
 
@@ -115,6 +121,9 @@ impl Default for ProxyStateOptions {
             config_path: None,
             auth_store: None,
             env_fallback: true,
+            role: None,
+            #[cfg(debug_assertions)]
+            health_version_override: None,
         }
     }
 }
@@ -125,6 +134,9 @@ struct ProxyStateInner {
     usage_sink: Arc<dyn UsageSink>,
     activity: Arc<ActivityTracker>,
     rss: rss::RssSampler,
+    role: Option<String>,
+    #[cfg(debug_assertions)]
+    health_version_override: Option<String>,
 }
 
 #[derive(Clone)]
@@ -177,6 +189,9 @@ impl ProxyState {
                 usage_sink,
                 activity: Arc::new(ActivityTracker::new()),
                 rss: rss::RssSampler::new(),
+                role: None,
+                #[cfg(debug_assertions)]
+                health_version_override: None,
             }),
         }
     }
@@ -252,6 +267,9 @@ impl ProxyState {
                 usage_sink,
                 activity: Arc::new(ActivityTracker::new()),
                 rss: rss::RssSampler::new(),
+                role: options.role,
+                #[cfg(debug_assertions)]
+                health_version_override: options.health_version_override,
             }),
         })
     }
@@ -270,6 +288,18 @@ impl ProxyState {
 
     pub fn idle_duration(&self) -> Duration {
         self.inner.activity.idle_duration()
+    }
+
+    pub(crate) fn role(&self) -> Option<&str> {
+        self.inner.role.as_deref()
+    }
+
+    pub(crate) fn health_version(&self) -> &str {
+        #[cfg(debug_assertions)]
+        if let Some(ref version) = self.inner.health_version_override {
+            return version.as_str();
+        }
+        env!("CARGO_PKG_VERSION")
     }
 
     pub(crate) fn enter_request(&self) -> InFlightGuard {

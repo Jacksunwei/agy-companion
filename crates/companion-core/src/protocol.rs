@@ -13,6 +13,8 @@ pub struct HealthResponse {
     pub status: String,
     pub version: String,
     pub protocol_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl HealthResponse {
@@ -21,7 +23,18 @@ impl HealthResponse {
             status: "ok".to_string(),
             version: version.into(),
             protocol_version: PROTOCOL_VERSION,
+            role: None,
         }
+    }
+
+    pub fn with_role(mut self, role: impl Into<String>) -> Self {
+        self.role = Some(role.into());
+        self
+    }
+
+    pub fn with_optional_role(mut self, role: Option<String>) -> Self {
+        self.role = role;
+        self
     }
 }
 
@@ -243,10 +256,29 @@ mod tests {
         assert_eq!(health.status, "ok");
         assert_eq!(health.version, "0.1.0");
         assert_eq!(health.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(health.role, None);
 
         let json = serde_json::to_string(&health).expect("serialize health");
+        assert!(
+            !json.contains("\"role\""),
+            "role must be omitted from JSON when None: {json}"
+        );
         let parsed: HealthResponse = serde_json::from_str(&json).expect("deserialize health");
         assert_eq!(parsed, health);
+
+        // Legacy 3-field payload without `role` deserializes cleanly.
+        let legacy: HealthResponse =
+            serde_json::from_str(r#"{"status":"ok","version":"0.1.0","protocol_version":1}"#)
+                .expect("deserialize legacy 3-field health");
+        assert_eq!(legacy, health);
+
+        // Additive `role` roundtrips cleanly.
+        let with_role = HealthResponse::ok("0.1.0").with_role("bootstrap");
+        let role_json = serde_json::to_string(&with_role).expect("serialize health with role");
+        assert!(role_json.contains("\"role\":\"bootstrap\""));
+        let role_parsed: HealthResponse =
+            serde_json::from_str(&role_json).expect("deserialize health with role");
+        assert_eq!(role_parsed, with_role);
     }
 
     #[test]
@@ -426,6 +458,7 @@ mod tests {
             status: "degraded".to_string(),
             version: "0.1.0".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            role: None,
         });
         assert!(degraded.reachable);
         assert_eq!(degraded.status.as_deref(), Some("degraded"));
@@ -439,6 +472,7 @@ mod tests {
             status: "ok\r\n".to_string(),
             version: "\x1b[31m0.1.0\n".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            role: None,
         });
         assert_eq!(injected.status.as_deref(), Some("ok"));
         assert_eq!(injected.version.as_deref(), Some("[31m0.1.0"));

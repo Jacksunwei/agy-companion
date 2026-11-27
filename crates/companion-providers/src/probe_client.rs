@@ -287,6 +287,7 @@ mod tests {
                     status: "ok".to_string(),
                     version: "0.1.0".to_string(),
                     protocol_version: PROTOCOL_VERSION,
+                    role: None,
                 })
             }),
         ))
@@ -603,6 +604,7 @@ mod tests {
                             status: s,
                             version: "0.1.0".to_string(),
                             protocol_version,
+                            role: None,
                         })
                     }
                 }),
@@ -715,6 +717,7 @@ mod tests {
                 status: "ok".to_string(),
                 version: "0.1.0".to_string(),
                 protocol_version: 99,
+                role: None,
             },
             "0.1.0",
             PROTOCOL_VERSION,
@@ -730,6 +733,7 @@ mod tests {
                 status: "ok".to_string(),
                 version: "9.9.9".to_string(),
                 protocol_version: 99,
+                role: None,
             },
             "0.1.0",
             PROTOCOL_VERSION,
@@ -747,6 +751,7 @@ mod tests {
                 status: "degraded".to_string(),
                 version: "0.1.0".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                role: None,
             },
             "0.1.0",
             PROTOCOL_VERSION,
@@ -760,6 +765,7 @@ mod tests {
                 status: "ok\r\n".to_string(),
                 version: "\x1b[31m0.1.0\n".to_string(),
                 protocol_version: PROTOCOL_VERSION,
+                role: None,
             },
             "0.1.0",
             PROTOCOL_VERSION,

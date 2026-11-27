@@ -9,6 +9,7 @@ pub mod integration;
 pub mod launch;
 pub mod ls_collector;
 pub mod models;
+pub mod plugin_upgrade;
 pub mod process;
 pub mod serve;
 pub mod sidecar_ui;

@@ -33,8 +33,9 @@ When Antigravity App starts from macOS Dock/Spotlight or a Linux desktop launche
          |            |-- Verifies ~/.gemini/config/plugins/agy-companion/plugin.json exists (else fail-open)
          |            |-- Probes http://127.0.0.1:<port>/health (250ms timeout, 64 KiB body cap)
          |            |-- If unreachable: spawns detached Managed On-Demand Daemon
-         |            |     agy-companion serve --idle-shutdown-secs 1800
-         |            |     (inherits live HTTPS_PROXY / XDG_*, writes 0600 proxy.pid & 0600 proxy.log)
+         |            |     agy-companion serve --idle-shutdown-secs 1800 [--watch-pid <ANTIGRAVITY_PID>]
+         |            |     (walks ancestor PIDs under ANTIGRAVITY_RESOLVING_ENVIRONMENT=1 to tie lifetime
+         |            |      to Antigravity.app, inherits live HTTPS_PROXY / XDG_*, writes 0600 proxy.pid & proxy.log)
          |            `-- Prints validated u16 port ONLY (or empty stdout, exiting 0 -> fail-open to stock Google)
          |      -> Exports CLOUD_CODE_URL, GOOGLE_GEMINI_BASE_URL, conditional GEMINI_API_KEY
          |         (NEVER overwrites or copies a real GEMINI_API_KEY or GOOGLE_API_KEY),
@@ -45,8 +46,19 @@ When Antigravity App starts from macOS Dock/Spotlight or a Linux desktop launche
          |-- T+839ms: POST /v1internal:fetchAvailableModels -> local proxy (ALREADY WARM)
          |              |-- Day-0 (no real API key saved): returns upstream JSON UNTOUCHED
          |              `-- Key saved: preserves ALL native Google models + appends (Proxy) models
-         |-- T+2.2s:  SidecarManager runs `serve --adopt-running` (500ms health poll)
-         |              `-- Adopts warm daemon and takes over in <1s on any mid-session crash
+         |-- T+2.2s:  SidecarManager runs `serve --adopt-running` (500ms health poll; owns Aux Panel UI)
+         |              |-- Adopts warm bootstrap daemon (toggling plugin off never breaks :24141)
+         |              |-- Watches `<plugin_dir>/plugin.json` (`AGY_COMPANION_PLUGIN_DIR` -> `AGY_PLUGINS_DIR`
+         |              |     -> default plugins dir) across both standby & active-listener states
+         |              |-- Converges toward `desired_version = plugin.json.version ?? running_version`:
+         |              |     * Direct skew (`health != running == desired`): spawns `current_exe()` `--replace-stale`
+         |              |     * Plugin advance/rollback (`health != desired != running`): passively polls local
+         |              |       candidate binaries (`AGY_COMPANION_BIN` -> dev `target/{debug,release}` -> startup
+         |              |       `current_exe()` -> cache `bin/` -> `$PATH`) gated by `(len, mtime)` + `--version`
+         |              |       and spawns the matching binary with `--replace-stale` (+ `--watch-pid`, sidecar
+         |              |       UI/LS/plugin env scrubbed) for ~10-20ms zero-drop SSE handoff; old sidecar stays
+         |              |       alive and goes idle once `/health.version == desired_version`
+         |              `-- Takes over in <1s on any mid-session crash
          |-- MCP servers (gemini-api, ui-mcp, 3P): restored via JETSKI_MCP_ENV_RESTORE_* + run-companion.sh scrub
          `-- Integrated terminals ($SHELL -l): env.sh value-guarded ${VAR+x} 3-state scrub restores clean env
 ```
@@ -85,13 +97,14 @@ Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionPr
 - On Day-0 (`!has_configured_api_key`), `POST /v1internal:fetchAvailableModels` returns upstream JSON and headers untouched (hiding `(Proxy)` models until a real API key is saved).
 - `GET /api/stats` exposes structured `StatsSnapshot` JSON (`{ "usage": { ... }, "cloudcode": { "mode", "resolved_upstream", "last_catalog_refresh_at_ms", "last_catalog_included_proxy_models" } }`).
 - Unsupported non-Gemini-3.8+/4+ `400` responses include the actionable hint `unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly`.
-- Managed On-Demand Daemon primitives: `--idle-shutdown-secs` guarded by active in-flight requests and open SSE streams (passive `/health` and `/api/stats` probes do not reset idle time), `64 KiB`-capped `/health` probe (`250ms` timeout in `hook-env`), `500ms` `--adopt-running` polling, atomic `0600` structured `proxy.pid`, and `0600` rotating `5 MiB` `proxy.log`.
+- Managed On-Demand Daemon primitives: `--watch-pid <PID>` (zombie- and PID-reuse-safe parent tracking that exits cleanly within ~1–2s after `Antigravity.app` quits once `in_flight_requests == 0`), `--idle-shutdown-secs 1800` fallback guarded by active in-flight requests and open SSE streams (passive `/health` and `/api/stats` probes do not reset idle time), `--replace-stale` smooth version-skew handoff (pre-initialized `ProxyState`, 4-layer OS-verified non-blocking `SIGTERM` without `SIGKILL`, `10ms` bind tight-poll while the old daemon drains active SSE streams, and idempotent exit `0` when a matching version already owns the port), `64 KiB`-capped `/health` probe with optional `role` (`"bootstrap"` | `"sidecar"` | `"standalone"`), `500ms` `--adopt-running` polling with plugin-manifest self-upgrade watching (`plugin/scripts/run-companion.sh` exports `AGY_COMPANION_PLUGIN_DIR`; `serve --adopt-running` fail-closed reads `plugin.json` across both standby and active-listener states, passively polls local candidate binaries gated by `(len, mtime)` + exact `--version` match whenever `/health` differs from `plugin.json`, spawns the matching binary with `--replace-stale` + `--watch-pid` while scrubbing `ANTIGRAVITY_SIDECAR_WEB_PORT`, `ANTIGRAVITY_SIDECAR_UI_TOKEN`, `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`, and `AGY_COMPANION_PLUGIN_DIR`, and keeps the sidecar alive without downgrading once `/health` converges), atomic `0600` structured `proxy.pid` (PID-matched `ProxyPidGuard::drop` race safety), and `0600` rotating `5 MiB` `proxy.log`.
 
 | Criterion | OS User Service (`launchd` / `systemd --user`) | Managed On-Demand Daemon + `SidecarManager` (Chosen) |
 | --- | --- | --- |
 | Live `HTTPS_PROXY` & `~/.zshrc` `XDG_*` | Stripped by OS service manager | Inherited automatically from `$SHELL -ilc` |
 | macOS Login Items alert | Triggers "Background Items Added" popup | Zero OS popups |
-| Idle footprint after `Cmd+Q` | Runs 24/7 | Exits cleanly via `--idle-shutdown-secs 1800` |
+| Idle footprint after `Cmd+Q` | Runs 24/7 | Exits cleanly within ~1–2s via `--watch-pid` (with `--idle-shutdown-secs 1800` fallback) |
+| Version bump / rebuild handoff | Manual restart drops active streams | ~10–20ms zero-drop SSE handoff via sidecar `--adopt-running` -> detached `--replace-stale` |
 | Mid-session crash recovery | Fast, but fights `SIGTERM` / port changes | `<1s` takeover via `SidecarManager` `serve --adopt-running` (`500ms` poll) |
 | Cross-platform portability | Divergent (`launchd` / `systemd` / Windows Task) | One unified lifecycle across macOS, Linux, WSL, containers, Windows |
 

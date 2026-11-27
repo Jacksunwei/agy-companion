@@ -35,6 +35,14 @@ pub enum Commands {
         /// (0 or omitted disables idle shutdown).
         #[arg(long = "idle-shutdown-secs")]
         idle_shutdown_secs: Option<u64>,
+        /// Automatically exit cleanly after this watched parent PID exits and in-flight requests
+        /// drain to zero (intended for bootstrap daemons tied to Antigravity.app).
+        #[arg(long = "watch-pid", value_parser = parse_watch_pid)]
+        watch_pid: Option<u32>,
+        /// If a stale-version agy-companion proxy occupies the port, gracefully signal it and
+        /// reclaim the port as it drains; exit 0 if a matching version is already running.
+        #[arg(long = "replace-stale", conflicts_with = "adopt_running")]
+        replace_stale: bool,
     },
     /// Inspect local config permissions, proxy /health, version skew, and environment.
     Doctor {
@@ -225,6 +233,22 @@ pub fn parse_nonzero_port(raw: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+pub fn parse_watch_pid(raw: &str) -> Result<u32, String> {
+    let pid: u32 = raw.parse().map_err(|_| {
+        format!(
+            "invalid watch PID '{raw}': expected integer between 2 and {}",
+            i32::MAX
+        )
+    })?;
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return Err(format!(
+            "watch PID must be between 2 and {} (got {pid})",
+            i32::MAX
+        ));
+    }
+    Ok(pid)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -274,6 +298,22 @@ mod tests {
                 "invalid --idle-shutdown-secs '{bad_idle}' must fail"
             );
         }
+        for bad_pid in ["0", "1", "abc", "-5", "2147483648"] {
+            assert!(
+                Cli::try_parse_from(["agy-companion", "serve", "--watch-pid", bad_pid]).is_err(),
+                "invalid --watch-pid '{bad_pid}' must fail"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "agy-companion",
+                "serve",
+                "--adopt-running",
+                "--replace-stale"
+            ])
+            .is_err(),
+            "--adopt-running and --replace-stale must conflict"
+        );
         assert!(
             Cli::try_parse_from(["agy-companion", "integration", "enable", "--shell", "tcsh"])
                 .is_err(),
@@ -301,6 +341,29 @@ mod tests {
                 adopt_running: true,
                 auto_enable_launcher: true,
                 idle_shutdown_secs: Some(0),
+                watch_pid: None,
+                replace_stale: false,
+            }
+        );
+
+        assert_eq!(
+            Cli::try_parse_from([
+                "agy-companion",
+                "serve",
+                "--watch-pid=4242",
+                "--replace-stale",
+                "--idle-shutdown-secs=1800",
+            ])
+            .expect("serve bootstrap lifecycle flags")
+            .command,
+            Commands::Serve {
+                port: None,
+                config: None,
+                adopt_running: false,
+                auto_enable_launcher: false,
+                idle_shutdown_secs: Some(1800),
+                watch_pid: Some(4242),
+                replace_stale: true,
             }
         );
 

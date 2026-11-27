@@ -626,6 +626,7 @@ main() {
     log_err "failed to resolve plugin directory from: ${script_dir}"
     exit 1
   }
+  export AGY_COMPANION_PLUGIN_DIR="${plugin_dir}"
   repo_root="$(cd -P -- "${plugin_dir}/.." >/dev/null 2>&1 && pwd -P)" || {
     log_err "failed to resolve parent directory from: ${plugin_dir}"
     exit 1

@@ -6,7 +6,7 @@ Loopback-only Axum HTTP proxy that routes Gemini API requests to your API key wh
 
 | File | Responsibility |
 | --- | --- |
-| `src/lib.rs` | `#![forbid(unsafe_code)]`, `ProxyError`, `ProxyState` (`new -> Result`, infallible `with_cloudcode` DI constructor, `from_config`, `from_config_with_options`, `from_config_with_codex_auth`), `ProxyStateOptions`, loopback listener binding & re-verification (`S1`), and `serve*` entrypoints |
+| `src/lib.rs` | `#![forbid(unsafe_code)]`, `ProxyError`, `ProxyState` (`new -> Result`, infallible `with_cloudcode` DI constructor, `from_config`, `from_config_with_options`, `from_config_with_codex_auth`), `ProxyStateOptions` (including optional `role`), loopback listener binding & re-verification (`S1`), and `serve*` entrypoints |
 | `src/activity.rs` | `ActivityTracker` and `InFlightGuard` tracking active in-flight requests and idle duration for `--idle-shutdown-secs` (ignoring passive `/health` and `/api/stats` probes) |
 | `src/hot_reload.rs` | Non-blocking async `HotReloadProvider` (`tokio::sync::Mutex` + `spawn_blocking` outside `RwLock`, zero stat debounce, `companion-core::fs_safe` TOCTOU `(dev, ino)` & symlink/FIFO safety watching `config.json`, `auth/gemini.json`, and `auth/codex.json`, preserving `CloudCodeClient` LRU and `CodexProvider` when unchanged) |
 | `src/cloudcode/mod.rs` | `MAX_CLOUDCODE_CATALOG_BYTES` (`16 MiB`), `CloudCodeError`, `CloudCodeStreamResponse`, `CloudCodeBufferedResponse`, and public CloudCode re-exports |
@@ -17,7 +17,7 @@ Loopback-only Axum HTTP proxy that routes Gemini API requests to your API key wh
 | `src/cloudcode/catalog.rs` | `pretty_model_name`, `merge_available_models`, `merge_available_models_multi_provider`, upstream Gemini compaction/experiment template inheritance, and explicit Codex metadata (`supportsThoughtCirculation: false`, `272K`/`500K` context) |
 | `src/routes/mod.rs` | `MAX_PROXY_BODY_BYTES` (`64 MiB`), `build_router` (`/health`, `/api/stats`, `/v1beta/models`, `/v1beta/models/{*rest}`, `/v1internal:fetchAvailableModels`, `/v1internal:*` fallback), `json_error_response`, and `S7` security headers |
 | `src/routes/middleware.rs` | `track_request_activity`, `enforce_get_post_only` (`405`), upfront `enforce_content_length_limit` (`400`/`413`), streaming `read_bounded_request_body` (`413` strictly on overflow, `400` on disconnect/read error), and inbound API-key/content-type validation |
-| `src/routes/internal.rs` | `GET /health`, `GET /api/stats`, and `GET /v1beta/models` handlers |
+| `src/routes/internal.rs` | `GET /health` (with optional `role`), `GET /api/stats`, and `GET /v1beta/models` handlers |
 | `src/routes/gemini.rs` | `POST /v1beta/models/{*rest}` multi-provider dispatch (`is_supported_gemini_model` → `GeminiProvider` with Gemini-only thought-signature retry vs `is_codex_model` → `CodexProvider`), pre-translation `conversation_id` extraction, and SSE/JSON usage tee wiring (`UsageOrigin::{GeminiProxy,CodexProxy}`) |
 | `src/routes/cloudcode.rs` | `POST /v1internal:fetchAvailableModels` (multi-provider `gemini_ready \|\| codex_ready` gating; Day-0 untouched pass-through vs merged `(Proxy)`/`(Codex)` catalog) and `/v1internal:*` raw streaming fallback (`TrackedStream`) |
 | `src/routes/thought_sig.rs` | `400 INVALID_THOUGHT_SIGNATURE` retry-strip fallback with strict `64 KiB` `sniff_error_prefix` cap and zero-copy `leftover` byte-stream replay |
