@@ -769,6 +769,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
                 last_catalog_included_proxy_models: Some(true),
             },
             proxy_rss_bytes: Some(25_165_824),
+            max_context_tokens: Some(512_000),
             recent_calls: vec![
                 RecentCallSnapshot {
                     timestamp_ms: 1_747_300_000_000,

@@ -269,6 +269,18 @@ class TestCujLsTelemetry(E2ETestCase):
                 },
             ],
         )
+        mock_ls.set_generator_metadata(
+            live_cid,
+            [
+                {
+                    "chatModel": {
+                        "chatStartMetadata": {
+                            "contextWindowMetadata": {"maxContextTokens": "512000"}
+                        }
+                    }
+                }
+            ],
+        )
         mock_ls.push_summary_delta(
             {
                 live_cid: {
@@ -326,8 +338,17 @@ class TestCujLsTelemetry(E2ETestCase):
         self.assertTrue(snap.get("ls_telemetry_active"), f"expected ls_telemetry_active=true: {snap}")
         stats = snap.get("stats") or {}
         self.assertEqual(stats.get("usage", {}).get("requests"), 2)
+        self.assertEqual(stats.get("max_context_tokens"), 512_000)
         models_seen = {c["model"] for c in stats.get("recent_calls", [])}
         self.assertEqual(models_seen, {"claude-opus-5-5", "gemini-4-hydrogen"})
+
+        gen_rpcs = mock_ls.captured_rpcs("GetCascadeTrajectoryGeneratorMetadata")
+        self.assertTrue(gen_rpcs, "expected GetCascadeTrajectoryGeneratorMetadata RPC")
+        self.assertEqual({r.body.get("cascadeId") for r in gen_rpcs}, {live_cid})
+        self.assertTrue(
+            all(r.body.get("includeMessages") is False for r in gen_rpcs),
+            f"expected includeMessages=False on all generator metadata RPCs: {gen_rpcs}",
+        )
 
         # Verify historical cascades were STILL never fetched.
         fetched_cids = {
@@ -445,6 +466,30 @@ class TestCujLsTelemetry(E2ETestCase):
         mock_ls.set_steps(root_cid, [root_step0, checkpoint_step1, post_cp_step2])
         mock_ls.set_steps(sub_cid, [sub_step0])
         mock_ls.set_steps(sideq_cid, [root_step0])
+        mock_ls.set_generator_metadata(
+            root_cid,
+            [
+                {
+                    "chatModel": {
+                        "chatStartMetadata": {
+                            "contextWindowMetadata": {"maxContextTokens": "512000"}
+                        }
+                    }
+                }
+            ],
+        )
+        mock_ls.set_generator_metadata(
+            sub_cid,
+            [
+                {
+                    "chatModel": {
+                        "chatStartMetadata": {
+                            "contextWindowMetadata": {"maxContextTokens": "200000"}
+                        }
+                    }
+                }
+            ],
+        )
 
         mock_ls.push_summary_delta(
             {
@@ -490,6 +535,12 @@ class TestCujLsTelemetry(E2ETestCase):
         self.assertTrue(snap.get("ls_telemetry_active"))
         stats = snap["stats"]
         self.assertEqual(stats["usage"]["requests"], 4)
+        self.assertEqual(stats["max_context_tokens"], 512_000)
+        gen_cids = {
+            r.body.get("cascadeId")
+            for r in mock_ls.captured_rpcs("GetCascadeTrajectoryGeneratorMetadata")
+        }
+        self.assertEqual(gen_cids, {root_cid})
         recent = stats["recent_calls"]
         self.assertEqual(len(recent), 4)
         self.assertTrue(
@@ -518,6 +569,18 @@ class TestCujLsTelemetry(E2ETestCase):
             },
         }
         mock_ls.set_steps(root_cid, [root_step0, post_revert_step1])
+        mock_ls.set_generator_metadata(
+            root_cid,
+            [
+                {
+                    "chatModel": {
+                        "chatStartMetadata": {
+                            "contextWindowMetadata": {"maxContextTokens": "256000"}
+                        }
+                    }
+                }
+            ],
+        )
         mock_ls.push_summary_delta(
             {
                 root_cid: {
@@ -546,6 +609,7 @@ class TestCujLsTelemetry(E2ETestCase):
             "structuredContent"
         ]
         self.assertEqual(snap_after["stats"]["usage"]["requests"], 3)
+        self.assertEqual(snap_after["stats"]["max_context_tokens"], 256_000)
 
     def test_cuj_ls_survives_proxy_restart_and_cli_fails_open_without_ls(self) -> None:
         """LS Monitor survives proxy restart/takeover with zero loss, and standalone sidecar fails open without LS env vars."""
@@ -618,6 +682,7 @@ class TestCujLsTelemetry(E2ETestCase):
         ]
         self.assertTrue(before["ls_telemetry_active"])
         self.assertEqual(before["stats"]["usage"]["requests"], 1)
+        self.assertIsNone(before["stats"]["max_context_tokens"])
         if sys.platform in ("darwin", "linux"):
             self.assertIsNotNone(before["stats"]["proxy_rss_bytes"])
 

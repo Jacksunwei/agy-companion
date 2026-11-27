@@ -102,6 +102,7 @@ export interface ModelSessionStats {
 export interface StatsSnapshot {
   usage: UsageStatsSnapshot;
   proxy_rss_bytes: number | null;
+  max_context_tokens: number | null;
   recent_calls: RecentCallSnapshot[];
   by_model: ModelSessionStats[];
 }
@@ -752,6 +753,9 @@ function parseStatsSnapshot(raw: unknown): StatsSnapshot | null {
     return null;
   }
 
+  const rawMaxCtx = asOptionalNullableNumber(raw.max_context_tokens);
+  const maxContextTokens = rawMaxCtx !== null && rawMaxCtx > 0 ? rawMaxCtx : null;
+
   return {
     usage: {
       requests,
@@ -762,6 +766,7 @@ function parseStatsSnapshot(raw: unknown): StatsSnapshot | null {
       cache_hit_ratio: cacheHitRatio,
     },
     proxy_rss_bytes: asOptionalNullableNumber(raw.proxy_rss_bytes),
+    max_context_tokens: maxContextTokens,
     recent_calls: parseRecentCalls(raw.recent_calls),
     by_model: parseByModel(raw.by_model),
   };

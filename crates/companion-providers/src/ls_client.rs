@@ -35,6 +35,8 @@ const RPC_GET_CASCADE_MODEL_CONFIG_DATA: &str =
     "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData";
 const RPC_GET_CASCADE_TRAJECTORY_STEPS: &str =
     "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps";
+const RPC_GET_CASCADE_TRAJECTORY_GENERATOR_METADATA: &str =
+    "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata";
 const RPC_GET_ALL_CASCADE_TRAJECTORIES: &str =
     "/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories";
 const RPC_JETBOX_SUBSCRIBE_TO_SUMMARIES: &str =
@@ -466,6 +468,66 @@ pub struct LsTrajectorySummary {
     pub trajectory_metadata: Option<LsTrajectoryMetadata>,
 }
 
+/// Strict allowlist DTO for `ContextWindowMetadata` inside generator metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LsContextWindowMetadata {
+    #[serde(default, deserialize_with = "deserialize_u64_from_str_or_num")]
+    pub max_context_tokens: u64,
+}
+
+/// Strict allowlist DTO for `ChatStartMetadata` inside generator metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LsChatStartMetadata {
+    #[serde(default)]
+    pub context_window_metadata: Option<LsContextWindowMetadata>,
+}
+
+/// Strict allowlist DTO for `ChatModelMetadata` inside generator metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LsChatModelMetadata {
+    #[serde(default)]
+    pub chat_start_metadata: Option<LsChatStartMetadata>,
+}
+
+/// Strict allowlist DTO for a single `GeneratorMetadata` entry returned by
+/// `GetCascadeTrajectoryGeneratorMetadata`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LsGeneratorMetadata {
+    #[serde(default)]
+    pub chat_model: Option<LsChatModelMetadata>,
+}
+
+impl LsGeneratorMetadata {
+    /// Returns the authoritative compaction window (`maxContextTokens`) when present and `> 0`.
+    pub fn max_context_tokens(&self) -> Option<u64> {
+        self.chat_model
+            .as_ref()
+            .and_then(|chat_model| chat_model.chat_start_metadata.as_ref())
+            .and_then(|start| start.context_window_metadata.as_ref())
+            .map(|window| window.max_context_tokens)
+            .filter(|&tokens| tokens > 0)
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetCascadeTrajectoryGeneratorMetadataRequest<'a> {
+    cascade_id: &'a str,
+    generator_metadata_offset: u32,
+    include_messages: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetCascadeTrajectoryGeneratorMetadataResponse {
+    #[serde(default)]
+    generator_metadata: Vec<LsGeneratorMetadata>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GetAllCascadeTrajectoriesRequest {
@@ -655,6 +717,31 @@ impl LsClient {
             )
             .await?;
         Ok(resp.steps)
+    }
+
+    pub async fn get_cascade_trajectory_generator_metadata(
+        &self,
+        cascade_id: &str,
+        generator_metadata_offset: u32,
+    ) -> Result<Vec<LsGeneratorMetadata>, LsError> {
+        let req_body = serde_json::to_vec(&GetCascadeTrajectoryGeneratorMetadataRequest {
+            cascade_id,
+            generator_metadata_offset,
+            include_messages: false,
+        })
+        .map_err(|_| LsError::InvalidJson {
+            rpc: "GetCascadeTrajectoryGeneratorMetadata",
+        })?;
+
+        let resp: GetCascadeTrajectoryGeneratorMetadataResponse = self
+            .post_unary_json(
+                "GetCascadeTrajectoryGeneratorMetadata",
+                RPC_GET_CASCADE_TRAJECTORY_GENERATOR_METADATA,
+                req_body,
+                MAX_LS_RESPONSE_BYTES,
+            )
+            .await?;
+        Ok(resp.generator_metadata)
     }
 
     pub async fn get_all_cascade_trajectories(
@@ -1968,5 +2055,163 @@ mod tests {
             assert!(!err.to_string().contains("store not initialized"));
             e_handle.abort();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_cascade_trajectory_generator_metadata_parses_str_and_num_ignores_unknown_and_sends_include_messages_false()
+     {
+        let captured = Arc::new(tokio::sync::Mutex::new(
+            Option::<(HeaderMap, Vec<u8>)>::None,
+        ));
+        let captured_clone = Arc::clone(&captured);
+
+        let app = Router::new().route(
+            RPC_GET_CASCADE_TRAJECTORY_GENERATOR_METADATA,
+            post(move |headers: HeaderMap, body: Bytes| {
+                let captured = Arc::clone(&captured_clone);
+                async move {
+                    *captured.lock().await = Some((headers, body.to_vec()));
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{
+                            "generatorMetadata": [
+                                {
+                                    "unknownTopField": {"nested": [1, 2, 3]},
+                                    "chatModel": {
+                                        "extraChatModelField": "ignored",
+                                        "chatStartMetadata": {
+                                            "contextWindowMetadata": {
+                                                "maxContextTokens": "512000",
+                                                "estimatedTokensUsed": "77000"
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    "chatModel": {
+                                        "chatStartMetadata": {
+                                            "contextWindowMetadata": {
+                                                "maxContextTokens": 200000
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    "chatModel": {
+                                        "chatStartMetadata": {
+                                            "contextWindowMetadata": {
+                                                "maxContextTokens": 0
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    "chatModel": {}
+                                }
+                            ]
+                        }"#,
+                    )
+                }
+            }),
+        );
+
+        let (port, handle) = spawn_ipv4_router(app).await;
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).unwrap(),
+            CsrfToken::parse(TEST_CSRF_SECRET).unwrap(),
+        )
+        .unwrap();
+
+        let entries = client
+            .get_cascade_trajectory_generator_metadata("cascade-abc", 3)
+            .await
+            .expect("generator metadata should parse");
+        handle.abort();
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].max_context_tokens(), Some(512_000));
+        assert_eq!(entries[1].max_context_tokens(), Some(200_000));
+        assert_eq!(entries[2].max_context_tokens(), None);
+        assert_eq!(entries[3].max_context_tokens(), None);
+
+        let (req_headers, req_body) = captured
+            .lock()
+            .await
+            .clone()
+            .expect("request should have been captured");
+        assert_eq!(
+            req_headers
+                .get(HEADER_ANTIGRAVITY_CSRF_TOKEN)
+                .and_then(|v| v.to_str().ok()),
+            Some(TEST_CSRF_SECRET)
+        );
+        assert_eq!(
+            req_headers
+                .get(HEADER_CODEIUM_CSRF_TOKEN)
+                .and_then(|v| v.to_str().ok()),
+            Some(TEST_CSRF_SECRET)
+        );
+        let req_json: serde_json::Value =
+            serde_json::from_slice(&req_body).expect("request body must be valid JSON");
+        assert_eq!(
+            req_json,
+            serde_json::json!({
+                "cascadeId": "cascade-abc",
+                "generatorMetadataOffset": 3,
+                "includeMessages": false,
+            })
+        );
+
+        // 404 maps to LsError::Unimplemented
+        let (unimpl_port, unimpl_handle) = spawn_ipv4_router(Router::new().route(
+            RPC_GET_CASCADE_TRAJECTORY_GENERATOR_METADATA,
+            post(|| async { (StatusCode::NOT_FOUND, r#"{"code":"unimplemented"}"#) }),
+        ))
+        .await;
+        let unimpl_client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{unimpl_port}")).unwrap(),
+            CsrfToken::parse(TEST_CSRF_SECRET).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            unimpl_client
+                .get_cascade_trajectory_generator_metadata("cascade-abc", 0)
+                .await
+                .expect_err("404 must map to Unimplemented"),
+            LsError::Unimplemented {
+                rpc: "GetCascadeTrajectoryGeneratorMetadata"
+            }
+        );
+        unimpl_handle.abort();
+
+        // Oversized response (> MAX_LS_RESPONSE_BYTES) maps to ResponseTooLarge
+        let (big_port, big_handle) = spawn_ipv4_router(Router::new().route(
+            RPC_GET_CASCADE_TRAJECTORY_GENERATOR_METADATA,
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    vec![b' '; MAX_LS_RESPONSE_BYTES + 1],
+                )
+            }),
+        ))
+        .await;
+        let big_client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{big_port}")).unwrap(),
+            CsrfToken::parse(TEST_CSRF_SECRET).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            big_client
+                .get_cascade_trajectory_generator_metadata("cascade-abc", 0)
+                .await
+                .expect_err("oversized response must fail closed"),
+            LsError::ResponseTooLarge {
+                rpc: "GetCascadeTrajectoryGeneratorMetadata",
+                max_bytes: MAX_LS_RESPONSE_BYTES,
+            }
+        );
+        big_handle.abort();
     }
 }

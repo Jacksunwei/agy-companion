@@ -85,6 +85,8 @@ pub struct StatsSnapshot {
     #[serde(default)]
     pub proxy_rss_bytes: Option<u64>,
     #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    #[serde(default)]
     pub recent_calls: Vec<RecentCallSnapshot>,
     #[serde(default)]
     pub by_model: Vec<ModelSessionStats>,
@@ -265,6 +267,7 @@ mod tests {
                 last_catalog_included_proxy_models: Some(true),
             },
             proxy_rss_bytes: Some(24 * 1024 * 1024),
+            max_context_tokens: Some(512_000),
             recent_calls: vec![RecentCallSnapshot {
                 timestamp_ms: 1_700_000_000_123,
                 provider: "gemini".to_string(),
@@ -293,11 +296,12 @@ mod tests {
 
         let val = serde_json::to_value(&snap).expect("to_value");
         let root = val.as_object().expect("root object");
-        assert_eq!(root.len(), 5);
+        assert_eq!(root.len(), 6);
         for k in [
             "usage",
             "cloudcode",
             "proxy_rss_bytes",
+            "max_context_tokens",
             "recent_calls",
             "by_model",
         ] {
@@ -338,6 +342,7 @@ mod tests {
         assert_eq!(partial.usage.requests, 1);
         assert_eq!(partial.cloudcode, CloudCodeStatsSnapshot::default());
         assert_eq!(partial.proxy_rss_bytes, None);
+        assert_eq!(partial.max_context_tokens, None);
         assert!(partial.recent_calls.is_empty());
         assert!(partial.by_model.is_empty());
 
@@ -364,6 +369,7 @@ mod tests {
                 last_catalog_included_proxy_models: Some(true),
             },
             proxy_rss_bytes: Some(u64::MAX),
+            max_context_tokens: Some(u64::MAX),
             recent_calls: (0..MAX_RECENT_CALLS)
                 .map(|_| RecentCallSnapshot {
                     timestamp_ms: u64::MAX,

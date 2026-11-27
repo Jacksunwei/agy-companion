@@ -96,7 +96,13 @@ export function buildMonitorView(state: AppState): DocumentFragment {
   const latestOutput = latest
     ? Math.max(0, latest.output_tokens)
     : Math.max(0, usage.output_tokens);
-  const maxCtx = getModelContextWindow(activeModelId);
+  const liveMaxCtx =
+    stats?.max_context_tokens != null &&
+    Number.isFinite(stats.max_context_tokens) &&
+    stats.max_context_tokens > 0
+      ? stats.max_context_tokens
+      : null;
+  const maxCtx = liveMaxCtx ?? getModelContextWindow(activeModelId);
   const ctxPct = maxCtx > 0 ? Math.min(100, Math.round((latestInput / maxCtx) * 100)) : 0;
 
   const ctxLbl = el("div", "tile-k", latest ? "Latest prompt" : "Session prompt");
@@ -110,13 +116,14 @@ export function buildMonitorView(state: AppState): DocumentFragment {
   card.append(ctxLbl, heroRow);
 
   const latestBarTotal = latestCached + latestNew + latestOutput;
+  const barDenom = maxCtx > 0 ? Math.max(maxCtx, latestBarTotal) : latestBarTotal;
   const bar = el("div", "prop-bar");
   const sCache = el("div", "prop-seg seg-cache");
   const sNew = el("div", "prop-seg seg-new");
   const sOut = el("div", "prop-seg seg-out");
-  setSegmentWidth(sCache, latestCached, latestBarTotal);
-  setSegmentWidth(sNew, latestNew, latestBarTotal);
-  setSegmentWidth(sOut, latestOutput, latestBarTotal);
+  setSegmentWidth(sCache, latestCached, barDenom);
+  setSegmentWidth(sNew, latestNew, barDenom);
+  setSegmentWidth(sOut, latestOutput, barDenom);
   bar.append(sCache, sNew, sOut);
   card.append(bar);
 

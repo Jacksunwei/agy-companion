@@ -746,6 +746,7 @@ mod tests {
                             last_catalog_included_proxy_models: Some(true),
                         },
                         proxy_rss_bytes: Some(16_777_216),
+                        max_context_tokens: None,
                         recent_calls: Vec::new(),
                         by_model: Vec::new(),
                     })
@@ -791,6 +792,22 @@ mod tests {
                                     "thinkingOutputTokens": "20",
                                     "apiProvider": "API_PROVIDER_ANTHROPIC_VERTEX",
                                     "responseHeader": { "sessionID": "sess-1" }
+                                }
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "generatorMetadata": [{
+                            "chatModel": {
+                                "chatStartMetadata": {
+                                    "contextWindowMetadata": {
+                                        "maxContextTokens": "512000"
+                                    }
                                 }
                             }
                         }]
@@ -861,8 +878,9 @@ mod tests {
         assert_eq!(stats.usage.requests, 1);
         assert_eq!(stats.usage.prompt_tokens, 2000);
         assert_eq!(stats.usage.cached_tokens, 1500);
-        // Preserved :24141 proxy cloudcode & proxy_rss_bytes!
+        // Preserved :24141 proxy cloudcode & proxy_rss_bytes, plus LS max_context_tokens!
         assert_eq!(stats.proxy_rss_bytes, Some(16_777_216));
+        assert_eq!(stats.max_context_tokens, Some(512_000));
         assert_eq!(
             stats.cloudcode.resolved_upstream.as_deref(),
             Some("https://cloudcode-pa.googleapis.com")
