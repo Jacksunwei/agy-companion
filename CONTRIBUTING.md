@@ -1,89 +1,95 @@
 # Contributing to Antigravity Companion
 
-Thank you for your interest in contributing to `agy-companion`. We value focused, well-tested pull requests with a clear thesis over sprawling multi-concern diffs.
+Thanks for helping improve `agy-companion`! For large changes or new provider adapters, please open an issue first so we can align on the approach before you write code.
 
 ## Prerequisites
 
-- **Rust toolchain:** stable Rust supporting `edition = "2024"` (`cargo`, `rustc`, `rustfmt`, `clippy`).
-- **Node.js:** `>= 18` (for building the embedded TypeScript Sidecar Web UI in `ui/`).
-- **Python 3:** `>= 3.9` (for running the pure-stdlib opaque-box E2E suite in `e2e/`; no `pip` dependencies required).
-- **Antigravity CLI (`agy`):** optional, used for `agy plugin validate --strict ./plugin` and live end-to-end testing (skipped cleanly by `agent_check.sh` when absent).
+- **Rust** — stable toolchain supporting `edition = "2024"` (`rustfmt`, `clippy`).
+- **Node.js** `>= 18` — builds the embedded Sidecar Web UI in `ui/`.
+- **Python** `>= 3.11` — runs the stdlib-only E2E suite in `e2e/` (no `pip` packages needed).
+- **Antigravity CLI (`agy`)** *(optional)* — used for `agy plugin validate --strict ./plugin` and live testing.
 
-## Repository Layout
+## Build from Source
 
-| Path | Role |
+```bash
+# Build UI + Rust debug binary and symlink ./plugin for local Antigravity testing
+./scripts/dev-install.sh
+
+# Or run the full installer directly from source
+cargo run -p companion-cli -- install
+
+# Or run the loopback proxy in the foreground
+cargo run -p companion-cli -- serve
+```
+
+To iterate on the Sidecar Web UI without rebuilding Rust, point `AGY_COMPANION_UI_HTML` at the built bundle, rebuild, and reopen the panel:
+
+```bash
+export AGY_COMPANION_UI_HTML="$(pwd)/ui/dist/index.html"
+npm --prefix ui run build
+```
+
+See [`.agents/skills/local-dev/SKILL.md`](.agents/skills/local-dev/SKILL.md) for sidecar logs and live reload tips.
+
+## Running Checks & Tests
+
+```bash
+# Primary verification gate (fmt, clippy, Rust tests, UI checks, plugin validation)
+./scripts/agent_check.sh
+
+# UI typecheck, tests, and bundle build (when editing ui/src/)
+npm --prefix ui ci && npm --prefix ui run typecheck && npm --prefix ui test && npm --prefix ui run build
+
+# Opaque-box E2E suite (-B avoids __pycache__)
+cargo build -p companion-cli
+python3 -B e2e/run_e2e.py --suite all --workers 4 --binary target/debug/agy-companion --repo-root . -v
+```
+
+## Architecture & Layout
+
+```mermaid
+flowchart LR
+    Client["Antigravity App"]
+    Proxy["Local Loopback Proxy & Sidecar Web UI<br/>127.0.0.1:24141 + Monitor / Usage / Settings"]
+    Adapter["ProviderAdapter<br/>Gemini pass-through · Codex Responses translator<br/>(planned: Ollama Cloud · OpenAI · Claude)"]
+    Upstream["Upstream Model APIs<br/>Gemini API · OpenAI Codex · CloudCode"]
+    Usage["Local SQLite usage.db (v2)<br/>Token, cache & latency metrics only"]
+
+    Client -->|"Gemini API / Hybrid Mode"| Proxy
+    Client <-->|"Sidecar Web UI (/_api/*) & LS telemetry"| Proxy
+    Proxy --> Adapter
+    Adapter -->|"HTTPS · header auth"| Upstream
+    Proxy -.->|"Zero-buffer SSE tee + LS collector"| Usage
+```
+
+| Path | Description |
 | --- | --- |
-| [`crates/companion-core/`](crates/companion-core/README.md) | Config schema, atomic/TOCTOU-safe file I/O (`fs_safe`), validation, model catalog, redaction, SQLite WAL `UsageSink`, shell RC integration |
-| [`crates/companion-providers/`](crates/companion-providers/README.md) | `ProviderAdapter` trait, zero-compression `GeminiProvider`, shared loopback probe client |
-| [`crates/companion-proxy/`](crates/companion-proxy/README.md) | `127.0.0.1` Axum HTTP proxy, Hybrid Mode bridge, SSE usage tee, hot-reload, idle shutdown |
-| [`crates/companion-ui/`](crates/companion-ui/README.md) | Embedded Sidecar Web UI assets, `SettingsSnapshot` / `UsageSummary` DTOs, and configuration/health handlers |
-| [`crates/companion-cli/`](crates/companion-cli/README.md) | Unified `agy-companion` binary (`install`, `uninstall`, `serve`, `doctor`, `models`, `launch`, `hook-env`, `integration`) |
-| `ui/` | Vite + TypeScript Sidecar Web UI frontend compiled to committed `ui/dist/index.html` |
-| [`plugin/`](plugin/README.md) | 6-file Antigravity plugin bundle embedded into `companion-cli` at compile time |
-| `packages/` | Cross-platform npm and Python (`maturin`) binary distribution shims |
-| [`e2e/`](e2e/README.md) | Pure Python 3 stdlib 4-tier opaque-box E2E suite |
-| [`docs/`](docs/README.md) | Architecture and feature design specs |
+| [`crates/companion-core/`](crates/companion-core/README.md) | Config schema, `auth/` credential store, model catalogs, redaction, SQLite usage sink, shell hooks |
+| [`crates/companion-providers/`](crates/companion-providers/README.md) | `ProviderAdapter` trait, Gemini & OpenAI Codex providers, Antigravity LS RPC client |
+| [`crates/companion-proxy/`](crates/companion-proxy/README.md) | Loopback Axum proxy, Hybrid Mode catalog bridge, hot-reload, SSE usage tee |
+| [`crates/companion-ui/`](crates/companion-ui/README.md) | Embedded UI asset loader and settings, OAuth, health, and usage backend service |
+| [`crates/companion-cli/`](crates/companion-cli/README.md) | Unified `agy-companion` binary (`install`, `uninstall`, `serve`, `doctor`, `launch`, `integration`) |
+| `ui/` | Zero-dependency Vite + TypeScript Sidecar Web UI compiled to `ui/dist/index.html` |
+| [`plugin/`](plugin/README.md) | 6-file Antigravity plugin bundle embedded into `companion-cli` |
+| `packages/` | npm (`agy-companion` / `agyc`) and Python (`maturin`) distribution wrappers |
+| [`e2e/`](e2e/README.md) | Python 3 stdlib parallel opaque-box E2E and headless Chrome UI smoke tests |
+| [`docs/`](docs/README.md) | Design specs and architecture decision records |
 
 ## Adding a Provider Adapter
 
-One of the highest-leverage contributions is implementing a new BYOM backend (Ollama Cloud, OpenAI-compatible endpoints, OpenRouter, Codex, or Claude).
+Want to add a new backend (Ollama Cloud, OpenAI-compatible endpoints, OpenRouter, or Claude)?
 
-1. **Propose or claim an adapter** using the [Provider Adapter issue form](https://github.com/Jacksunwei/agy-companion/issues/new?template=provider_adapter.yml) so we can align on config schema and streaming/cache behavior upfront.
-2. **Implement [`ProviderAdapter`](crates/companion-providers/src/lib.rs)** inside `crates/companion-providers/src/`:
-   - **Direct 1-hop translation:** Antigravity speaks Gemini API inbound; translate directly between Gemini payloads and the upstream provider without chaining a second local proxy process.
-   - **Zero-compression `reqwest` invariant (S4):** Never enable `gzip`, `brotli`, `deflate`, or `zstd` on `reqwest` in `Cargo.toml` — byte-for-byte streaming pass-through is required to preserve implicit prompt caching.
-   - **SSRF & auth safety (S3):** Require `https://` for remote upstream `base_url` (allowing `http://` only for literal `127.0.0.1` / `localhost`), disable HTTP redirects (`Policy::none()`), authenticate via headers (never query params), and redact credentials from logs and `Debug` impls.
-   - **Zero `unsafe`:** All workspace crates enforce `#![forbid(unsafe_code)]`.
-3. **Add unit and proxy integration tests** covering streaming, error mapping, auth redaction, and invalid `base_url` rejection.
+1. Open a [Provider Adapter proposal](https://github.com/Jacksunwei/agy-companion/issues/new?template=provider_adapter.yml) to align on config and streaming behavior.
+2. Implement [`ProviderAdapter`](crates/companion-providers/src/lib.rs) under `crates/companion-providers/src/`:
+   - Translate directly between Antigravity's inbound Gemini API and the upstream provider in a single hop.
+   - Keep `reqwest` compression disabled (`gzip`/`brotli`/`deflate`/`zstd` off) so streaming pass-through preserves prompt caching.
+   - Require `https://` for remote URLs (`http://` only for `127.0.0.1` / `localhost`), disable redirects (`Policy::none()`), authenticate via headers, and redact credentials from logs and `Debug`.
+   - Keep `#![forbid(unsafe_code)]` across all crates.
+3. Add unit and proxy integration tests covering streaming, error handling, auth redaction, and invalid `base_url` rejection.
 
-## Local Development Loop
+## Pull Requests
 
-See [`.agents/skills/local-dev/SKILL.md`](.agents/skills/local-dev/SKILL.md) for the full runbook.
-
-```bash
-# Build UI + Rust debug binary and symlink ./plugin into ~/.gemini/config/plugins/agy-companion
-./scripts/dev-install.sh
-
-# Instant Sidecar Web UI iteration without rebuilding Rust:
-export AGY_COMPANION_UI_HTML="$(pwd)/ui/dist/index.html"
-npm --prefix ui run build
-# Then close and reopen the Antigravity Companion side panel.
-```
-
-> **Never** commit real API keys (`AIza...`), `.env` files, `.DS_Store`, or Python `__pycache__` artifacts. Always invoke Python test commands with `python3 -B`.
-
-## Mandatory Verification Before Opening a PR
-
-Run the 7-gate local verification script before every commit and pull request:
-
-```bash
-# Primary gate: governance, hygiene/secret scan, commit checks, shell syntax,
-# 4-way version parity, Rust fmt/clippy -D warnings/tests, UI CSP/size, plugin validation
-./scripts/agent_check.sh
-```
-
-When touching proxy, CLI, installer, plugin, or UI behavior, also run the opaque-box E2E suite:
-
-```bash
-cargo build -p companion-cli
-python3 -B e2e/run_e2e.py --tier all --binary target/debug/agy-companion --repo-root . -v
-```
-
-If you edit `ui/src/`, rebuild and verify determinism of the committed single-file bundle:
-
-```bash
-npm --prefix ui ci && npm --prefix ui run typecheck && npm --prefix ui run build
-```
-
-## Branches, Commits & Pull Requests
-
-1. **Branch off `main`:** Use `<type>/<short-description>` (e.g., `feat/ollama-adapter`, `fix/proxy-timeout`, `docs/readme-quickstart`). Never push directly to `main`.
-2. **Conventional Commits (zero AI attribution):**
-   - Format: `<type>(<scope>): <imperative lowercase summary without trailing period>`
-   - Explain *why* the change exists rather than restating the diff.
-   - **No AI attribution** in commit messages (no `Co-Authored-By:` lines naming an assistant or `Generated with ...` footers — enforced by `./scripts/agent_check.sh`).
-3. **Pull Request:** Fill out [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) with a clear summary and pasted local verification output. Update relevant specs in `docs/` alongside behavioral changes.
-
-## Using Coding Agents?
-
-If you are using an AI coding agent in this repository, point it at [`AGENTS.md`](AGENTS.md) — it is the single canonical engineering contract covering repo layout, verification gates, and the S1–S8 architecture and security invariants. Do not create `GEMINI.md`.
+- Keep PRs small and focused on one change.
+- Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat(scope): ...`, `fix(scope): ...`, `docs: ...`) and do not include AI attribution footers (enforced by `./scripts/agent_check.sh`).
+- Run `./scripts/agent_check.sh` before opening a PR and fill out the PR template.
+- Using an AI coding agent? Point it at [`AGENTS.md`](AGENTS.md) for the repo contract and security invariants.
