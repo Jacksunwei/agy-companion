@@ -19,7 +19,8 @@ description: Product, UX, and model-catalog guardrails for agy-companion. Activa
 
 ## Zero AI Slop in Aux Panel UI
 
-- **Single-column layout:** Keep the Aux Panel single-column; avoid 2-column dashboards or decorative cards.
+- **Full-width single-column layout:** Keep the Aux Panel single-column with the inner content container spanning the full panel width (no narrow centered max-width box or wasted horizontal gutters); avoid 2-column dashboards or decorative cards.
+- **Modern web platform baseline:** Prefer native Chromium/Baseline primitives (`light-dark()`, `popover` API, `:has()`, `scrollbar-gutter: stable`, `rem` typography, `prefers-contrast`) over custom JS/CSS re-implementations, with zero runtime polyfills or external CDN loads (S5).
 - **No redundant metadata:** Never display facts the user already knows (e.g., OS/platform badge).
 - **Unambiguous user copy:**
   - Say **"Quit and reopen Antigravity (`⌘Q`)"** — never vague "Restart" that sounds like an OS reboot.
