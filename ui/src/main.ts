@@ -1,4 +1,4 @@
-import { buildBannerNode } from "./banners.ts";
+import { buildBannerNode, computeBannerSignature } from "./banners.ts";
 import {
   copyTextWithFallback,
   createBrandMarkSvg,
@@ -8,7 +8,7 @@ import {
   quitReopenSentence,
 } from "./dom.ts";
 import { createFooterController } from "./footer.ts";
-import { buildMonitorView } from "./monitor.ts";
+import { buildMonitorView, computeMonitorSignature } from "./monitor.ts";
 import { createSettingsView } from "./settings.ts";
 import {
   UNHEALTHY_BACKOFF_MS,
@@ -16,6 +16,7 @@ import {
   createCatalogRefreshReminder,
   needsSettingsAttention,
   nextPollDelayMs,
+  nextTabForKey,
   reconcileCatalogRefreshReminder,
   shouldApplyRefresh,
   toggleEnabledModel,
@@ -45,7 +46,7 @@ import {
   inferThemeFromCssVars,
   isPluginHostProtocol,
 } from "./transport.ts";
-import { buildUsageView } from "./usage.ts";
+import { buildUsageView, computeUsageSignature } from "./usage.ts";
 
 const FOCUS_RECHECK_MIN_GAP_MS = 2_000;
 
@@ -111,6 +112,9 @@ async function main(): Promise<void> {
   let pollTimer: number | null = null;
   let toastTimer: number | null = null;
   let lastPollCompletedAt = 0;
+  let lastBannerSig: string | null = null;
+  let lastMonitorSig: string | null = null;
+  let lastUsageSig: string | null = null;
 
   function isWriteInFlight(): boolean {
     return (
@@ -131,9 +135,12 @@ async function main(): Promise<void> {
   const verEl = el("span", "hdr-ver", "");
   brand.append(mark, el("h1", "brand-name", "Antigravity Companion"), verEl);
 
-  const nav = el("nav", "hdr-tabs");
-  nav.setAttribute("role", "tablist");
+  const nav = el("nav", "hdr-nav");
   nav.setAttribute("aria-label", "Companion views");
+  const tablist = el("div", "hdr-tabs");
+  tablist.setAttribute("role", "tablist");
+  tablist.setAttribute("aria-label", "Companion views");
+  nav.append(tablist);
 
   const tabSpecs: ReadonlyArray<{
     id: ActiveTab;
@@ -144,6 +151,7 @@ async function main(): Promise<void> {
     { id: "usage", icon: "bars", label: "Usage & Costs" },
     { id: "settings", icon: "gear", label: "Settings" },
   ];
+  const tabOrder: ReadonlyArray<ActiveTab> = tabSpecs.map((spec) => spec.id);
 
   const tabBtns = new Map<ActiveTab, HTMLButtonElement>();
   const settingsDot = el("span", "tab-dot");
@@ -151,10 +159,14 @@ async function main(): Promise<void> {
 
   for (const spec of tabSpecs) {
     const btn = el("button", "icon-tab");
+    const isActive = state.activeTab === spec.id;
+    btn.id = `tab-${spec.id}`;
     btn.type = "button";
     btn.setAttribute("role", "tab");
     btn.setAttribute("aria-label", spec.label);
-    btn.setAttribute("aria-selected", String(state.activeTab === spec.id));
+    btn.setAttribute("aria-controls", `panel-${spec.id}`);
+    btn.setAttribute("aria-selected", String(isActive));
+    btn.setAttribute("tabindex", isActive ? "0" : "-1");
     btn.title = spec.label;
     btn.append(createIcon(spec.icon));
     if (spec.id === "settings") {
@@ -164,20 +176,32 @@ async function main(): Promise<void> {
       selectTab(spec.id, true);
     });
     tabBtns.set(spec.id, btn);
-    nav.append(btn);
+    tablist.append(btn);
   }
+  tablist.addEventListener("keydown", (event: KeyboardEvent) => {
+    const focusedTab =
+      tabSpecs.find((spec) => tabBtns.get(spec.id) === document.activeElement)?.id ??
+      state.activeTab;
+    const nextTab = nextTabForKey(tabOrder, focusedTab, event.key);
+    if (!nextTab) return;
+    event.preventDefault();
+    selectTab(nextTab, true);
+    tabBtns.get(nextTab)?.focus();
+  });
   hdr.append(brand, nav);
 
-  const scroll = el("div", "pane-scroll");
+  const scroll = el("main", "pane-scroll");
   const contentWrap = el("div", "content-wrap");
   const bannerSlot = el("div", "banner-slot");
   const monitorPanel = el("div", "tab-panel");
+  monitorPanel.id = "panel-monitor";
   monitorPanel.setAttribute("role", "tabpanel");
-  monitorPanel.setAttribute("aria-label", "Monitor");
+  monitorPanel.setAttribute("aria-labelledby", "tab-monitor");
 
   const usagePanel = el("div", "tab-panel");
+  usagePanel.id = "panel-usage";
   usagePanel.setAttribute("role", "tabpanel");
-  usagePanel.setAttribute("aria-label", "Usage");
+  usagePanel.setAttribute("aria-labelledby", "tab-usage");
 
   const toastEl = el("div", "host-toast");
   toastEl.setAttribute("role", "status");
@@ -301,8 +325,9 @@ async function main(): Promise<void> {
     },
     tooltip,
   );
+  settingsView.root.id = "panel-settings";
   settingsView.root.setAttribute("role", "tabpanel");
-  settingsView.root.setAttribute("aria-label", "Settings");
+  settingsView.root.setAttribute("aria-labelledby", "tab-settings");
 
   contentWrap.append(bannerSlot, monitorPanel, usagePanel, settingsView.root);
   scroll.append(contentWrap);
@@ -330,7 +355,9 @@ async function main(): Promise<void> {
   function renderHeader(): void {
     verEl.textContent = state.snapshot?.binary_version || "";
     for (const [id, btn] of tabBtns.entries()) {
-      btn.setAttribute("aria-selected", String(state.activeTab === id));
+      const selected = state.activeTab === id;
+      btn.setAttribute("aria-selected", String(selected));
+      btn.setAttribute("tabindex", selected ? "0" : "-1");
     }
 
     settingsDot.hidden = !(
@@ -339,19 +366,27 @@ async function main(): Promise<void> {
   }
 
   function renderBanner(): void {
-    const node = buildBannerNode(state, {
-      onRecheck: () => {
-        void refreshSettings(false);
+    const nowMs = Date.now();
+    const sig = computeBannerSignature(state, nowMs);
+    if (sig === lastBannerSig) return;
+    lastBannerSig = sig;
+    const node = buildBannerNode(
+      state,
+      {
+        onRecheck: () => {
+          void refreshSettings(false);
+        },
+        onEnableProxy: () => {
+          void handleSetLauncherIntegration(true);
+        },
+        onDismissCatalogReminder: () => {
+          state.catalogRefreshReminder = null;
+          renderBanner();
+        },
+        onToast: showToast,
       },
-      onEnableProxy: () => {
-        void handleSetLauncherIntegration(true);
-      },
-      onDismissCatalogReminder: () => {
-        state.catalogRefreshReminder = null;
-        renderBanner();
-      },
-      onToast: showToast,
-    });
+      nowMs,
+    );
     if (node) {
       bannerSlot.replaceChildren(node);
     } else {
@@ -365,28 +400,49 @@ async function main(): Promise<void> {
     settingsView.root.hidden = state.activeTab !== "settings";
 
     if (state.activeTab === "monitor") {
-      monitorPanel.replaceChildren(buildMonitorView(state));
+      const monSig = computeMonitorSignature(state);
+      if (monSig !== lastMonitorSig) {
+        lastMonitorSig = monSig;
+        monitorPanel.replaceChildren(buildMonitorView(state));
+      }
     } else if (state.activeTab === "usage") {
-      usagePanel.replaceChildren(
-        buildUsageView(state, {
-          onSelectRange: (range: UsageRange) => {
-            if (state.usageRange !== range) {
-              state.usageRange = range;
-              state.usageSummary = null;
+      const usageSig = computeUsageSignature(state);
+      if (usageSig !== lastUsageSig) {
+        lastUsageSig = usageSig;
+        const activeEl = document.activeElement;
+        const focusedCtrl =
+          activeEl instanceof HTMLElement && usagePanel.contains(activeEl)
+            ? activeEl.getAttribute("data-usage-ctrl")
+            : null;
+        usagePanel.replaceChildren(
+          buildUsageView(state, {
+            onSelectRange: (range: UsageRange) => {
+              if (state.usageRange !== range) {
+                state.usageRange = range;
+                state.usageSummary = null;
+                renderActiveTab();
+                void loadUsage(range, false);
+              }
+            },
+            onSelectUnit: (unit: UsageUnit) => {
+              state.usageUnit = unit;
               renderActiveTab();
-              void loadUsage(range, false);
-            }
-          },
-          onSelectUnit: (unit: UsageUnit) => {
-            state.usageUnit = unit;
-            renderActiveTab();
-          },
-          onSelectGroup: (group: UsageGroup) => {
-            state.usageGroup = group;
-            renderActiveTab();
-          },
-        }),
-      );
+            },
+            onSelectGroup: (group: UsageGroup) => {
+              state.usageGroup = group;
+              renderActiveTab();
+            },
+          }),
+        );
+        if (focusedCtrl) {
+          const nextCtrl = Array.from(
+            usagePanel.querySelectorAll("button[data-usage-ctrl]"),
+          ).find((btn) => btn.getAttribute("data-usage-ctrl") === focusedCtrl);
+          if (nextCtrl instanceof HTMLElement) {
+            nextCtrl.focus();
+          }
+        }
+      }
     } else {
       settingsView.update(state);
     }

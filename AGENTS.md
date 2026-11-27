@@ -69,6 +69,8 @@ All 5 Rust crates (`crates/*/src/lib.rs`), `crates/companion-cli/src/main.rs`, a
 | **S7** | Minimal HTTP surface & upfront body limits | Permit `GET`/`POST` only (`405` otherwise); reject malformed/oversized `Content-Length > 64 MiB` upfront with `400`/`413` JSON plus streaming `64 MiB` cap; emit `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`. |
 | **S8** | Launcher integrity & packaging allow-list | `run-companion.sh` scrubs inherited proxy envs, checks version-matched cache before `$PATH`, uses physical `cd -P --`, HTTPS + SHA-256 verification, and tarball traversal checks. npm shim uses `execFileSync` + 5-target allow-list and public registry `publishConfig`. Keep all 4 manifests version-synced. |
 
+**UI Browser Support Policy:** The Aux Panel UI targets the modern Chromium/Electron webview shipped with Antigravity App and Baseline Newly Available web platform features. Newer CSS and DOM APIs are used strictly as progressive enhancements with zero runtime polyfills and zero external CDN dependencies (per **S5**).
+
 ## Workflows & Runbooks
 
 - **Git, PR & Auto-Merge:** Follow [`.agents/rules/workflow.md`](.agents/rules/workflow.md) (focused branch → `./scripts/agent_check.sh` → Conventional Commit with zero AI attribution → PR via `.github/PULL_REQUEST_TEMPLATE.md` → squash auto-merge once green → fast-forward `main`).

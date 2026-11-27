@@ -19,14 +19,86 @@ export interface BannerActions {
   onToast: (message: string) => void;
 }
 
+const DEFAULT_MANUAL_SNIPPET =
+  '[ -r "$HOME/.local/share/agy-companion/env.sh" ] && . "$HOME/.local/share/agy-companion/env.sh"';
+
+export function computeBannerSignature(
+  state: AppState,
+  nowMs = Date.now(),
+): string {
+  if (state.standalone) {
+    return "standalone";
+  }
+
+  if (state.loadError && !state.snapshot) {
+    return JSON.stringify(["load_error", state.loadError, state.refreshing]);
+  }
+
+  const snap = state.snapshot;
+  if (!snap) return "none";
+
+  const platform = snap.platform;
+  const li = snap.launcher_integration;
+  const writeBusy =
+    state.saving || state.clearing || state.updatingIntegration || state.codexBusy;
+
+  if (li && li.state === "manual_required") {
+    const snippet = li.manual_snippet?.trim() || DEFAULT_MANUAL_SNIPPET;
+    return JSON.stringify([
+      "manual_required",
+      platform,
+      snippet,
+      state.refreshing || writeBusy,
+    ]);
+  }
+
+  if (!snap.proxy.reachable) {
+    return JSON.stringify(["proxy_offline", platform]);
+  }
+
+  const byomConfigured = hasConfiguredByomProvider(snap);
+  const suppressProxySetupNags = snap.ls_telemetry_active && !byomConfigured;
+
+  if (
+    !suppressProxySetupNags &&
+    platform !== "windows" &&
+    li &&
+    !li.enabled &&
+    li.state !== "unsupported"
+  ) {
+    return JSON.stringify([
+      "proxy_disabled",
+      platform,
+      state.updatingIntegration,
+      !state.connected || writeBusy,
+    ]);
+  }
+
+  const hybridActive = li?.hybrid_active === true;
+  if (!suppressProxySetupNags && platform === "windows" && !hybridActive) {
+    return "reopen_windows";
+  }
+
+  if (!suppressProxySetupNags && platform !== "windows" && li && li.enabled && !hybridActive) {
+    return JSON.stringify(["reopen_unix", platform]);
+  }
+
+  if (hybridActive && state.catalogRefreshReminder) {
+    const waitHint = formatCatalogRefreshWaitHint(snap.last_catalog_refresh_at_ms, nowMs);
+    return JSON.stringify(["catalog_refresh", platform, waitHint]);
+  }
+
+  return "none";
+}
+
 export function buildBannerNode(
   state: AppState,
   actions: BannerActions,
   nowMs = Date.now(),
 ): HTMLElement | null {
   if (state.standalone) {
-    const b = el("div", "banner info");
-    b.setAttribute("role", "alert");
+    const b = el("aside", "banner info");
+    b.setAttribute("aria-label", "Preview mode");
     const ic = el("span", "ic");
     ic.append(createIcon("info"));
     const txt = el("div", "txt");
@@ -75,7 +147,7 @@ export function buildBannerNode(
   // Priority 1: Symlinked or read-only shell profile requiring one manual line
   if (li && li.state === "manual_required") {
     const b = el("div", "banner warn");
-    b.setAttribute("role", "alert");
+    b.setAttribute("role", "status");
     const ic = el("span", "ic");
     ic.append(createIcon("warn"));
     const txt = el("div", "txt");
@@ -89,9 +161,7 @@ export function buildBannerNode(
     );
 
     const act = el("div", "b-act");
-    const snippet =
-      li.manual_snippet?.trim() ||
-      '[ -r "$HOME/.local/share/agy-companion/env.sh" ] && . "$HOME/.local/share/agy-companion/env.sh"';
+    const snippet = li.manual_snippet?.trim() || DEFAULT_MANUAL_SNIPPET;
     const chip = el("div", "cmd");
     const code = el("code", null, snippet);
     code.title = snippet;
@@ -157,7 +227,7 @@ export function buildBannerNode(
     li.state !== "unsupported"
   ) {
     const b = el("div", "banner warn");
-    b.setAttribute("role", "alert");
+    b.setAttribute("role", "status");
     const ic = el("span", "ic");
     ic.append(createIcon("warn"));
     const txt = el("div", "txt");
@@ -188,8 +258,8 @@ export function buildBannerNode(
   // Priority 4: Enabled (or Windows) but Antigravity has not reconnected yet
   const hybridActive = li?.hybrid_active === true;
   if (!suppressProxySetupNags && platform === "windows" && !hybridActive) {
-    const b = el("div", "banner warn");
-    b.setAttribute("role", "alert");
+    const b = el("aside", "banner warn");
+    b.setAttribute("aria-label", "Reopen Antigravity");
     const ic = el("span", "ic");
     ic.append(createIcon("warn"));
     const txt = el("div", "txt");
@@ -206,8 +276,8 @@ export function buildBannerNode(
   }
 
   if (!suppressProxySetupNags && platform !== "windows" && li && li.enabled && !hybridActive) {
-    const b = el("div", "banner warn");
-    b.setAttribute("role", "alert");
+    const b = el("aside", "banner warn");
+    b.setAttribute("aria-label", "Reopen Antigravity");
     const ic = el("span", "ic");
     ic.append(createIcon("warn"));
     const txt = el("div", "txt");

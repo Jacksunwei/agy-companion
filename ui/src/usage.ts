@@ -72,6 +72,19 @@ function pickAxisLabels(
   return out;
 }
 
+export function computeUsageSignature(state: AppState): string {
+  return JSON.stringify([
+    state.usageRange,
+    state.usageUnit,
+    state.usageGroup,
+    state.usageLoading,
+    state.usageError,
+    state.usageSummary,
+    state.snapshot?.supported_models ?? null,
+    state.snapshot?.supported_codex_models ?? null,
+  ]);
+}
+
 export function buildUsageView(
   state: AppState,
   actions: UsageViewActions,
@@ -92,6 +105,7 @@ export function buildUsageView(
   for (const r of ranges) {
     const b = el("button", null, r.label);
     b.type = "button";
+    b.setAttribute("data-usage-ctrl", `range:${r.id}`);
     b.setAttribute("aria-pressed", String(state.usageRange === r.id));
     b.addEventListener("click", () => actions.onSelectRange(r.id));
     rangeSeg.append(b);
@@ -107,6 +121,7 @@ export function buildUsageView(
   for (const u of units) {
     const b = el("button", null, u.label);
     b.type = "button";
+    b.setAttribute("data-usage-ctrl", `unit:${u.id}`);
     b.setAttribute("aria-pressed", String(state.usageUnit === u.id));
     b.addEventListener("click", () => actions.onSelectUnit(u.id));
     unitSeg.append(b);
@@ -120,7 +135,7 @@ export function buildUsageView(
   if (!summary && state.usageLoading) {
     const loadingCard = el("section", "card empty-card");
     loadingCard.append(
-      el("div", "empty-title", "Loading usage history\u2026"),
+      el("h2", "empty-title", "Loading usage history\u2026"),
       el("div", "empty-sub", "Reading local usage metrics from SQLite."),
     );
     frag.append(loadingCard);
@@ -130,7 +145,7 @@ export function buildUsageView(
   if (!summary && state.usageError) {
     const errCard = el("section", "card empty-card");
     errCard.append(
-      el("div", "empty-title", "Unable to load usage history"),
+      el("h2", "empty-title", "Unable to load usage history"),
       el("div", "empty-sub", state.usageError),
     );
     frag.append(errCard);
@@ -139,7 +154,6 @@ export function buildUsageView(
 
   if (!summary || summary.totals.requests <= 0) {
     const emptyCard = el("section", "card empty-card");
-    emptyCard.setAttribute("aria-label", "Usage summary");
     const rangeDesc =
       state.usageRange === "1d"
         ? "today"
@@ -147,7 +161,7 @@ export function buildUsageView(
           ? "in the last 7 days"
           : "in the last 30 days";
     emptyCard.append(
-      el("div", "empty-title", "No usage recorded yet"),
+      el("h2", "empty-title", "No usage recorded yet"),
       el(
         "div",
         "empty-sub",
@@ -177,7 +191,7 @@ export function buildUsageView(
 
   // 1. Summary + Stacked Bar Chart Card
   const sumCard = el("section", "card");
-  sumCard.setAttribute("aria-label", "Usage summary");
+  sumCard.append(el("h2", "visually-hidden", "Usage summary"));
 
   const heroRow = el("div", "hero-row");
   const heroLeft = el("div");
@@ -329,13 +343,35 @@ export function buildUsageView(
       }
       sumCard.append(axis);
     }
+
+    const dataTable = el("table", "visually-hidden");
+    dataTable.append(el("caption", null, `${chartLabel} usage`));
+    const thead = el("thead");
+    const headRow = el("tr");
+    for (const colTitle of ["Period", useCostScale ? "Estimated cost" : "Tokens", "Calls"]) {
+      const th = el("th", null, colTitle);
+      th.setAttribute("scope", "col");
+      headRow.append(th);
+    }
+    thead.append(headRow);
+    const tbody = el("tbody");
+    for (const m of bucketMetrics) {
+      const tr = el("tr");
+      const labelCell = el("th", null, formatBucketLabel(m.bucket.label, summary.range));
+      labelCell.setAttribute("scope", "row");
+      const callLabel = m.bucket.requests === 1 ? "1 call" : `${m.bucket.requests} calls`;
+      tr.append(labelCell, el("td", null, m.displayVal), el("td", null, callLabel));
+      tbody.append(tr);
+    }
+    dataTable.append(thead, tbody);
+    sumCard.append(dataTable);
   }
 
   frag.append(sumCard);
 
   // 2. Breakdown Card: Model | Provider
   const bkCard = el("section", "card");
-  bkCard.setAttribute("aria-label", "Usage breakdown");
+  bkCard.append(el("h2", "visually-hidden", "Usage breakdown"));
 
   const bkSeg = el("div", "pill-seg");
   bkSeg.setAttribute("role", "group");
@@ -346,6 +382,7 @@ export function buildUsageView(
   ]) {
     const b = el("button", null, g.label);
     b.type = "button";
+    b.setAttribute("data-usage-ctrl", `group:${g.id}`);
     b.setAttribute("aria-pressed", String(state.usageGroup === g.id));
     b.addEventListener("click", () => actions.onSelectGroup(g.id));
     bkSeg.append(b);

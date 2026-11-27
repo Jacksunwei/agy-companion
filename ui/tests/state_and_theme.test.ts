@@ -13,6 +13,7 @@ import {
   formatCatalogRefreshWaitHint,
   needsSettingsAttention,
   nextPollDelayMs,
+  nextTabForKey,
   reconcileCatalogRefreshReminder,
   shouldApplyRefresh,
   toggleEnabledModel,
@@ -554,6 +555,48 @@ describe("ui/src/style.css theme tokens & WCAG AA contrast", () => {
     assert.ok(darkBg && darkBrand && darkBrandFg);
     assert.ok(contrastRatio(darkBrand, darkBg) >= 4.5);
     assert.ok(contrastRatio(darkBrand, darkBrandFg) >= 4.5);
+  });
+
+  it("uses native :has(:checked), reduced-motion, contrast scrollbar, single-edge gutter, and progressive smooth details", () => {
+    assert.ok(css.includes(".pr-row:has(.pr-inp:checked)"));
+    assert.equal(css.includes(".pr-row.sel"), false, "Legacy JS .pr-row.sel class must be removed");
+
+    assert.ok(css.includes("scrollbar-gutter: stable;"));
+    assert.equal(css.includes("both-edges"), false, "Must use single-edge scrollbar-gutter: stable only");
+
+    assert.ok(/@media\s*\(prefers-contrast:\s*more\)/.test(css));
+    assert.ok(/@media\s*\(prefers-reduced-motion:\s*reduce\)/.test(css));
+    assert.equal(
+      /\*\s*\{\s*animation-duration\s*:/.test(css),
+      false,
+      "Must not use destructive wildcard animation-duration override",
+    );
+    const reducedBlock = /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{([\s\S]*?)\n\}/.exec(css);
+    assert.ok(reducedBlock, "Expected @media (prefers-reduced-motion: reduce) block");
+    assert.equal(
+      reducedBlock[1].includes(".host-toast"),
+      false,
+      "prefers-reduced-motion must not touch .host-toast translateX(-50%) centering",
+    );
+
+    assert.ok(css.includes("interpolate-size: allow-keywords"));
+    assert.ok(css.includes("details.adv-details::details-content"));
+    assert.ok(css.includes("details.codex-fallback::details-content"));
+  });
+});
+
+describe("WAI-ARIA tablist keyboard navigation helper", () => {
+  const tabs = ["monitor", "usage", "settings"] as const;
+
+  it("wraps ArrowRight/ArrowLeft and jumps Home/End while ignoring other keys", () => {
+    assert.equal(nextTabForKey(tabs, "monitor", "ArrowRight"), "usage");
+    assert.equal(nextTabForKey(tabs, "settings", "ArrowRight"), "monitor");
+    assert.equal(nextTabForKey(tabs, "monitor", "ArrowLeft"), "settings");
+    assert.equal(nextTabForKey(tabs, "usage", "ArrowLeft"), "monitor");
+    assert.equal(nextTabForKey(tabs, "usage", "Home"), "monitor");
+    assert.equal(nextTabForKey(tabs, "monitor", "End"), "settings");
+    assert.equal(nextTabForKey(tabs, "monitor", "Enter"), null);
+    assert.equal(nextTabForKey([], "monitor", "ArrowRight"), null);
   });
 });
 

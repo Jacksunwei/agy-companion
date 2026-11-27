@@ -10,6 +10,8 @@ export interface FakeRect {
 export interface FakeEventInit {
   bubbles?: boolean;
   key?: string;
+  isComposing?: boolean;
+  keyCode?: number;
   relatedTarget?: FakeNode | null;
 }
 
@@ -17,6 +19,8 @@ export class FakeEvent {
   type: string;
   bubbles: boolean;
   key: string;
+  isComposing: boolean;
+  keyCode: number;
   relatedTarget: FakeNode | null;
   target: FakeNode | null;
   currentTarget: FakeNode | null;
@@ -27,6 +31,8 @@ export class FakeEvent {
     this.type = type;
     this.bubbles = init.bubbles ?? false;
     this.key = init.key ?? "";
+    this.isComposing = init.isComposing ?? false;
+    this.keyCode = init.keyCode ?? 0;
     this.relatedTarget = init.relatedTarget ?? null;
     this.target = null;
     this.currentTarget = null;
@@ -516,6 +522,30 @@ export class FakeElement extends FakeNode {
     } else {
       this.attrs.set("type", str);
     }
+  }
+
+  get htmlFor(): string {
+    return this.attrs.get("for") ?? "";
+  }
+
+  set htmlFor(value: string) {
+    const str = String(value);
+    if (str.length === 0) {
+      this.attrs.delete("for");
+    } else {
+      this.attrs.set("for", str);
+    }
+  }
+
+  get tabIndex(): number {
+    const raw = this.attrs.get("tabindex");
+    if (raw === undefined) return -1;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isNaN(parsed) ? -1 : parsed;
+  }
+
+  set tabIndex(value: number) {
+    this.attrs.set("tabindex", String(Math.trunc(value)));
   }
 
   setAttribute(name: string, value: string): void {

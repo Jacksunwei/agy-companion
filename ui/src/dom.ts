@@ -281,6 +281,7 @@ export function createTooltipController(container: HTMLElement): TooltipControll
   container.append(tip);
 
   let hideTimer: number | null = null;
+  let activeAnchor: HTMLElement | null = null;
 
   const cancelHide = () => {
     if (hideTimer !== null) {
@@ -289,8 +290,16 @@ export function createTooltipController(container: HTMLElement): TooltipControll
     }
   };
 
+  const clearActiveAnchor = () => {
+    if (activeAnchor) {
+      activeAnchor.removeAttribute("aria-describedby");
+      activeAnchor = null;
+    }
+  };
+
   const hideNow = () => {
     cancelHide();
+    clearActiveAnchor();
     tip.classList.remove("visible");
   };
 
@@ -298,6 +307,7 @@ export function createTooltipController(container: HTMLElement): TooltipControll
     cancelHide();
     hideTimer = window.setTimeout(() => {
       hideTimer = null;
+      clearActiveAnchor();
       tip.classList.remove("visible");
     }, 120);
   };
@@ -307,6 +317,11 @@ export function createTooltipController(container: HTMLElement): TooltipControll
 
   const show = (anchorBtn: HTMLElement, model: CuratedModelInfo) => {
     cancelHide();
+    if (activeAnchor && activeAnchor !== anchorBtn) {
+      activeAnchor.removeAttribute("aria-describedby");
+    }
+    activeAnchor = anchorBtn;
+    anchorBtn.setAttribute("aria-describedby", "model-tooltip");
 
     const titleRow = el("div", "tip-title");
     titleRow.append(el("span", null, model.label), el("span", "tip-id", model.id));
@@ -347,6 +362,7 @@ export function createTooltipController(container: HTMLElement): TooltipControll
 
   const destroy = () => {
     cancelHide();
+    clearActiveAnchor();
     tip.remove();
   };
 

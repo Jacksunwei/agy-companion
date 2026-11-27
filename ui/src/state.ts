@@ -26,6 +26,28 @@ export function chooseInitialTab(snapshot: SettingsSnapshot): ActiveTab {
   return lsTelemetryActive || hybridActive || byomConfigured ? "monitor" : "settings";
 }
 
+export function nextTabForKey(
+  tabIds: ReadonlyArray<ActiveTab>,
+  current: ActiveTab,
+  key: string,
+): ActiveTab | null {
+  if (tabIds.length === 0) return null;
+  const idx = Math.max(0, tabIds.indexOf(current));
+  if (key === "ArrowRight") {
+    return tabIds[(idx + 1) % tabIds.length];
+  }
+  if (key === "ArrowLeft") {
+    return tabIds[(idx - 1 + tabIds.length) % tabIds.length];
+  }
+  if (key === "Home") {
+    return tabIds[0];
+  }
+  if (key === "End") {
+    return tabIds[tabIds.length - 1];
+  }
+  return null;
+}
+
 export function shouldApplyRefresh(
   startedEpoch: number,
   currentEpoch: number,
