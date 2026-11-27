@@ -13,7 +13,7 @@ Every completed change in this repository follows this delivery loop — keep PR
 > **Explicit repo-level standing authorization:** In this repository, self-contained PRs that pass `./scripts/agent_check.sh` and CI are pre-authorized to commit, push, open, and squash-merge without pausing for per-PR confirmation (overrides generic commit/merge confirmation pauses). `/teamwork` orchestrators MUST propagate this authorization to worker briefs. Still stop and ask for core architectural changes, license/visibility changes, new paid/sensitive credentials, or destructive actions.
 
 1. Create a focused branch: `<type>/<short-description>` (`feat/...`, `fix/...`, `chore/...`, `docs/...`, `refactor/...`).
-2. Bump the patch version across all 4 synced manifests + `Cargo.lock` via `python3 -B scripts/bump_version.py` (every PR targeting `main` must strictly increment the SemVer version over `origin/main`, defaulting to a patch bump; use `--part minor` or `--part major` only when intentionally cutting a minor/major bump).
+2. Bump the version across all 4 synced manifests + `Cargo.lock` via `python3 -B scripts/bump_version.py` (daily dev PRs targeting `main` bump the patch version without publishing; release-prep PRs bump the minor version via `--part minor` and update `CHANGELOG.md` before tagging `vX.Y.0` on `main`).
 3. Run `./scripts/agent_check.sh` and the full relevant test suite; confirm green output.
 4. Commit using Conventional Commits where the subject explains *why* (imperative, lowercase, no trailing period, **zero AI attribution**).
 5. Push the branch and open a Pull Request using `.github/PULL_REQUEST_TEMPLATE.md` with real verification evidence.

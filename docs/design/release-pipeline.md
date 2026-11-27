@@ -91,14 +91,21 @@ No `PYPI_API_TOKEN` secret is needed; PEP 740 attestations are uploaded automati
 
 ## Cutting a Release
 
-```bash
-# 1. Confirm main is clean and up to date
-git checkout main && git pull --ff-only
+Daily development PRs bump the **patch** version (`python3 -B scripts/bump_version.py`) without triggering a release. When ready to cut a public release:
 
-# 2. Read the current synced version from Cargo.toml (e.g. 0.0.12)
-ver="$(python3 -B -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'])")"
+1. Open a release-prep PR bumping the **minor** version and updating [`CHANGELOG.md`](../../CHANGELOG.md):
+   ```bash
+   git checkout -b chore/release-vX.Y.0
+   python3 -B scripts/bump_version.py --part minor
+   # Move [Unreleased] highlights in CHANGELOG.md under [X.Y.0] - YYYY-MM-DD
+   ./scripts/agent_check.sh
+   ```
+   Merge the PR to `main` once CI is green.
 
-# 3. Tag and push to trigger .github/workflows/release.yml
-git tag -a "v${ver}" -m "Release v${ver}"
-git push origin "v${ver}"
-```
+2. Tag `main` and push the tag to trigger `.github/workflows/release.yml`:
+   ```bash
+   git checkout main && git pull --ff-only
+   ver="$(python3 -B -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'])")"
+   git tag -a "v${ver}" -m "Release v${ver}"
+   git push origin "v${ver}"
+   ```
