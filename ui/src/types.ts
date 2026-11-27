@@ -138,6 +138,7 @@ export interface SettingsSnapshot {
   platform: HostPlatform;
   account_plan: AccountPlanStatus;
   proxy_rss_bytes: number | null;
+  ls_telemetry_active: boolean;
 }
 
 export interface UsageBucket {
@@ -849,6 +850,7 @@ export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
   const accountPlan = parseAccountPlanStatus(raw.account_plan);
   const topRss = asOptionalNullableNumber(raw.proxy_rss_bytes);
   const proxyRssBytes = topRss !== null ? topRss : (stats?.proxy_rss_bytes ?? null);
+  const lsTelemetryActive = asBoolean(raw.ls_telemetry_active) ?? false;
 
   return {
     config,
@@ -863,6 +865,7 @@ export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
     platform,
     account_plan: accountPlan,
     proxy_rss_bytes: proxyRssBytes,
+    ls_telemetry_active: lsTelemetryActive,
   };
 }
 

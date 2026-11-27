@@ -50,6 +50,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
       resolved: "organization",
     });
     assert.equal(parsed.platform, "macos");
+    assert.equal(parsed.ls_telemetry_active, false);
 
     assert.equal(parsed.config.schema_version, 1);
     assert.deepEqual(parsed.config.proxy, { host: "127.0.0.1", port: 24141 });
@@ -112,6 +113,7 @@ describe("golden wire fixtures (Rust <-> TS parity)", () => {
     assert.equal(parsed.launcher_integration?.hybrid_active, false);
     assert.ok(parsed.launcher_integration?.manual_snippet?.includes("env.sh"));
     assert.equal(parsed.platform, "macos");
+    assert.equal(parsed.ls_telemetry_active, false);
     assert.deepEqual(parsed.account_plan, { mode: "auto", resolved: null });
   });
 
@@ -444,6 +446,24 @@ describe("parseSettingsSnapshot defensive invariants", () => {
     assert.equal(parsed.stats.by_model.length, 1);
     assert.equal(parsed.stats.by_model[0].reasoning_tokens, 0);
     assert.equal(parsed.stats.by_model[0].total_latency_ms, 0);
+  });
+
+  it("parses ls_telemetry_active true, false, omitted, and non-boolean safely", () => {
+    const activeLs = cloneJson(activeBase);
+    activeLs.ls_telemetry_active = true;
+    assert.equal(parseSettingsSnapshot(activeLs)?.ls_telemetry_active, true);
+
+    const inactiveLs = cloneJson(activeBase);
+    inactiveLs.ls_telemetry_active = false;
+    assert.equal(parseSettingsSnapshot(inactiveLs)?.ls_telemetry_active, false);
+
+    const omittedLs = cloneJson(activeBase);
+    delete omittedLs.ls_telemetry_active;
+    assert.equal(parseSettingsSnapshot(omittedLs)?.ls_telemetry_active, false);
+
+    const nonBoolLs = cloneJson(activeBase);
+    nonBoolLs.ls_telemetry_active = "true";
+    assert.equal(parseSettingsSnapshot(nonBoolLs)?.ls_telemetry_active, false);
   });
 });
 

@@ -448,7 +448,7 @@ export function buildUsageView(
       const item = el("div");
       const top = el("div", "bk-row-top");
       top.append(
-        el("span", "bk-name", formatProviderFullName(row.key)),
+        el("span", "bk-name", formatProviderFullName(row.key, row.source)),
         el("span", "bk-val num", rightVal),
       );
 

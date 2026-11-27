@@ -281,6 +281,78 @@ describe("buildBannerNode priority queue & interactions", () => {
       buildBannerNode(makeState({ snapshot: { ...base, version_skew: true } }), actions),
       null,
     );
+
+    // ls_telemetry_active WITHOUT any BYOM key configured:
+    // suppresses Priority 3 (Unix disabled) & Priority 4 (!hybrid_active), keeps Priority 1 & 2
+    const lsNoByomBase: SettingsSnapshot = {
+      ...base,
+      ls_telemetry_active: true,
+      config: {
+        ...base.config,
+        providers: {
+          ...base.config.providers,
+          gemini: { ...base.config.providers.gemini, api_key_configured: false, api_key_hint: null },
+          codex: { ...base.config.providers.codex, authenticated: false },
+        },
+      },
+      launcher_integration: base.launcher_integration
+        ? { ...base.launcher_integration, state: "enabled", enabled: true, hybrid_active: false }
+        : null,
+    };
+    assert.equal(buildBannerNode(makeState({ snapshot: lsNoByomBase }), actions), null);
+    assert.equal(
+      buildBannerNode(
+        makeState({
+          snapshot: {
+            ...lsNoByomBase,
+            launcher_integration: lsNoByomBase.launcher_integration
+              ? { ...lsNoByomBase.launcher_integration, state: "disabled", enabled: false }
+              : null,
+          },
+        }),
+        actions,
+      ),
+      null,
+    );
+    assert.equal(
+      buildBannerNode(makeState({ snapshot: { ...lsNoByomBase, platform: "windows" } }), actions),
+      null,
+    );
+    // Priority 1 manual_required & Priority 2 !reachable remain active even when ls_telemetry_active
+    const lsManual = buildBannerNode(
+      makeState({
+        snapshot: {
+          ...lsNoByomBase,
+          launcher_integration: lsNoByomBase.launcher_integration
+            ? { ...lsNoByomBase.launcher_integration, state: "manual_required" }
+            : null,
+        },
+      }),
+      actions,
+    ) as unknown as FakeElement;
+    assert.ok(lsManual.textContent.includes("One manual step needed"));
+    const lsOffline = buildBannerNode(
+      makeState({
+        snapshot: {
+          ...lsNoByomBase,
+          proxy: { ...lsNoByomBase.proxy, reachable: false },
+        },
+      }),
+      actions,
+    ) as unknown as FakeElement;
+    assert.ok(lsOffline.textContent.includes("Local proxy offline"));
+
+    // ls_telemetry_active WITH BYOM key configured STILL shows "Quit (⌘Q) and reopen Antigravity" when !hybrid_active
+    const lsWithKeyNotHybrid = buildBannerNode(
+      makeState({
+        snapshot: {
+          ...macNotHybrid,
+          ls_telemetry_active: true,
+        },
+      }),
+      actions,
+    ) as unknown as FakeElement;
+    assert.ok(lsWithKeyNotHybrid.textContent.includes("Quit (\u2318Q) and reopen Antigravity"));
   });
 });
 
@@ -468,6 +540,74 @@ describe("buildMonitorView empty states & active mixed session", () => {
     assert.equal(host2.querySelectorAll("button").length, 0);
     assert.equal(host2.querySelectorAll(".tile").length, 0);
     assert.equal(host2.textContent.includes("Open Settings"), false);
+
+    // ls_telemetry_active empty state even when !hybrid_active -> connected "Waiting for requests"
+    const lsEmptySnap: SettingsSnapshot = {
+      ...notHybridSnap,
+      ls_telemetry_active: true,
+    };
+    const host3 = env.document.createElement("div");
+    host3.append(buildMonitorView(makeState({ snapshot: lsEmptySnap })) as unknown as FakeElement);
+    assert.ok(host3.textContent.includes("Waiting for requests"));
+    assert.equal(host3.textContent.includes("Waiting for Antigravity to connect"), false);
+    assert.equal(host3.querySelectorAll("button").length, 0);
+    assert.equal(host3.querySelectorAll(".tile").length, 0);
+  });
+
+  it("renders Vertex Claude session with Claude builtin badge, 200K context window, and est. list price", () => {
+    const base = loadActiveSnapshot();
+    const claudeSnap: SettingsSnapshot = {
+      ...base,
+      ls_telemetry_active: true,
+      stats: {
+        usage: {
+          requests: 1,
+          prompt_tokens: 100_000,
+          cached_tokens: 80_000,
+          output_tokens: 2_000,
+          reasoning_tokens: 500,
+          cache_hit_ratio: 0.8,
+        },
+        proxy_rss_bytes: 25_165_824,
+        recent_calls: [
+          {
+            timestamp_ms: 1747300200000,
+            provider: "vertex_claude",
+            source: "builtin",
+            model: "claude-sonnet-4-6-high",
+            input_tokens: 100_000,
+            cached_tokens: 80_000,
+            output_tokens: 2_000,
+            reasoning_tokens: 500,
+            latency_ms: 600,
+            cold_start: false,
+            cache_break: false,
+          },
+        ],
+        by_model: [
+          {
+            provider: "vertex_claude",
+            source: "builtin",
+            model: "claude-sonnet-4-6-high",
+            requests: 1,
+            input_tokens: 100_000,
+            cached_tokens: 80_000,
+            output_tokens: 2_000,
+            reasoning_tokens: 500,
+            total_latency_ms: 600,
+          },
+        ],
+      },
+    };
+    const host = env.document.createElement("div");
+    host.append(buildMonitorView(makeState({ snapshot: claudeSnap })) as unknown as FakeElement);
+    const hdrTag = host.querySelector(".mon-model-hdr .tag");
+    assert.equal(hdrTag?.textContent, "Claude");
+    assert.equal(hdrTag?.className, "tag");
+    assert.ok(host.textContent.includes("of 200K"));
+    assert.ok(host.textContent.includes("50%"));
+    const costVal = host.querySelector(".cost-foot-val");
+    assert.ok(costVal && costVal.textContent.startsWith("\u2248 $"));
   });
 
   it("renders active mixed built-in + BYOM session with prompt hero, call dots, 3 tiles, list price, and breakdown", () => {
@@ -633,6 +773,26 @@ describe("buildUsageView filters, states & breakdowns", () => {
       .querySelectorAll(".breakdown-list .bk-name")
       .map((n) => n.textContent);
     assert.deepEqual(provNames, ["Google AI Studio", "Antigravity"]);
+
+    // Vertex Claude & Vertex OpenAI provider names
+    const vertexUsage: UsageSummary = {
+      ...usage,
+      by_provider: [
+        { ...usage.by_provider[0], key: "vertex_claude", provider: "vertex_claude", source: null },
+        { ...usage.by_provider[1], key: "vertex_openai", provider: "vertex_openai", source: null },
+      ],
+    };
+    const vertexHost = env.document.createElement("div");
+    vertexHost.append(
+      buildUsageView(
+        makeState({ usageRange: "7d", usageUnit: "tok", usageGroup: "provider", usageSummary: vertexUsage }),
+        actions,
+      ) as unknown as FakeElement,
+    );
+    assert.deepEqual(
+      vertexHost.querySelectorAll(".breakdown-list .bk-name").map((n) => n.textContent),
+      ["Vertex Claude", "Vertex OpenAI"],
+    );
   });
 });
 

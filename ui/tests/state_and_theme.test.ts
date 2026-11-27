@@ -120,6 +120,14 @@ describe("ui/src/state.ts pure state helpers", () => {
     // launcher_integration null without key -> settings
     const noIntegration: SettingsSnapshot = { ...day0, launcher_integration: null };
     assert.equal(chooseInitialTab(noIntegration), "settings");
+
+    // ls_telemetry_active without hybrid_active or BYOM key -> monitor
+    const lsOnly: SettingsSnapshot = {
+      ...day0,
+      ls_telemetry_active: true,
+      launcher_integration: null,
+    };
+    assert.equal(chooseInitialTab(lsOnly), "monitor");
   });
 
   it("shouldApplyRefresh guards against stale snapshotEpoch and in-flight writes", () => {
@@ -261,6 +269,75 @@ describe("ui/src/state.ts pure state helpers", () => {
 
     // launcher_integration null -> needs attention
     assert.equal(needsSettingsAttention({ ...active, launcher_integration: null }), true);
+
+    // ls_telemetry_active WITHOUT any BYOM provider configured:
+    // does NOT nag for !hybrid_active, unixDisabled, or null integration, but DOES flag manual_required
+    const lsNoByomNotHybrid: SettingsSnapshot = {
+      ...noKey,
+      ls_telemetry_active: true,
+      launcher_integration: noKey.launcher_integration
+        ? { ...noKey.launcher_integration, state: "enabled", enabled: true, hybrid_active: false }
+        : null,
+    };
+    assert.equal(needsSettingsAttention(lsNoByomNotHybrid), false);
+    assert.equal(
+      needsSettingsAttention({
+        ...lsNoByomNotHybrid,
+        launcher_integration: lsNoByomNotHybrid.launcher_integration
+          ? { ...lsNoByomNotHybrid.launcher_integration, state: "disabled", enabled: false }
+          : null,
+      }),
+      false,
+    );
+    assert.equal(
+      needsSettingsAttention({ ...lsNoByomNotHybrid, launcher_integration: null }),
+      false,
+    );
+    assert.equal(
+      needsSettingsAttention({
+        ...lsNoByomNotHybrid,
+        launcher_integration: lsNoByomNotHybrid.launcher_integration
+          ? { ...lsNoByomNotHybrid.launcher_integration, state: "manual_required" }
+          : null,
+      }),
+      true,
+    );
+
+    // ls_telemetry_active WITH Gemini key OR Codex auth configured still flags !hybrid_active / unixDisabled
+    assert.equal(
+      needsSettingsAttention({
+        ...notHybrid,
+        ls_telemetry_active: true,
+      }),
+      true,
+    );
+    assert.equal(
+      needsSettingsAttention({
+        ...unixDisabled,
+        ls_telemetry_active: true,
+      }),
+      true,
+    );
+    assert.equal(
+      needsSettingsAttention({
+        ...lsNoByomNotHybrid,
+        config: {
+          ...lsNoByomNotHybrid.config,
+          providers: {
+            ...lsNoByomNotHybrid.config.providers,
+            codex: { ...lsNoByomNotHybrid.config.providers.codex, authenticated: true },
+          },
+        },
+      }),
+      true,
+    );
+    assert.equal(
+      needsSettingsAttention({
+        ...active,
+        ls_telemetry_active: true,
+      }),
+      false,
+    );
   });
 });
 
