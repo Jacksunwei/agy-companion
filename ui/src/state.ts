@@ -6,12 +6,15 @@ import {
 } from "./types.ts";
 
 export const HEALTHY_POLL_MS = 10_000;
+export const CODEX_PENDING_POLL_MS = 2_000;
 export const UNHEALTHY_BACKOFF_MS: ReadonlyArray<number> = [3_000, 5_000, 10_000];
 
 export function chooseInitialTab(snapshot: SettingsSnapshot): ActiveTab {
   const hybridActive = snapshot.launcher_integration?.hybrid_active === true;
-  const apiKeyConfigured = snapshot.config.providers.gemini.api_key_configured;
-  return hybridActive || apiKeyConfigured ? "monitor" : "settings";
+  const anyProviderConfigured =
+    snapshot.config.providers.gemini.api_key_configured ||
+    snapshot.config.providers.codex.authenticated;
+  return hybridActive || anyProviderConfigured ? "monitor" : "settings";
 }
 
 export function shouldApplyRefresh(
@@ -25,7 +28,11 @@ export function shouldApplyRefresh(
 export function nextPollDelayMs(
   reachable: boolean,
   unhealthyStreak: number,
+  codexLoginPending = false,
 ): number {
+  if (codexLoginPending) {
+    return CODEX_PENDING_POLL_MS;
+  }
   if (reachable && unhealthyStreak === 0) {
     return HEALTHY_POLL_MS;
   }
@@ -68,8 +75,11 @@ export function needsSettingsAttention(snapshot: SettingsSnapshot | null): boole
     li !== null &&
     !li.enabled &&
     li.state !== "unsupported";
+  const anyProviderConfigured =
+    snapshot.config.providers.gemini.api_key_configured ||
+    snapshot.config.providers.codex.authenticated;
   return (
-    !snapshot.config.providers.gemini.api_key_configured ||
+    !anyProviderConfigured ||
     unixDisabled ||
     li?.state === "manual_required" ||
     li?.hybrid_active !== true

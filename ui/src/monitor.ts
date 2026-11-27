@@ -13,7 +13,11 @@ import {
   isBuiltinProvider,
   sessionModelKey,
 } from "./pricing.ts";
-import { DEFAULT_MODEL_PRESETS, type AppState } from "./types.ts";
+import {
+  DEFAULT_CODEX_MODEL_PRESETS,
+  DEFAULT_MODEL_PRESETS,
+  type AppState,
+} from "./types.ts";
 
 function setSegmentWidth(node: HTMLElement, value: number, total: number): void {
   const pct = total > 0 && Number.isFinite(value) && value > 0
@@ -46,8 +50,12 @@ export function buildMonitorView(state: AppState): DocumentFragment {
     return frag;
   }
 
-  const presets =
-    snap && snap.supported_models.length > 0 ? snap.supported_models : DEFAULT_MODEL_PRESETS;
+  const presets = [
+    ...(snap && snap.supported_models.length > 0 ? snap.supported_models : DEFAULT_MODEL_PRESETS),
+    ...(snap && snap.supported_codex_models.length > 0
+      ? snap.supported_codex_models
+      : DEFAULT_CODEX_MODEL_PRESETS),
+  ];
   const recentCalls = stats?.recent_calls ?? [];
   const byModel = stats?.by_model ?? [];
   const latest = recentCalls.length > 0 ? recentCalls[recentCalls.length - 1] : null;

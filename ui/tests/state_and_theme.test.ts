@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  CODEX_PENDING_POLL_MS,
   HEALTHY_POLL_MS,
   UNHEALTHY_BACKOFF_MS,
   chooseInitialTab,
@@ -99,6 +100,19 @@ describe("ui/src/state.ts pure state helpers", () => {
     };
     assert.equal(chooseInitialTab(keyNotHybrid), "monitor");
 
+    // Codex-only authenticated without Gemini key or hybrid_active -> monitor
+    const codexOnly: SettingsSnapshot = {
+      ...day0,
+      config: {
+        ...day0.config,
+        providers: {
+          ...day0.config.providers,
+          codex: { ...day0.config.providers.codex, authenticated: true },
+        },
+      },
+    };
+    assert.equal(chooseInitialTab(codexOnly), "monitor");
+
     // Both active -> monitor
     const active = loadSnapshot("settings_snapshot_active.json");
     assert.equal(chooseInitialTab(active), "monitor");
@@ -115,11 +129,14 @@ describe("ui/src/state.ts pure state helpers", () => {
     assert.equal(shouldApplyRefresh(1, 2, true), false);
   });
 
-  it("nextPollDelayMs uses HEALTHY_POLL_MS when healthy and clamps backoff when unhealthy", () => {
+  it("nextPollDelayMs uses CODEX_PENDING_POLL_MS (2s) while pending, HEALTHY_POLL_MS when healthy, and clamps backoff when unhealthy", () => {
     assert.equal(HEALTHY_POLL_MS, 10_000);
+    assert.equal(CODEX_PENDING_POLL_MS, 2_000);
     assert.deepEqual(UNHEALTHY_BACKOFF_MS, [3_000, 5_000, 10_000]);
 
     assert.equal(nextPollDelayMs(true, 0), 10_000);
+    assert.equal(nextPollDelayMs(true, 0, true), 2_000);
+    assert.equal(nextPollDelayMs(false, 2, true), 2_000);
     assert.equal(nextPollDelayMs(false, 0), 3_000);
     assert.equal(nextPollDelayMs(false, 1), 3_000);
     assert.equal(nextPollDelayMs(false, 2), 5_000);
@@ -189,7 +206,7 @@ describe("ui/src/state.ts pure state helpers", () => {
     };
     assert.equal(needsSettingsAttention(linuxUnsupported), false);
 
-    // Missing API key (even when hybrid_active: true) -> needs attention
+    // Missing Gemini key AND Codex signed out (even when hybrid_active: true) -> needs attention
     const noKey: SettingsSnapshot = {
       ...active,
       config: {
@@ -201,6 +218,19 @@ describe("ui/src/state.ts pure state helpers", () => {
       },
     };
     assert.equal(needsSettingsAttention(noKey), true);
+
+    // Codex-only user (no Gemini key, codex.authenticated: true, hybrid_active: true) -> zero attention dot!
+    const codexOnlyHealthy: SettingsSnapshot = {
+      ...noKey,
+      config: {
+        ...noKey.config,
+        providers: {
+          ...noKey.config.providers,
+          codex: { ...noKey.config.providers.codex, authenticated: true },
+        },
+      },
+    };
+    assert.equal(needsSettingsAttention(codexOnlyHealthy), false);
 
     // Unix disabled -> needs attention
     const unixDisabled: SettingsSnapshot = {

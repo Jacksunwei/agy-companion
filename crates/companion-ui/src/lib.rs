@@ -14,8 +14,9 @@ pub use companion_core::protocol::{
 pub use server::{CompanionUiServer, DEFAULT_PROBE_TIMEOUT_SECS};
 pub use types::{
     AccountPlan, AccountPlanMode, AccountPlanStatus, ApiKeyPatch, CloudCodeSettingsPatch,
-    GeminiSettingsPatch, GetUsageArgs, ProvidersSettingsPatch, ProxySettingsPatch,
-    ResolvedAccountPlan, SaveSettingsArgs, SettingsSnapshot, TestConnectionPayload, UiError,
-    UiHtmlSource, UiServerOptions, UsageRangeArg,
+    CodexSettingsPatch, CompleteCodexLoginArgs, GeminiSettingsPatch, GetUsageArgs,
+    ProvidersSettingsPatch, ProxySettingsPatch, ResolvedAccountPlan, SaveSettingsArgs,
+    SettingsSnapshot, StartCodexLoginPayload, TestConnectionArgs, TestConnectionPayload,
+    TestConnectionProvider, UiError, UiHtmlSource, UiServerOptions, UsageRangeArg,
 };
 pub use ui_resource::{EMBEDDED_UI_HTML, MAX_UI_HTML_BYTES, UI_HTML_ENV_VAR};

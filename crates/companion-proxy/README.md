@@ -6,7 +6,7 @@ Loopback-only Axum HTTP proxy that routes Gemini API requests to your API key wh
 
 | File | Responsibility |
 | --- | --- |
-| `src/lib.rs` | `#![forbid(unsafe_code)]`, `ProxyError`, `ProxyState` (`new -> Result`, infallible `with_cloudcode` DI constructor, `from_config`, `from_config_with_options`), `ProxyStateOptions`, loopback listener binding & re-verification (`S1`), and `serve*` entrypoints |
+| `src/lib.rs` | `#![forbid(unsafe_code)]`, `ProxyError`, `ProxyState` (`new -> Result`, infallible `with_cloudcode` DI constructor, `from_config`, `from_config_with_options`, `from_config_with_codex_auth`), `ProxyStateOptions`, loopback listener binding & re-verification (`S1`), and `serve*` entrypoints |
 | `src/activity.rs` | `ActivityTracker` and `InFlightGuard` tracking active in-flight requests and idle duration for `--idle-shutdown-secs` (ignoring passive `/health` and `/api/stats` probes) |
 | `src/hot_reload.rs` | Non-blocking async `HotReloadProvider` (`tokio::sync::Mutex` + `spawn_blocking` outside `RwLock`, zero stat debounce, `companion-core::fs_safe` TOCTOU `(dev, ino)` & symlink/FIFO safety watching `config.json`, `auth/gemini.json`, and `auth/codex.json`, preserving `CloudCodeClient` LRU and `CodexProvider` when unchanged) |
 | `src/cloudcode/mod.rs` | `MAX_CLOUDCODE_CATALOG_BYTES` (`16 MiB`), `CloudCodeError`, `CloudCodeStreamResponse`, `CloudCodeBufferedResponse`, and public CloudCode re-exports |

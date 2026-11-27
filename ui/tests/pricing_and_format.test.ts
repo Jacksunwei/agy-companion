@@ -63,7 +63,13 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     );
     assert.equal(getModelListPrice("gemini-3.8-pro"), null);
     assert.equal(getModelListPrice("antigravity-builtin"), null);
+    assert.equal(getModelListPrice("gpt-6.2-astra"), null);
+    assert.equal(getModelListPrice("gpt-6.2-sol"), null);
     assert.equal(getModelListPrice(""), null);
+    assert.equal(getModelContextWindow("gpt-6.2-astra"), 272_000);
+    assert.equal(getModelContextWindow("gpt-6.2-sol"), 500_000);
+    assert.equal(getModelContextWindow("gpt-6.1-terra"), 500_000);
+    assert.equal(getModelContextWindow("gpt-6-luna"), 272_000);
     assert.equal(getModelContextWindow("unknown-model"), 1_000_000);
   });
 
@@ -203,6 +209,10 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     assert.equal(formatModelLabel("models/GEMINI-4-CARBON", customPresets), "Carbon Override");
     assert.equal(formatModelLabel("gemini-4-neon", []), "Gemini 4 Neon");
     assert.equal(formatModelLabel("gemini-4-hydrogen", DEFAULT_MODEL_PRESETS), "Gemini 4 Hydrogen");
+    assert.equal(formatModelLabel("gpt-6.2-astra", []), "GPT-6.2 Astra");
+    assert.equal(formatModelLabel("gpt-6.2-sol", []), "GPT-6.2 Sol");
+    assert.equal(formatModelLabel("gpt-6.1-terra", []), "GPT-6.1 Terra");
+    assert.equal(formatModelLabel("gpt-6-luna", []), "GPT-6 Luna");
     assert.equal(formatModelLabel("antigravity-builtin", []), "Antigravity Built-in");
     assert.equal(formatModelLabel("  custom-model-v1  ", []), "custom-model-v1");
     assert.equal(formatModelLabel("   ", []), "Unknown model");
@@ -211,17 +221,20 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     assert.equal(formatProviderBadge("gemini", "builtin"), "Antigravity");
     assert.equal(formatProviderBadge("", null), "Antigravity");
     assert.equal(formatProviderBadge("gemini", "proxy"), "Gemini");
+    assert.equal(formatProviderBadge("openai-codex", "proxy"), "Codex");
     assert.equal(formatProviderBadge("openai", "proxy"), "Openai");
 
     assert.equal(isBuiltinProvider("antigravity", "proxy"), true);
     assert.equal(isBuiltinProvider(" Antigravity ", null), true);
     assert.equal(isBuiltinProvider("gemini", "BUILTIN"), true);
     assert.equal(isBuiltinProvider("gemini", "proxy"), false);
+    assert.equal(isBuiltinProvider("openai-codex", "proxy"), false);
     assert.equal(isBuiltinProvider("", null), false);
 
     assert.equal(formatProviderFullName("antigravity"), "Antigravity");
     assert.equal(formatProviderFullName(""), "Antigravity");
     assert.equal(formatProviderFullName("gemini"), "Google AI Studio");
+    assert.equal(formatProviderFullName("openai-codex"), "OpenAI Codex");
     assert.equal(formatProviderFullName("anthropic"), "Anthropic");
   });
 });

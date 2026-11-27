@@ -4,10 +4,13 @@ use std::time::Duration;
 use companion_core::{
     ApiKey, CodexCredentials, Config, CoreError, GeminiCredentials, UsageRange, UsageSummary,
 };
-use companion_providers::{GeminiProvider, ProviderAdapter};
+use companion_providers::{CodexAuth, CodexProvider, GeminiProvider, ProviderAdapter};
 
 use crate::server::CompanionUiServer;
-use crate::types::{ApiKeyPatch, SaveSettingsArgs, SettingsSnapshot, TestConnectionPayload};
+use crate::types::{
+    ApiKeyPatch, SaveSettingsArgs, SettingsSnapshot, StartCodexLoginPayload, TestConnectionPayload,
+    TestConnectionProvider,
+};
 
 const MAX_TEST_CONNECTION_TIMEOUT_SECS: u64 = 15;
 
@@ -114,49 +117,144 @@ impl CompanionUiServer {
             .await)
     }
 
-    pub async fn test_connection_payload(&self) -> Result<TestConnectionPayload, String> {
+    pub async fn test_connection_payload(
+        &self,
+        provider: TestConnectionProvider,
+    ) -> Result<TestConnectionPayload, String> {
         let (cfg, gemini_creds, _codex_creds) = self.load_config_and_auth_blocking().await?;
 
-        let timeout = self
-            .options
-            .test_connection_timeout_override
-            .unwrap_or_else(|| {
-                Duration::from_secs(
-                    cfg.providers
-                        .gemini
-                        .timeout_secs
-                        .clamp(1, MAX_TEST_CONNECTION_TIMEOUT_SECS),
-                )
-            });
+        match provider {
+            TestConnectionProvider::Gemini => {
+                let timeout = self
+                    .options
+                    .test_connection_timeout_override
+                    .unwrap_or_else(|| {
+                        Duration::from_secs(
+                            cfg.providers
+                                .gemini
+                                .timeout_secs
+                                .clamp(1, MAX_TEST_CONNECTION_TIMEOUT_SECS),
+                        )
+                    });
 
-        let provider = match GeminiProvider::from_config_with_timeout(
-            &cfg.providers.gemini,
-            gemini_creds.as_ref().map(|c| &c.api_key),
-            timeout,
-        ) {
-            Ok(provider) => provider.with_env_fallback(self.options.env_api_key_fallback),
-            Err(err) => {
-                return Ok(TestConnectionPayload {
-                    ok: false,
-                    message: err.to_string(),
-                });
+                let provider = match GeminiProvider::from_config_with_timeout(
+                    &cfg.providers.gemini,
+                    gemini_creds.as_ref().map(|c| &c.api_key),
+                    timeout,
+                ) {
+                    Ok(provider) => provider.with_env_fallback(self.options.env_api_key_fallback),
+                    Err(err) => {
+                        return Ok(TestConnectionPayload {
+                            ok: false,
+                            message: err.to_string(),
+                        });
+                    }
+                };
+
+                let payload = match provider.health_check().await {
+                    Ok(()) => TestConnectionPayload {
+                        ok: true,
+                        message: format!(
+                            "Connected to Gemini upstream ({}) successfully.",
+                            cfg.providers.gemini.base_url
+                        ),
+                    },
+                    Err(err) => TestConnectionPayload {
+                        ok: false,
+                        message: err.to_string(),
+                    },
+                };
+                Ok(payload)
             }
-        };
+            TestConnectionProvider::Codex => {
+                let timeout = self
+                    .options
+                    .test_connection_timeout_override
+                    .unwrap_or_else(|| {
+                        Duration::from_secs(
+                            cfg.providers
+                                .codex
+                                .timeout_secs
+                                .clamp(1, MAX_TEST_CONNECTION_TIMEOUT_SECS),
+                        )
+                    });
 
-        let payload = match provider.health_check().await {
-            Ok(()) => TestConnectionPayload {
-                ok: true,
-                message: format!(
-                    "Connected to Gemini upstream ({}) successfully.",
-                    cfg.providers.gemini.base_url
-                ),
-            },
-            Err(err) => TestConnectionPayload {
-                ok: false,
-                message: err.to_string(),
-            },
-        };
-        Ok(payload)
+                let codex_auth: Arc<dyn CodexAuth> =
+                    Arc::clone(&self.codex_auth) as Arc<dyn CodexAuth>;
+                let provider = match CodexProvider::from_config_with_timeout(
+                    &cfg.providers.codex,
+                    codex_auth,
+                    timeout,
+                ) {
+                    Ok(provider) => provider,
+                    Err(err) => {
+                        return Ok(TestConnectionPayload {
+                            ok: false,
+                            message: err.to_string(),
+                        });
+                    }
+                };
+
+                let payload = match provider.health_check().await {
+                    Ok(()) => TestConnectionPayload {
+                        ok: true,
+                        message: format!(
+                            "Connected to OpenAI Codex upstream ({}) successfully.",
+                            cfg.providers.codex.base_url
+                        ),
+                    },
+                    Err(err) => TestConnectionPayload {
+                        ok: false,
+                        message: err.to_string(),
+                    },
+                };
+                Ok(payload)
+            }
+        }
+    }
+
+    pub async fn start_codex_login(&self) -> Result<StartCodexLoginPayload, String> {
+        let started = self
+            .codex_auth
+            .start_login()
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(StartCodexLoginPayload {
+            authorize_url: started.authorize_url,
+            callback_listening: started.callback_listening,
+            manual_fallback: started.manual_fallback,
+        })
+    }
+
+    pub async fn cancel_codex_login_snapshot(
+        &self,
+        conversation_id: Option<&str>,
+    ) -> Result<SettingsSnapshot, String> {
+        self.codex_auth.cancel_login().await;
+        self.get_settings_snapshot(conversation_id).await
+    }
+
+    pub async fn complete_codex_login_snapshot(
+        &self,
+        callback_input: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<SettingsSnapshot, String> {
+        self.codex_auth
+            .complete_login_manual(callback_input)
+            .await
+            .map_err(|err| err.to_string())?;
+        self.get_settings_snapshot(conversation_id).await
+    }
+
+    pub async fn disconnect_codex_snapshot(
+        &self,
+        conversation_id: Option<&str>,
+    ) -> Result<SettingsSnapshot, String> {
+        self.codex_auth
+            .disconnect()
+            .await
+            .map_err(|err| err.to_string())?;
+        self.get_settings_snapshot(conversation_id).await
     }
 
     pub async fn set_launcher_integration_snapshot(

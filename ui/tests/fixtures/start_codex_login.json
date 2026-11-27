@@ -1,0 +1,5 @@
+{
+  "authorize_url": "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann",
+  "callback_listening": true,
+  "manual_fallback": false
+}

@@ -80,6 +80,8 @@ STRIPPED_ENV_VARS: tuple[str, ...] = (
     "no_proxy",
     "AGY_COMPANION_CONFIG",
     "AGY_COMPANION_UI_HTML",
+    "AGY_COMPANION_CODEX_OAUTH_ISSUER",
+    "AGY_COMPANION_CODEX_CALLBACK_PORT",
     "AGY_COMPANION_BIN",
     "AGY_COMPANION_E2E_BIN",
     "AGY_COMPANION_HOOK_ACTIVE",
@@ -543,6 +545,8 @@ class IsolatedEnv:
         schema_version: int = 1,
         cloudcode_upstream_url: str | None = None,
         launcher_auto_start: bool | None = None,
+        codex_base_url: str | None = None,
+        codex_enabled_models: list[str] | None = None,
     ) -> dict[str, Any]:
         """Build a nested schema_version=1 non-secret config dict pointing at isolated usage_dir by default."""
         gemini_cfg: dict[str, Any] = {
@@ -552,6 +556,14 @@ class IsolatedEnv:
         }
         if enabled_models is not None:
             gemini_cfg["enabled_models"] = list(enabled_models)
+        providers_cfg: dict[str, Any] = {"gemini": gemini_cfg}
+        if codex_base_url is not None or codex_enabled_models is not None:
+            codex_cfg: dict[str, Any] = {}
+            if codex_base_url is not None:
+                codex_cfg["base_url"] = codex_base_url
+            if codex_enabled_models is not None:
+                codex_cfg["enabled_models"] = list(codex_enabled_models)
+            providers_cfg["codex"] = codex_cfg
         resolved_port = listen_port if listen_port is not None else find_free_port()
         cfg: dict[str, Any] = {
             "schema_version": schema_version,
@@ -562,9 +574,7 @@ class IsolatedEnv:
             "cloudcode": {
                 "upstream": cloudcode_upstream_url if cloudcode_upstream_url is not None else "auto",
             },
-            "providers": {
-                "gemini": gemini_cfg,
-            },
+            "providers": providers_cfg,
         }
         if launcher_auto_start is not None:
             cfg["launcher_auto_start"] = launcher_auto_start
@@ -613,6 +623,11 @@ class IsolatedEnv:
         """Return sibling auth/gemini.json path for config_path (or default self.config_path)."""
         target_cfg = config_path if config_path is not None else self.config_path
         return self.auth_dir_for_config(target_cfg) / "gemini.json"
+
+    def codex_auth_path_for(self, config_path: Path | None = None) -> Path:
+        """Return sibling auth/codex.json path for config_path (or default self.config_path)."""
+        target_cfg = config_path if config_path is not None else self.config_path
+        return self.auth_dir_for_config(target_cfg) / "codex.json"
 
     def write_gemini_auth(
         self,

@@ -5,9 +5,12 @@ use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::protocol::PROTOCOL_VERSION;
 use companion_core::{
     AuthStore, CloudCodeStatus, CodexCredentials, Config, CoreError, FileAuthStore,
-    GeminiCredentials, HostPlatform, ProxyHealthSummary, StatsSnapshot, curated_model_presets,
+    GeminiCredentials, HostPlatform, ProxyHealthSummary, StatsSnapshot,
+    curated_codex_model_presets, curated_model_presets,
 };
-use companion_providers::{DEFAULT_PROBE_TIMEOUT, LoopbackProxyClient, evaluate_health};
+use companion_providers::{
+    CodexAuthManager, DEFAULT_PROBE_TIMEOUT, LoopbackProxyClient, evaluate_health,
+};
 
 use crate::types::{AccountPlanStatus, SettingsSnapshot, UiError, UiServerOptions};
 use crate::ui_resource::{EMBEDDED_UI_HTML, load_ui_html_override, resolve_ui_html_override_path};
@@ -18,6 +21,7 @@ pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = DEFAULT_PROBE_TIMEOUT.as_secs();
 pub struct CompanionUiServer {
     pub(crate) config_path: PathBuf,
     pub(crate) auth_store: Arc<dyn AuthStore>,
+    pub(crate) codex_auth: Arc<CodexAuthManager>,
     pub(crate) proxy_client: LoopbackProxyClient,
     pub(crate) config_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) integration_write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -37,12 +41,20 @@ impl CompanionUiServer {
                     .map_err(|err| UiError::Initialize(err.to_string()))?,
             ),
         };
+        let codex_auth: Arc<CodexAuthManager> = match options.codex_auth_override.clone() {
+            Some(manager) => manager,
+            None => Arc::new(
+                CodexAuthManager::new(Arc::clone(&auth_store))
+                    .map_err(|err| UiError::Initialize(err.to_string()))?,
+            ),
+        };
         let proxy_client = LoopbackProxyClient::new(options.probe_timeout, options.probe_timeout)
             .map_err(|err| UiError::HttpClient(err.to_string()))?;
 
         Ok(Self {
             config_path,
             auth_store,
+            codex_auth,
             proxy_client,
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             integration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -178,8 +190,11 @@ impl CompanionUiServer {
             }
         };
 
-        let ((proxy, version_skew, stats), mut launcher_integration) =
-            tokio::join!(probe_fut, integration_fut);
+        let ((proxy, version_skew, stats), mut launcher_integration, codex_login_pending) = tokio::join!(
+            probe_fut,
+            integration_fut,
+            self.codex_auth.is_login_pending()
+        );
 
         let cloudcode = CloudCodeStatus::from_config_and_stats(
             &cfg.cloudcode.upstream,
@@ -210,6 +225,8 @@ impl CompanionUiServer {
             launcher_integration,
             cloudcode,
             supported_models: curated_model_presets(),
+            supported_codex_models: curated_codex_model_presets(),
+            codex_login_pending,
             platform: HostPlatform::current(),
             account_plan,
             proxy_rss_bytes,

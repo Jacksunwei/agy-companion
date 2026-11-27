@@ -133,6 +133,8 @@ export interface SettingsSnapshot {
   stats: StatsSnapshot | null;
   launcher_integration: LauncherIntegrationStatus | null;
   supported_models: ModelPreset[];
+  supported_codex_models: ModelPreset[];
+  codex_login_pending: boolean;
   platform: HostPlatform;
   account_plan: AccountPlanStatus;
   proxy_rss_bytes: number | null;
@@ -171,12 +173,21 @@ export interface UsageSummary {
 
 export type ApiKeyPatch = "clear" | { set: string };
 
+export type TestConnectionProvider = "gemini" | "codex";
+
+export interface CodexSettingsPatch {
+  base_url?: string;
+  default_model?: string;
+  enabled_models?: string[];
+}
+
 export interface SaveSettingsArgs {
   providers?: {
     gemini?: {
       api_key?: ApiKeyPatch;
       enabled_models?: string[];
     };
+    codex?: CodexSettingsPatch;
   };
   account_plan?: AccountPlanChoice;
 }
@@ -184,6 +195,12 @@ export interface SaveSettingsArgs {
 export interface TestConnectionPayload {
   ok: boolean;
   message: string;
+}
+
+export interface StartCodexLoginPayload {
+  authorize_url: string;
+  callback_listening: boolean;
+  manual_fallback: boolean;
 }
 
 export interface ToolCallResultLike {
@@ -239,6 +256,15 @@ export interface AppState {
   keyFeedback: InlineFeedback | null;
   modelFeedback: InlineFeedback | null;
   advFeedback: InlineFeedback | null;
+
+  codexBusy: boolean;
+  codexTesting: boolean;
+  codexAuthorizeUrl: string | null;
+  codexManualFallbackOpen: boolean;
+  codexManualInputDraft: string;
+  codexSignOutConfirmOpen: boolean;
+  codexFeedback: InlineFeedback | null;
+  codexModelFeedback: InlineFeedback | null;
 
   usageRange: UsageRange;
   usageUnit: UsageUnit;
@@ -323,6 +349,48 @@ export const DEFAULT_ENABLED_CODEX_MODELS: ReadonlyArray<string> = [
   "gpt-6.2-astra",
   "gpt-6.2-sol",
 ];
+
+export const CURATED_CODEX_MODEL_CATALOG: ReadonlyArray<CuratedModelInfo> = [
+  {
+    id: "gpt-6.2-astra",
+    label: "6.2 Astra",
+    displayName: "GPT-6.2 Astra",
+    defaultOn: true,
+    desc: "Best for complex coding, hard debugging, architecture, and deep professional work.",
+    meta: "272K context \u00b7 Low / Medium / High / XHigh \u00b7 ChatGPT subscription",
+  },
+  {
+    id: "gpt-6.2-sol",
+    label: "6.2 Sol",
+    displayName: "GPT-6.2 Sol",
+    defaultOn: true,
+    desc: "Best as the fast, go-to model for everyday coding and large-context repositories.",
+    meta: "500K context \u00b7 Low / Medium / High / XHigh \u00b7 ChatGPT subscription",
+  },
+  {
+    id: "gpt-6.1-terra",
+    label: "6.1 Terra",
+    displayName: "GPT-6.1 Terra",
+    defaultOn: false,
+    desc: "Best for visual understanding, screenshots, and efficient computer-use workflows.",
+    meta: "500K context \u00b7 Low / Medium / High \u00b7 ChatGPT subscription",
+  },
+  {
+    id: "gpt-6-luna",
+    label: "6 Luna",
+    displayName: "GPT-6 Luna",
+    defaultOn: false,
+    desc: "Best for fast, lightweight edits and preserving ChatGPT subscription quota.",
+    meta: "272K context \u00b7 Low / Medium / High \u00b7 ChatGPT subscription",
+  },
+];
+
+export const DEFAULT_CODEX_MODEL_PRESETS: ReadonlyArray<ModelPreset> =
+  CURATED_CODEX_MODEL_CATALOG.map((m) => ({
+    id: m.id,
+    display_name: m.displayName,
+    short_label: m.label,
+  }));
 
 export const DEFAULT_CODEX_CONFIG: RedactedCodexConfig = {
   base_url: "https://chatgpt.com/backend-api/codex",
@@ -721,9 +789,12 @@ function parseLauncherIntegration(raw: unknown): LauncherIntegrationStatus | nul
   };
 }
 
-function parseModelPresets(raw: unknown): ModelPreset[] {
+function parseModelPresetsWithFallback(
+  raw: unknown,
+  fallback: ReadonlyArray<ModelPreset>,
+): ModelPreset[] {
   if (!Array.isArray(raw)) {
-    return [...DEFAULT_MODEL_PRESETS];
+    return [...fallback];
   }
   const presets: ModelPreset[] = [];
   for (const item of raw) {
@@ -735,7 +806,7 @@ function parseModelPresets(raw: unknown): ModelPreset[] {
       presets.push({ id, display_name: displayName, short_label: shortLabel });
     }
   }
-  return presets.length > 0 ? presets : [...DEFAULT_MODEL_PRESETS];
+  return presets.length > 0 ? presets : [...fallback];
 }
 
 export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
@@ -760,7 +831,20 @@ export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
     raw.launcher_integration !== undefined && raw.launcher_integration !== null
       ? parseLauncherIntegration(raw.launcher_integration)
       : null;
-  const supportedModels = parseModelPresets(raw.supported_models);
+  const supportedModels = parseModelPresetsWithFallback(
+    raw.supported_models,
+    DEFAULT_MODEL_PRESETS,
+  );
+  const supportedCodexModels = parseModelPresetsWithFallback(
+    raw.supported_codex_models,
+    DEFAULT_CODEX_MODEL_PRESETS,
+  );
+  let codexLoginPending = false;
+  if (raw.codex_login_pending !== undefined) {
+    const parsedPending = asBoolean(raw.codex_login_pending);
+    if (parsedPending === null) return null;
+    codexLoginPending = parsedPending;
+  }
   const platform = normalizeHostPlatform(raw.platform);
   const accountPlan = parseAccountPlanStatus(raw.account_plan);
   const topRss = asOptionalNullableNumber(raw.proxy_rss_bytes);
@@ -774,6 +858,8 @@ export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
     stats,
     launcher_integration: launcherIntegration,
     supported_models: supportedModels,
+    supported_codex_models: supportedCodexModels,
+    codex_login_pending: codexLoginPending,
     platform,
     account_plan: accountPlan,
     proxy_rss_bytes: proxyRssBytes,
@@ -895,6 +981,19 @@ export function parseTestConnectionPayload(raw: unknown): TestConnectionPayload 
   const message = asString(raw.message);
   if (ok === null || message === null) return null;
   return { ok, message };
+}
+
+export function parseStartCodexLoginPayload(raw: unknown): StartCodexLoginPayload | null {
+  if (!isRecord(raw)) return null;
+  const authorizeUrl = asString(raw.authorize_url)?.trim() ?? "";
+  const callbackListening = asBoolean(raw.callback_listening);
+  const manualFallback = asBoolean(raw.manual_fallback);
+  if (!authorizeUrl || callbackListening === null || manualFallback === null) return null;
+  return {
+    authorize_url: authorizeUrl,
+    callback_listening: callbackListening,
+    manual_fallback: manualFallback,
+  };
 }
 
 export function extractToolText(result: ToolCallResultLike): string {

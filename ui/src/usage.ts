@@ -14,6 +14,7 @@ import {
   isBuiltinProvider,
 } from "./pricing.ts";
 import {
+  DEFAULT_CODEX_MODEL_PRESETS,
   DEFAULT_MODEL_PRESETS,
   type AppState,
   type UsageGroup,
@@ -157,10 +158,14 @@ export function buildUsageView(
     return frag;
   }
 
-  const presets =
-    state.snapshot && state.snapshot.supported_models.length > 0
+  const presets = [
+    ...(state.snapshot && state.snapshot.supported_models.length > 0
       ? state.snapshot.supported_models
-      : DEFAULT_MODEL_PRESETS;
+      : DEFAULT_MODEL_PRESETS),
+    ...(state.snapshot && state.snapshot.supported_codex_models.length > 0
+      ? state.snapshot.supported_codex_models
+      : DEFAULT_CODEX_MODEL_PRESETS),
+  ];
   const costs = estimateUsageSummaryCosts(summary);
   const totals = summary.totals;
   const totalInput = Math.max(0, totals.input_tokens);
