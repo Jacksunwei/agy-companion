@@ -503,11 +503,73 @@ class CheckRunner:
                             )
                             failed = True
 
+        if cargo_ver:
+            bump_error = self._check_pr_version_bump(cargo_ver)
+            if bump_error:
+                self.fail(
+                    f"{tag} Version sync & packaging: PR version bump check failed",
+                    [bump_error],
+                )
+                failed = True
+
         if not failed:
             self.pass_(
-                f"{tag} Version sync & packaging: 4-way version {cargo_ver}, publishConfig, "
+                f"{tag} Version sync & packaging: 4-way version {cargo_ver}, PR version bump, publishConfig, "
                 "5 platform manifests, node --check, execFileSync hygiene & py_compile passed"
             )
+
+    def _check_pr_version_bump(self, current_ver: str) -> str | None:
+        git = self.tool("git")
+        if not git:
+            return None
+
+        base_ref = "origin/main"
+        gh_base = os.environ.get("GITHUB_BASE_REF", "").strip()
+        if gh_base:
+            candidate = f"origin/{gh_base}"
+            if self.run_capture([git, "rev-parse", "--verify", candidate]).returncode == 0:
+                base_ref = candidate
+            elif self.run_capture([git, "rev-parse", "--verify", gh_base]).returncode == 0:
+                base_ref = gh_base
+
+        if self.run_capture([git, "rev-parse", "--verify", base_ref]).returncode != 0:
+            return None
+
+        is_pr_event = os.environ.get("GITHUB_EVENT_NAME", "").strip() == "pull_request"
+        if not is_pr_event:
+            ahead_proc = self.run_capture([git, "rev-list", "--count", f"{base_ref}..HEAD"])
+            ahead_count = int(ahead_proc.stdout.strip()) if ahead_proc.returncode == 0 and ahead_proc.stdout.strip().isdigit() else 0
+            branch_proc = self.run_capture([git, "rev-parse", "--abbrev-ref", "HEAD"])
+            branch = branch_proc.stdout.strip() if branch_proc.returncode == 0 else ""
+            status_proc = self.run_capture([git, "status", "--porcelain"])
+            is_dirty = status_proc.returncode == 0 and bool(status_proc.stdout.strip())
+
+            # On clean main (or untouched branch with no commits ahead of origin/main), skip.
+            if ahead_count == 0 and (not is_dirty or branch == "main"):
+                return None
+
+        base_cargo = self.run_capture([git, "show", f"{base_ref}:Cargo.toml"])
+        if base_cargo.returncode != 0:
+            return None
+
+        try:
+            base_ver = _parse_toml_value_text(base_cargo.stdout, "workspace.package", "version", f"{base_ref}:Cargo.toml")
+        except Exception as exc:
+            return f"failed to read base version from {base_ref}:Cargo.toml: {exc}"
+
+        cur_tuple = _parse_semver_tuple(current_ver)
+        base_tuple = _parse_semver_tuple(base_ver)
+        if cur_tuple is None:
+            return f"current workspace version {current_ver!r} is not valid MAJOR.MINOR.PATCH SemVer"
+        if base_tuple is None:
+            return f"base version {base_ver!r} on {base_ref} is not valid MAJOR.MINOR.PATCH SemVer"
+
+        if cur_tuple <= base_tuple:
+            return (
+                f"PR version bump required: workspace version {current_ver} is not greater than "
+                f"{base_ref} ({base_ver}); run 'python3 -B scripts/bump_version.py' to bump the patch version"
+            )
+        return None
 
     def check_fmt_ui_static_and_hermeticity(self, tag: str) -> None:
         failed = False
@@ -716,18 +778,27 @@ class CheckRunner:
             self.fail(f"{tag} UI tests: npm --prefix ui test failed")
 
     def check_svg_validator_unit_tests(self, tag: str) -> None:
-        logo_tests = self.repo_root / "scripts" / "test_check_plugin_logo.py"
-        if not logo_tests.is_file():
-            self.fail(f"{tag} SVG validator unit tests: missing scripts/test_check_plugin_logo.py")
-            return
-        proc = self.run_capture([sys.executable, "-B", str(logo_tests)])
-        if proc.returncode == 0:
-            self.pass_(f"{tag} SVG validator unit tests: scripts/test_check_plugin_logo.py passed")
-        else:
-            details = [
-                line for line in (proc.stdout + "\n" + proc.stderr).splitlines() if line.strip()
-            ]
-            self.fail(f"{tag} SVG validator unit tests: scripts/test_check_plugin_logo.py failed", details)
+        test_scripts = (
+            self.repo_root / "scripts" / "test_check_plugin_logo.py",
+            self.repo_root / "scripts" / "test_version_bump.py",
+        )
+        failed = False
+        for test_script in test_scripts:
+            rel = test_script.relative_to(self.repo_root).as_posix()
+            if not test_script.is_file():
+                self.fail(f"{tag} Script unit tests: missing {rel}")
+                failed = True
+                continue
+            proc = self.run_capture([sys.executable, "-B", str(test_script)])
+            if proc.returncode != 0:
+                details = [
+                    line for line in (proc.stdout + "\n" + proc.stderr).splitlines() if line.strip()
+                ]
+                self.fail(f"{tag} Script unit tests: {rel} failed", details)
+                failed = True
+        if not failed:
+            names = ", ".join(p.relative_to(self.repo_root).as_posix() for p in test_scripts)
+            self.pass_(f"{tag} Script unit tests: {names} passed")
 
     def check_e2e_suite(self, tag: str) -> None:
         cargo_bin = self.tool("cargo")
@@ -802,8 +873,21 @@ class CheckRunner:
 # ----------------------------------------------------------------------
 
 
+SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def _parse_semver_tuple(version: str) -> tuple[int, int, int] | None:
+    m = SEMVER_RE.match(version.strip())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
 def _parse_toml_value(path: pathlib.Path, section: str, key: str) -> str:
-    text = path.read_text(encoding="utf-8")
+    return _parse_toml_value_text(path.read_text(encoding="utf-8"), section, key, str(path))
+
+
+def _parse_toml_value_text(text: str, section: str, key: str, label: str) -> str:
     try:
         import tomllib  # type: ignore[import-not-found]
 
@@ -835,7 +919,7 @@ def _parse_toml_value(path: pathlib.Path, section: str, key: str) -> str:
                 m = key_re.match(line)
                 if m:
                     return m.group(1)
-        raise ValueError(f"could not locate [{section}].{key} in {path}")
+        raise ValueError(f"could not locate [{section}].{key} in {label}")
 
 
 def _validate_manifests_and_py_compile(root: pathlib.Path) -> tuple[str | None, list[str]]:

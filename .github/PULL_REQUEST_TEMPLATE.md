@@ -16,6 +16,7 @@
 ## Checklist
 
 - [ ] Branch created from `main` (not pushed directly to `main`)
+- [ ] Patch version bumped across manifests (`python3 -B scripts/bump_version.py`)
 - [ ] Conventional commit messages answering *why* with zero AI attribution
 - [ ] Design / ADR docs updated in `docs/` if architecture or behavior changed
 - [ ] No secrets, `.env` files, or local/runtime artifacts tracked

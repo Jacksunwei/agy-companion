@@ -220,7 +220,7 @@ See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and [`AGENT
 | `agy-companion launch` | `[--port <PORT>]` `[--config <CONFIG>]` `[--app <PATH>]` `[--print-env]` — launches Antigravity App directly in Hybrid Mode for a single session. |
 | `agy-companion doctor` | `[--config <CONFIG>]` `[--port <PORT>]` `[--json]` — verifies config permissions, schema, proxy `/health`, version match, and env setup. |
 | `agy-companion models` | `[--json]` `[--port <PORT>]` `[--config <CONFIG>]` — prints `customModelsConfig` JSON for `agy` CLI. |
-| `agy-companion --version` | Prints `agy-companion 0.0.3`. |
+| `agy-companion --version` | Prints `agy-companion <version>`. |
 
 #### Local HTTP Endpoints (`127.0.0.1:24141`)
 
