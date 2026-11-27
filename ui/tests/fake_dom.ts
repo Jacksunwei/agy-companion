@@ -13,6 +13,8 @@ export interface FakeEventInit {
   isComposing?: boolean;
   keyCode?: number;
   relatedTarget?: FakeNode | null;
+  oldState?: string;
+  newState?: string;
 }
 
 export class FakeEvent {
@@ -22,6 +24,8 @@ export class FakeEvent {
   isComposing: boolean;
   keyCode: number;
   relatedTarget: FakeNode | null;
+  oldState: string;
+  newState: string;
   target: FakeNode | null;
   currentTarget: FakeNode | null;
   defaultPrevented: boolean;
@@ -34,6 +38,8 @@ export class FakeEvent {
     this.isComposing = init.isComposing ?? false;
     this.keyCode = init.keyCode ?? 0;
     this.relatedTarget = init.relatedTarget ?? null;
+    this.oldState = init.oldState ?? "";
+    this.newState = init.newState ?? "";
     this.target = null;
     this.currentTarget = null;
     this.defaultPrevented = false;
@@ -395,7 +401,9 @@ export class FakeElement extends FakeNode {
     contains: (token: string) => boolean;
     toggle: (token: string, force?: boolean) => boolean;
   };
+  readonly dataset: Record<string, string | undefined>;
   private attrs: Map<string, string>;
+  _popoverOpen: boolean;
 
   constructor(
     tag: string,
@@ -415,7 +423,36 @@ export class FakeElement extends FakeNode {
     this.spellcheck = false;
     this.scrollTop = 0;
     this.attrs = new Map();
+    this._popoverOpen = false;
     this.rect = { left: 0, top: 0, right: 100, bottom: 30, width: 100, height: 30 };
+
+    const attrsMap = this.attrs;
+    const toDataAttr = (prop: string): string =>
+      `data-${prop.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}`;
+    this.dataset = new Proxy<Record<string, string | undefined>>(
+      {},
+      {
+        get(_target, prop) {
+          if (typeof prop !== "string") return undefined;
+          return attrsMap.get(toDataAttr(prop));
+        },
+        set(_target, prop, value) {
+          if (typeof prop !== "string") return true;
+          if (value === undefined) {
+            attrsMap.delete(toDataAttr(prop));
+          } else {
+            attrsMap.set(toDataAttr(prop), String(value));
+          }
+          return true;
+        },
+        deleteProperty(_target, prop) {
+          if (typeof prop === "string") {
+            attrsMap.delete(toDataAttr(prop));
+          }
+          return true;
+        },
+      },
+    );
 
     const styleObj = {
       setProperty(k: string, v: string): void {
@@ -598,17 +635,49 @@ export class FakeElement extends FakeNode {
     this.dispatchEvent(new FakeEvent("focusout", { bubbles: true, relatedTarget }));
   }
 
+  matches(selector: string): boolean {
+    if (selector.trim() === ":popover-open") {
+      return this._popoverOpen;
+    }
+    return matchesSelectorList(this, selector);
+  }
+
   select(): void {
     // No-op for offscreen textarea copy path
   }
 
   click(): void {
     if (this.disabled) return;
-    this.dispatchEvent(new FakeEvent("click", { bubbles: true }));
+    const ev = new FakeEvent("click", { bubbles: true });
+    this.dispatchEvent(ev);
+    if (
+      !ev.defaultPrevented &&
+      "popover" in FakeElement.prototype &&
+      this.hasAttribute("popovertarget")
+    ) {
+      const targetId = this.getAttribute("popovertarget");
+      const target = targetId ? this.ownerDocument?.getElementById(targetId) : null;
+      if (target) {
+        const action = (this.getAttribute("popovertargetaction") ?? "toggle").toLowerCase();
+        const targetAny = target as unknown as {
+          showPopover?: () => void;
+          hidePopover?: () => void;
+          togglePopover?: () => boolean;
+        };
+        if (action === "show") {
+          targetAny.showPopover?.();
+        } else if (action === "hide") {
+          targetAny.hidePopover?.();
+        } else {
+          targetAny.togglePopover?.();
+        }
+      }
+    }
   }
 }
 
 export class FakeDocument extends FakeNode {
+  documentElement: FakeElement;
   body: FakeElement;
   activeElement: FakeElement | null;
   hidden: boolean;
@@ -617,9 +686,11 @@ export class FakeDocument extends FakeNode {
   constructor() {
     super(null);
     this.ownerDocument = this;
+    this.documentElement = new FakeElement("html", this);
+    this.documentElement.parentNode = this;
     this.body = new FakeElement("body", this);
-    this.body.parentNode = this;
-    this.childNodes.push(this.body);
+    this.documentElement.append(this.body);
+    this.childNodes.push(this.documentElement);
     this.activeElement = null;
     this.hidden = false;
     this.execCommandResult = false;
@@ -662,6 +733,7 @@ export interface FakeDomEnv {
   pendingTimerCount: () => number;
   mockClipboard: (writeText?: (text: string) => Promise<void>) => void;
   mockUserAgent: (userAgent: string) => void;
+  enableNativePopover: () => void;
   teardown: () => void;
 }
 
@@ -716,6 +788,78 @@ export function installFakeDom(): FakeDomEnv {
     touchGlobal("navigator", navObj);
   };
 
+  let nativePopoverInstalled = false;
+  const savedProtoDescriptors = new Map<string, PropertyDescriptor | undefined>();
+  const popoverProtoKeys = ["popover", "showPopover", "hidePopover", "togglePopover"] as const;
+
+  const enableNativePopover = (): void => {
+    if (nativePopoverInstalled) return;
+    nativePopoverInstalled = true;
+    for (const key of popoverProtoKeys) {
+      savedProtoDescriptors.set(
+        key,
+        Object.getOwnPropertyDescriptor(FakeElement.prototype, key),
+      );
+    }
+    Object.defineProperty(FakeElement.prototype, "popover", {
+      configurable: true,
+      get(this: FakeElement): string | null {
+        return this.getAttribute("popover");
+      },
+      set(this: FakeElement, value: string | null) {
+        if (value === null) {
+          this.removeAttribute("popover");
+        } else {
+          this.setAttribute("popover", String(value));
+        }
+      },
+    });
+    Object.defineProperty(FakeElement.prototype, "showPopover", {
+      configurable: true,
+      writable: true,
+      value(this: FakeElement): void {
+        if (this._popoverOpen) return;
+        this._popoverOpen = true;
+        this.dispatchEvent(
+          new FakeEvent("toggle", {
+            bubbles: false,
+            oldState: "closed",
+            newState: "open",
+          }),
+        );
+      },
+    });
+    Object.defineProperty(FakeElement.prototype, "hidePopover", {
+      configurable: true,
+      writable: true,
+      value(this: FakeElement): void {
+        if (!this._popoverOpen) return;
+        this._popoverOpen = false;
+        this.dispatchEvent(
+          new FakeEvent("toggle", {
+            bubbles: false,
+            oldState: "open",
+            newState: "closed",
+          }),
+        );
+      },
+    });
+    Object.defineProperty(FakeElement.prototype, "togglePopover", {
+      configurable: true,
+      writable: true,
+      value(this: FakeElement, force?: boolean): boolean {
+        const next = force !== undefined ? Boolean(force) : !this._popoverOpen;
+        const self = this as unknown as { showPopover: () => void; hidePopover: () => void };
+        if (next) {
+          self.showPopover();
+        } else {
+          self.hidePopover();
+        }
+        return this._popoverOpen;
+      },
+    });
+  };
+
   return {
     document: doc,
     window: fakeWindow,
@@ -736,8 +880,21 @@ export function installFakeDom(): FakeDomEnv {
       currentUa = userAgent;
       applyNavigator();
     },
+    enableNativePopover,
     teardown: (): void => {
       timers.clear();
+      if (nativePopoverInstalled) {
+        const proto = FakeElement.prototype as unknown as Record<string, unknown>;
+        for (const [key, desc] of savedProtoDescriptors.entries()) {
+          if (desc === undefined) {
+            delete proto[key];
+          } else {
+            Object.defineProperty(FakeElement.prototype, key, desc);
+          }
+        }
+        savedProtoDescriptors.clear();
+        nativePopoverInstalled = false;
+      }
       for (const [key, desc] of savedDescriptors.entries()) {
         if (desc === undefined) {
           delete g[key];

@@ -299,6 +299,10 @@ class TestUiSmoke(E2ETestCase):
                     tabs,
                     tabWiring,
                     refreshBtns,
+                    rootFontSize: getComputedStyle(document.documentElement).fontSize,
+                    bodyFontSize: getComputedStyle(document.body).fontSize,
+                    toastPopoverAttr: document.querySelector('.host-toast')?.getAttribute('popover') ?? null,
+                    toastRole: document.querySelector('.host-toast')?.getAttribute('role') ?? null,
                   };
                 })()"""
             )
@@ -319,6 +323,10 @@ class TestUiSmoke(E2ETestCase):
                 ],
             )
             self.assertEqual(header["refreshBtns"], 0)
+            self.assertEqual(header["rootFontSize"], "16px")
+            self.assertEqual(header["bodyFontSize"], "13px")
+            self.assertEqual(header["toastPopoverAttr"], "manual")
+            self.assertEqual(header["toastRole"], "status")
 
             # Verify WAI-ARIA tablist keyboard navigation (ArrowRight/ArrowLeft/End/Home) + roving tabindex.
             read_tab_state_js = """(() => {
@@ -477,8 +485,7 @@ class TestUiSmoke(E2ETestCase):
                                 f"""(() => {{
                                   {_OPAQUE_BG_HELPER_JS}
                                   const geminiCard = document.querySelector('[data-provider="gemini"]');
-                                  const rootBrand = getComputedStyle(document.documentElement)
-                                    .getPropertyValue('--brand').trim();
+                                  const rootColorScheme = getComputedStyle(document.documentElement).colorScheme;
                                   const lnk = geminiCard.querySelector('button.lnk');
                                   const lnkFg = lnk ? getComputedStyle(lnk).color : null;
                                   const lnkBg = lnk ? opaqueBg(lnk) : null;
@@ -493,10 +500,11 @@ class TestUiSmoke(E2ETestCase):
                                     (b) => !b.hidden && (b.textContent || '').trim() === 'Cancel'
                                   );
                                   if (cancelBtn) cancelBtn.click();
-                                  return {{ rootBrand, lnkFg, lnkBg, btnDisabled, btnFg, btnBg }};
+                                  return {{ rootColorScheme, lnkFg, lnkBg, btnDisabled, btnFg, btnBg }};
                                 }})()"""
                             )
-                            self.assertEqual(parse_css_rgb(brand_check["rootBrand"]), (21, 88, 176))
+                            self.assertEqual(brand_check["rootColorScheme"], "light")
+                            self.assertEqual(parse_css_rgb(brand_check["lnkFg"]), (21, 88, 176))
                             self.assertFalse(brand_check["btnDisabled"])
                             self.assertEqual(parse_css_rgb(brand_check["btnBg"]), (21, 88, 176))
                             lnk_ratio = wcag_contrast_ratio(
@@ -587,13 +595,29 @@ class TestUiSmoke(E2ETestCase):
               const ram = document.querySelector('span.footer-ram');
               const pop = document.getElementById('status-popover');
               const footer = document.querySelector('footer.status-bar');
+              const popRect = pop ? pop.getBoundingClientRect() : null;
+              const popStyle = pop ? getComputedStyle(pop) : null;
+              const popOpen = Boolean(pop && pop.matches(':popover-open'));
+              const popVisible = Boolean(
+                pop &&
+                !pop.hidden &&
+                popOpen &&
+                popStyle &&
+                popStyle.display !== 'none' &&
+                popRect &&
+                popRect.height > 0 &&
+                popRect.width > 0
+              );
               return {
                 triggerText: (trigger && trigger.innerText || '').trim(),
                 expanded: trigger ? trigger.getAttribute('aria-expanded') : null,
                 ramHidden: ram ? Boolean(ram.hidden) : true,
                 ramText: (ram && ram.textContent || '').trim(),
                 footerText: (footer && footer.innerText || '').trim(),
-                popVisible: Boolean(pop && !pop.hidden && pop.offsetParent !== null),
+                popoverAttr: pop ? pop.getAttribute('popover') : null,
+                popoverOpen: popOpen,
+                popPosition: popStyle ? popStyle.position : null,
+                popVisible,
                 popText: (pop && pop.innerText || '').trim(),
               };
             })()"""
@@ -603,13 +627,17 @@ class TestUiSmoke(E2ETestCase):
             self.assertNotIn(str(_MOCK_PROXY_PORT), initial["triggerText"])
             self.assertFalse(initial["ramHidden"])
             self.assertRegex(initial["ramText"], r"\b24\s*MB\s*RAM\b")
+            self.assertEqual(initial["popoverAttr"], "auto")
+            self.assertFalse(initial["popoverOpen"])
             self.assertFalse(initial["popVisible"])
 
             # Open popover via click from clean closed state (avoids mouseenter->click toggle race).
             session.eval_app("document.querySelector('button.status-trigger').click()")
             session._flush_frames()
             opened = session.eval_app(read_footer_js)
+            self.assertTrue(opened["popoverOpen"])
             self.assertTrue(opened["popVisible"])
+            self.assertEqual(opened["popPosition"], "fixed")
             self.assertEqual(opened["expanded"], "true")
             for required in (
                 "Endpoint",
@@ -629,8 +657,75 @@ class TestUiSmoke(E2ETestCase):
             session.eval_app("document.querySelector('button.status-trigger').focus()")
             session.press_key("Escape")
             closed = session.eval_app(read_footer_js)
+            self.assertFalse(closed["popoverOpen"])
             self.assertFalse(closed["popVisible"])
             self.assertEqual(closed["expanded"], "false")
+
+            # Real pointer click on trigger opens, and real outside pointer click light-dismisses + syncs aria-expanded.
+            pts = session.eval_app(
+                """(() => {
+                  const t = document.querySelector('button.status-trigger').getBoundingClientRect();
+                  const b = document.querySelector('.brand-name').getBoundingClientRect();
+                  return {
+                    tx: t.left + t.width / 2,
+                    ty: t.top + t.height / 2,
+                    ox: b.left + b.width / 2,
+                    oy: b.top + b.height / 2,
+                  };
+                })()"""
+            )
+            session.click_point(pts["tx"], pts["ty"])
+            opened_ptr = session.eval_app(read_footer_js)
+            self.assertTrue(opened_ptr["popoverOpen"])
+            self.assertTrue(opened_ptr["popVisible"])
+            self.assertEqual(opened_ptr["expanded"], "true")
+
+            session.click_point(pts["ox"], pts["oy"])
+            outside_closed = session.eval_app(read_footer_js)
+            self.assertFalse(outside_closed["popoverOpen"])
+            self.assertFalse(outside_closed["popVisible"])
+            self.assertEqual(outside_closed["expanded"], "false")
+
+            # Real pointer click on trigger opens then second click on trigger closes cleanly (no light-dismiss double-toggle race).
+            session.click_point(pts["tx"], pts["ty"])
+            self.assertTrue(session.eval_app(read_footer_js)["popoverOpen"])
+            session.click_point(pts["tx"], pts["ty"])
+            reclosed_ptr = session.eval_app(read_footer_js)
+            self.assertFalse(reclosed_ptr["popoverOpen"])
+            self.assertEqual(reclosed_ptr["expanded"], "false")
+
+            # Native popover="manual" .host-toast coexists with open popover="auto" #status-popover in the top layer.
+            session.click_point(pts["tx"], pts["ty"])
+            self.assertTrue(session.eval_app(read_footer_js)["popoverOpen"])
+            session.eval_app(
+                """(() => {
+                  const toast = document.querySelector('.host-toast');
+                  toast.textContent = 'Top-layer toast check';
+                  toast.showPopover();
+                })()"""
+            )
+            session._flush_frames()
+            coexist = session.eval_app(
+                """(() => {
+                  const toast = document.querySelector('.host-toast');
+                  const pop = document.getElementById('status-popover');
+                  const tRect = toast ? toast.getBoundingClientRect() : null;
+                  return {
+                    toastPopover: toast ? toast.getAttribute('popover') : null,
+                    toastRole: toast ? toast.getAttribute('role') : null,
+                    toastOpen: Boolean(toast && toast.matches(':popover-open')),
+                    toastHeight: tRect ? tRect.height : 0,
+                    footerStillOpen: Boolean(pop && pop.matches(':popover-open')),
+                  };
+                })()"""
+            )
+            self.assertEqual(coexist["toastPopover"], "manual")
+            self.assertEqual(coexist["toastRole"], "status")
+            self.assertTrue(coexist["toastOpen"])
+            self.assertGreater(coexist["toastHeight"], 0)
+            self.assertTrue(coexist["footerStillOpen"])
+            session.eval_app("document.querySelector('.host-toast').hidePopover()")
+            session.press_key("Escape")
 
             # Push offline snapshot: RAM hides and `Issue` row appears inside popover.
             session.set_snapshot(offline)
@@ -779,7 +874,36 @@ class TestUiSmoke(E2ETestCase):
         if os.name != "nt":
             self.assertIn("MB RAM", alpha_text)
 
-        # 2. Live theme-change postMessage from Antigravity host switches Light <-> Dark.
+        # 1b. Live OS prefers-color-scheme flips update light-dark() when no explicit host theme-change has fired.
+        cdp.call(
+            "Emulation.setEmulatedMedia",
+            {"features": [{"name": "prefers-color-scheme", "value": "light"}]},
+        )
+        wait_expr("document.documentElement.dataset.theme === 'light'")
+        self.assertEqual(
+            cdp.evaluate("getComputedStyle(document.body).backgroundColor"),
+            "rgb(255, 255, 255)",
+        )
+        self.assertEqual(
+            cdp.evaluate("getComputedStyle(document.documentElement).colorScheme"),
+            "light",
+        )
+
+        cdp.call(
+            "Emulation.setEmulatedMedia",
+            {"features": [{"name": "prefers-color-scheme", "value": "dark"}]},
+        )
+        wait_expr("document.documentElement.dataset.theme === 'dark'")
+        self.assertEqual(
+            cdp.evaluate("getComputedStyle(document.body).backgroundColor"),
+            "rgb(27, 28, 31)",
+        )
+        self.assertEqual(
+            cdp.evaluate("getComputedStyle(document.documentElement).colorScheme"),
+            "dark",
+        )
+
+        # 2. Live theme-change postMessage from Antigravity host switches Light <-> Dark and takes precedence over OS media flips.
         cdp.evaluate(
             """window.postMessage({
               type: 'theme-change',
@@ -787,6 +911,17 @@ class TestUiSmoke(E2ETestCase):
             }, '*')"""
         )
         wait_expr("document.documentElement.dataset.theme === 'light'")
+        cdp.call(
+            "Emulation.setEmulatedMedia",
+            {"features": [{"name": "prefers-color-scheme", "value": "dark"}]},
+        )
+        cdp.pump_events(0.05)
+        self.assertEqual(cdp.evaluate("document.documentElement.dataset.theme"), "light")
+        self.assertEqual(
+            cdp.evaluate("getComputedStyle(document.body).backgroundColor"),
+            "rgb(255, 255, 255)",
+        )
+        cdp.call("Emulation.setEmulatedMedia", {"features": []})
         cdp.evaluate(
             """window.postMessage({
               type: 'theme-change',

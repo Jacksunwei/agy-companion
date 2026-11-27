@@ -463,6 +463,11 @@ class CdpClient:
         self.call("Input.dispatchKeyEvent", {"type": "rawKeyDown", **base})
         self.call("Input.dispatchKeyEvent", {"type": "keyUp", **base})
 
+    def click_point(self, x: float, y: float) -> None:
+        base = {"x": float(x), "y": float(y), "button": "left", "clickCount": 1}
+        self.call("Input.dispatchMouseEvent", {"type": "mousePressed", **base})
+        self.call("Input.dispatchMouseEvent", {"type": "mouseReleased", **base})
+
     def close(self) -> None:
         if self._closed and self._sock is None:
             return
@@ -998,6 +1003,11 @@ class UiCdpSession:
     def press_key(self, key: str) -> None:
         assert self._cdp is not None
         self._cdp.press_key(key)
+        self._flush_frames()
+
+    def click_point(self, x: float, y: float) -> None:
+        assert self._cdp is not None
+        self._cdp.click_point(x, y)
         self._flush_frames()
 
     def assert_no_console_errors(self) -> None:

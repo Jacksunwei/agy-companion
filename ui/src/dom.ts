@@ -368,3 +368,163 @@ export function createTooltipController(container: HTMLElement): TooltipControll
 
   return { show, scheduleHide, hideNow, destroy };
 }
+
+export type ThemeMode = "dark" | "light";
+
+export interface ThemeMediaQueryListLike {
+  readonly matches: boolean;
+  addEventListener?: (type: "change", listener: (event: { matches: boolean }) => void) => void;
+  removeEventListener?: (type: "change", listener: (event: { matches: boolean }) => void) => void;
+}
+
+export interface ThemeController {
+  applyHostTheme: (theme: ThemeMode) => void;
+  isHostExplicit: () => boolean;
+  currentTheme: () => ThemeMode;
+  destroy: () => void;
+}
+
+export function createThemeController(
+  docEl: HTMLElement,
+  rootEl: HTMLElement | null,
+  matchMediaFn?: ((query: string) => ThemeMediaQueryListLike) | null,
+): ThemeController {
+  let hostThemeExplicit = false;
+  let activeTheme: ThemeMode = "dark";
+
+  const applyTheme = (theme: ThemeMode): void => {
+    activeTheme = theme;
+    docEl.dataset.theme = theme;
+    docEl.style.colorScheme = theme;
+    rootEl?.setAttribute("data-theme", theme);
+  };
+
+  const mql =
+    typeof matchMediaFn === "function"
+      ? matchMediaFn("(prefers-color-scheme: light)")
+      : null;
+
+  const syncOsTheme = (matchesLight: boolean): void => {
+    if (hostThemeExplicit) return;
+    applyTheme(matchesLight ? "light" : "dark");
+  };
+
+  const onOsThemeChange = (event: { matches: boolean }): void => {
+    syncOsTheme(Boolean(event.matches));
+  };
+
+  if (mql) {
+    syncOsTheme(Boolean(mql.matches));
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", onOsThemeChange);
+    }
+  }
+
+  return {
+    applyHostTheme: (theme: ThemeMode) => {
+      hostThemeExplicit = true;
+      applyTheme(theme);
+    },
+    isHostExplicit: () => hostThemeExplicit,
+    currentTheme: () => activeTheme,
+    destroy: () => {
+      if (mql && typeof mql.removeEventListener === "function") {
+        mql.removeEventListener("change", onOsThemeChange);
+      }
+    },
+  };
+}
+
+export function supportsNativePopover(node: HTMLElement): boolean {
+  return (
+    typeof HTMLElement !== "undefined" &&
+    "popover" in HTMLElement.prototype &&
+    typeof node.showPopover === "function" &&
+    typeof node.hidePopover === "function"
+  );
+}
+
+export interface ToastController {
+  element: HTMLElement;
+  show: (message: string, durationMs?: number, onHide?: () => void) => void;
+  hide: () => void;
+  isOpen: () => boolean;
+  destroy: () => void;
+}
+
+export function createToastController(container: HTMLElement): ToastController {
+  const toastEl = el("div", "host-toast");
+  toastEl.setAttribute("popover", "manual");
+  toastEl.setAttribute("role", "status");
+
+  const useNativePopover = supportsNativePopover(toastEl);
+  if (!useNativePopover) {
+    toastEl.hidden = true;
+  }
+
+  let timer: number | null = null;
+  let open = false;
+
+  const isNativeOpen = (): boolean =>
+    typeof toastEl.matches === "function" ? toastEl.matches(":popover-open") : open;
+
+  const clearTimer = (): void => {
+    if (timer !== null) {
+      window.clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const hide = (): void => {
+    clearTimer();
+    open = false;
+    if (useNativePopover) {
+      if (isNativeOpen()) {
+        try {
+          toastEl.hidePopover();
+        } catch {
+          // Guard against disconnected node or unsupported state
+        }
+      }
+    } else {
+      toastEl.hidden = true;
+    }
+  };
+
+  const show = (message: string, durationMs = 3200, onHide?: () => void): void => {
+    toastEl.textContent = message;
+    open = true;
+    if (useNativePopover) {
+      if (!isNativeOpen()) {
+        try {
+          toastEl.showPopover();
+        } catch {
+          // Guard against disconnected node or unsupported state
+        }
+      }
+    } else {
+      toastEl.hidden = false;
+    }
+    clearTimer();
+    timer = window.setTimeout(() => {
+      timer = null;
+      hide();
+      onHide?.();
+    }, durationMs);
+  };
+
+  const destroy = (): void => {
+    hide();
+    toastEl.remove();
+  };
+
+  container.append(toastEl);
+
+  return {
+    element: toastEl,
+    show,
+    hide,
+    isOpen: () => (useNativePopover ? isNativeOpen() : open),
+    destroy,
+  };
+}
