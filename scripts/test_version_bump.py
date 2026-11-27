@@ -452,6 +452,41 @@ class TestCheckPrVersionBump(unittest.TestCase):
         finally:
             self._restore_ci_env(saved)
 
+    def test_dev_track_retarget_allows_new_dev0_above_latest_release_tag(self) -> None:
+        saved = self._clean_ci_env()
+        try:
+            cases = [
+                # (base_ver, head_ver, release_tags, expect_pass)
+                ("0.2.0-dev.5", "0.1.1-dev.0", ["v0.1.0"], True),
+                ("0.2.0-dev.5", "0.1.1-dev.0", [], True),
+                ("0.2.0-dev.5", "0.1.0-dev.0", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.0.13-dev.0", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.1.1-dev.1", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.2.0-dev.0", ["v0.1.0"], False),
+                ("0.2.0", "0.1.1-dev.0", ["v0.1.0"], False),
+                ("0.2.0-dev.5", "0.1.1", ["v0.1.0"], False),
+            ]
+            for base_ver, head_ver, tags, expect_pass in cases:
+                with self.subTest(base=base_ver, head=head_ver, tags=tags):
+                    with tempfile.TemporaryDirectory() as td:
+                        root = pathlib.Path(td)
+                        _init_git_repo_with_origin_main(root, version=base_ver)
+                        for tag in tags:
+                            _git(root, "tag", tag)
+                        _git(root, "checkout", "-b", "chore/retarget-dev-track")
+                        (root / "notes.txt").write_text("retarget\n", encoding="utf-8")
+                        _git(root, "add", "notes.txt")
+                        _git(root, "commit", "-m", "chore: retarget dev version")
+
+                        runner = check.CheckRunner(root, verify_ui_build=False, with_e2e=False)
+                        err = runner._check_pr_version_bump(head_ver)
+                        if expect_pass:
+                            self.assertIsNone(err, f"expected pass, got {err!r}")
+                        else:
+                            self.assertIsNotNone(err, f"expected rejection for {base_ver} -> {head_ver}")
+        finally:
+            self._restore_ci_env(saved)
+
     def test_validate_manifests_rejects_invalid_semver_on_clean_main(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)
