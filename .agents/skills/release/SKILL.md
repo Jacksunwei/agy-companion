@@ -114,6 +114,15 @@ Idempotent failure recovery:
   gh run rerun <run_id> --failed
   ```
 
+### Troubleshooting npm OIDC & Registry Delays
+
+| Symptom | Root Cause | Resolution |
+| --- | --- | --- |
+| `npm publish` exits with `ENEEDAUTH` (`This command requires you to be logged in`) under OIDC | npm 11+ silently falls back to `ENEEDAUTH` when OIDC exchange is rejected: Trusted Publisher was not saved (e.g., interrupted by npm's 2FA enrollment wizard), a field mismatches case-sensitively (`Jacksunwei`, `agy-companion`, `release.yml`, `npm`), or **`Allow npm publish`** was left unchecked. | Verify the saved connection on `https://www.npmjs.com/package/<pkg>/access`, confirm `Allow npm publish` is checked, then run `gh run rerun <run_id> --failed`. |
+| `403 Forbidden` on `agy-companion` while `@agy-companion/*` succeeded | A stale `NPM_TOKEN` secret in GitHub `Settings → Environments → npm` overrides OIDC Trusted Publishing and lacks scope on the unscoped package. | Delete `NPM_TOKEN` from the `npm` GitHub Environment (`gh secret list --env npm` must show `no secrets found`), then re-run `--failed`. |
+| npm prompts for Security Key only when configuring Trusted Publisher | npm phased out TOTP authenticator apps for new 2FA enrollments and requires WebAuthn passkeys/security keys. | Enroll a platform passkey (Mac Touch ID / Apple Passwords / Chrome Google Password Manager) — no physical USB key needed — then re-save the Trusted Publisher connection. |
+| `npm view` / `npx` briefly returns `404` or `ETARGET` right after `npm publish` succeeds | npm prints *"Your package is being processed and may take a few minutes to become available"* (~1–3 min async processing before `registry.npmjs.org` serves the new version; `www.npmjs.com` web pages lag ~5–15 min behind the registry). | Wait ~2 minutes and verify via `npm view agy-companion dist-tags --registry=https://registry.npmjs.org/` and `npx -y --registry=https://registry.npmjs.org/ agy-companion@latest --version`. |
+
 ## 6. Post-Release Live Verification
 
 Verify all three live channels after `release.yml` completes:
