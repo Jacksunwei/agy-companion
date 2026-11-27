@@ -4,7 +4,7 @@
 Profiles:
   --profile repo : OS-independent hygiene, secrets, commits, shell syntax,
                    4-way version/packaging sync, rustfmt, UI S5/bundle gate,
-                   5 static hermeticity guards, and plugin manifest/SVG checks.
+                   7 static hermeticity & S3/S4 guards, and plugin manifest/SVG checks.
   --profile os   : OS-dependent runtime checks (cargo clippy, cargo test,
                    UI behavioral tests, SVG validator unit tests, and optional
                    parallel opaque-box E2E via --with-e2e).
@@ -628,11 +628,11 @@ class CheckRunner:
                     )
                     failed = True
 
-        # 5 Automated Static Hermeticity Guards (Gate 6c)
+        # 7 Automated Static Hermeticity & S3/S4 Security Guards (Gate 6c)
         guard_errors = _run_static_hermeticity_guards(self.repo_root)
         if guard_errors:
             self.fail(
-                f"{tag} Static & UI: static hermeticity guard(s) failed",
+                f"{tag} Static & UI: static hermeticity/security guard(s) failed",
                 guard_errors,
             )
             failed = True
@@ -640,7 +640,7 @@ class CheckRunner:
         if not failed:
             build_note = " (+ deterministic UI rebuild)" if self.verify_ui_build else ""
             self.pass_(
-                f"{tag} Static & UI: cargo fmt, 5 static hermeticity guards, 0 forbidden sinks/external tags, "
+                f"{tag} Static & UI: cargo fmt, 7 static hermeticity/security guards, 0 forbidden sinks/external tags, "
                 f"ui/dist/index.html is {bundle_bytes} bytes (< {MAX_UI_BUNDLE_BYTES}){build_note}"
             )
 
@@ -1243,6 +1243,120 @@ def _run_static_hermeticity_guards(root: pathlib.Path) -> list[str]:
                             errors.append(
                                 f"Guard 5 ({rel}:{node.lineno}): run_cli() passed env=None"
                             )
+
+    # Guard 6 (S4): reqwest must keep default-features = false and enable zero compression features
+    # (gzip, brotli, deflate, zstd) across root Cargo.toml and all crates/*/Cargo.toml.
+    forbidden_reqwest_features = frozenset({"gzip", "brotli", "deflate", "zstd"})
+    cargo_manifests = [root / "Cargo.toml", *sorted(crates_dir.glob("*/Cargo.toml"))]
+    saw_workspace_reqwest = False
+    for manifest in cargo_manifests:
+        if not manifest.is_file():
+            continue
+        rel = manifest.relative_to(root).as_posix()
+        text = manifest.read_text(encoding="utf-8")
+        try:
+            import tomllib  # type: ignore[import-not-found]
+
+            data = tomllib.loads(text)
+        except ImportError:
+            # Minimal fallback for Python <3.11 without tomllib.
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                stripped = line.split("#", 1)[0]
+                if not re.match(r"^\s*reqwest\s*=", stripped):
+                    continue
+                if manifest == root / "Cargo.toml":
+                    saw_workspace_reqwest = True
+                for feat in sorted(forbidden_reqwest_features):
+                    if re.search(rf"""["']{feat}["']""", stripped, re.IGNORECASE):
+                        errors.append(
+                            f"Guard 6 ({rel}:{line_no}): forbidden reqwest compression feature {feat!r}"
+                        )
+                if "workspace" not in stripped and not re.search(
+                    r"default[-_]features\s*=\s*false\b", stripped
+                ):
+                    errors.append(
+                        f"Guard 6 ({rel}:{line_no}): reqwest must set default-features = false"
+                    )
+            continue
+        except Exception as exc:
+            errors.append(f"Guard 6 ({rel}): failed to parse TOML: {exc}")
+            continue
+
+        dep_tables: list[tuple[str, object]] = []
+        ws_node = data.get("workspace")
+        if isinstance(ws_node, dict) and isinstance(ws_node.get("dependencies"), dict):
+            dep_tables.append(("workspace.dependencies", ws_node["dependencies"]))
+        for sec in ("dependencies", "dev-dependencies", "build-dependencies"):
+            if isinstance(data.get(sec), dict):
+                dep_tables.append((sec, data[sec]))
+        target_node = data.get("target")
+        if isinstance(target_node, dict):
+            for tgt_name, tgt_val in target_node.items():
+                if not isinstance(tgt_val, dict):
+                    continue
+                for sec in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    if isinstance(tgt_val.get(sec), dict):
+                        dep_tables.append((f"target.{tgt_name}.{sec}", tgt_val[sec]))
+
+        for sec_name, deps in dep_tables:
+            assert isinstance(deps, dict)
+            for dep_key, spec in deps.items():
+                is_reqwest = dep_key == "reqwest" or (
+                    isinstance(spec, dict) and spec.get("package") == "reqwest"
+                )
+                if not is_reqwest:
+                    continue
+                if manifest == root / "Cargo.toml" and sec_name == "workspace.dependencies":
+                    saw_workspace_reqwest = True
+                if isinstance(spec, str):
+                    errors.append(
+                        f"Guard 6 ({rel} [{sec_name}].{dep_key}): "
+                        "reqwest must use table syntax with default-features = false"
+                    )
+                    continue
+                if not isinstance(spec, dict):
+                    errors.append(
+                        f"Guard 6 ({rel} [{sec_name}].{dep_key}): unsupported reqwest dependency entry"
+                    )
+                    continue
+
+                features = spec.get("features") or []
+                if isinstance(features, list):
+                    for feat in features:
+                        if isinstance(feat, str) and feat.strip().lower() in forbidden_reqwest_features:
+                            errors.append(
+                                f"Guard 6 ({rel} [{sec_name}].{dep_key}): "
+                                f"forbidden reqwest compression feature {feat!r} (S4)"
+                            )
+
+                df = spec.get("default-features", spec.get("default_features"))
+                if spec.get("workspace") is True:
+                    if df is True:
+                        errors.append(
+                            f"Guard 6 ({rel} [{sec_name}].{dep_key}): "
+                            "reqwest workspace dependency must not set default-features = true (S4)"
+                        )
+                elif df is not False:
+                    errors.append(
+                        f"Guard 6 ({rel} [{sec_name}].{dep_key}): "
+                        "reqwest must explicitly set default-features = false (S4)"
+                    )
+
+    if not saw_workspace_reqwest:
+        errors.append(
+            "Guard 6 (Cargo.toml): expected reqwest in [workspace.dependencies] with default-features = false"
+        )
+
+    # Guard 7 (S3): Zero danger_accept_invalid_certs anywhere in crates/**/*.rs (comment-stripped).
+    danger_certs_re = re.compile(r"\bdanger_accept_invalid_certs\b")
+    for rs_file in sorted(crates_dir.rglob("*.rs")):
+        rel = rs_file.relative_to(root).as_posix()
+        cleaned = _strip_rust_comments(rs_file.read_text(encoding="utf-8"))
+        for match in danger_certs_re.finditer(cleaned):
+            line_no = cleaned.count("\n", 0, match.start()) + 1
+            errors.append(
+                f"Guard 7 ({rel}:{line_no}): forbidden danger_accept_invalid_certs in Rust workspace (S3)"
+            )
 
     return errors
 
