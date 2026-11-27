@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import sqlite3
+import sys
 import time
 from typing import Any
 
@@ -617,7 +618,8 @@ class TestCujLsTelemetry(E2ETestCase):
         ]
         self.assertTrue(before["ls_telemetry_active"])
         self.assertEqual(before["stats"]["usage"]["requests"], 1)
-        self.assertIsNotNone(before["stats"]["proxy_rss_bytes"])
+        if sys.platform in ("darwin", "linux"):
+            self.assertIsNotNone(before["stats"]["proxy_rss_bytes"])
 
         # Stop primary proxy; sidecar remains alive & Monitor preserves LS telemetry during/after takeover.
         primary_proxy.stop()
