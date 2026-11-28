@@ -7,14 +7,14 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, SecondsFormat, Utc};
 use companion_core::fs_safe::{self, OpenRegularMode};
 use companion_core::{
-    LsSyncWatermark, MAX_RECENT_CALLS, MAX_SESSION_MODELS, ModelSessionStats, RecentCallSnapshot,
-    SqliteUsageSink, StatsSnapshot, TelemetrySource, UsageEvent, UsageStatsSnapshot,
-    normalize_utc_timestamp, sanitize_conversation_id, sanitize_model_display_name,
-    sanitize_response_id,
+    LsSyncWatermark, MAX_RECENT_CALLS, MAX_SESSION_MODELS, ModelSessionStats, ObservedModel,
+    RecentCallSnapshot, SqliteUsageSink, StatsSnapshot, TelemetrySource, UsageEvent,
+    UsageStatsSnapshot, normalize_utc_timestamp, sanitize_conversation_id,
+    sanitize_model_display_name, sanitize_response_id,
 };
 use companion_providers::{
-    LsClient, LsError, LsModelConfig, LsModelUsage, LsStepMetadata, LsSummaryDelta,
-    LsTrajectoryStep, LsTrajectorySummary,
+    LsClient, LsError, LsGeneratorMetadata, LsModelConfig, LsModelUsage, LsStepMetadata,
+    LsSummaryDelta, LsTrajectoryStep, LsTrajectorySummary,
 };
 use tokio::sync::{Mutex, Notify, Semaphore, watch};
 
@@ -37,6 +37,8 @@ const MAX_CACHED_CALLS_PER_CASCADE: usize = 64;
 const MAX_STATS_MODEL_LEN: usize = 128;
 const LARGE_CASCADE_HYDRATION_THRESHOLD: u32 = 500;
 const LARGE_CASCADE_TAIL_WINDOW: u32 = 64;
+const MAX_GEN_META_TAIL_SEEK_RPCS: usize = 24;
+const GEN_META_EXPANSION_MIN_STEP: u32 = 64;
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(50);
 
 const STEP_TYPE_PLANNER_RESPONSE: &str = "CORTEX_STEP_TYPE_PLANNER_RESPONSE";
@@ -226,6 +228,8 @@ pub fn canonicalize_model_id(raw: &str) -> String {
     let lower = without_prefix.to_ascii_lowercase();
     let stripped = if lower.ends_with("-medium") {
         &without_prefix[..without_prefix.len() - 7]
+    } else if lower.ends_with("-xhigh") {
+        &without_prefix[..without_prefix.len() - 6]
     } else if lower.ends_with("-high") {
         &without_prefix[..without_prefix.len() - 5]
     } else if lower.ends_with("-low") || lower.ends_with("-max") {
@@ -352,30 +356,6 @@ pub fn resolve_attribution(
         "builtin".to_string()
     };
 
-    let api_provider = usage.api_provider.as_deref().or_else(|| {
-        meta.model_info
-            .as_ref()
-            .and_then(|i| i.api_provider.as_deref())
-    });
-    let provider = if is_companion_catalog {
-        "gemini".to_string()
-    } else {
-        map_provider_from_api_provider(
-            api_provider,
-            &source,
-            model_enum,
-            catalog_entry.and_then(|c| c.provider.as_deref()),
-            catalog_model_id.or_else(|| {
-                meta.model_info.as_ref().and_then(|i| {
-                    i.vertex_model_id
-                        .as_deref()
-                        .or(i.model_name.as_deref())
-                        .or(i.model_id.as_deref())
-                })
-            }),
-        )
-    };
-
     let model = if is_companion_catalog {
         if let Some(url_model) = catalog_model_url.and_then(|u| u.strip_prefix("gemini-api://"))
             && !url_model.trim().is_empty()
@@ -408,6 +388,36 @@ pub fn resolve_attribution(
         sanitize_stats_model(model_enum.unwrap_or("unknown"))
     };
 
+    let api_provider = usage.api_provider.as_deref().or_else(|| {
+        meta.model_info
+            .as_ref()
+            .and_then(|i| i.api_provider.as_deref())
+    });
+    let provider = if is_companion_catalog {
+        if companion_core::is_codex_model(&model) {
+            "openai-codex".to_string()
+        } else {
+            "gemini".to_string()
+        }
+    } else if source == "proxy" && companion_core::is_codex_model(&model) {
+        "openai-codex".to_string()
+    } else {
+        map_provider_from_api_provider(
+            api_provider,
+            &source,
+            model_enum,
+            catalog_entry.and_then(|c| c.provider.as_deref()),
+            catalog_model_id.or_else(|| {
+                meta.model_info.as_ref().and_then(|i| {
+                    i.vertex_model_id
+                        .as_deref()
+                        .or(i.model_name.as_deref())
+                        .or(i.model_id.as_deref())
+                })
+            }),
+        )
+    };
+
     let model_display_name = catalog_entry
         .and_then(|c| c.label.as_deref())
         .or_else(|| {
@@ -429,6 +439,60 @@ pub fn resolve_attribution(
         model,
         model_display_name,
         variant_key,
+    }
+}
+
+fn generator_metadata_model_enum(entry: &LsGeneratorMetadata) -> Option<&str> {
+    let chat = entry.chat_model.as_ref()?;
+    chat.model
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            chat.usage
+                .as_ref()
+                .and_then(|u| u.model.as_deref())
+                .filter(|s| !s.trim().is_empty())
+        })
+}
+
+fn resolve_generator_metadata_model(
+    entry: &LsGeneratorMetadata,
+    catalog: &ModelCatalog,
+) -> Option<(String, String)> {
+    let chat = entry.chat_model.as_ref()?;
+    let chat_model = chat.model.as_deref().filter(|s| !s.trim().is_empty());
+    let usage_model = chat
+        .usage
+        .as_ref()
+        .and_then(|u| u.model.as_deref())
+        .filter(|s| !s.trim().is_empty());
+    let response_model = chat
+        .response_model
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
+    if chat_model.is_none() && usage_model.is_none() && response_model.is_none() {
+        return None;
+    }
+    let generator_model = chat_model
+        .or_else(|| {
+            if usage_model.is_none() {
+                response_model
+            } else {
+                None
+            }
+        })
+        .map(str::to_string);
+    let meta = LsStepMetadata {
+        generator_model,
+        ..Default::default()
+    };
+    let default_usage = LsModelUsage::default();
+    let usage = chat.usage.as_ref().unwrap_or(&default_usage);
+    let attr = resolve_attribution(&meta, usage, catalog);
+    if attr.model == "unknown" {
+        None
+    } else {
+        Some((attr.provider, attr.model))
     }
 }
 
@@ -795,6 +859,7 @@ pub struct CascadeFoldState {
     pub trajectory_id: String,
     pub step_offset: u32,
     pub generator_metadata_offset: u32,
+    generator_metadata_probed_step: Option<u32>,
     pub max_context_tokens: Option<u64>,
     seen_variants: HashSet<(String, String, String)>,
     saw_checkpoint_since_last_planner: bool,
@@ -1016,6 +1081,7 @@ struct CollectorState {
     circuit_open_until: Option<Instant>,
     catalog: ModelCatalog,
     persisted_watermarks: HashMap<String, LsSyncWatermark>,
+    observed_compaction_limits: HashMap<(String, String), u64>,
     boot_baselines: HashMap<String, BootBaseline>,
     summaries: HashMap<String, LsTrajectorySummary>,
     children_by_root: HashMap<String, HashSet<String>>,
@@ -1025,10 +1091,22 @@ struct CollectorState {
 }
 
 impl CollectorState {
-    fn new(collector_boot_utc: DateTime<Utc>, watermarks: Vec<LsSyncWatermark>) -> Self {
+    fn new(
+        collector_boot_utc: DateTime<Utc>,
+        watermarks: Vec<LsSyncWatermark>,
+        observed_models: Vec<ObservedModel>,
+    ) -> Self {
         let mut persisted_watermarks = HashMap::with_capacity(watermarks.len());
         for wm in watermarks {
             persisted_watermarks.insert(wm.cascade_id.clone(), wm);
+        }
+        let mut observed_compaction_limits = HashMap::with_capacity(observed_models.len());
+        for observed in observed_models {
+            if let Some(tokens) = observed.compaction_limit_tokens
+                && tokens > 0
+            {
+                observed_compaction_limits.insert((observed.provider, observed.model), tokens);
+            }
         }
         Self {
             collector_boot_utc,
@@ -1038,6 +1116,7 @@ impl CollectorState {
             circuit_open_until: None,
             catalog: ModelCatalog::default(),
             persisted_watermarks,
+            observed_compaction_limits,
             boot_baselines: HashMap::new(),
             summaries: HashMap::new(),
             children_by_root: HashMap::new(),
@@ -1396,6 +1475,14 @@ pub fn spawn_ls_collector(
         }
     };
 
+    let initial_observed_models = match sqlite_sink.load_all_observed_models() {
+        Ok(models) => models,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to load persisted observed models at startup");
+            Vec::new()
+        }
+    };
+
     let cutoff = (Utc::now() - chrono::Duration::days(config.watermark_retention_days))
         .to_rfc3339_opts(SecondsFormat::Secs, true);
     if let Err(err) = sqlite_sink.prune_stale_watermarks(&cutoff) {
@@ -1407,7 +1494,11 @@ pub fn spawn_ls_collector(
         sqlite_sink,
         step_semaphore: Arc::new(Semaphore::new(config.max_in_flight_steps.max(1))),
         config,
-        state: Mutex::new(CollectorState::new(Utc::now(), initial_watermarks)),
+        state: Mutex::new(CollectorState::new(
+            Utc::now(),
+            initial_watermarks,
+            initial_observed_models,
+        )),
         dirty_notify: Notify::new(),
     });
 
@@ -1518,10 +1609,16 @@ impl LsCollectorHandle {
             .filter_map(|cid| guard.monitor_cache.get(cid))
             .collect();
         let mut snap = merge_cascade_folds(&folds);
-        snap.max_context_tokens = guard
-            .monitor_cache
-            .get(&focused_cid)
-            .and_then(|f| f.max_context_tokens);
+        snap.max_context_tokens = guard.monitor_cache.get(&focused_cid).and_then(|fold| {
+            fold.max_context_tokens.or_else(|| {
+                fold.recent_calls.back().and_then(|call| {
+                    guard
+                        .observed_compaction_limits
+                        .get(&(call.provider.clone(), call.model.clone()))
+                        .copied()
+                })
+            })
+        });
         Some(snap)
     }
 }
@@ -1582,6 +1679,117 @@ async fn refresh_catalog(inner: &LsCollectorInner, force_rate_limit: bool) -> bo
     }
 }
 
+async fn fetch_generator_metadata_tail_seeking(
+    client: &LsClient,
+    cascade_id: &str,
+    req_offset: u32,
+    summary_steps: u32,
+) -> Result<Option<(u32, Vec<LsGeneratorMetadata>)>, LsError> {
+    let mut rpcs = 0usize;
+    let mut phase_a: Option<(u32, u32)> = None;
+    let mut phase_b: Option<(Option<u32>, u32)> = None;
+
+    if req_offset > 0 || summary_steps <= LARGE_CASCADE_HYDRATION_THRESHOLD {
+        rpcs += 1;
+        match client
+            .get_cascade_trajectory_generator_metadata(cascade_id, req_offset)
+            .await
+        {
+            Ok(entries) => return Ok(Some((req_offset, entries))),
+            Err(LsError::ResponseTooLarge { .. }) => {
+                let initial_step = summary_steps
+                    .saturating_sub(req_offset)
+                    .max(GEN_META_EXPANSION_MIN_STEP);
+                phase_a = Some((req_offset, initial_step));
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        let probe = summary_steps / 2;
+        rpcs += 1;
+        match client
+            .get_cascade_trajectory_generator_metadata(cascade_id, probe)
+            .await
+        {
+            Ok(entries) if !entries.is_empty() => return Ok(Some((probe, entries))),
+            Ok(_) => {
+                phase_b = Some((None, probe));
+            }
+            Err(LsError::ResponseTooLarge { .. }) => {
+                let initial_step = summary_steps
+                    .saturating_sub(probe)
+                    .max(GEN_META_EXPANSION_MIN_STEP);
+                phase_a = Some((probe, initial_step));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    // Phase A: exponential bracket expansion from a known ResponseTooLarge lower bound.
+    if let Some((mut lo, mut step)) = phase_a {
+        while rpcs < MAX_GEN_META_TAIL_SEEK_RPCS {
+            let probe = lo.saturating_add(step);
+            if probe == lo {
+                return Ok(None);
+            }
+            rpcs += 1;
+            match client
+                .get_cascade_trajectory_generator_metadata(cascade_id, probe)
+                .await
+            {
+                Ok(entries) if !entries.is_empty() => return Ok(Some((probe, entries))),
+                Ok(_) => {
+                    phase_b = Some((Some(lo), probe));
+                    break;
+                }
+                Err(LsError::ResponseTooLarge { .. }) => {
+                    lo = probe;
+                    step = step.saturating_mul(2);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    // Phase B: binary search into the trailing window that fits within MAX_LS_RESPONSE_BYTES.
+    if let Some((mut too_large_lo, mut hi)) = phase_b {
+        while too_large_lo.is_none() && hi > 0 && rpcs < MAX_GEN_META_TAIL_SEEK_RPCS {
+            let mid = hi / 2;
+            rpcs += 1;
+            match client
+                .get_cascade_trajectory_generator_metadata(cascade_id, mid)
+                .await
+            {
+                Ok(entries) if !entries.is_empty() => return Ok(Some((mid, entries))),
+                Ok(_) => hi = mid,
+                Err(LsError::ResponseTooLarge { .. }) => too_large_lo = Some(mid),
+                Err(err) => return Err(err),
+            }
+        }
+        if too_large_lo.is_none() && hi == 0 {
+            return Ok(Some((0, Vec::new())));
+        }
+
+        if let Some(mut lo) = too_large_lo {
+            while lo.saturating_add(1) < hi && rpcs < MAX_GEN_META_TAIL_SEEK_RPCS {
+                let mid = lo + (hi - lo) / 2;
+                rpcs += 1;
+                match client
+                    .get_cascade_trajectory_generator_metadata(cascade_id, mid)
+                    .await
+                {
+                    Ok(entries) if !entries.is_empty() => return Ok(Some((mid, entries))),
+                    Ok(_) => hi = mid,
+                    Err(LsError::ResponseTooLarge { .. }) => lo = mid,
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 async fn hydrate_cascade_for_monitor(
     inner: &LsCollectorInner,
     cascade_id: &str,
@@ -1621,7 +1829,6 @@ async fn hydrate_cascade_for_monitor(
         }
     };
 
-    let mut steps_fetched = false;
     if let Some((start_offset, reset_fold, summary_opt, traj_id)) = step_plan {
         let _permit = match inner.step_semaphore.clone().acquire_owned().await {
             Ok(p) => p,
@@ -1698,45 +1905,143 @@ async fn hydrate_cascade_for_monitor(
                 .or_insert_with(|| CascadeFoldState::new(traj_id.clone(), start_offset))
         };
         fold.apply_batch(&batch);
-        steps_fetched = true;
     }
 
     if fetch_generator_metadata {
-        let gen_req_offset = {
+        let gen_plan = {
             let guard = inner.state.lock().await;
+            let summary_steps = guard
+                .summaries
+                .get(cascade_id)
+                .map(|s| s.step_count)
+                .unwrap_or(0);
             guard.monitor_cache.get(cascade_id).and_then(|fold| {
-                if steps_fetched || fold.max_context_tokens.is_none() {
-                    Some(fold.generator_metadata_offset)
+                let should_probe = fold.generator_metadata_probed_step != Some(fold.step_offset);
+                if should_probe {
+                    Some((
+                        fold.generator_metadata_offset,
+                        fold.step_offset,
+                        summary_steps,
+                    ))
                 } else {
                     None
                 }
             })
         };
 
-        if let Some(req_offset) = gen_req_offset {
+        if let Some((req_offset, probed_step, summary_steps)) = gen_plan {
             let _permit = match inner.step_semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return Ok(()),
             };
-            match inner
-                .client
-                .get_cascade_trajectory_generator_metadata(cascade_id, req_offset)
-                .await
+            match fetch_generator_metadata_tail_seeking(
+                &inner.client,
+                cascade_id,
+                req_offset,
+                summary_steps,
+            )
+            .await
             {
-                Ok(entries) => {
-                    let mut guard = inner.state.lock().await;
-                    if let Some(fold) = guard.monitor_cache.get_mut(cascade_id) {
-                        fold.generator_metadata_offset = fold
-                            .generator_metadata_offset
-                            .max(req_offset.saturating_add(entries.len() as u32));
+                Ok(Some((effective_offset, entries))) => {
+                    let has_unknown_placeholder = {
+                        let guard = inner.state.lock().await;
+                        entries.iter().any(|entry| {
+                            entry.max_context_tokens().is_some()
+                                && generator_metadata_model_enum(entry).is_some_and(|key| {
+                                    key.starts_with("MODEL_PLACEHOLDER_")
+                                        && guard.catalog.lookup(key).is_none()
+                                })
+                        })
+                    };
+                    if has_unknown_placeholder {
+                        let _ = refresh_catalog(inner, true).await;
+                    }
+
+                    let mut dirty_observed: HashMap<(String, String), u64> = HashMap::new();
+                    {
+                        let mut guard = inner.state.lock().await;
+                        let mut latest_tokens = None;
+                        let mut observed_updates: Vec<(String, String, u64)> = Vec::new();
                         for entry in &entries {
                             if let Some(tokens) = entry.max_context_tokens() {
+                                latest_tokens = Some(tokens);
+                                if let Some((provider, model)) =
+                                    resolve_generator_metadata_model(entry, &guard.catalog)
+                                {
+                                    observed_updates.push((provider, model, tokens));
+                                }
+                            }
+                        }
+
+                        if let Some(fold) = guard.monitor_cache.get_mut(cascade_id) {
+                            fold.generator_metadata_offset = fold
+                                .generator_metadata_offset
+                                .max(effective_offset.saturating_add(entries.len() as u32));
+                            fold.generator_metadata_probed_step = Some(probed_step);
+                            if let Some(tokens) = latest_tokens {
                                 fold.max_context_tokens = Some(tokens);
                             }
                         }
+
+                        for (provider, model, tokens) in observed_updates {
+                            let key = (provider.clone(), model.clone());
+                            if guard.observed_compaction_limits.get(&key).copied() != Some(tokens) {
+                                guard.observed_compaction_limits.insert(key.clone(), tokens);
+                                dirty_observed.insert(key, tokens);
+                            }
+                        }
+                    }
+
+                    if !dirty_observed.is_empty() {
+                        let sink = Arc::clone(&inner.sqlite_sink);
+                        let updated_at_utc = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                        let rows: Vec<ObservedModel> = dirty_observed
+                            .into_iter()
+                            .map(|((provider, model), tokens)| ObservedModel {
+                                provider,
+                                model,
+                                compaction_limit_tokens: Some(tokens),
+                                updated_at_utc: updated_at_utc.clone(),
+                            })
+                            .collect();
+                        let res = tokio::task::spawn_blocking(move || {
+                            for row in &rows {
+                                if let Err(err) = sink.upsert_observed_model(row) {
+                                    tracing::warn!(
+                                        provider = %row.provider,
+                                        model = %row.model,
+                                        error = %err,
+                                        "failed to persist observed model compaction limit"
+                                    );
+                                }
+                            }
+                        })
+                        .await;
+                        if let Err(err) = res {
+                            tracing::warn!(
+                                error = %err,
+                                "observed model persistence task failed"
+                            );
+                        }
                     }
                 }
+                Ok(None) => {
+                    let mut guard = inner.state.lock().await;
+                    if let Some(fold) = guard.monitor_cache.get_mut(cascade_id) {
+                        fold.generator_metadata_probed_step = Some(probed_step);
+                    }
+                    tracing::debug!(
+                        cascade_id,
+                        req_offset,
+                        summary_steps,
+                        "generator metadata tail-seeking exhausted budget or trailing entry exceeded cap; falling back to observed cache"
+                    );
+                }
                 Err(err) => {
+                    let mut guard = inner.state.lock().await;
+                    if let Some(fold) = guard.monitor_cache.get_mut(cascade_id) {
+                        fold.generator_metadata_probed_step = Some(probed_step);
+                    }
                     // Strictly fail-open: never fail Monitor hydration, pause collector,
                     // or trip the circuit breaker on generator metadata errors.
                     tracing::debug!(
@@ -3003,6 +3308,7 @@ mod tests {
                 last_modified_utc: boot.to_rfc3339_opts(SecondsFormat::Secs, true),
                 updated_at_utc: boot.to_rfc3339_opts(SecondsFormat::Secs, true),
             }],
+            Vec::new(),
         );
         state.boot_settled = true;
         state.monitor_cache.insert(
@@ -3764,5 +4070,1375 @@ mod tests {
             let _ = tx.send(true);
             srv.abort();
         }
+    }
+
+    #[test]
+    fn consistent_provider_model_normalization_across_builtin_gemini_proxy_and_codex_xhigh() {
+        assert_eq!(
+            canonicalize_model_id("companion/gpt-6.2-astra-xhigh"),
+            "gpt-6.2-astra"
+        );
+        assert_eq!(
+            canonicalize_model_id("companion/gpt-6.2-astra-high"),
+            "gpt-6.2-astra"
+        );
+        assert_eq!(
+            canonicalize_model_id("companion/gemini-4-hydrogen-xhigh"),
+            "gemini-4-hydrogen"
+        );
+
+        let mut catalog = ModelCatalog::default();
+        catalog.update(
+            vec![
+                LsModelConfig {
+                    label: Some("Gemini 4 Neon".to_string()),
+                    model_or_alias: Some(companion_providers::LsModelOrAlias {
+                        model: Some("MODEL_PLACEHOLDER_M501".to_string()),
+                        alias: None,
+                    }),
+                    model_id: Some("gemini-4-neon".to_string()),
+                    provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                    model_url: None,
+                    ..Default::default()
+                },
+                LsModelConfig {
+                    label: Some("Gemini 4 Hydrogen (High)".to_string()),
+                    model_or_alias: Some(companion_providers::LsModelOrAlias {
+                        model: Some("MODEL_PLACEHOLDER_M601".to_string()),
+                        alias: None,
+                    }),
+                    model_id: Some("companion/gemini-4-hydrogen-high".to_string()),
+                    provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                    model_url: Some("gemini-api://gemini-4-hydrogen".to_string()),
+                    ..Default::default()
+                },
+                LsModelConfig {
+                    label: Some("GPT 6.2 Astra (Extra High)".to_string()),
+                    model_or_alias: Some(companion_providers::LsModelOrAlias {
+                        model: Some("MODEL_PLACEHOLDER_M701".to_string()),
+                        alias: None,
+                    }),
+                    model_id: Some("companion/gpt-6.2-astra-xhigh".to_string()),
+                    provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                    model_url: Some("gemini-api://gpt-6.2-astra".to_string()),
+                    ..Default::default()
+                },
+                LsModelConfig {
+                    label: Some("GPT 5.2 (Vertex)".to_string()),
+                    model_or_alias: Some(companion_providers::LsModelOrAlias {
+                        model: Some("MODEL_PLACEHOLDER_M801".to_string()),
+                        alias: None,
+                    }),
+                    model_id: Some("gpt-5.2".to_string()),
+                    provider: Some("MODEL_PROVIDER_OPENAI".to_string()),
+                    model_url: None,
+                    ..Default::default()
+                },
+            ],
+            Instant::now(),
+        );
+
+        // 1. Built-in Gemini
+        let builtin_meta = LsStepMetadata {
+            generator_model: Some("MODEL_PLACEHOLDER_M501".to_string()),
+            ..Default::default()
+        };
+        let builtin_usage = LsModelUsage {
+            api_provider: Some("API_PROVIDER_GOOGLE_GEMINI".to_string()),
+            ..Default::default()
+        };
+        let builtin_attr = resolve_attribution(&builtin_meta, &builtin_usage, &catalog);
+        assert_eq!(
+            (builtin_attr.provider.as_str(), builtin_attr.model.as_str()),
+            ("antigravity", "gemini-4-neon")
+        );
+
+        // 2. Gemini Proxy
+        let gemini_proxy_meta = LsStepMetadata {
+            generator_model: Some("MODEL_PLACEHOLDER_M601".to_string()),
+            ..Default::default()
+        };
+        let gemini_proxy_usage = LsModelUsage {
+            api_provider: Some("API_PROVIDER_GOOGLE_GEMINI".to_string()),
+            ..Default::default()
+        };
+        let gemini_proxy_attr =
+            resolve_attribution(&gemini_proxy_meta, &gemini_proxy_usage, &catalog);
+        assert_eq!(
+            (
+                gemini_proxy_attr.provider.as_str(),
+                gemini_proxy_attr.model.as_str()
+            ),
+            ("gemini", "gemini-4-hydrogen")
+        );
+
+        // 3. Injected OpenAI Codex Proxy (modelUrl starts with gemini-api://, modelId ends with -xhigh)
+        let codex_meta = LsStepMetadata {
+            generator_model: Some("MODEL_PLACEHOLDER_M701".to_string()),
+            ..Default::default()
+        };
+        let codex_usage = LsModelUsage {
+            api_provider: Some("API_PROVIDER_GOOGLE_GEMINI".to_string()),
+            ..Default::default()
+        };
+        let codex_attr = resolve_attribution(&codex_meta, &codex_usage, &catalog);
+        assert_eq!(
+            (
+                codex_attr.provider.as_str(),
+                codex_attr.source.as_str(),
+                codex_attr.model.as_str()
+            ),
+            ("openai-codex", "proxy", "gpt-6.2-astra")
+        );
+
+        // Generator metadata entry resolves to the exact same (provider, model) key!
+        let codex_gen_entry = LsGeneratorMetadata {
+            chat_model: Some(companion_providers::LsChatModelMetadata {
+                model: Some("MODEL_PLACEHOLDER_M701".to_string()),
+                usage: Some(codex_usage),
+                response_model: None,
+                model_display_name: None,
+                chat_start_metadata: Some(companion_providers::LsChatStartMetadata {
+                    context_window_metadata: Some(companion_providers::LsContextWindowMetadata {
+                        max_context_tokens: 400_000,
+                    }),
+                }),
+            }),
+        };
+        assert_eq!(
+            resolve_generator_metadata_model(&codex_gen_entry, &catalog),
+            Some(("openai-codex".to_string(), "gpt-6.2-astra".to_string()))
+        );
+
+        // 4. Built-in Vertex OpenAI remains vertex_openai (not reclassified to openai-codex).
+        let vertex_openai_meta = LsStepMetadata {
+            generator_model: Some("MODEL_PLACEHOLDER_M801".to_string()),
+            ..Default::default()
+        };
+        let vertex_openai_usage = LsModelUsage {
+            api_provider: Some("API_PROVIDER_OPENAI_VERTEX".to_string()),
+            ..Default::default()
+        };
+        let vertex_openai_attr =
+            resolve_attribution(&vertex_openai_meta, &vertex_openai_usage, &catalog);
+        assert_eq!(
+            (
+                vertex_openai_attr.provider.as_str(),
+                vertex_openai_attr.source.as_str(),
+                vertex_openai_attr.model.as_str()
+            ),
+            ("vertex_openai", "builtin", "gpt-5.2")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observed_models_persistence_startup_preload_update_on_change_and_global_none() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct MockState {
+            steps: Vec<serde_json::Value>,
+            gen_meta_status: Option<StatusCode>,
+            gen_meta: Vec<serde_json::Value>,
+        }
+
+        let mk_step = |resp_id: &str| {
+            serde_json::json!({
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "status": "CORTEX_STEP_STATUS_DONE",
+                "metadata": {
+                    "createdAt": "2026-11-26T10:00:00Z",
+                    "finishedGeneratingAt": "2026-11-26T10:00:01Z",
+                    "generatorModel": "MODEL_PLACEHOLDER_M501",
+                    "modelUsage": {
+                        "inputTokens": "1000",
+                        "cacheReadTokens": "500",
+                        "outputTokens": "100",
+                        "responseOutputTokens": "100",
+                        "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                        "responseId": resp_id,
+                        "responseHeader": { "sessionID": "builtin-sess-1" }
+                    }
+                }
+            })
+        };
+        let mk_gen = |limit: u64| {
+            serde_json::json!({
+                "chatModel": {
+                    "model": "MODEL_PLACEHOLDER_M501",
+                    "usage": {
+                        "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                        "responseHeader": { "sessionID": "builtin-sess-1" }
+                    },
+                    "chatStartMetadata": {
+                        "contextWindowMetadata": { "maxContextTokens": limit.to_string() }
+                    }
+                }
+            })
+        };
+
+        let mock_state = Arc::new(StdMutex::new(MockState {
+            steps: vec![mk_step("r1")],
+            gen_meta_status: None,
+            gen_meta: vec![mk_gen(512_000)],
+        }));
+
+        let build_router = |st: Arc<StdMutex<MockState>>| {
+            let st_steps = Arc::clone(&st);
+            let st_gen = Arc::clone(&st);
+            Router::new()
+                .route(
+                    "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                    post(|| async {
+                        axum::Json(serde_json::json!({
+                            "clientModelConfigs": [{
+                                "label": "Gemini 4 Neon",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M501" },
+                                "provider": "MODEL_PROVIDER_GOOGLE",
+                                "modelId": "gemini-4-neon"
+                            }]
+                        }))
+                    }),
+                )
+                .route(
+                    "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                    post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                        let st = Arc::clone(&st_steps);
+                        async move {
+                            let offset =
+                                req.get("stepOffset").and_then(|v| v.as_u64()).unwrap_or(0)
+                                    as usize;
+                            let guard = st.lock().unwrap();
+                            let slice = if offset < guard.steps.len() {
+                                guard.steps[offset..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            axum::Json(serde_json::json!({ "steps": slice }))
+                        }
+                    }),
+                )
+                .route(
+                    "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                    post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                        let st = Arc::clone(&st_gen);
+                        async move {
+                            let offset = req
+                                .get("generatorMetadataOffset")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as usize;
+                            let guard = st.lock().unwrap();
+                            if let Some(code) = guard.gen_meta_status {
+                                return (code, axum::Json(serde_json::json!({})));
+                            }
+                            let slice = if offset < guard.gen_meta.len() {
+                                guard.gen_meta[offset..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            (
+                                StatusCode::OK,
+                                axum::Json(serde_json::json!({ "generatorMetadata": slice })),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                    post(|| async {
+                        let mut resp = Response::new(Body::from(encode_connect_frame(0x00, b"{}")));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/connect+json"),
+                        );
+                        resp
+                    }),
+                )
+        };
+
+        let tmp = TempDir::new().expect("tmp");
+        let usage_dir = tmp.path().join("usage");
+
+        // --- Collector 1: observes 512_000 and persists to observed_models ---
+        let listener1 = TcpListener::bind("127.0.0.1:0").await.expect("bind 1");
+        let port1 = listener1.local_addr().expect("addr 1").port();
+        let router1 = build_router(Arc::clone(&mock_state));
+        let srv1 = tokio::spawn(async move {
+            let _ = axum::serve(listener1, router1).await;
+        });
+        tokio::task::yield_now().await;
+
+        let sink1 = Arc::new(SqliteUsageSink::new(&usage_dir).expect("sink1"));
+        let client1 = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port1}")).expect("ep1"),
+            CsrfToken::parse(TEST_CSRF).expect("csrf"),
+        )
+        .expect("client1");
+        let (tx1, rx1) = watch::channel(false);
+        let handle1 = spawn_ls_collector(
+            client1,
+            Arc::clone(&sink1),
+            LsCollectorConfig::default(),
+            rx1,
+        );
+
+        let snap1 = handle1
+            .session_stats(Some("conv-obs-1"))
+            .await
+            .expect("snap1");
+        assert_eq!(snap1.max_context_tokens, Some(512_000));
+
+        // Global view (None) MUST remain None.
+        let global1 = handle1.session_stats(None).await.expect("global1");
+        assert_eq!(global1.max_context_tokens, None);
+
+        // Verify persisted in usage.db.
+        let persisted = sink1.load_all_observed_models().expect("load persisted");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].provider, "antigravity");
+        assert_eq!(persisted[0].model, "gemini-4-neon");
+        assert_eq!(persisted[0].compaction_limit_tokens, Some(512_000));
+
+        let _ = tx1.send(true);
+        srv1.abort();
+
+        // --- Collector 2: starts against same usage.db with LS generator metadata failing (500) ---
+        mock_state.lock().unwrap().gen_meta_status = Some(StatusCode::INTERNAL_SERVER_ERROR);
+
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.expect("bind 2");
+        let port2 = listener2.local_addr().expect("addr 2").port();
+        let router2 = build_router(Arc::clone(&mock_state));
+        let srv2 = tokio::spawn(async move {
+            let _ = axum::serve(listener2, router2).await;
+        });
+        tokio::task::yield_now().await;
+
+        let sink2 = Arc::new(SqliteUsageSink::new(&usage_dir).expect("sink2"));
+        let client2 = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port2}")).expect("ep2"),
+            CsrfToken::parse(TEST_CSRF).expect("csrf"),
+        )
+        .expect("client2");
+        let (tx2, rx2) = watch::channel(false);
+        let handle2 = spawn_ls_collector(
+            client2,
+            Arc::clone(&sink2),
+            LsCollectorConfig::default(),
+            rx2,
+        );
+
+        // Even though generator metadata returns 500, focused session resolves 512_000 from preloaded observed_models.
+        let snap2 = handle2
+            .session_stats(Some("conv-obs-2"))
+            .await
+            .expect("snap2");
+        assert_eq!(snap2.max_context_tokens, Some(512_000));
+        assert_eq!(
+            handle2
+                .session_stats(None)
+                .await
+                .expect("global2")
+                .max_context_tokens,
+            None
+        );
+
+        // Now LS recovers and reports a new compaction limit (256_000) on a new step.
+        {
+            let mut g = mock_state.lock().unwrap();
+            g.gen_meta_status = None;
+            g.steps.push(mk_step("r2"));
+            g.gen_meta.push(mk_gen(256_000));
+        }
+        let snap2_updated = handle2
+            .session_stats(Some("conv-obs-2"))
+            .await
+            .expect("snap2 updated");
+        assert_eq!(snap2_updated.max_context_tokens, Some(256_000));
+
+        let persisted_after = sink2
+            .load_all_observed_models()
+            .expect("load persisted after update");
+        assert_eq!(persisted_after.len(), 1);
+        assert_eq!(persisted_after[0].compaction_limit_tokens, Some(256_000));
+
+        let _ = tx2.send(true);
+        srv2.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generator_metadata_response_too_large_tail_seeking_recovery_and_pathological_fallback()
+    {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct TailSeekMock {
+            /// Total virtual generator metadata entries.
+            total_entries: usize,
+            /// Any request with `offset < too_large_below` returns > MAX_LS_RESPONSE_BYTES.
+            too_large_below: usize,
+            /// Compaction limit for entries `[0..total_entries - 1]` vs latest entry.
+            latest_limit: u64,
+            /// Recorded offsets requested from GetCascadeTrajectoryGeneratorMetadata.
+            requested_offsets: Vec<u32>,
+            /// Steps returned for GetCascadeTrajectorySteps.
+            steps: Vec<serde_json::Value>,
+        }
+
+        let oversized_body = axum::body::Bytes::from(vec![
+            b' ';
+            companion_providers::MAX_LS_RESPONSE_BYTES
+                + 1024
+        ]);
+        let mk_step = |resp_id: &str| {
+            serde_json::json!({
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "status": "CORTEX_STEP_STATUS_DONE",
+                "metadata": {
+                    "createdAt": "2026-11-26T10:00:00Z",
+                    "finishedGeneratingAt": "2026-11-26T10:00:01Z",
+                    "generatorModel": "MODEL_PLACEHOLDER_M501",
+                    "modelUsage": {
+                        "inputTokens": "1000",
+                        "cacheReadTokens": "500",
+                        "outputTokens": "100",
+                        "responseOutputTokens": "100",
+                        "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                        "responseId": resp_id,
+                        "responseHeader": { "sessionID": "builtin-tail-1" }
+                    }
+                }
+            })
+        };
+
+        let mock = Arc::new(StdMutex::new(TailSeekMock {
+            total_entries: 1600,
+            too_large_below: 1000,
+            latest_limit: 512_000,
+            requested_offsets: Vec::new(),
+            steps: vec![mk_step("tail-s1")],
+        }));
+
+        let (delta_tx, delta_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let delta_rx_slot = Arc::new(tokio::sync::Mutex::new(Some(delta_rx)));
+
+        let send_summary = |tx: &tokio::sync::mpsc::Sender<Vec<u8>>, cid: &str, step_count: u32| {
+            let payload = serde_json::json!({
+                "updates": {
+                    cid: {
+                        "trajectoryId": format!("traj-{cid}"),
+                        "stepCount": step_count,
+                        "lastModifiedTime": "2026-11-26T10:00:05Z",
+                        "status": "CASCADE_RUN_STATUS_IDLE"
+                    }
+                }
+            });
+            tx.try_send(encode_connect_frame(0x00, payload.to_string().as_bytes()))
+                .expect("send summary");
+        };
+
+        let mock_steps = Arc::clone(&mock);
+        let mock_gen = Arc::clone(&mock);
+        let oversized_clone = oversized_body.clone();
+        let router = Router::new()
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "clientModelConfigs": [{
+                            "label": "Gemini 4 Neon",
+                            "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M501" },
+                            "provider": "MODEL_PROVIDER_GOOGLE",
+                            "modelId": "gemini-4-neon"
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                post(move || {
+                    let st = Arc::clone(&mock_steps);
+                    async move {
+                        let steps = st.lock().unwrap().steps.clone();
+                        axum::Json(serde_json::json!({ "steps": steps }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let st = Arc::clone(&mock_gen);
+                    let big = oversized_clone.clone();
+                    async move {
+                        let offset = req
+                            .get("generatorMetadataOffset")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let mut guard = st.lock().unwrap();
+                        guard.requested_offsets.push(offset as u32);
+                        if offset >= guard.total_entries {
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(r#"{"generatorMetadata":[]}"#))
+                                .unwrap();
+                        }
+                        if offset < guard.too_large_below {
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(big))
+                                .unwrap();
+                        }
+                        let count = guard.total_entries - offset;
+                        let limit = guard.latest_limit;
+                        let mut entries = Vec::with_capacity(count);
+                        for i in 0..count {
+                            let tok = if i + 1 == count { limit } else { 512_000 };
+                            entries.push(serde_json::json!({
+                                "chatModel": {
+                                    "model": "MODEL_PLACEHOLDER_M501",
+                                    "usage": {
+                                        "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                                        "responseHeader": { "sessionID": "builtin-tail-1" }
+                                    },
+                                    "chatStartMetadata": {
+                                        "contextWindowMetadata": { "maxContextTokens": tok.to_string() }
+                                    }
+                                }
+                            }));
+                        }
+                        let body = serde_json::json!({ "generatorMetadata": entries }).to_string();
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                post(move || {
+                    let slot = Arc::clone(&delta_rx_slot);
+                    async move {
+                        let rx = slot.lock().await.take().expect("single stream");
+                        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                            rx.recv().await.map(|frame| {
+                                (Ok::<_, std::io::Error>(axum::body::Bytes::from(frame)), rx)
+                            })
+                        });
+                        let mut resp = Response::new(Body::from_stream(stream));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/connect+json"),
+                        );
+                        resp
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::task::yield_now().await;
+
+        let tmp = TempDir::new().expect("tmp");
+        let sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).expect("sink"));
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).expect("ep"),
+            CsrfToken::parse(TEST_CSRF).expect("csrf"),
+        )
+        .expect("client");
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn_ls_collector(
+            client,
+            Arc::clone(&sink),
+            LsCollectorConfig {
+                snapshot_settle_idle: Duration::from_millis(20),
+                snapshot_settle_max: Duration::from_millis(80),
+                cascade_debounce: Duration::from_millis(20),
+                ..LsCollectorConfig::default()
+            },
+            rx,
+        );
+
+        // --- Case A: Large cascade (4600 steps, 1600 entries, <1000 is >4 MiB) ---
+        send_summary(&delta_tx, "conv-large-4600", 4600);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let has_summary = handle
+                .inner
+                .state
+                .lock()
+                .await
+                .summaries
+                .contains_key("conv-large-4600");
+            if has_summary {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for summary");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let snap_a = handle
+            .session_stats(Some("conv-large-4600"))
+            .await
+            .expect("snap_a");
+        assert_eq!(snap_a.max_context_tokens, Some(512_000));
+        let offsets_a = mock.lock().unwrap().requested_offsets.clone();
+        assert!(
+            offsets_a.len() <= MAX_GEN_META_TAIL_SEEK_RPCS && offsets_a.len() <= 3,
+            "expected proactive large-cascade tail-seek in <=3 RPCs, got {offsets_a:?}"
+        );
+        assert_eq!(offsets_a[0], 2300);
+
+        // Turn 2 on the same large cascade: detects mid-session switch to 256_000 at offset 1600 in 1 RPC!
+        {
+            let mut g = mock.lock().unwrap();
+            g.requested_offsets.clear();
+            g.total_entries = 1601;
+            g.latest_limit = 256_000;
+            g.steps.push(mk_step("tail-s2"));
+        }
+        send_summary(&delta_tx, "conv-large-4600", 4601);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = handle
+                .session_stats(Some("conv-large-4600"))
+                .await
+                .expect("snap_a_turn2");
+            if snap.max_context_tokens == Some(256_000) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for turn2 256K switch"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(mock.lock().unwrap().requested_offsets, vec![1600]);
+
+        // --- Case B: Unknown/small step_count hitting ResponseTooLarge at offset 0 -> exponential expansion + binary search ---
+        {
+            let mut g = mock.lock().unwrap();
+            g.requested_offsets.clear();
+            g.total_entries = 900;
+            g.too_large_below = 700;
+            g.latest_limit = 384_000;
+        }
+        let snap_b = handle
+            .session_stats(Some("conv-small-unknown"))
+            .await
+            .expect("snap_b");
+        assert_eq!(snap_b.max_context_tokens, Some(384_000));
+        let offsets_b = mock.lock().unwrap().requested_offsets.clone();
+        assert_eq!(offsets_b[0], 0);
+        assert!(
+            offsets_b.len() <= MAX_GEN_META_TAIL_SEEK_RPCS,
+            "RPC count exceeded cap: {offsets_b:?}"
+        );
+
+        // --- Case C: Pathological >4 MiB single trailing entry -> falls back to observed_models cache & no idle re-probe ---
+        {
+            let mut g = mock.lock().unwrap();
+            g.requested_offsets.clear();
+            g.total_entries = 10;
+            g.too_large_below = 10; // even the last single entry at offset 9 is > 4 MiB
+        }
+        send_summary(&delta_tx, "conv-pathological", 2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if handle
+                .inner
+                .state
+                .lock()
+                .await
+                .summaries
+                .contains_key("conv-pathological")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for conv-pathological summary"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snap_c = handle
+            .session_stats(Some("conv-pathological"))
+            .await
+            .expect("snap_c");
+        // Falls back to the latest observed_models limit (384_000 from Case B) for ("antigravity", "gemini-4-neon").
+        assert_eq!(snap_c.max_context_tokens, Some(384_000));
+        let probe_count = mock.lock().unwrap().requested_offsets.len();
+        assert!(
+            probe_count > 0 && probe_count <= MAX_GEN_META_TAIL_SEEK_RPCS,
+            "expected bounded probe count, got {probe_count}"
+        );
+
+        // Idle re-poll at same step_offset MUST NOT re-run tail-seek!
+        mock.lock().unwrap().requested_offsets.clear();
+        let snap_c_idle = handle
+            .session_stats(Some("conv-pathological"))
+            .await
+            .expect("snap_c_idle");
+        assert_eq!(snap_c_idle.max_context_tokens, Some(384_000));
+        assert!(
+            mock.lock().unwrap().requested_offsets.is_empty(),
+            "idle poll must not repeat generator metadata tail-seek"
+        );
+
+        drop(delta_tx);
+        let _ = tx.send(true);
+        srv.abort();
+    }
+
+    #[test]
+    fn resolve_generator_metadata_model_ignores_empty_chat_model_and_uses_usage_model() {
+        let catalog = make_catalog();
+        let entry = LsGeneratorMetadata {
+            chat_model: Some(companion_providers::LsChatModelMetadata {
+                model: Some("   ".to_string()),
+                usage: Some(LsModelUsage {
+                    model: Some("MODEL_PLACEHOLDER_M467".to_string()),
+                    api_provider: Some("24".to_string()),
+                    response_header: Some(LsResponseHeaderFingerprint {
+                        session_id_upper: Some("builtin-sess".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                response_model: Some("".to_string()),
+                model_display_name: None,
+                chat_start_metadata: None,
+            }),
+        };
+        assert_eq!(
+            generator_metadata_model_enum(&entry),
+            Some("MODEL_PLACEHOLDER_M467")
+        );
+        assert_eq!(
+            resolve_generator_metadata_model(&entry, &catalog),
+            Some(("antigravity".to_string(), "gemini-4-neon".to_string()))
+        );
+
+        let all_empty = LsGeneratorMetadata {
+            chat_model: Some(companion_providers::LsChatModelMetadata {
+                model: Some("".to_string()),
+                usage: Some(LsModelUsage {
+                    model: Some("  ".to_string()),
+                    ..Default::default()
+                }),
+                response_model: Some("".to_string()),
+                model_display_name: None,
+                chat_start_metadata: None,
+            }),
+        };
+        assert_eq!(generator_metadata_model_enum(&all_empty), None);
+        assert_eq!(resolve_generator_metadata_model(&all_empty, &catalog), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_poll_with_inflight_step_or_no_summary_skips_reprobe_and_revert_reprobes() {
+        use std::sync::Mutex as StdMutex;
+
+        struct MockState {
+            steps: Vec<serde_json::Value>,
+            pathological: bool,
+            total_entries: usize,
+            latest_limit: u64,
+            requested_offsets: Vec<u32>,
+        }
+
+        let mk_step = |status: &str, resp_id: &str| {
+            serde_json::json!({
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "status": status,
+                "metadata": {
+                    "createdAt": "2026-11-26T10:00:00Z",
+                    "finishedGeneratingAt": "2026-11-26T10:00:01Z",
+                    "generatorModel": "MODEL_PLACEHOLDER_M501",
+                    "modelUsage": {
+                        "inputTokens": "1000",
+                        "cacheReadTokens": "500",
+                        "outputTokens": "100",
+                        "responseOutputTokens": "100",
+                        "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                        "responseId": resp_id,
+                        "responseHeader": { "sessionID": "builtin-inflight-1" }
+                    }
+                }
+            })
+        };
+
+        let oversized_body = axum::body::Bytes::from(vec![
+            b' ';
+            companion_providers::MAX_LS_RESPONSE_BYTES
+                + 1024
+        ]);
+
+        let mock = Arc::new(StdMutex::new(MockState {
+            steps: vec![
+                mk_step("CORTEX_STEP_STATUS_DONE", "inflight-r1"),
+                mk_step("CORTEX_STEP_STATUS_GENERATING", "inflight-r2"),
+            ],
+            pathological: true,
+            total_entries: 10,
+            latest_limit: 512_000,
+            requested_offsets: Vec::new(),
+        }));
+
+        let (delta_tx, delta_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let delta_rx_slot = Arc::new(tokio::sync::Mutex::new(Some(delta_rx)));
+
+        let send_summary =
+            |tx: &tokio::sync::mpsc::Sender<Vec<u8>>, cid: &str, traj_id: &str, step_count: u32| {
+                let payload = serde_json::json!({
+                    "updates": {
+                        cid: {
+                            "trajectoryId": traj_id,
+                            "stepCount": step_count,
+                            "lastModifiedTime": "2026-11-26T10:00:05Z",
+                            "status": "CASCADE_RUN_STATUS_RUNNING"
+                        }
+                    }
+                });
+                tx.try_send(encode_connect_frame(0x00, payload.to_string().as_bytes()))
+                    .expect("send summary");
+            };
+
+        let mock_steps = Arc::clone(&mock);
+        let mock_gen = Arc::clone(&mock);
+        let big_clone = oversized_body.clone();
+        let router = Router::new()
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "clientModelConfigs": [{
+                            "label": "Gemini 4 Neon",
+                            "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M501" },
+                            "provider": "MODEL_PROVIDER_GOOGLE",
+                            "modelId": "gemini-4-neon"
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let st = Arc::clone(&mock_steps);
+                    async move {
+                        let offset = req
+                            .get("stepOffset")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let guard = st.lock().unwrap();
+                        let slice = if offset < guard.steps.len() {
+                            guard.steps[offset..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        axum::Json(serde_json::json!({ "steps": slice }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let st = Arc::clone(&mock_gen);
+                    let big = big_clone.clone();
+                    async move {
+                        let offset = req
+                            .get("generatorMetadataOffset")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let mut guard = st.lock().unwrap();
+                        guard.requested_offsets.push(offset as u32);
+                        if offset >= guard.total_entries {
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(r#"{"generatorMetadata":[]}"#))
+                                .unwrap();
+                        }
+                        if guard.pathological {
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(big))
+                                .unwrap();
+                        }
+                        let limit = guard.latest_limit;
+                        let body = serde_json::json!({
+                            "generatorMetadata": [{
+                                "chatModel": {
+                                    "model": "MODEL_PLACEHOLDER_M501",
+                                    "usage": {
+                                        "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                                        "responseHeader": { "sessionID": "builtin-inflight-1" }
+                                    },
+                                    "chatStartMetadata": {
+                                        "contextWindowMetadata": { "maxContextTokens": limit.to_string() }
+                                    }
+                                }
+                            }]
+                        })
+                        .to_string();
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                post(move || {
+                    let slot = Arc::clone(&delta_rx_slot);
+                    async move {
+                        let rx = slot.lock().await.take().expect("single stream");
+                        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                            rx.recv().await.map(|frame| {
+                                (Ok::<_, std::io::Error>(axum::body::Bytes::from(frame)), rx)
+                            })
+                        });
+                        let mut resp = Response::new(Body::from_stream(stream));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/connect+json"),
+                        );
+                        resp
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::task::yield_now().await;
+
+        let tmp = TempDir::new().expect("tmp");
+        let sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).expect("sink"));
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).expect("ep"),
+            CsrfToken::parse(TEST_CSRF).expect("csrf"),
+        )
+        .expect("client");
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn_ls_collector(
+            client,
+            Arc::clone(&sink),
+            LsCollectorConfig {
+                snapshot_settle_idle: Duration::from_millis(20),
+                snapshot_settle_max: Duration::from_millis(80),
+                cascade_debounce: Duration::from_millis(20),
+                ..LsCollectorConfig::default()
+            },
+            rx,
+        );
+
+        // Subcase A: In-flight GENERATING step at index 1 keeps fold.step_offset == 1 < summary_steps (2).
+        send_summary(&delta_tx, "conv-inflight", "traj-v1", 2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if handle
+                .inner
+                .state
+                .lock()
+                .await
+                .summaries
+                .contains_key("conv-inflight")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for summary");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let snap1 = handle
+            .session_stats(Some("conv-inflight"))
+            .await
+            .expect("snap1");
+        assert_eq!(snap1.max_context_tokens, None);
+        {
+            let guard = handle.inner.state.lock().await;
+            let fold = guard.monitor_cache.get("conv-inflight").expect("fold");
+            assert_eq!(fold.step_offset, 1);
+            assert_eq!(fold.generator_metadata_probed_step, Some(1));
+        }
+        assert!(!mock.lock().unwrap().requested_offsets.is_empty());
+
+        // Idle poll while step 1 is still GENERATING must issue 0 generator-metadata RPCs.
+        mock.lock().unwrap().requested_offsets.clear();
+        let snap2 = handle
+            .session_stats(Some("conv-inflight"))
+            .await
+            .expect("snap2");
+        assert_eq!(snap2.max_context_tokens, None);
+        assert!(
+            mock.lock().unwrap().requested_offsets.is_empty(),
+            "in-flight GENERATING idle poll must issue 0 gen_meta RPCs"
+        );
+
+        // Subcase B: Monitor-only window (no summary cached for conv-no-summary) must also skip re-probe.
+        mock.lock().unwrap().requested_offsets.clear();
+        let _ = handle
+            .session_stats(Some("conv-no-summary"))
+            .await
+            .expect("no-summary snap1");
+        assert!(!mock.lock().unwrap().requested_offsets.is_empty());
+
+        mock.lock().unwrap().requested_offsets.clear();
+        let _ = handle
+            .session_stats(Some("conv-no-summary"))
+            .await
+            .expect("no-summary snap2");
+        assert!(
+            mock.lock().unwrap().requested_offsets.is_empty(),
+            "Monitor-only (summary_opt == None) idle poll must issue 0 gen_meta RPCs"
+        );
+
+        // Subcase C: RevertToStep (new trajectoryId) resets fold and properly re-probes.
+        {
+            let mut g = mock.lock().unwrap();
+            g.pathological = false;
+            g.total_entries = 1;
+            g.latest_limit = 256_000;
+            g.steps = vec![mk_step("CORTEX_STEP_STATUS_DONE", "reverted-r1")];
+            g.requested_offsets.clear();
+        }
+        send_summary(&delta_tx, "conv-inflight", "traj-v2", 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let updated = handle
+                .inner
+                .state
+                .lock()
+                .await
+                .summaries
+                .get("conv-inflight")
+                .and_then(|s| s.trajectory_id.as_deref())
+                == Some("traj-v2");
+            if updated {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for revert summary"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let snap_reverted = handle
+            .session_stats(Some("conv-inflight"))
+            .await
+            .expect("snap_reverted");
+        assert_eq!(snap_reverted.max_context_tokens, Some(256_000));
+        assert_eq!(mock.lock().unwrap().requested_offsets, vec![0]);
+
+        drop(delta_tx);
+        let _ = tx.send(true);
+        srv.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_ingested_step_still_probes_generator_metadata_for_mid_session_switch() {
+        use std::sync::Mutex as StdMutex;
+
+        struct SwitchMock {
+            steps: Vec<serde_json::Value>,
+            gen_meta: Vec<serde_json::Value>,
+            requested_offsets: Vec<u32>,
+        }
+
+        let mk_step = |model_enum: &str, api_provider: &str, resp_id: &str| {
+            serde_json::json!({
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "status": "CORTEX_STEP_STATUS_DONE",
+                "metadata": {
+                    "createdAt": "2026-11-26T10:00:00Z",
+                    "finishedGeneratingAt": "2026-11-26T10:00:01Z",
+                    "generatorModel": model_enum,
+                    "modelUsage": {
+                        "inputTokens": "1000",
+                        "cacheReadTokens": "500",
+                        "outputTokens": "100",
+                        "responseOutputTokens": "100",
+                        "apiProvider": api_provider,
+                        "responseId": resp_id,
+                        "responseHeader": { "sessionID": "builtin-switch-1" }
+                    }
+                }
+            })
+        };
+        let mk_gen = |model_enum: &str, api_provider: &str, limit: u64| {
+            serde_json::json!({
+                "chatModel": {
+                    "model": model_enum,
+                    "usage": {
+                        "apiProvider": api_provider,
+                        "responseHeader": { "sessionID": "builtin-switch-1" }
+                    },
+                    "chatStartMetadata": {
+                        "contextWindowMetadata": { "maxContextTokens": limit.to_string() }
+                    }
+                }
+            })
+        };
+
+        let mock = Arc::new(StdMutex::new(SwitchMock {
+            steps: vec![mk_step(
+                "MODEL_PLACEHOLDER_M501",
+                "API_PROVIDER_GOOGLE_GEMINI",
+                "sw-r1",
+            )],
+            gen_meta: vec![mk_gen(
+                "MODEL_PLACEHOLDER_M501",
+                "API_PROVIDER_GOOGLE_GEMINI",
+                512_000,
+            )],
+            requested_offsets: Vec::new(),
+        }));
+
+        let (delta_tx, delta_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let delta_rx_slot = Arc::new(tokio::sync::Mutex::new(Some(delta_rx)));
+
+        let send_summary = |tx: &tokio::sync::mpsc::Sender<Vec<u8>>, cid: &str, step_count: u32| {
+            let payload = serde_json::json!({
+                "updates": {
+                    cid: {
+                        "trajectoryId": format!("traj-{cid}"),
+                        "stepCount": step_count,
+                        "lastModifiedTime": "2026-11-26T10:00:05Z",
+                        "status": "CASCADE_RUN_STATUS_IDLE"
+                    }
+                }
+            });
+            tx.try_send(encode_connect_frame(0x00, payload.to_string().as_bytes()))
+                .expect("send summary");
+        };
+
+        let mock_steps = Arc::clone(&mock);
+        let mock_gen = Arc::clone(&mock);
+        let router = Router::new()
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "clientModelConfigs": [
+                            {
+                                "label": "Gemini 4 Neon",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M501" },
+                                "provider": "MODEL_PROVIDER_GOOGLE",
+                                "modelId": "gemini-4-neon"
+                            },
+                            {
+                                "label": "Claude Opus 5.5",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M601" },
+                                "provider": "MODEL_PROVIDER_ANTHROPIC",
+                                "modelId": "claude-opus-5-5"
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let st = Arc::clone(&mock_steps);
+                    async move {
+                        let offset = req
+                            .get("stepOffset")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let guard = st.lock().unwrap();
+                        let slice = if offset < guard.steps.len() {
+                            guard.steps[offset..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        axum::Json(serde_json::json!({ "steps": slice }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                    let st = Arc::clone(&mock_gen);
+                    async move {
+                        let offset = req
+                            .get("generatorMetadataOffset")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let mut guard = st.lock().unwrap();
+                        guard.requested_offsets.push(offset as u32);
+                        let slice = if offset < guard.gen_meta.len() {
+                            guard.gen_meta[offset..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        axum::Json(serde_json::json!({ "generatorMetadata": slice }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                post(move || {
+                    let slot = Arc::clone(&delta_rx_slot);
+                    async move {
+                        let rx = slot.lock().await.take().expect("single stream");
+                        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                            rx.recv().await.map(|frame| {
+                                (Ok::<_, std::io::Error>(axum::body::Bytes::from(frame)), rx)
+                            })
+                        });
+                        let mut resp = Response::new(Body::from_stream(stream));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/connect+json"),
+                        );
+                        resp
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::task::yield_now().await;
+
+        let tmp = TempDir::new().expect("tmp");
+        let sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).expect("sink"));
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).expect("ep"),
+            CsrfToken::parse(TEST_CSRF).expect("csrf"),
+        )
+        .expect("client");
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn_ls_collector(
+            client,
+            Arc::clone(&sink),
+            LsCollectorConfig {
+                snapshot_settle_idle: Duration::from_millis(20),
+                snapshot_settle_max: Duration::from_millis(80),
+                cascade_debounce: Duration::from_millis(20),
+                ..LsCollectorConfig::default()
+            },
+            rx,
+        );
+
+        send_summary(&delta_tx, "conv-bg-switch", 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let ready = {
+                let guard = handle.inner.state.lock().await;
+                guard.boot_settled && guard.summaries.contains_key("conv-bg-switch")
+            };
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for initial summary and boot settle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Initial hydration observes 512_000 for ("antigravity", "gemini-4-neon").
+        let snap1 = handle
+            .session_stats(Some("conv-bg-switch"))
+            .await
+            .expect("snap1");
+        assert_eq!(snap1.max_context_tokens, Some(512_000));
+
+        // Mid-session switch to Claude Opus 5.5 (400_000): push step 1 and let background
+        // ingest_dirty_cascade advance monitor_cache.step_offset to 2 BEFORE session_stats runs.
+        {
+            let mut g = mock.lock().unwrap();
+            g.steps.push(mk_step(
+                "MODEL_PLACEHOLDER_M601",
+                "API_PROVIDER_ANTHROPIC_VERTEX",
+                "sw-r2",
+            ));
+            g.gen_meta.push(mk_gen(
+                "MODEL_PLACEHOLDER_M601",
+                "API_PROVIDER_ANTHROPIC_VERTEX",
+                400_000,
+            ));
+            g.requested_offsets.clear();
+        }
+        send_summary(&delta_tx, "conv-bg-switch", 2);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let offset = handle
+                .inner
+                .state
+                .lock()
+                .await
+                .monitor_cache
+                .get("conv-bg-switch")
+                .map(|f| f.step_offset);
+            if offset == Some(2) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for background ingest_dirty_cascade to advance step_offset to 2"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Confirm precondition: fold already at step_offset == 2 with stale max_context_tokens == Some(512_000).
+        {
+            let guard = handle.inner.state.lock().await;
+            let fold = guard.monitor_cache.get("conv-bg-switch").expect("fold");
+            assert_eq!(fold.step_offset, 2);
+            assert_eq!(fold.max_context_tokens, Some(512_000));
+            assert_eq!(fold.generator_metadata_probed_step, Some(1));
+        }
+        assert!(mock.lock().unwrap().requested_offsets.is_empty());
+
+        // session_stats must STILL probe generator metadata and update both snapshot and observed_models.
+        let snap2 = handle
+            .session_stats(Some("conv-bg-switch"))
+            .await
+            .expect("snap2");
+        assert_eq!(snap2.max_context_tokens, Some(400_000));
+        assert_eq!(mock.lock().unwrap().requested_offsets, vec![1]);
+
+        let observed = sink.load_all_observed_models().expect("load observed");
+        assert!(
+            observed.iter().any(|m| {
+                m.provider == "antigravity"
+                    && m.model == "gemini-4-neon"
+                    && m.compaction_limit_tokens == Some(512_000)
+            }),
+            "expected initial model in observed_models: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|m| {
+                m.provider == "vertex_claude"
+                    && m.model == "claude-opus-5-5"
+                    && m.compaction_limit_tokens == Some(400_000)
+            }),
+            "expected switched model in observed_models: {observed:?}"
+        );
+
+        drop(delta_tx);
+        let _ = tx.send(true);
+        srv.abort();
     }
 }

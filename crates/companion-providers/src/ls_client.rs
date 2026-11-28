@@ -488,6 +488,14 @@ pub struct LsChatStartMetadata {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LsChatModelMetadata {
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_i64")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub usage: Option<LsModelUsage>,
+    #[serde(default)]
+    pub response_model: Option<String>,
+    #[serde(default)]
+    pub model_display_name: Option<String>,
     #[serde(default)]
     pub chat_start_metadata: Option<LsChatStartMetadata>,
 }
@@ -2080,6 +2088,20 @@ mod tests {
                                     "unknownTopField": {"nested": [1, 2, 3]},
                                     "chatModel": {
                                         "extraChatModelField": "ignored",
+                                        "systemPrompt": "ignored large prompt",
+                                        "tools": [{"name": "ignored"}],
+                                        "model": "MODEL_PLACEHOLDER_M467",
+                                        "responseModel": "gemini-4-neon",
+                                        "modelDisplayName": "Gemini 4 Neon",
+                                        "usage": {
+                                            "model": "MODEL_PLACEHOLDER_M467",
+                                            "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                                            "inputTokens": "1024",
+                                            "outputTokens": "256",
+                                            "responseHeader": {
+                                                "sessionID": "agyc_proxy_sess"
+                                            }
+                                        },
                                         "chatStartMetadata": {
                                             "contextWindowMetadata": {
                                                 "maxContextTokens": "512000",
@@ -2090,6 +2112,7 @@ mod tests {
                                 },
                                 {
                                     "chatModel": {
+                                        "model": 467,
                                         "chatStartMetadata": {
                                             "contextWindowMetadata": {
                                                 "maxContextTokens": 200000
@@ -2131,7 +2154,33 @@ mod tests {
 
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].max_context_tokens(), Some(512_000));
+        let chat0 = entries[0].chat_model.as_ref().expect("chat_model 0");
+        assert_eq!(chat0.model.as_deref(), Some("MODEL_PLACEHOLDER_M467"));
+        assert_eq!(chat0.response_model.as_deref(), Some("gemini-4-neon"));
+        assert_eq!(chat0.model_display_name.as_deref(), Some("Gemini 4 Neon"));
+        let usage0 = chat0.usage.as_ref().expect("usage 0");
+        assert_eq!(usage0.model.as_deref(), Some("MODEL_PLACEHOLDER_M467"));
+        assert_eq!(
+            usage0.api_provider.as_deref(),
+            Some("API_PROVIDER_GOOGLE_GEMINI")
+        );
+        assert_eq!(usage0.input_tokens, 1024);
+        assert_eq!(usage0.output_tokens, 256);
+        assert_eq!(
+            usage0
+                .response_header
+                .as_ref()
+                .and_then(|h| h.session_id_upper.as_deref()),
+            Some("agyc_proxy_sess")
+        );
         assert_eq!(entries[1].max_context_tokens(), Some(200_000));
+        assert_eq!(
+            entries[1]
+                .chat_model
+                .as_ref()
+                .and_then(|c| c.model.as_deref()),
+            Some("467")
+        );
         assert_eq!(entries[2].max_context_tokens(), None);
         assert_eq!(entries[3].max_context_tokens(), None);
 

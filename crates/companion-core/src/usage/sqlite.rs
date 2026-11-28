@@ -7,9 +7,9 @@ use std::time::Duration;
 use rusqlite::{Connection, ErrorCode, OpenFlags, Row, Statement, TransactionBehavior, params};
 
 use super::{
-    LsSyncWatermark, TelemetrySource, USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION, UsageEvent,
-    UsageRange, UsageSink, UsageSummary, normalize_utc_timestamp, sanitize_conversation_id,
-    sanitize_model_display_name, sanitize_response_id,
+    LsSyncWatermark, ObservedModel, TelemetrySource, USAGE_DB_FILENAME, USAGE_DB_SCHEMA_VERSION,
+    UsageEvent, UsageRange, UsageSink, UsageSummary, normalize_utc_timestamp,
+    sanitize_conversation_id, sanitize_model_display_name, sanitize_response_id,
 };
 use crate::config::CoreError;
 use crate::fs_safe::{self, FsError, OpenRegularMode};
@@ -19,7 +19,7 @@ const SQLITE_INIT_BUSY_RETRIES: u32 = 16;
 const SIDECAR_TIGHTEN_MAX_ATTEMPTS: usize = 3;
 const SIDECAR_TIGHTEN_RETRY_DELAY: Duration = Duration::from_millis(5);
 
-const SCHEMA_V2_DDL: &str = "
+const SCHEMA_V3_DDL: &str = "
 CREATE TABLE IF NOT EXISTS usage_events (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp_utc           TEXT    NOT NULL,
@@ -70,7 +70,15 @@ CREATE TABLE IF NOT EXISTS ls_sync_watermarks (
     updated_at_utc    TEXT    NOT NULL
 );
 
-PRAGMA user_version = 2;
+CREATE TABLE IF NOT EXISTS observed_models (
+    provider                TEXT    NOT NULL,
+    model                   TEXT    NOT NULL,
+    compaction_limit_tokens INTEGER CHECK (compaction_limit_tokens IS NULL OR compaction_limit_tokens > 0),
+    updated_at_utc          TEXT    NOT NULL,
+    PRIMARY KEY (provider, model)
+);
+
+PRAGMA user_version = 3;
 ";
 
 const MIGRATE_V1_TO_V2_DDL: &str = "
@@ -105,6 +113,30 @@ CREATE TABLE IF NOT EXISTS ls_sync_watermarks (
 );
 
 PRAGMA user_version = 2;
+";
+
+const MIGRATE_V2_TO_V3_DDL: &str = "
+CREATE TABLE IF NOT EXISTS observed_models (
+    provider                TEXT    NOT NULL,
+    model                   TEXT    NOT NULL,
+    compaction_limit_tokens INTEGER CHECK (compaction_limit_tokens IS NULL OR compaction_limit_tokens > 0),
+    updated_at_utc          TEXT    NOT NULL,
+    PRIMARY KEY (provider, model)
+);
+
+PRAGMA user_version = 3;
+";
+
+const SCHEMA_MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATE_V1_TO_V2_DDL), (2, MIGRATE_V2_TO_V3_DDL)];
+
+const UPSERT_OBSERVED_MODEL_SQL: &str = "
+INSERT INTO observed_models (
+    provider, model, compaction_limit_tokens, updated_at_utc
+) VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT(provider, model) DO UPDATE SET
+    compaction_limit_tokens = excluded.compaction_limit_tokens,
+    updated_at_utc = excluded.updated_at_utc
+WHERE observed_models.compaction_limit_tokens IS NOT excluded.compaction_limit_tokens
 ";
 
 const UPSERT_USAGE_EVENT_SQL: &str = "
@@ -563,14 +595,31 @@ impl SqliteUsageSink {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| self.db_error(err))?;
-            let tx_version = self.read_user_version(&tx)?;
+            let mut tx_version = self.read_user_version(&tx)?;
             self.check_schema_version(tx_version)?;
             if tx_version == 0 {
-                tx.execute_batch(SCHEMA_V2_DDL)
+                tx.execute_batch(SCHEMA_V3_DDL)
                     .map_err(|err| self.db_error(err))?;
-            } else if tx_version == 1 {
-                tx.execute_batch(MIGRATE_V1_TO_V2_DDL)
-                    .map_err(|err| self.db_error(err))?;
+            } else {
+                while tx_version < USAGE_DB_SCHEMA_VERSION {
+                    let Some((_, ddl)) = SCHEMA_MIGRATIONS
+                        .iter()
+                        .find(|(from_ver, _)| *from_ver == tx_version)
+                    else {
+                        return Err(self.db_error(format!(
+                            "missing migration step for schema version {tx_version}"
+                        )));
+                    };
+                    tx.execute_batch(ddl).map_err(|err| self.db_error(err))?;
+                    let next_version = self.read_user_version(&tx)?;
+                    self.check_schema_version(next_version)?;
+                    if next_version <= tx_version {
+                        return Err(self.db_error(format!(
+                            "migration from schema version {tx_version} did not advance user_version (got {next_version})"
+                        )));
+                    }
+                    tx_version = next_version;
+                }
             }
             tx.commit().map_err(|err| self.db_error(err))?;
         }
@@ -655,6 +704,36 @@ impl SqliteUsageSink {
             events.push(row.map_err(|err| self.db_error(err))?);
         }
         Ok(events)
+    }
+
+    fn query_observed_models_from_connection(
+        &self,
+        conn: &Connection,
+    ) -> Result<Vec<ObservedModel>, CoreError> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT provider, model, compaction_limit_tokens, updated_at_utc \
+                 FROM observed_models \
+                 ORDER BY provider ASC, model ASC",
+            )
+            .map_err(|err| self.db_error(err))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let raw_limit: Option<i64> = row.get(2)?;
+                Ok(ObservedModel {
+                    provider: row.get(0)?,
+                    model: row.get(1)?,
+                    compaction_limit_tokens: raw_limit.and_then(|v| u64::try_from(v).ok()),
+                    updated_at_utc: row.get(3)?,
+                })
+            })
+            .map_err(|err| self.db_error(err))?;
+
+        let mut models = Vec::new();
+        for row in rows {
+            models.push(row.map_err(|err| self.db_error(err))?);
+        }
+        Ok(models)
     }
 
     fn query_watermarks_from_connection(
@@ -817,13 +896,116 @@ impl SqliteUsageSink {
 
         let version = self.read_user_version_with_busy_retry(&conn)?;
         self.check_schema_version(version)?;
-        if version < USAGE_DB_SCHEMA_VERSION {
+        if version < 2 {
             return Ok(Vec::new());
         }
         let watermarks = self.query_watermarks_from_connection(&conn)?;
         drop(conn);
         self.tighten_sqlite_file_permissions(true)?;
         Ok(watermarks)
+    }
+
+    /// Loads all persisted `observed_models` rows ordered by `(provider ASC, model ASC)`.
+    ///
+    /// Lazy read-only: returns `Ok(Vec::new())` without creating files when `usage_dir` or
+    /// `usage.db` does not exist or when `PRAGMA user_version < 3`. Fails closed on
+    /// `user_version > USAGE_DB_SCHEMA_VERSION`, negative `user_version`, or symlink/FIFO paths.
+    pub fn load_all_observed_models(&self) -> Result<Vec<ObservedModel>, CoreError> {
+        let mut conn_guard = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(ref conn) = *conn_guard {
+            return match self.query_observed_models_from_connection(conn) {
+                Ok(models) => Ok(models),
+                Err(err) => {
+                    *conn_guard = None;
+                    Err(err)
+                }
+            };
+        }
+
+        if fs_safe::inspect_existing_dir(&self.usage_dir)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let Some(_) = self.validate_sqlite_paths()? else {
+            return Ok(Vec::new());
+        };
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn =
+            Connection::open_with_flags(&self.db_path, flags).map_err(|err| self.db_error(err))?;
+        conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+            .map_err(|err| self.db_error(err))?;
+
+        let version = self.read_user_version_with_busy_retry(&conn)?;
+        self.check_schema_version(version)?;
+        if version < 3 {
+            return Ok(Vec::new());
+        }
+        let models = self.query_observed_models_from_connection(&conn)?;
+        drop(conn);
+        self.tighten_sqlite_file_permissions(true)?;
+        Ok(models)
+    }
+
+    /// Inserts or updates an `observed_models` row only when the `(provider, model)` entry is
+    /// new or its `compaction_limit_tokens` value changed (NULL-safe `IS NOT` comparison).
+    ///
+    /// Returns `Ok(true)` if a row was inserted or updated, `Ok(false)` if unchanged (no-op).
+    /// Rejects `compaction_limit_tokens == Some(0)` via SQLite CHECK constraint without
+    /// invalidating the cached connection.
+    pub fn upsert_observed_model(&self, observed: &ObservedModel) -> Result<bool, CoreError> {
+        let updated_at = normalize_utc_timestamp(&observed.updated_at_utc)
+            .unwrap_or_else(|| observed.updated_at_utc.clone());
+        let compaction_limit = observed.compaction_limit_tokens.map(u64_to_sqlite_i64);
+
+        let mut conn_guard = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if conn_guard.is_none() {
+            *conn_guard = Some(self.open_rw_connection()?);
+        }
+
+        let tx_res: rusqlite::Result<usize> = {
+            let conn = conn_guard
+                .as_mut()
+                .expect("connection initialized immediately above");
+            (|| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let affected = tx.execute(
+                    UPSERT_OBSERVED_MODEL_SQL,
+                    params![
+                        observed.provider,
+                        observed.model,
+                        compaction_limit,
+                        updated_at,
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(affected)
+            })()
+        };
+
+        let affected = match tx_res {
+            Ok(count) => count,
+            Err(err) => {
+                if should_invalidate_connection(&err) {
+                    *conn_guard = None;
+                }
+                return Err(self.db_error(err));
+            }
+        };
+
+        if let Err(err) = self.tighten_sqlite_file_permissions(true) {
+            *conn_guard = None;
+            return Err(err);
+        }
+
+        Ok(affected > 0)
     }
 
     pub fn prune_stale_watermarks(&self, cutoff_utc: &str) -> Result<usize, CoreError> {
@@ -922,7 +1104,7 @@ impl SqliteUsageSink {
 
         let version = self.read_user_version_with_busy_retry(&conn)?;
         self.check_schema_version(version)?;
-        if version < USAGE_DB_SCHEMA_VERSION {
+        if version < 2 {
             return Ok(Vec::new());
         }
         let events = self.query_conversation_events_from_connection(&conn, &sanitized_id, limit)?;
@@ -1066,17 +1248,35 @@ mod tests {
         assert!(!contains_bytes(&raw_bytes, b"systemPrompt"));
         assert!(!contains_bytes(&raw_bytes, b"api_key"));
 
-        // Verify PRAGMA user_version, WAL mode, and v2 schema columns directly.
+        // Verify PRAGMA user_version, WAL mode, and v3 schema columns directly.
         let conn = Connection::open(sink.db_path()).expect("open db");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("user_version");
         assert_eq!(version, USAGE_DB_SCHEMA_VERSION);
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let journal_mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("journal_mode");
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let mut observed_stmt = conn
+            .prepare("PRAGMA table_info(observed_models)")
+            .expect("observed_models table_info");
+        let observed_cols: Vec<String> = observed_stmt
+            .query_map([], |row| row.get(1))
+            .expect("query observed_models columns")
+            .map(|r| r.expect("col name"))
+            .collect();
+        assert_eq!(
+            observed_cols,
+            vec![
+                "provider",
+                "model",
+                "compaction_limit_tokens",
+                "updated_at_utc",
+            ]
+        );
 
         let mut stmt = conn
             .prepare("PRAGMA table_info(usage_events)")
@@ -1219,7 +1419,7 @@ mod tests {
     #[test]
     fn sqlite_sink_rejects_future_schema_version_fail_closed() {
         for (raw_version, expected_err_substr) in [
-            (3_i64, "schema version 3"),
+            (4_i64, "schema version 4"),
             (-1_i64, "invalid negative or out-of-range user_version -1"),
         ] {
             let tmp = TempDir::new().expect("temp dir");
@@ -1261,6 +1461,14 @@ mod tests {
             assert!(
                 matches!(read_err, CoreError::UsageDatabase { .. }),
                 "expected UsageDatabase error on read, got {read_err:?}"
+            );
+
+            let observed_err = sink
+                .load_all_observed_models()
+                .expect_err("unsupported schema version must fail observed_models read");
+            assert!(
+                matches!(observed_err, CoreError::UsageDatabase { .. }),
+                "expected UsageDatabase error on observed_models read, got {observed_err:?}"
             );
 
             let after_bytes = fs::read(&db_path).expect("read db bytes after");
@@ -1623,8 +1831,13 @@ mod tests {
                 .expect("watermarks on v1")
                 .is_empty()
         );
+        assert!(
+            sink.load_all_observed_models()
+                .expect("observed_models on v1")
+                .is_empty()
+        );
 
-        // First write triggers atomic v1 -> v2 migration in-place.
+        // First write triggers atomic v1 -> v2 -> v3 sequential migration in-place.
         let mut v2_ev = sample_event("2026-11-21T12:00:00.500Z", "ls:conv_abc123:1:0");
         v2_ev.response_id = Some("resp-v2-001".to_string());
         v2_ev.conversation_id = Some("conv_abc123".to_string());
@@ -1634,13 +1847,13 @@ mod tests {
         v2_ev.model_display_name = Some("Gemini 4 Hydrogen".to_string());
         v2_ev.telemetry_source = TelemetrySource::Ls;
         v2_ev.cascade_step_index = Some(1);
-        sink.record_checked(&v2_ev).expect("migrate and write v2");
+        sink.record_checked(&v2_ev).expect("migrate and write v3");
 
         let conn = Connection::open(&db_path).expect("open migrated db");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let all = sink.read_all_events().expect("read migrated events");
         assert_eq!(all.len(), 2);
@@ -2126,6 +2339,276 @@ mod tests {
             sink.query_events_for_root_or_conversation("../bad", 10)
                 .expect("invalid conv id")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_v2_to_v3_in_place_migration_preserves_events_and_watermarks_with_readonly_compat() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join(USAGE_DB_FILENAME);
+
+        // Seed an authentic schema v2 database on disk with usage_events and ls_sync_watermarks.
+        {
+            let conn = Connection::open(&db_path).expect("open v2 db");
+            conn.execute_batch(
+                "CREATE TABLE usage_events (
+                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_utc           TEXT    NOT NULL,
+                    request_id              TEXT    NOT NULL UNIQUE,
+                    provider                TEXT    NOT NULL,
+                    model                   TEXT    NOT NULL,
+                    input_tokens            INTEGER NOT NULL CHECK (input_tokens >= 0),
+                    output_tokens           INTEGER NOT NULL CHECK (output_tokens >= 0),
+                    cached_tokens           INTEGER NOT NULL CHECK (cached_tokens >= 0),
+                    reasoning_tokens        INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
+                    latency_ms              INTEGER NOT NULL CHECK (latency_ms >= 0),
+                    source                  TEXT    NOT NULL,
+                    response_id             TEXT,
+                    conversation_id         TEXT,
+                    root_conversation_id    TEXT,
+                    parent_conversation_id  TEXT,
+                    cache_write_tokens      INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+                    ttft_ms                 INTEGER CHECK (ttft_ms IS NULL OR ttft_ms >= 0),
+                    model_display_name      TEXT,
+                    telemetry_source        TEXT    NOT NULL DEFAULT 'proxy'
+                                            CHECK (telemetry_source IN ('proxy', 'ls', 'reconciled')),
+                    cascade_step_index      INTEGER CHECK (cascade_step_index IS NULL OR cascade_step_index >= 0)
+                );
+                CREATE INDEX idx_usage_events_timestamp_utc ON usage_events (timestamp_utc);
+                CREATE INDEX idx_usage_events_provider_model ON usage_events (provider, model);
+                CREATE UNIQUE INDEX idx_usage_events_response_id
+                    ON usage_events (response_id) WHERE response_id IS NOT NULL;
+                CREATE INDEX idx_usage_events_conversation_ts
+                    ON usage_events (conversation_id, timestamp_utc DESC, id DESC)
+                    WHERE conversation_id IS NOT NULL;
+                CREATE INDEX idx_usage_events_root_conv_ts
+                    ON usage_events (root_conversation_id, timestamp_utc DESC, id DESC)
+                    WHERE root_conversation_id IS NOT NULL;
+                CREATE TABLE ls_sync_watermarks (
+                    cascade_id        TEXT    PRIMARY KEY,
+                    trajectory_id     TEXT    NOT NULL,
+                    step_offset       INTEGER NOT NULL CHECK (step_offset >= 0),
+                    last_modified_utc TEXT    NOT NULL,
+                    updated_at_utc    TEXT    NOT NULL
+                );
+                INSERT INTO usage_events (
+                    timestamp_utc, request_id, provider, model,
+                    input_tokens, output_tokens, cached_tokens, reasoning_tokens,
+                    latency_ms, source, conversation_id, root_conversation_id,
+                    telemetry_source, cascade_step_index
+                ) VALUES (
+                    '2026-11-22T10:00:00Z', 'ls:conv_v2_001:4:0', 'antigravity', 'gemini-4-neon',
+                    1200, 300, 600, 50, 400, 'builtin', 'conv_v2_001', 'conv_v2_001',
+                    'ls', 4
+                );
+                INSERT INTO ls_sync_watermarks (
+                    cascade_id, trajectory_id, step_offset, last_modified_utc, updated_at_utc
+                ) VALUES (
+                    'conv_v2_001', 'traj_v2_001', 5, '2026-11-22T10:00:00Z', '2026-11-22T10:00:00Z'
+                );
+                PRAGMA user_version = 2;",
+            )
+            .expect("seed v2 schema");
+        }
+
+        let before_bytes = fs::read(&db_path).expect("read v2 bytes before");
+        let sink = SqliteUsageSink::new(tmp.path()).expect("sink init");
+
+        // Unmigrated v2 DB remains fully readable read-only without mutating disk.
+        let watermarks_before = sink.load_all_watermarks().expect("load watermarks on v2");
+        assert_eq!(watermarks_before.len(), 1);
+        assert_eq!(watermarks_before[0].cascade_id, "conv_v2_001");
+        assert_eq!(watermarks_before[0].step_offset, 5);
+
+        let conv_before = sink
+            .query_events_for_root_or_conversation("conv_v2_001", 10)
+            .expect("query conversation on v2");
+        assert_eq!(conv_before.len(), 1);
+        assert_eq!(conv_before[0].request_id, "ls:conv_v2_001:4:0");
+
+        let observed_before = sink
+            .load_all_observed_models()
+            .expect("load observed_models on v2 returns empty");
+        assert!(observed_before.is_empty());
+
+        let summary_before = crate::usage::query_usage_summary_at(
+            tmp.path(),
+            UsageRange::Days7,
+            chrono::DateTime::parse_from_rfc3339("2026-11-23T00:00:00Z")
+                .expect("ts")
+                .with_timezone(&chrono::Utc),
+        )
+        .expect("query summary on v2");
+        assert_eq!(summary_before.totals.requests, 1);
+
+        let after_ro_bytes = fs::read(&db_path).expect("read v2 bytes after ro");
+        assert_eq!(
+            after_ro_bytes, before_bytes,
+            "read-only queries on v2 must not mutate disk"
+        );
+
+        // First write triggers atomic v2 -> v3 migration in-place.
+        let changed = sink
+            .upsert_observed_model(&ObservedModel {
+                provider: "antigravity".to_string(),
+                model: "gemini-4-neon".to_string(),
+                compaction_limit_tokens: Some(512_000),
+                updated_at_utc: "2026-11-22T10:05:00.250Z".to_string(),
+            })
+            .expect("migrate v2->v3 and upsert observed_model");
+        assert!(changed);
+
+        let conn = Connection::open(&db_path).expect("open migrated v3 db");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(version, 3);
+
+        // Existing v2 usage_events and ls_sync_watermarks are intact.
+        let events_after = sink.read_all_events().expect("read events after v3");
+        assert_eq!(events_after.len(), 1);
+        assert_eq!(events_after[0].request_id, "ls:conv_v2_001:4:0");
+
+        let wms_after = sink
+            .load_all_watermarks()
+            .expect("read watermarks after v3");
+        assert_eq!(wms_after, watermarks_before);
+
+        let observed_after = sink
+            .load_all_observed_models()
+            .expect("read observed_models after v3");
+        assert_eq!(
+            observed_after,
+            vec![ObservedModel {
+                provider: "antigravity".to_string(),
+                model: "gemini-4-neon".to_string(),
+                compaction_limit_tokens: Some(512_000),
+                updated_at_utc: "2026-11-22T10:05:00Z".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn sqlite_observed_models_lazy_read_upsert_on_change_and_check_constraint() {
+        let tmp = TempDir::new().expect("temp dir");
+        let usage_dir = tmp.path().join("lazy_observed");
+        let sink = SqliteUsageSink::new(&usage_dir).expect("sink init");
+
+        // Missing dir/db returns empty without creating files.
+        assert!(
+            sink.load_all_observed_models()
+                .expect("lazy read missing")
+                .is_empty()
+        );
+        assert!(!usage_dir.exists());
+
+        // Insert new row -> Ok(true).
+        assert!(
+            sink.upsert_observed_model(&ObservedModel {
+                provider: "antigravity".to_string(),
+                model: "gemini-4-neon".to_string(),
+                compaction_limit_tokens: None,
+                updated_at_utc: "2026-11-22T10:00:00Z".to_string(),
+            })
+            .expect("insert None")
+        );
+
+        // Identical NULL re-upsert -> Ok(false) (NULL-safe IS NOT), updated_at_utc unchanged.
+        assert!(
+            !sink
+                .upsert_observed_model(&ObservedModel {
+                    provider: "antigravity".to_string(),
+                    model: "gemini-4-neon".to_string(),
+                    compaction_limit_tokens: None,
+                    updated_at_utc: "2026-11-22T10:01:00Z".to_string(),
+                })
+                .expect("no-op NULL re-upsert")
+        );
+        let rows = sink
+            .load_all_observed_models()
+            .expect("load after NULL no-op");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].updated_at_utc, "2026-11-22T10:00:00Z");
+
+        // None -> Some(512_000) -> Ok(true), updated_at_utc updated.
+        assert!(
+            sink.upsert_observed_model(&ObservedModel {
+                provider: "antigravity".to_string(),
+                model: "gemini-4-neon".to_string(),
+                compaction_limit_tokens: Some(512_000),
+                updated_at_utc: "2026-11-22T10:02:00Z".to_string(),
+            })
+            .expect("update None -> 512k")
+        );
+
+        // Identical Some(512_000) re-upsert -> Ok(false), updated_at_utc unchanged.
+        assert!(
+            !sink
+                .upsert_observed_model(&ObservedModel {
+                    provider: "antigravity".to_string(),
+                    model: "gemini-4-neon".to_string(),
+                    compaction_limit_tokens: Some(512_000),
+                    updated_at_utc: "2026-11-22T10:03:00Z".to_string(),
+                })
+                .expect("no-op 512k re-upsert")
+        );
+        let rows = sink
+            .load_all_observed_models()
+            .expect("load after 512k no-op");
+        assert_eq!(rows[0].compaction_limit_tokens, Some(512_000));
+        assert_eq!(rows[0].updated_at_utc, "2026-11-22T10:02:00Z");
+
+        // Changed value 512_000 -> 1_000_000 -> Ok(true).
+        assert!(
+            sink.upsert_observed_model(&ObservedModel {
+                provider: "antigravity".to_string(),
+                model: "gemini-4-neon".to_string(),
+                compaction_limit_tokens: Some(1_000_000),
+                updated_at_utc: "2026-11-22T10:04:00Z".to_string(),
+            })
+            .expect("update 512k -> 1m")
+        );
+
+        // Some(0) violates CHECK constraint without invalidating cached connection.
+        let check_err = sink
+            .upsert_observed_model(&ObservedModel {
+                provider: "openai-codex".to_string(),
+                model: "gpt-6.2-astra".to_string(),
+                compaction_limit_tokens: Some(0),
+                updated_at_utc: "2026-11-22T10:05:00Z".to_string(),
+            })
+            .expect_err("compaction_limit_tokens = 0 must fail CHECK");
+        assert!(matches!(check_err, CoreError::UsageDatabase { .. }));
+
+        // Subsequent valid write on same sink succeeds cleanly.
+        assert!(
+            sink.upsert_observed_model(&ObservedModel {
+                provider: "openai-codex".to_string(),
+                model: "gpt-6.2-astra".to_string(),
+                compaction_limit_tokens: Some(400_000),
+                updated_at_utc: "2026-11-22T10:06:00Z".to_string(),
+            })
+            .expect("valid write after CHECK error")
+        );
+
+        // Verify deterministic ordering by (provider ASC, model ASC).
+        let final_rows = sink.load_all_observed_models().expect("final load");
+        assert_eq!(
+            final_rows,
+            vec![
+                ObservedModel {
+                    provider: "antigravity".to_string(),
+                    model: "gemini-4-neon".to_string(),
+                    compaction_limit_tokens: Some(1_000_000),
+                    updated_at_utc: "2026-11-22T10:04:00Z".to_string(),
+                },
+                ObservedModel {
+                    provider: "openai-codex".to_string(),
+                    model: "gpt-6.2-astra".to_string(),
+                    compaction_limit_tokens: Some(400_000),
+                    updated_at_utc: "2026-11-22T10:06:00Z".to_string(),
+                },
+            ]
         );
     }
 }
