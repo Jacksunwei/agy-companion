@@ -309,7 +309,7 @@ if is_legacy_repo_symlink "${PLUGIN_TARGET}"; then
   AUTO_MIGRATE_SYMLINK=1
 fi
 
-INSTALL_ARGS=(install)
+INSTALL_ARGS=(install --channel npx)
 [[ ${CONFIG_SET} -eq 1 ]] && INSTALL_ARGS+=(--config "${CONFIG_ARG}")
 [[ ${PLUGINS_DIR_EXPLICIT} -eq 1 ]] && INSTALL_ARGS+=(--plugins-dir "${PLUGINS_DIR}")
 [[ ${NO_LAUNCHER_HOOK} -eq 1 ]] && INSTALL_ARGS+=(--no-launcher-hook)

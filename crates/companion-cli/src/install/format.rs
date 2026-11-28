@@ -23,6 +23,7 @@ pub(crate) fn format_install_report<W: Write>(
         writeln!(out, "  Symlink:  {}", link.display())?;
     }
     writeln!(out, "  Plugin:   {}", report.plugin_dir.display())?;
+    writeln!(out, "  Channel:  {}", report.install_channel)?;
     if report.port_auto_selected {
         writeln!(
             out,

@@ -347,10 +347,15 @@ pub async fn run_uninstall<W: Write>(opts: UninstallOptions, out: &mut W) -> Res
             log_dirs.push(data_dir.clone());
         }
         for dir in deduplicate_paths(log_dirs) {
-            for fname in [PROXY_LOG_FILENAME, PROXY_LOG_ROTATED_FILENAME] {
-                let log_path = dir.join(fname);
-                if remove_regular_file_if_present(&log_path, opts.dry_run, &mut warnings)? {
-                    purged_paths.push(log_path);
+            for fname in [
+                PROXY_LOG_FILENAME,
+                PROXY_LOG_ROTATED_FILENAME,
+                companion_core::UPDATE_STATE_FILENAME,
+            ] {
+                let state_or_log_path = dir.join(fname);
+                if remove_regular_file_if_present(&state_or_log_path, opts.dry_run, &mut warnings)?
+                {
+                    purged_paths.push(state_or_log_path);
                 }
             }
         }

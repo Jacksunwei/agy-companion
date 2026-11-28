@@ -148,6 +148,7 @@ async fn main() -> ExitCode {
             no_launcher_hook,
             no_start_proxy,
             force,
+            channel,
             json,
         } => {
             init_tracing("warn", std::io::stderr);
@@ -159,6 +160,7 @@ async fn main() -> ExitCode {
                     no_launcher_hook,
                     no_start_proxy,
                     force,
+                    channel: channel.map(Into::into),
                     json,
                 },
                 &mut stdout,

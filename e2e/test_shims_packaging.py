@@ -769,7 +769,9 @@ class TestShimNpmPackaging(E2ETestCase):
             stub_bin = node_path / "@agy-companion" / pkg_name / "bin" / bin_name
             stub_bin.parent.mkdir(parents=True, exist_ok=True)
             stub_bin.write_text(
-                '#!/bin/sh\nif [ "$1" = "--fail" ]; then echo "stub-err" >&2; exit 42; fi\necho "ARGV:$*"\n',
+                '#!/bin/sh\nif [ "$1" = "--fail" ]; then echo "stub-err" >&2; exit 42; fi\n'
+                'if [ "$1" = "--print-channel" ]; then echo "CH:${AGY_COMPANION_INSTALL_CHANNEL:-unset}|ARGV:$*"; exit 0; fi\n'
+                'echo "ARGV:$*"\n',
                 encoding="utf-8",
             )
             os.chmod(stub_bin, 0o755)
@@ -778,6 +780,26 @@ class TestShimNpmPackaging(E2ETestCase):
             r_ok = run_cli([node, str(shim), "--hello", "world"], env=stub_env, cwd=env.root)
             self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
             self.assertEqual(r_ok.stdout.strip(), "ARGV:--hello world")
+
+            # npm_command=exec injects AGY_COMPANION_INSTALL_CHANNEL=npx without mutating argv or overriding explicit env.
+            npx_env = env.build_env(extra={"NODE_PATH": str(node_path), "npm_command": "exec"})
+            npx_env.pop("AGY_COMPANION_INSTALL_CHANNEL", None)
+            r_npx = run_cli([node, str(shim), "--print-channel"], env=npx_env, cwd=env.root)
+            self.assertEqual(r_npx.returncode, 0, r_npx.stderr)
+            self.assertEqual(r_npx.stdout.strip(), "CH:npx|ARGV:--print-channel")
+
+            explicit_env = env.build_env(
+                extra={
+                    "NODE_PATH": str(node_path),
+                    "npm_command": "exec",
+                    "AGY_COMPANION_INSTALL_CHANNEL": "uvx",
+                }
+            )
+            r_explicit = run_cli(
+                [node, str(shim), "--print-channel"], env=explicit_env, cwd=env.root
+            )
+            self.assertEqual(r_explicit.returncode, 0, r_explicit.stderr)
+            self.assertEqual(r_explicit.stdout.strip(), "CH:uvx|ARGV:--print-channel")
 
             r_fail = run_cli([node, str(shim), "--fail"], env=stub_env, cwd=env.root)
             self.assertEqual(r_fail.returncode, 42)
