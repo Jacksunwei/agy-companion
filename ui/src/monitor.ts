@@ -148,10 +148,8 @@ export function buildMonitorView(
   const ctxLbl = el("div", "tile-k", latest ? "Latest prompt" : "Session prompt");
   const heroRow = el("div", "hero-row");
   const heroLeft = el("div", "hero-left");
-  heroLeft.append(
-    el("span", "hero-val num", formatCompactTokens(latestInput)),
-    el("span", "hero-sub num", `of ${formatCompactTokens(maxCtx)}`),
-  );
+  const windowLimit = el("span", "hero-sub num", `of ${formatCompactTokens(maxCtx)}`);
+  heroLeft.append(el("span", "hero-val num", formatCompactTokens(latestInput)), windowLimit);
   if (liveMaxCtx !== null && liveMaxCtx < modelMaxCtx) {
     const infoBtn = el("button", "ctx-info-btn");
     infoBtn.type = "button";
@@ -171,7 +169,7 @@ export function buildMonitorView(
       infoBtn.addEventListener("focus", () => tooltip.showInfo(infoBtn, tipContent));
       infoBtn.addEventListener("blur", () => tooltip.hideNow());
     }
-    heroLeft.append(infoBtn);
+    windowLimit.append(infoBtn);
   }
   heroRow.append(heroLeft, el("span", "hero-pct num", `${ctxPct}%`));
   card.append(ctxLbl, heroRow);
