@@ -1,4 +1,8 @@
-use companion_core::{find_curated_codex_model, is_supported_gemini_model};
+use companion_core::{
+    DEFAULT_GEMINI_CONTEXT_WINDOW, DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, FALLBACK_CODEX_CONTEXT_WINDOW,
+    FALLBACK_CODEX_MAX_OUTPUT_TOKENS, compute_compaction_window, find_curated_codex_model,
+    is_supported_gemini_model,
+};
 use serde_json::{Map, Value, json};
 
 use super::slots::{
@@ -72,8 +76,13 @@ fn build_injected_codex_variant_details(
     display_name: &str,
 ) -> Value {
     let curated = find_curated_codex_model(raw_id);
-    let max_tokens = curated.map_or(272_000, |m| m.context_window);
-    let max_output_tokens = curated.map_or(128_000, |m| m.max_output_tokens);
+    let max_tokens = curated.map_or(FALLBACK_CODEX_CONTEXT_WINDOW, |m| m.context_window);
+    let max_output_tokens =
+        curated.map_or(FALLBACK_CODEX_MAX_OUTPUT_TOKENS, |m| m.max_output_tokens);
+    let compaction_window = curated.map_or_else(
+        || compute_compaction_window(max_tokens, max_output_tokens),
+        |m| m.compaction_window,
+    );
 
     // Explicit Codex metadata: NEVER copy Gemini upstream templates or `modelExperimentIds`.
     // Enable `supportsThoughtCirculation: true` so Antigravity circulates Codex's namespaced
@@ -107,6 +116,18 @@ fn build_injected_codex_variant_details(
         json!("TOOL_FORMATTER_TYPE_NONE"),
     );
     details_map.insert("quotaInfo".to_string(), json!({ "remainingFraction": 1.0 }));
+    if compaction_window > 0 {
+        details_map.insert(
+            "modelExperiments".to_string(),
+            json!({
+                "experiments": {
+                    "CASCADE_USE_EXPERIMENT_CHECKPOINTER": {
+                        "stringValue": json!({ "maxTokenLimit": compaction_window }).to_string()
+                    }
+                }
+            }),
+        );
+    }
     Value::Object(details_map)
 }
 
@@ -210,14 +231,20 @@ fn build_injected_variant_details(
         .and_then(Value::as_u64)
         .is_some_and(|v| v > 0);
     if !has_valid_max_tokens {
-        details_map.insert("maxTokens".to_string(), json!(1048576));
+        details_map.insert(
+            "maxTokens".to_string(),
+            json!(DEFAULT_GEMINI_CONTEXT_WINDOW),
+        );
     }
     let has_valid_max_output = details_map
         .get("maxOutputTokens")
         .and_then(Value::as_u64)
         .is_some_and(|v| v > 0);
     if !has_valid_max_output {
-        details_map.insert("maxOutputTokens".to_string(), json!(65536));
+        details_map.insert(
+            "maxOutputTokens".to_string(),
+            json!(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS),
+        );
     }
     if !details_map.contains_key("supportedMimeTypes") {
         details_map.insert(

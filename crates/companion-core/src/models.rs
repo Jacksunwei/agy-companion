@@ -12,6 +12,24 @@ use crate::config::CoreError;
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-hydrogen";
 pub const MAX_GEMINI_MODEL_LEN: usize = 128;
 
+/// Percentage of available input context (`context_window - max_output_tokens`) allocated to the
+/// compaction window, leaving headroom for turn overflow, the compaction prompt, and tokenizer variance.
+pub const COMPACTION_WINDOW_PERCENT: u64 = 85;
+pub const DEFAULT_GEMINI_CONTEXT_WINDOW: u64 = 1_048_576;
+pub const DEFAULT_GEMINI_MAX_OUTPUT_TOKENS: u64 = 65_536;
+pub const FALLBACK_CODEX_CONTEXT_WINDOW: u64 = 272_000;
+pub const FALLBACK_CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
+
+/// Derives a model's compaction window from `context_window` and `max_output_tokens`.
+///
+/// Reserves `max_output_tokens` for the response (`max_input = context_window - max_output_tokens`)
+/// and takes 85% of `max_input`, leaving ~15% headroom for turn overflow, the compaction prompt,
+/// and tokenizer variance (`compaction_window + overflow + compact_prompt <= max_input`).
+pub const fn compute_compaction_window(context_window: u64, max_output_tokens: u64) -> u64 {
+    let max_input = context_window.saturating_sub(max_output_tokens);
+    ((max_input as u128) * (COMPACTION_WINDOW_PERCENT as u128) / 100) as u64
+}
+
 /// Default enabled Gemini models injected into Antigravity's model picker (11/32 placeholder slots).
 pub const DEFAULT_ENABLED_GEMINI_MODELS: &[&str] =
     &["gemini-4-carbon", "gemini-4-neon", "gemini-4-hydrogen"];
@@ -42,6 +60,9 @@ pub struct CuratedGeminiModel {
     pub id: &'static str,
     pub display_name: &'static str,
     pub short_label: &'static str,
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+    pub compaction_window: u64,
 }
 
 /// Canonical capability-ordered curated Gemini catalog (matches native Antigravity picker & UI pills).
@@ -50,26 +71,56 @@ pub const CURATED_GEMINI_MODELS: &[CuratedGeminiModel] = &[
         id: "gemini-4-carbon",
         display_name: "Gemini 4 Carbon",
         short_label: "4 Carbon",
+        context_window: DEFAULT_GEMINI_CONTEXT_WINDOW,
+        max_output_tokens: DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        compaction_window: compute_compaction_window(
+            DEFAULT_GEMINI_CONTEXT_WINDOW,
+            DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        ),
     },
     CuratedGeminiModel {
         id: "gemini-4-neon",
         display_name: "Gemini 4 Neon",
         short_label: "4 Neon",
+        context_window: DEFAULT_GEMINI_CONTEXT_WINDOW,
+        max_output_tokens: DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        compaction_window: compute_compaction_window(
+            DEFAULT_GEMINI_CONTEXT_WINDOW,
+            DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        ),
     },
     CuratedGeminiModel {
         id: "gemini-4-hydrogen",
         display_name: "Gemini 4 Hydrogen",
         short_label: "4 Hydrogen",
+        context_window: DEFAULT_GEMINI_CONTEXT_WINDOW,
+        max_output_tokens: DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        compaction_window: compute_compaction_window(
+            DEFAULT_GEMINI_CONTEXT_WINDOW,
+            DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        ),
     },
     CuratedGeminiModel {
         id: "gemini-4-argon",
         display_name: "Gemini 4 Argon",
         short_label: "4 Argon",
+        context_window: DEFAULT_GEMINI_CONTEXT_WINDOW,
+        max_output_tokens: DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        compaction_window: compute_compaction_window(
+            DEFAULT_GEMINI_CONTEXT_WINDOW,
+            DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        ),
     },
     CuratedGeminiModel {
         id: "gemini-3.8-flash",
         display_name: "Gemini 3.8 Flash",
         short_label: "3.8 Flash",
+        context_window: DEFAULT_GEMINI_CONTEXT_WINDOW,
+        max_output_tokens: DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        compaction_window: compute_compaction_window(
+            DEFAULT_GEMINI_CONTEXT_WINDOW,
+            DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+        ),
     },
 ];
 
@@ -254,6 +305,7 @@ pub struct CuratedCodexModel {
     pub short_label: &'static str,
     pub context_window: u64,
     pub max_output_tokens: u64,
+    pub compaction_window: u64,
     pub reasoning_efforts: &'static [&'static str],
     pub default_enabled: bool,
 }
@@ -266,6 +318,7 @@ pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
         short_label: "6.2 Astra",
         context_window: 1_050_000,
         max_output_tokens: 128_000,
+        compaction_window: compute_compaction_window(1_050_000, 128_000),
         reasoning_efforts: &["low", "medium", "high", "xhigh"],
         default_enabled: true,
     },
@@ -275,6 +328,7 @@ pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
         short_label: "6.2 Sol",
         context_window: 1_050_000,
         max_output_tokens: 128_000,
+        compaction_window: compute_compaction_window(1_050_000, 128_000),
         reasoning_efforts: &["low", "medium", "high", "xhigh"],
         default_enabled: true,
     },
@@ -284,6 +338,7 @@ pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
         short_label: "6.1 Terra",
         context_window: 1_050_000,
         max_output_tokens: 128_000,
+        compaction_window: compute_compaction_window(1_050_000, 128_000),
         reasoning_efforts: &["low", "medium", "high"],
         default_enabled: false,
     },
@@ -293,6 +348,7 @@ pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
         short_label: "6 Luna",
         context_window: 1_050_000,
         max_output_tokens: 128_000,
+        compaction_window: compute_compaction_window(1_050_000, 128_000),
         reasoning_efforts: &["low", "medium", "high"],
         default_enabled: false,
     },
@@ -685,6 +741,13 @@ mod tests {
         );
         assert!(ids.contains(&DEFAULT_GEMINI_MODEL));
         assert!(validate_gemini_model(DEFAULT_GEMINI_MODEL).is_ok());
+
+        for model in CURATED_GEMINI_MODELS {
+            assert_eq!(model.context_window, DEFAULT_GEMINI_CONTEXT_WINDOW);
+            assert_eq!(model.max_output_tokens, DEFAULT_GEMINI_MAX_OUTPUT_TOKENS);
+            assert_eq!(model.compaction_window, 835_584);
+            assert!(model.compaction_window < model.context_window - model.max_output_tokens);
+        }
 
         let presets = curated_model_presets();
         assert_eq!(presets.len(), 5);
@@ -1088,28 +1151,72 @@ mod tests {
         let astra = find_curated_codex_model("gpt-6.2-astra").expect("astra");
         assert_eq!(astra.context_window, 1_050_000);
         assert_eq!(astra.max_output_tokens, 128_000);
+        assert_eq!(astra.compaction_window, 783_700);
         assert_eq!(astra.reasoning_efforts, &["low", "medium", "high", "xhigh"]);
         assert!(astra.default_enabled);
 
         let sol = find_curated_codex_model("gpt-6.2-sol").expect("sol");
         assert_eq!(sol.context_window, 1_050_000);
+        assert_eq!(sol.compaction_window, 783_700);
         assert!(sol.default_enabled);
 
         let terra = find_curated_codex_model("gpt-6.1-terra").expect("terra");
         assert_eq!(terra.context_window, 1_050_000);
+        assert_eq!(terra.compaction_window, 783_700);
         assert_eq!(terra.reasoning_efforts, &["low", "medium", "high"]);
         assert!(!terra.default_enabled);
 
         let luna = find_curated_codex_model("gpt-6-luna").expect("luna");
         assert_eq!(luna.context_window, 1_050_000);
+        assert_eq!(luna.compaction_window, 783_700);
         assert!(!luna.default_enabled);
         assert!(find_curated_codex_model("gpt-5.4").is_none());
+
+        for model in CURATED_CODEX_MODELS {
+            assert_eq!(
+                model.compaction_window,
+                compute_compaction_window(model.context_window, model.max_output_tokens)
+            );
+            assert!(model.compaction_window < model.context_window - model.max_output_tokens);
+        }
 
         let presets = curated_codex_model_presets();
         assert_eq!(presets.len(), 4);
         let json = serde_json::to_string(&presets).expect("serialize presets");
         let parsed: Vec<ModelPreset> = serde_json::from_str(&json).expect("deserialize presets");
         assert_eq!(parsed, presets);
+    }
+
+    #[test]
+    fn compute_compaction_window_handles_curated_fallback_underflow_zero_and_u64_max() {
+        assert_eq!(COMPACTION_WINDOW_PERCENT, 85);
+        // Curated Codex: (1_050_000 - 128_000) * 85 / 100 = 922_000 * 85 / 100 = 783_700
+        assert_eq!(compute_compaction_window(1_050_000, 128_000), 783_700);
+        // Fallback Codex: (272_000 - 128_000) * 85 / 100 = 144_000 * 85 / 100 = 122_400
+        assert_eq!(
+            compute_compaction_window(
+                FALLBACK_CODEX_CONTEXT_WINDOW,
+                FALLBACK_CODEX_MAX_OUTPUT_TOKENS
+            ),
+            122_400
+        );
+        // Curated Gemini: (1_048_576 - 65_536) * 85 / 100 = 983_040 * 85 / 100 = 835_584
+        assert_eq!(
+            compute_compaction_window(
+                DEFAULT_GEMINI_CONTEXT_WINDOW,
+                DEFAULT_GEMINI_MAX_OUTPUT_TOKENS
+            ),
+            835_584
+        );
+        // Underflow / equal bounds saturate at 0
+        assert_eq!(compute_compaction_window(128_000, 128_000), 0);
+        assert_eq!(compute_compaction_window(64_000, 128_000), 0);
+        // Zero inputs
+        assert_eq!(compute_compaction_window(0, 0), 0);
+        assert_eq!(compute_compaction_window(0, 65_536), 0);
+        // Overflow safety on u64::MAX (uses u128 intermediate)
+        let expected_max = ((u64::MAX as u128) * 85 / 100) as u64;
+        assert_eq!(compute_compaction_window(u64::MAX, 0), expected_max);
     }
 
     #[test]

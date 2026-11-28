@@ -669,6 +669,10 @@ describe("ui/src/style.css theme tokens & WCAG AA contrast", () => {
       reducedBlock[1].includes(".model-tooltip.visible"),
       "prefers-reduced-motion must match .model-tooltip.visible specificity",
     );
+    assert.ok(
+      reducedBlock[1].includes(".ctx-info-btn"),
+      "prefers-reduced-motion must disable .ctx-info-btn transitions",
+    );
 
     assert.ok(css.includes("interpolate-size: allow-keywords"));
     assert.ok(css.includes("details.adv-details::details-content"));

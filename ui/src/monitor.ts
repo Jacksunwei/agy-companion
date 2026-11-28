@@ -1,9 +1,11 @@
 import {
+  createIcon,
   el,
   formatCompactTokens,
   formatTimeHHMM,
   formatUsd,
   quitReopenCapitalized,
+  type TooltipController,
 } from "./dom.ts";
 import {
   estimateSessionSummary,
@@ -47,7 +49,18 @@ export function computeMonitorSignature(state: AppState): string {
   ]);
 }
 
-export function buildMonitorView(state: AppState): DocumentFragment {
+function formatFullWindow(raw: number): string {
+  const n = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 0;
+  if (n >= 1_000_000) {
+    return `${(n / 1_000_000).toFixed(2).replace(/\.?0+$/, "")}M`;
+  }
+  return formatCompactTokens(n);
+}
+
+export function buildMonitorView(
+  state: AppState,
+  tooltip?: TooltipController,
+): DocumentFragment {
   const frag = document.createDocumentFragment();
   const snap = state.snapshot;
   const platform = snap?.platform ?? "macos";
@@ -128,16 +141,38 @@ export function buildMonitorView(state: AppState): DocumentFragment {
     stats.max_context_tokens > 0
       ? stats.max_context_tokens
       : null;
-  const maxCtx = liveMaxCtx ?? getModelContextWindow(activeModelId);
+  const modelMaxCtx = getModelContextWindow(activeModelId);
+  const maxCtx = liveMaxCtx ?? modelMaxCtx;
   const ctxPct = maxCtx > 0 ? Math.min(100, Math.round((latestInput / maxCtx) * 100)) : 0;
 
   const ctxLbl = el("div", "tile-k", latest ? "Latest prompt" : "Session prompt");
   const heroRow = el("div", "hero-row");
-  const heroLeft = el("div");
+  const heroLeft = el("div", "hero-left");
   heroLeft.append(
     el("span", "hero-val num", formatCompactTokens(latestInput)),
     el("span", "hero-sub num", `of ${formatCompactTokens(maxCtx)}`),
   );
+  if (liveMaxCtx !== null && liveMaxCtx < modelMaxCtx) {
+    const infoBtn = el("button", "ctx-info-btn");
+    infoBtn.type = "button";
+    infoBtn.setAttribute(
+      "aria-label",
+      "Why the compaction window is smaller than the full context window",
+    );
+    infoBtn.append(createIcon("info"));
+    if (tooltip) {
+      const tipContent = {
+        title: "Compaction window",
+        badge: `${formatCompactTokens(liveMaxCtx)} / ${formatFullWindow(modelMaxCtx)}`,
+        desc: "Compacts early to reserve room for max output, turn overflow, and the summary prompt.",
+      };
+      infoBtn.addEventListener("mouseenter", () => tooltip.showInfo(infoBtn, tipContent));
+      infoBtn.addEventListener("mouseleave", () => tooltip.scheduleHide());
+      infoBtn.addEventListener("focus", () => tooltip.showInfo(infoBtn, tipContent));
+      infoBtn.addEventListener("blur", () => tooltip.hideNow());
+    }
+    heroLeft.append(infoBtn);
+  }
   heroRow.append(heroLeft, el("span", "hero-pct num", `${ctxPct}%`));
   card.append(ctxLbl, heroRow);
 

@@ -297,6 +297,14 @@ class TestCujCodex(E2ETestCase):
         self.assertIn("MODEL_PLACEHOLDER_M351", codex_placeholders)
         for entry in codex_entries.values():
             self.assertIs(entry.get("supportsThoughtCirculation"), True)
+            checkpointer_raw = (
+                entry.get("modelExperiments", {})
+                .get("experiments", {})
+                .get("CASCADE_USE_EXPERIMENT_CHECKPOINTER", {})
+                .get("stringValue")
+            )
+            self.assertIsInstance(checkpointer_raw, str)
+            self.assertEqual(json.loads(checkpointer_raw).get("maxTokenLimit"), 783_700)
 
         # 5. Streaming Gemini -> Codex Responses SSE translation + per-session stats + SQLite usage.
         conv_id = "conv-codex-e2e-42"

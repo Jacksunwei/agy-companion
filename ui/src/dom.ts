@@ -267,8 +267,17 @@ export async function copyTextWithFallback(text: string): Promise<boolean> {
   }
 }
 
+export interface TooltipContent {
+  title: string;
+  badge?: string | null;
+  desc: string;
+  meta?: string | null;
+}
+
 export interface TooltipController {
   show: (anchorBtn: HTMLElement, model: CuratedModelInfo) => void;
+  showInfo: (anchorBtn: HTMLElement, content: TooltipContent) => void;
+  hideIfInside: (ancestor: HTMLElement) => void;
   scheduleHide: () => void;
   hideNow: () => void;
   destroy: () => void;
@@ -315,7 +324,7 @@ export function createTooltipController(container: HTMLElement): TooltipControll
   tip.addEventListener("mouseenter", cancelHide);
   tip.addEventListener("mouseleave", scheduleHide);
 
-  const show = (anchorBtn: HTMLElement, model: CuratedModelInfo) => {
+  const showInfo = (anchorBtn: HTMLElement, content: TooltipContent) => {
     cancelHide();
     if (activeAnchor && activeAnchor !== anchorBtn) {
       activeAnchor.removeAttribute("aria-describedby");
@@ -324,10 +333,16 @@ export function createTooltipController(container: HTMLElement): TooltipControll
     anchorBtn.setAttribute("aria-describedby", "model-tooltip");
 
     const titleRow = el("div", "tip-title");
-    titleRow.append(el("span", null, model.label), el("span", "tip-id", model.id));
-    const desc = el("p", "tip-desc", model.desc);
-    const meta = el("div", "tip-meta", model.meta);
-    tip.replaceChildren(titleRow, desc, meta);
+    titleRow.append(el("span", null, content.title));
+    if (content.badge) {
+      titleRow.append(el("span", "tip-id", content.badge));
+    }
+    const desc = el("p", "tip-desc", content.desc);
+    const nodes: HTMLElement[] = [titleRow, desc];
+    if (content.meta) {
+      nodes.push(el("div", "tip-meta", content.meta));
+    }
+    tip.replaceChildren(...nodes);
 
     tip.style.left = "0px";
     tip.style.top = "0px";
@@ -360,13 +375,28 @@ export function createTooltipController(container: HTMLElement): TooltipControll
     tip.style.top = `${Math.round(top)}px`;
   };
 
+  const show = (anchorBtn: HTMLElement, model: CuratedModelInfo) => {
+    showInfo(anchorBtn, {
+      title: model.label,
+      badge: model.id,
+      desc: model.desc,
+      meta: model.meta,
+    });
+  };
+
+  const hideIfInside = (ancestor: HTMLElement) => {
+    if (activeAnchor && ancestor.contains(activeAnchor)) {
+      hideNow();
+    }
+  };
+
   const destroy = () => {
     cancelHide();
     clearActiveAnchor();
     tip.remove();
   };
 
-  return { show, scheduleHide, hideNow, destroy };
+  return { show, showInfo, hideIfInside, scheduleHide, hideNow, destroy };
 }
 
 export type ThemeMode = "dark" | "light";

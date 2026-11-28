@@ -2728,7 +2728,13 @@ fn merge_available_models_multi_provider_allocates_31_of_32_slots_with_explicit_
         );
         assert_eq!(entry["quotaInfo"], json!({ "remainingFraction": 1.0 }));
         assert!(entry.get("modelExperimentIds").is_none());
-        assert!(entry.get("modelExperiments").is_none());
+        let checkpointer_raw = entry["modelExperiments"]["experiments"]
+            ["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]["stringValue"]
+            .as_str()
+            .expect("codex checkpointer stringValue");
+        let checkpointer: Value =
+            serde_json::from_str(checkpointer_raw).expect("valid checkpointer JSON");
+        assert_eq!(checkpointer["maxTokenLimit"], 783_700);
     }
 
     // Grouped models include Codex base entries with proper display names.
@@ -2809,4 +2815,38 @@ fn merge_available_models_multi_provider_codex_only_and_slot_pressure_default_re
     assert!(models.contains_key("companion/gpt-6.2-sol-high"));
     assert!(!models.contains_key("companion/gemini-4-carbon-high"));
     assert!(!models.contains_key("companion/gpt-6.2-astra-high"));
+}
+
+#[test]
+fn merge_available_models_multi_provider_fallback_codex_sets_computed_compaction_window() {
+    let upstream = json!({
+        "models": {},
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "displayName": "Models", "modelIds": [] }]
+        }]
+    });
+
+    let merged_bytes = merge_available_models_multi_provider(
+        &serde_json::to_vec(&upstream).unwrap(),
+        &[],
+        "",
+        &["gpt-6.3-preview".to_string()],
+        "gpt-6.3-preview",
+    )
+    .expect("fallback codex merge");
+    let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+    let entry = merged["models"]
+        .get("companion/gpt-6.3-preview-high")
+        .expect("fallback codex high variant");
+    assert_eq!(entry["maxTokens"], 272_000);
+    assert_eq!(entry["maxOutputTokens"], 128_000);
+    assert!(entry.get("modelExperimentIds").is_none());
+    let checkpointer_raw = entry["modelExperiments"]["experiments"]
+        ["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]["stringValue"]
+        .as_str()
+        .expect("fallback codex checkpointer stringValue");
+    let checkpointer: Value =
+        serde_json::from_str(checkpointer_raw).expect("valid fallback checkpointer JSON");
+    assert_eq!(checkpointer["maxTokenLimit"], 122_400);
 }

@@ -432,7 +432,8 @@ async function main(): Promise<void> {
       const monSig = computeMonitorSignature(state);
       if (monSig !== lastMonitorSig) {
         lastMonitorSig = monSig;
-        monitorPanel.replaceChildren(buildMonitorView(state));
+        tooltip.hideIfInside(monitorPanel);
+        monitorPanel.replaceChildren(buildMonitorView(state, tooltip));
       }
     } else if (state.activeTab === "usage") {
       const usageSig = computeUsageSignature(state);
