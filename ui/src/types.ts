@@ -367,7 +367,7 @@ export const CURATED_CODEX_MODEL_CATALOG: ReadonlyArray<CuratedModelInfo> = [
     displayName: "GPT-6.2 Astra",
     defaultOn: true,
     desc: "Best for complex coding, hard debugging, architecture, and deep professional work.",
-    meta: "272K context \u00b7 Low / Medium / High / XHigh \u00b7 ChatGPT subscription",
+    meta: "1.05M context \u00b7 Low / Medium / High / XHigh \u00b7 ChatGPT subscription",
   },
   {
     id: "gpt-6.2-sol",
@@ -375,7 +375,7 @@ export const CURATED_CODEX_MODEL_CATALOG: ReadonlyArray<CuratedModelInfo> = [
     displayName: "GPT-6.2 Sol",
     defaultOn: true,
     desc: "Best as the fast, go-to model for everyday coding and large-context repositories.",
-    meta: "500K context \u00b7 Low / Medium / High / XHigh \u00b7 ChatGPT subscription",
+    meta: "1.05M context \u00b7 Low / Medium / High / XHigh \u00b7 ChatGPT subscription",
   },
   {
     id: "gpt-6.1-terra",
@@ -383,7 +383,7 @@ export const CURATED_CODEX_MODEL_CATALOG: ReadonlyArray<CuratedModelInfo> = [
     displayName: "GPT-6.1 Terra",
     defaultOn: false,
     desc: "Best for visual understanding, screenshots, and efficient computer-use workflows.",
-    meta: "500K context \u00b7 Low / Medium / High \u00b7 ChatGPT subscription",
+    meta: "1.05M context \u00b7 Low / Medium / High \u00b7 ChatGPT subscription",
   },
   {
     id: "gpt-6-luna",
@@ -391,7 +391,7 @@ export const CURATED_CODEX_MODEL_CATALOG: ReadonlyArray<CuratedModelInfo> = [
     displayName: "GPT-6 Luna",
     defaultOn: false,
     desc: "Best for fast, lightweight edits and preserving ChatGPT subscription quota.",
-    meta: "272K context \u00b7 Low / Medium / High \u00b7 ChatGPT subscription",
+    meta: "1.05M context \u00b7 Low / Medium / High \u00b7 ChatGPT subscription",
   },
 ];
 

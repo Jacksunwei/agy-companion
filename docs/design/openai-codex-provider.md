@@ -214,10 +214,10 @@ Verified directly against OpenAI's official `openai/codex` `codex-rs/models-mana
 
 | Chip Label | Model ID | Default | Context Window | Reasoning Efforts | Slot Cost | Best-For Tooltip |
 | --- | --- | :---: | ---: | --- | :---: | --- |
-| **`6.2 Astra`** | `gpt-6.2-astra` | **ON** | `272K` | `Low`, `Medium`, `High`, `XHigh` | 4 | `Best for complex coding, hard debugging, architecture, and deep professional work.` |
-| **`6.2 Sol`** | `gpt-6.2-sol` | **ON** | `500K` | `Low`, `Medium`, `High`, `XHigh` | 4 | `Best as the fast, go-to model for everyday coding and large-context repositories.` |
-| **`6.1 Terra`** | `gpt-6.1-terra` | OFF | `500K` | `Low`, `Medium`, `High` | 3 | `Best for visual understanding, screenshots, and efficient computer-use workflows.` |
-| **`6 Luna`** | `gpt-6-luna` | OFF | `272K` | `Low`, `Medium`, `High` | 3 | `Best for fast, lightweight edits and preserving ChatGPT subscription quota.` |
+| **`6.2 Astra`** | `gpt-6.2-astra` | **ON** | `1.05M` | `Low`, `Medium`, `High`, `XHigh` | 4 | `Best for complex coding, hard debugging, architecture, and deep professional work.` |
+| **`6.2 Sol`** | `gpt-6.2-sol` | **ON** | `1.05M` | `Low`, `Medium`, `High`, `XHigh` | 4 | `Best as the fast, go-to model for everyday coding and large-context repositories.` |
+| **`6.1 Terra`** | `gpt-6.1-terra` | OFF | `1.05M` | `Low`, `Medium`, `High` | 3 | `Best for visual understanding, screenshots, and efficient computer-use workflows.` |
+| **`6 Luna`** | `gpt-6-luna` | OFF | `1.05M` | `Low`, `Medium`, `High` | 3 | `Best for fast, lightweight edits and preserving ChatGPT subscription quota.` |
 
 All four models are available on ChatGPT Plus, Pro, Team, and Enterprise plans (`available_in_plans`). Custom GPT-6+ model IDs remain valid when configured in `config.json` via `validate_codex_model()` (strict ASCII slug `[a-zA-Z0-9._-]`, `<= 128` chars, non-empty, rejecting Gemini prefix collisions).
 
@@ -234,7 +234,7 @@ In `crates/companion-proxy/src/cloudcode/slots.rs`, Antigravity provides **32 de
   - `modelUrl`: `"gemini-api://<codex-model-id>"` (routes exclusively through `GOOGLE_GEMINI_BASE_URL` → `http://127.0.0.1:<port>/v1beta/models/<codex-model-id>:streamGenerateContent?alt=sse`).
   - `displayName`: `"GPT-6.2 Astra (Codex) (High)"` (collapses into `"GPT-6.2 Astra (Codex)"` with native Low/Medium/High/Extra effort flyout via Antigravity's `EFFORT_LABEL_RE`).
   - **Do NOT blindly copy Gemini `modelExperimentIds` or `supportsThoughtCirculation: true`** from upstream Gemini templates (which would expect Gemini cryptographic `thoughtSignature` tokens). Set explicit Codex metadata:
-    - `maxTokens`: model-specific (`500_000` for `gpt-6.2-sol` / `gpt-6.1-terra`; `272_000` for `gpt-6.2-astra` / `gpt-6-luna`)
+    - `maxTokens`: `1_050_000` for all four curated models
     - `maxOutputTokens`: `128_000`
     - `supportsThinking`: `true`, `thinkingLevel`: `1 | 2 | 3 | 7`
     - `supportsImages`: `true`, `supportsVideo`: `false`, `supportsPdf`: `false`

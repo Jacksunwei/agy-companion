@@ -260,7 +260,7 @@ pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
         id: "gpt-6.2-astra",
         display_name: "GPT-6.2 Astra",
         short_label: "6.2 Astra",
-        context_window: 272_000,
+        context_window: 1_050_000,
         max_output_tokens: 128_000,
         reasoning_efforts: &["low", "medium", "high", "xhigh"],
         default_enabled: true,
@@ -269,7 +269,7 @@ pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
         id: "gpt-6.2-sol",
         display_name: "GPT-6.2 Sol",
         short_label: "6.2 Sol",
-        context_window: 500_000,
+        context_window: 1_050_000,
         max_output_tokens: 128_000,
         reasoning_efforts: &["low", "medium", "high", "xhigh"],
         default_enabled: true,
@@ -278,7 +278,7 @@ pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
         id: "gpt-6.1-terra",
         display_name: "GPT-6.1 Terra",
         short_label: "6.1 Terra",
-        context_window: 500_000,
+        context_window: 1_050_000,
         max_output_tokens: 128_000,
         reasoning_efforts: &["low", "medium", "high"],
         default_enabled: false,
@@ -287,7 +287,7 @@ pub const CURATED_CODEX_MODELS: &[CuratedCodexModel] = &[
         id: "gpt-6-luna",
         display_name: "GPT-6 Luna",
         short_label: "6 Luna",
-        context_window: 272_000,
+        context_window: 1_050_000,
         max_output_tokens: 128_000,
         reasoning_efforts: &["low", "medium", "high"],
         default_enabled: false,
@@ -805,22 +805,22 @@ mod tests {
         );
 
         let astra = find_curated_codex_model("gpt-6.2-astra").expect("astra");
-        assert_eq!(astra.context_window, 272_000);
+        assert_eq!(astra.context_window, 1_050_000);
         assert_eq!(astra.max_output_tokens, 128_000);
         assert_eq!(astra.reasoning_efforts, &["low", "medium", "high", "xhigh"]);
         assert!(astra.default_enabled);
 
         let sol = find_curated_codex_model("gpt-6.2-sol").expect("sol");
-        assert_eq!(sol.context_window, 500_000);
+        assert_eq!(sol.context_window, 1_050_000);
         assert!(sol.default_enabled);
 
         let terra = find_curated_codex_model("gpt-6.1-terra").expect("terra");
-        assert_eq!(terra.context_window, 500_000);
+        assert_eq!(terra.context_window, 1_050_000);
         assert_eq!(terra.reasoning_efforts, &["low", "medium", "high"]);
         assert!(!terra.default_enabled);
 
         let luna = find_curated_codex_model("gpt-6-luna").expect("luna");
-        assert_eq!(luna.context_window, 272_000);
+        assert_eq!(luna.context_window, 1_050_000);
         assert!(!luna.default_enabled);
         assert!(find_curated_codex_model("gpt-5.4").is_none());
 

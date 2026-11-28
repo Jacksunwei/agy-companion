@@ -157,17 +157,17 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     assert.equal(getModelContextWindow("o3-pro"), 200_000);
     assert.equal(getModelContextWindow("o4-mini-high"), 200_000);
     assert.equal(getModelContextWindow("gpt-4o-mini"), 128_000);
-    assert.equal(getModelContextWindow("gpt-6.2-sol"), 500_000);
-    assert.equal(getModelContextWindow("gpt-6.2-astra"), 272_000);
+    assert.equal(getModelContextWindow("gpt-6.2-sol"), 1_050_000);
+    assert.equal(getModelContextWindow("gpt-6.2-astra"), 1_050_000);
     assert.equal(getModelListPrice("antigravity-builtin"), null);
     assert.equal(getModelListPrice("gpt-6.2-astra"), null);
     assert.equal(getModelListPrice("gpt-6.2-sol"), null);
     assert.equal(getModelListPrice("gemini-unpriced-preview"), null);
     assert.equal(getModelListPrice(""), null);
-    assert.equal(getModelContextWindow("gpt-6.2-astra"), 272_000);
-    assert.equal(getModelContextWindow("gpt-6.2-sol"), 500_000);
-    assert.equal(getModelContextWindow("gpt-6.1-terra"), 500_000);
-    assert.equal(getModelContextWindow("gpt-6-luna"), 272_000);
+    assert.equal(getModelContextWindow("gpt-6.2-astra"), 1_050_000);
+    assert.equal(getModelContextWindow("gpt-6.2-sol"), 1_050_000);
+    assert.equal(getModelContextWindow("gpt-6.1-terra"), 1_050_000);
+    assert.equal(getModelContextWindow("gpt-6-luna"), 1_050_000);
     assert.equal(getModelContextWindow("unknown-model"), 1_000_000);
   });
 
