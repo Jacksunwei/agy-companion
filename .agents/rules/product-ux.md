@@ -27,3 +27,9 @@ description: Product, UX, and model-catalog guardrails for agy-companion. Activa
   - Frame opt-out switches negatively with clear consequence (e.g., **"Disable proxy"** with a warning, rather than ambiguous "Auto-start with Antigravity").
 - **Minimal footer:** Show only a compact status dot (`Live` / unhealthy alert), proxy RAM usage, and a health-only hover popover (do not clutter the footer with enabled-model lists).
 - **Session-accurate Monitor tab:** Reflect the current session's live traffic and capture built-in Antigravity model requests even before an external provider API key is configured.
+
+## UI PR Before / After Evidence
+
+- **Mandatory PR comment:** Every UI change MUST include a standalone **Before / After** comparison posted as a **PR comment** — never inside the git commit message, and never by committing temporary screenshot files into the repo.
+- **Fake data only:** Capture both Before (`main`) and After (PR branch) strictly using **fake/synthetic data** (e.g., `ui/tests/fixtures/*.json` or isolated mock state) — never real user sessions, real usage DBs, real API keys, or personal config.
+- **Cover affected states:** Show the changed views/states (and both Light and Dark themes when styling or contrast changes).
