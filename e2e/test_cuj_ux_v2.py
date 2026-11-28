@@ -396,6 +396,7 @@ class TestCujUxV2(E2ETestCase):
         )
 
         # Register RAII teardown strictly on the main thread before concurrent work.
+        env._spawned_sidecar = True
         proc_env = env.build_env(extra=shell_extra)
         ready_timeout = min(10.0, self.cfg.default_timeout)
         proxy = CompanionProcess(

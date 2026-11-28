@@ -1564,6 +1564,8 @@ class CompanionProcess:
         self._lock = threading.Lock()
         self._stdout_lines: list[str] = []
         self._stderr_lines: list[str] = []
+        self._stdout_file: Any | None = None
+        self._stderr_file: Any | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._stopped = False
@@ -1591,11 +1593,25 @@ class CompanionProcess:
     @property
     def stdout_text(self) -> str:
         with self._lock:
+            if self._stdout_file is not None:
+                try:
+                    self._stdout_file.flush()
+                    self._stdout_file.seek(0)
+                    return self._stdout_file.read().decode("utf-8", errors="replace")
+                except (OSError, ValueError):
+                    pass
             return "".join(self._stdout_lines)
 
     @property
     def stderr_text(self) -> str:
         with self._lock:
+            if self._stderr_file is not None:
+                try:
+                    self._stderr_file.flush()
+                    self._stderr_file.seek(0)
+                    return self._stderr_file.read().decode("utf-8", errors="replace")
+                except (OSError, ValueError):
+                    pass
             return "".join(self._stderr_lines)
 
     def _build_cmd(self) -> list[str]:
@@ -1616,6 +1632,23 @@ class CompanionProcess:
         self._stdout_lines = []
         self._stderr_lines = []
         self._stopped = False
+        if os.name == "nt":
+            # Avoid Windows CRT pipe-close deadlocks when detached grandchild daemons
+            # inherit stdout/stderr handles (bInheritHandles=TRUE).
+            self._stdout_file = tempfile.TemporaryFile()
+            self._stderr_file = tempfile.TemporaryFile()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=self._stdout_file,
+                stderr=self._stderr_file,
+                env=self._env,
+                cwd=self._cwd,
+            )
+            self._proc = proc
+            with _ACTIVE_COMPANION_LOCK:
+                _ACTIVE_COMPANION_PIDS.add(proc.pid)
+            return
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1757,6 +1790,23 @@ class CompanionProcess:
                     pipe.close()
                 except OSError:
                     pass
+        with self._lock:
+            if self._stdout_file is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._stdout_file.flush()
+                    self._stdout_file.seek(0)
+                    self._stdout_lines = [self._stdout_file.read().decode("utf-8", errors="replace")]
+                with contextlib.suppress(OSError):
+                    self._stdout_file.close()
+                self._stdout_file = None
+            if self._stderr_file is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._stderr_file.flush()
+                    self._stderr_file.seek(0)
+                    self._stderr_lines = [self._stderr_file.read().decode("utf-8", errors="replace")]
+                with contextlib.suppress(OSError):
+                    self._stderr_file.close()
+                self._stderr_file = None
 
         with _ACTIVE_COMPANION_LOCK:
             _ACTIVE_COMPANION_PIDS.discard(proc.pid)
@@ -2088,6 +2138,7 @@ class SidecarUiClient:
         self.ready_timeout = float(ready_timeout)
         self._proc: subprocess.Popen[bytes] | None = None
         self._stderr_chunks: list[bytes] = []
+        self._stderr_file: Any | None = None
         self._stderr_thread: threading.Thread | None = None
 
     @staticmethod
@@ -2100,35 +2151,51 @@ class SidecarUiClient:
 
     @property
     def stderr_text(self) -> str:
+        if self._stderr_file is not None:
+            with contextlib.suppress(OSError, ValueError):
+                self._stderr_file.flush()
+                self._stderr_file.seek(0)
+                return self._stderr_file.read().decode("utf-8", errors="replace")
         return b"".join(self._stderr_chunks).decode("utf-8", errors="replace")
 
     def start(self) -> SidecarUiClient:
-        kwargs: dict[str, Any] = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.PIPE,
-            "env": self.env,
-        }
-        if os.name != "nt":
-            kwargs["start_new_session"] = True
-        self._proc = subprocess.Popen(self.cmd, **kwargs)
-        stderr_pipe = self._proc.stderr
-        assert stderr_pipe is not None
+        if os.name == "nt":
+            # Avoid Windows CRT pipe-close deadlocks when detached bootstrap daemons
+            # inherit stderr handles (bInheritHandles=TRUE).
+            self._stderr_file = tempfile.TemporaryFile()
+            kwargs: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": self._stderr_file,
+                "env": self.env,
+            }
+            self._proc = subprocess.Popen(self.cmd, **kwargs)
+        else:
+            kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.PIPE,
+                "env": self.env,
+                "start_new_session": True,
+            }
+            self._proc = subprocess.Popen(self.cmd, **kwargs)
+            stderr_pipe = self._proc.stderr
+            assert stderr_pipe is not None
 
-        def _drain_stderr() -> None:
-            if stderr_pipe is None:
-                return
-            try:
-                while True:
-                    chunk = stderr_pipe.read(4096)
-                    if not chunk:
-                        break
-                    self._stderr_chunks.append(chunk)
-            except (OSError, ValueError):
-                pass
+            def _drain_stderr() -> None:
+                if stderr_pipe is None:
+                    return
+                try:
+                    while True:
+                        chunk = stderr_pipe.read(4096)
+                        if not chunk:
+                            break
+                        self._stderr_chunks.append(chunk)
+                except (OSError, ValueError):
+                    pass
 
-        self._stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        self._stderr_thread.start()
+            self._stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            self._stderr_thread.start()
 
         deadline = time.monotonic() + self.ready_timeout
         last_err: str = "not ready"
@@ -2284,6 +2351,14 @@ class SidecarUiClient:
         if proc is not None and proc.stderr is not None:
             with contextlib.suppress(OSError):
                 proc.stderr.close()
+        if self._stderr_file is not None:
+            with contextlib.suppress(OSError, ValueError):
+                self._stderr_file.flush()
+                self._stderr_file.seek(0)
+                self._stderr_chunks = [self._stderr_file.read()]
+            with contextlib.suppress(OSError):
+                self._stderr_file.close()
+            self._stderr_file = None
 
     def __enter__(self) -> SidecarUiClient:
         return self.start()
