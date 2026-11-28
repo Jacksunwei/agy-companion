@@ -5042,10 +5042,14 @@ mod tests {
             )
             .route(
                 "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
-                post(move || {
+                post(move |axum::Json(req): axum::Json<serde_json::Value>| {
                     let st = Arc::clone(&mock_steps);
                     async move {
-                        let steps = st.lock().unwrap().steps.clone();
+                        let offset = req["stepOffset"].as_u64().unwrap_or(0) as usize;
+                        let prefix: usize = if req["cascadeId"] == "conv-large-4600" { 4599 } else { 0 };
+                        let guard = st.lock().unwrap();
+                        let mut steps = vec![serde_json::json!({"status": "CORTEX_STEP_STATUS_DONE"}); prefix.saturating_sub(offset)];
+                        steps.extend(guard.steps.iter().skip(offset.saturating_sub(prefix)).cloned());
                         axum::Json(serde_json::json!({ "steps": steps }))
                     }
                 }),
@@ -5156,13 +5160,10 @@ mod tests {
         send_summary(&delta_tx, "conv-large-4600", 4600);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let has_summary = handle
-                .inner
-                .state
-                .lock()
-                .await
-                .summaries
-                .contains_key("conv-large-4600");
+            let has_summary = {
+                let state = handle.inner.state.lock().await;
+                state.boot_settled && state.summaries.contains_key("conv-large-4600")
+            };
             if has_summary {
                 break;
             }
@@ -5192,6 +5193,17 @@ mod tests {
         }
         send_summary(&delta_tx, "conv-large-4600", 4601);
         let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle
+            .inner
+            .state
+            .lock()
+            .await
+            .persisted_watermarks
+            .contains_key("conv-large-4600")
+        {
+            assert!(Instant::now() < deadline, "turn 2 was not ingested");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         loop {
             let snap = handle
                 .session_stats(Some("conv-large-4600"))

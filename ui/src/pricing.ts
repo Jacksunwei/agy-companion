@@ -215,10 +215,10 @@ export const MODEL_LIST_PRICES: Readonly<Record<string, ModelListPrice>> = {
 };
 
 export const CODEX_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
-  "gpt-6.2-astra": 272_000,
-  "gpt-6.2-sol": 500_000,
-  "gpt-6.1-terra": 500_000,
-  "gpt-6-luna": 272_000,
+  "gpt-6.2-astra": 1_050_000,
+  "gpt-6.2-sol": 1_050_000,
+  "gpt-6.1-terra": 1_050_000,
+  "gpt-6-luna": 1_050_000,
 };
 
 const STATIC_PLACEHOLDER_MAP: Readonly<
