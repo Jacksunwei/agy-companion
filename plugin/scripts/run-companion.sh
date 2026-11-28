@@ -43,7 +43,44 @@ is_usable_binary() {
   is_executable_file "${candidate}" && ! [[ "${candidate}" -ef "${self_path}" ]]
 }
 
+is_loopback_hybrid_url() {
+  local raw="$1"
+  local url_re='^[Hh][Tt][Tt][Pp]://(127\.0\.0\.1|[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]):([0-9]{1,5})([/?#][^[:space:]]*)?$'
+  if [[ "${raw}" =~ ${url_re} ]]; then
+    local port="${BASH_REMATCH[2]}"
+    if (( 10#${port} >= 1 && 10#${port} <= 65535 )); then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 scrub_injected_proxy_env() {
+  # Evaluate parent Hybrid Mode provenance BEFORE unsetting CLOUD_CODE_URL and
+  # AGY_COMPANION_HOOK_ACTIVE, matching companion_core::integration::detect_hybrid_active_from:
+  # non-empty CLOUD_CODE_URL wins (active iff valid loopback http://127.0.0.1:<port> or
+  # http://localhost:<port> without userinfo); else active iff AGY_COMPANION_HOOK_ACTIVE=1
+  # or AGY_COMPANION_PARENT_HYBRID_ACTIVE=1.
+  local parent_hybrid_active=0
+  local trimmed_cc="${CLOUD_CODE_URL:-}"
+  trimmed_cc="${trimmed_cc#"${trimmed_cc%%[![:space:]]*}"}"
+  trimmed_cc="${trimmed_cc%"${trimmed_cc##*[![:space:]]}"}"
+  if [[ -n "${trimmed_cc}" ]]; then
+    if is_loopback_hybrid_url "${trimmed_cc}"; then
+      parent_hybrid_active=1
+    fi
+  else
+    local trimmed_hook="${AGY_COMPANION_HOOK_ACTIVE:-}"
+    trimmed_hook="${trimmed_hook#"${trimmed_hook%%[![:space:]]*}"}"
+    trimmed_hook="${trimmed_hook%"${trimmed_hook##*[![:space:]]}"}"
+    local trimmed_parent="${AGY_COMPANION_PARENT_HYBRID_ACTIVE:-}"
+    trimmed_parent="${trimmed_parent#"${trimmed_parent%%[![:space:]]*}"}"
+    trimmed_parent="${trimmed_parent%"${trimmed_parent##*[![:space:]]}"}"
+    if [[ "${trimmed_hook}" == "1" || "${trimmed_parent}" == "1" ]]; then
+      parent_hybrid_active=1
+    fi
+  fi
+
   local prefix="${JETSKI_MCP_ENV_RESTORE_PREFIX:-}"
   case "${prefix}" in
     [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_]*)
@@ -68,6 +105,12 @@ scrub_injected_proxy_env() {
     AGY_COMPANION_ORIG_RESTORE_PREFIX AGY_COMPANION_ORIG_RESTORE_VARS \
     AGY_COMPANION_ADDED_PREFIX_CLOUD_CODE AGY_COMPANION_ADDED_PREFIX_GEMINI_BASE \
     JETSKI_MCP_ENV_RESTORE_PREFIX JETSKI_MCP_ENV_RESTORE_VARS
+
+  if [[ ${parent_hybrid_active} -eq 1 ]]; then
+    export AGY_COMPANION_PARENT_HYBRID_ACTIVE=1
+  else
+    unset AGY_COMPANION_PARENT_HYBRID_ACTIVE
+  fi
 
   # Scrub GEMINI_API_KEY only when it equals the local placeholder sentinel;
   # preserve any real user GEMINI_API_KEY and never touch GOOGLE_API_KEY.

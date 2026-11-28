@@ -498,6 +498,7 @@ pub(crate) fn build_detached_proxy_daemon_command(
     cmd.env_remove("CLOUD_CODE_URL")
         .env_remove("GOOGLE_GEMINI_BASE_URL")
         .env_remove("AGY_COMPANION_HOOK_ACTIVE")
+        .env_remove(companion_core::integration::PARENT_HYBRID_ACTIVE_ENV)
         .env_remove("AGY_COMPANION_INJECTED_URL")
         .env_remove("JETSKI_MCP_ENV_RESTORE_PREFIX")
         .env_remove("JETSKI_MCP_ENV_RESTORE_VARS")
@@ -846,6 +847,8 @@ mod tests {
             crate::plugin_upgrade::PLUGIN_DIR_ENV,
             "CLOUD_CODE_URL",
             "GOOGLE_GEMINI_BASE_URL",
+            "AGY_COMPANION_HOOK_ACTIVE",
+            companion_core::integration::PARENT_HYBRID_ACTIVE_ENV,
         ] {
             assert!(
                 removed_envs.iter().any(|k| k == key),

@@ -1391,3 +1391,107 @@ fn resolve_install_channel_follows_five_level_precedence_including_windows_uvx_p
     assert_eq!(switched.latest_version, None);
     assert_eq!(switched.last_upgrade, seeded.last_upgrade);
 }
+
+#[cfg(unix)]
+#[test]
+fn run_companion_sh_preserves_parent_hybrid_active_across_env_scrub() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let fake_bin = tmp.path().join("fake-agy-companion");
+    fs::write(
+        &fake_bin,
+        "#!/usr/bin/env bash\n\
+         printf 'CLOUD_CODE_URL=%s\\n' \"${CLOUD_CODE_URL-<UNSET>}\"\n\
+         printf 'AGY_COMPANION_HOOK_ACTIVE=%s\\n' \"${AGY_COMPANION_HOOK_ACTIVE-<UNSET>}\"\n\
+         printf 'AGY_COMPANION_PARENT_HYBRID_ACTIVE=%s\\n' \"${AGY_COMPANION_PARENT_HYBRID_ACTIVE-<UNSET>}\"\n",
+    )
+    .expect("write fake bin");
+    fs::set_permissions(&fake_bin, fs::Permissions::from_mode(0o755)).expect("chmod fake bin");
+
+    let launcher_script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/scripts/run-companion.sh");
+    assert!(
+        launcher_script.is_file(),
+        "launcher script missing at {}",
+        launcher_script.display()
+    );
+
+    let run_case = |envs: &[(&str, &str)]| -> String {
+        let mut cmd = Command::new("bash");
+        cmd.arg(&launcher_script)
+            .env_remove("CLOUD_CODE_URL")
+            .env_remove("GOOGLE_GEMINI_BASE_URL")
+            .env_remove("AGY_COMPANION_HOOK_ACTIVE")
+            .env_remove("AGY_COMPANION_PARENT_HYBRID_ACTIVE")
+            .env_remove("AGY_COMPANION_INJECTED_URL")
+            .env_remove("JETSKI_MCP_ENV_RESTORE_PREFIX")
+            .env_remove("JETSKI_MCP_ENV_RESTORE_VARS")
+            .env("AGY_COMPANION_BIN", &fake_bin);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("run launcher");
+        assert!(
+            out.status.success(),
+            "launcher failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("utf8 stdout")
+    };
+
+    // 1. Loopback CLOUD_CODE_URL -> scrubbed, AGY_COMPANION_PARENT_HYBRID_ACTIVE=1
+    for loopback in [
+        "http://127.0.0.1:4141",
+        "  http://localhost:4242/  ",
+        "HTTP://LOCALHOST:65535/v1",
+    ] {
+        let out = run_case(&[("CLOUD_CODE_URL", loopback)]);
+        assert!(
+            out.contains("CLOUD_CODE_URL=<UNSET>\n"),
+            "CLOUD_CODE_URL must be scrubbed for {loopback}: {out}"
+        );
+        assert!(
+            out.contains("AGY_COMPANION_PARENT_HYBRID_ACTIVE=1\n"),
+            "expected PARENT_HYBRID_ACTIVE=1 for {loopback}: {out}"
+        );
+    }
+
+    // 2. HOOK_ACTIVE=1 without CLOUD_CODE_URL -> scrubbed, PARENT_HYBRID_ACTIVE=1
+    let out_hook = run_case(&[("AGY_COMPANION_HOOK_ACTIVE", "1")]);
+    assert!(out_hook.contains("AGY_COMPANION_HOOK_ACTIVE=<UNSET>\n"));
+    assert!(out_hook.contains("AGY_COMPANION_PARENT_HYBRID_ACTIVE=1\n"));
+
+    // 3. Existing PARENT_HYBRID_ACTIVE=1 without CLOUD_CODE_URL -> preserved
+    let out_parent = run_case(&[("AGY_COMPANION_PARENT_HYBRID_ACTIVE", "1")]);
+    assert!(out_parent.contains("AGY_COMPANION_PARENT_HYBRID_ACTIVE=1\n"));
+
+    // 4. Day-0 unset -> PARENT_HYBRID_ACTIVE remains unset
+    let out_day0 = run_case(&[]);
+    assert!(out_day0.contains("AGY_COMPANION_PARENT_HYBRID_ACTIVE=<UNSET>\n"));
+
+    // 5. Non-loopback or invalid CLOUD_CODE_URL overrides HOOK_ACTIVE=1 and stale PARENT_HYBRID_ACTIVE=1
+    for non_loopback in [
+        "https://cloudcode-pa.googleapis.com",
+        "https://127.0.0.1:4141",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:65536",
+        "http://user:pass@127.0.0.1:4141",
+        "http://127.0.0.1:4141@evil.example",
+    ] {
+        let out = run_case(&[
+            ("CLOUD_CODE_URL", non_loopback),
+            ("AGY_COMPANION_HOOK_ACTIVE", "1"),
+            ("AGY_COMPANION_PARENT_HYBRID_ACTIVE", "1"),
+        ]);
+        assert!(
+            out.contains("CLOUD_CODE_URL=<UNSET>\n"),
+            "CLOUD_CODE_URL must be scrubbed for {non_loopback}: {out}"
+        );
+        assert!(
+            out.contains("AGY_COMPANION_PARENT_HYBRID_ACTIVE=<UNSET>\n"),
+            "non-loopback {non_loopback} must unset stale PARENT_HYBRID_ACTIVE: {out}"
+        );
+    }
+}

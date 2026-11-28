@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::protocol::PROTOCOL_VERSION;
@@ -25,6 +26,7 @@ pub struct CompanionUiServer {
     pub(crate) proxy_client: LoopbackProxyClient,
     pub(crate) config_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) integration_write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) latched_hybrid_active: Arc<AtomicBool>,
     pub(crate) options: UiServerOptions,
 }
 
@@ -58,6 +60,7 @@ impl CompanionUiServer {
             proxy_client,
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             integration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            latched_hybrid_active: Arc::new(AtomicBool::new(false)),
             options,
         })
     }
@@ -213,6 +216,18 @@ impl CompanionUiServer {
         // fetchAvailableModels refresh on our local proxy is authoritative proof of live Hybrid Mode.
         if last_catalog_refresh_at_ms.is_some() {
             launcher_integration.mark_hybrid_active();
+        }
+
+        // In production (`hybrid_active_override.is_none()`), latch hybrid_active for the lifetime
+        // of the sidecar process so a proxy restart (which resets in-memory `last_catalog_refresh_at_ms`)
+        // never regresses the UI back to "Restart required". Tests using `hybrid_active_override`
+        // bypass the latch to stay deterministic across snapshots.
+        if self.options.hybrid_active_override.is_none() {
+            if launcher_integration.hybrid_active {
+                self.latched_hybrid_active.store(true, Ordering::Relaxed);
+            } else if self.latched_hybrid_active.load(Ordering::Relaxed) {
+                launcher_integration.mark_hybrid_active();
+            }
         }
 
         SettingsSnapshot {

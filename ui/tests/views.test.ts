@@ -238,7 +238,7 @@ describe("buildBannerNode priority queue & interactions", () => {
     assert.ok(p2.textContent.includes("Local proxy offline"));
     assert.ok(p2.textContent.includes("\u2318Q"));
 
-    // Priority 3: Unix !enabled overrides !hybrid_active
+    // Priority 3b (Journey 4b): Unix !enabled && !hybrid_active overrides !hybrid_active
     const unixDisabled: SettingsSnapshot = {
       ...base,
       launcher_integration: base.launcher_integration
@@ -248,11 +248,36 @@ describe("buildBannerNode priority queue & interactions", () => {
     const p3 = buildBannerNode(makeState({ snapshot: unixDisabled }), actions) as unknown as FakeElement;
     assert.equal(p3.getAttribute("role"), "status");
     assert.ok(p3.textContent.includes("Local proxy is disabled"));
+    assert.ok(p3.textContent.includes("Your enabled models won't appear in Antigravity."));
     const enableBtn = p3.querySelector("button");
     assert.ok(enableBtn);
     assert.equal(enableBtn.textContent, "Re-enable proxy");
     enableBtn.click();
     assert.equal(calls.enableProxy, 1);
+
+    // Priority 3a (Journey 4a): Unix !enabled && hybrid_active (disabled for next launch, still active this session)
+    const unixDisabledHybrid: SettingsSnapshot = {
+      ...base,
+      launcher_integration: base.launcher_integration
+        ? { ...base.launcher_integration, state: "disabled", enabled: false, hybrid_active: true }
+        : null,
+    };
+    const p3Hybrid = buildBannerNode(
+      makeState({ snapshot: unixDisabledHybrid }),
+      actions,
+    ) as unknown as FakeElement;
+    assert.equal(p3Hybrid.getAttribute("role"), "status");
+    assert.ok(p3Hybrid.textContent.includes("Local proxy disabled for next launch"));
+    assert.ok(
+      p3Hybrid.textContent.includes(
+        "Enabled models still work in this session, but won't load after you reopen Antigravity.",
+      ),
+    );
+    const enableHybridBtn = p3Hybrid.querySelector("button");
+    assert.ok(enableHybridBtn);
+    assert.equal(enableHybridBtn.textContent, "Re-enable proxy");
+    enableHybridBtn.click();
+    assert.equal(calls.enableProxy, 2);
 
     const p3Busy = buildBannerNode(
       makeState({ snapshot: unixDisabled, updatingIntegration: true }),
@@ -510,6 +535,24 @@ describe("buildBannerNode priority queue & interactions", () => {
     assert.notEqual(
       computeBannerSignature(remState, t0),
       computeBannerSignature(remState, tLaterBucket),
+    );
+
+    // Priority 3 signature flips between Journey 4a (hybrid_active=true) and 4b (hybrid_active=false)
+    const disabledHybrid: SettingsSnapshot = {
+      ...active,
+      launcher_integration: active.launcher_integration
+        ? { ...active.launcher_integration, state: "disabled", enabled: false, hybrid_active: true }
+        : null,
+    };
+    const disabledNotHybrid: SettingsSnapshot = {
+      ...active,
+      launcher_integration: active.launcher_integration
+        ? { ...active.launcher_integration, state: "disabled", enabled: false, hybrid_active: false }
+        : null,
+    };
+    assert.notEqual(
+      computeBannerSignature(makeState({ snapshot: disabledHybrid }), 1000),
+      computeBannerSignature(makeState({ snapshot: disabledNotHybrid }), 1000),
     );
   });
 });
@@ -2045,16 +2088,24 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     );
     assert.ok(proxyWrap.textContent.includes("Reopen Antigravity"));
 
-    // Unix Disabled -> Re-enable proxy
+    // Unix Disabled (Journey 4a: hybrid_active=true) -> Disabled pill + next-launch subcopy + Re-enable proxy
     view.update(
       makeState({
         snapshot: {
           ...active,
           launcher_integration: active.launcher_integration
-            ? { ...active.launcher_integration, state: "disabled", enabled: false }
+            ? { ...active.launcher_integration, state: "disabled", enabled: false, hybrid_active: true }
             : null,
         },
       }),
+    );
+    const proxyBadge = proxyWrap.querySelector(".tag")!;
+    const proxySub = proxyWrap.querySelector(".opt-sub")!;
+    assert.equal(proxyBadge.className, "tag tag-warn");
+    assert.equal(proxyBadge.textContent, "Disabled");
+    assert.equal(
+      proxySub.textContent,
+      "Enabled models still work in this session, but won't load after you reopen Antigravity.",
     );
     const enableBtn = proxyWrap
       .querySelectorAll("button")
@@ -2062,6 +2113,22 @@ describe("createSettingsView API key lifecycle, enabled_models, Advanced plan & 
     assert.equal(enableBtn.hidden, false);
     enableBtn.click();
     assert.equal(calls.at(-1), "enableProxy");
+
+    // Unix Disabled (Journey 4b: hybrid_active=false) -> Disabled pill + offline-models subcopy
+    view.update(
+      makeState({
+        snapshot: {
+          ...active,
+          launcher_integration: active.launcher_integration
+            ? { ...active.launcher_integration, state: "disabled", enabled: false, hybrid_active: false }
+            : null,
+        },
+      }),
+    );
+    assert.equal(proxyBadge.className, "tag tag-warn");
+    assert.equal(proxyBadge.textContent, "Disabled");
+    assert.ok(proxySub.textContent.includes("Local proxy is disabled. Re-enable it, then "));
+    assert.equal(enableBtn.hidden, false);
 
     // Unix Manual -> Re-check
     view.update(makeState({ snapshot: loadOfflineSnapshot() }));

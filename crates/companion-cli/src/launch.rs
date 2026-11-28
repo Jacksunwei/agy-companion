@@ -129,6 +129,10 @@ pub fn build_hybrid_launch_env(port: u16, snapshot: &LaunchEnvSnapshot) -> Hybri
 
     set.push(("CLOUD_CODE_URL".to_string(), proxy_url.clone()));
     set.push(("GOOGLE_GEMINI_BASE_URL".to_string(), proxy_url));
+    set.push((
+        companion_core::integration::PARENT_HYBRID_ACTIVE_ENV.to_string(),
+        "1".to_string(),
+    ));
 
     if !snapshot.has_real_gemini_api_key {
         set.push((
@@ -421,12 +425,29 @@ mod tests {
         );
         assert!(rendered.contains("CLOUD_CODE_URL=\"http://127.0.0.1:4141\""));
         assert!(rendered.contains("GOOGLE_GEMINI_BASE_URL=\"http://127.0.0.1:4141\""));
+        assert!(rendered.contains("AGY_COMPANION_PARENT_HYBRID_ACTIVE=\"1\""));
         assert!(rendered.contains("GEMINI_API_KEY=\"agy-companion-local\""));
         assert!(rendered.contains("JETSKI_MCP_ENV_RESTORE_PREFIX=\"AGY_COMPANION_ORIG_\""));
         assert!(rendered.contains(
             "JETSKI_MCP_ENV_RESTORE_VARS=\"CLOUD_CODE_URL,GOOGLE_GEMINI_BASE_URL,GEMINI_API_KEY\""
         ));
         assert!(rendered.contains("/Applications/Antigravity.app/Contents/MacOS/Antigravity"));
+
+        let env = build_hybrid_launch_env(4141, &LaunchEnvSnapshot::default());
+        assert!(env.set.contains(&(
+            companion_core::integration::PARENT_HYBRID_ACTIVE_ENV.to_string(),
+            "1".to_string()
+        )));
+        let restore_vars = env
+            .set
+            .iter()
+            .find(|(k, _)| k == "JETSKI_MCP_ENV_RESTORE_VARS")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert!(
+            !restore_vars.contains(companion_core::integration::PARENT_HYBRID_ACTIVE_ENV),
+            "AGY_COMPANION_PARENT_HYBRID_ACTIVE must stay outside JETSKI_MCP_ENV_RESTORE_VARS"
+        );
 
         let quoted = format_hybrid_launch_command(4242, Path::new("/tmp/My App/Antigravity"));
         assert!(quoted.contains("'/tmp/My App/Antigravity'"));

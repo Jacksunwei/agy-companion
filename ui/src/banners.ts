@@ -58,6 +58,7 @@ export function computeBannerSignature(
 
   const byomConfigured = hasConfiguredByomProvider(snap);
   const suppressProxySetupNags = snap.ls_telemetry_active && !byomConfigured;
+  const hybridActive = li?.hybrid_active === true;
 
   if (
     !suppressProxySetupNags &&
@@ -69,12 +70,12 @@ export function computeBannerSignature(
     return JSON.stringify([
       "proxy_disabled",
       platform,
+      hybridActive,
       state.updatingIntegration,
       !state.connected || writeBusy,
     ]);
   }
 
-  const hybridActive = li?.hybrid_active === true;
   if (!suppressProxySetupNags && platform === "windows" && !hybridActive) {
     return "reopen_windows";
   }
@@ -217,6 +218,7 @@ export function buildBannerNode(
   // opt-out or reopening Antigravity for custom models the user hasn't configured.
   const byomConfigured = hasConfiguredByomProvider(snap);
   const suppressProxySetupNags = snap.ls_telemetry_active && !byomConfigured;
+  const hybridActive = li?.hybrid_active === true;
 
   // Priority 3: Explicit Unix opt-out (local proxy hook disabled)
   if (
@@ -232,11 +234,17 @@ export function buildBannerNode(
     ic.append(createIcon("warn"));
     const txt = el("div", "txt");
     txt.append(
-      el("b", null, "Local proxy is disabled"),
+      el(
+        "b",
+        null,
+        hybridActive ? "Local proxy disabled for next launch" : "Local proxy is disabled",
+      ),
       el(
         "span",
         "sub",
-        `Your enabled models won't appear in Antigravity. Re-enable the proxy, then ${quitReopenSentence(platform)}.`,
+        hybridActive
+          ? "Enabled models still work in this session, but won't load after you reopen Antigravity."
+          : `Your enabled models won't appear in Antigravity. Re-enable the proxy, then ${quitReopenSentence(platform)}.`,
       ),
     );
     const act = el("div", "b-act");
@@ -256,7 +264,6 @@ export function buildBannerNode(
   }
 
   // Priority 4: Enabled (or Windows) but Antigravity has not reconnected yet
-  const hybridActive = li?.hybrid_active === true;
   if (!suppressProxySetupNags && platform === "windows" && !hybridActive) {
     const b = el("aside", "banner warn");
     b.setAttribute("aria-label", "Reopen Antigravity");

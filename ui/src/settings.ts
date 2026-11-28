@@ -854,7 +854,9 @@ export function createSettingsView(
       } else {
         proxyBadge.className = "tag tag-warn";
         proxyBadge.textContent = "Disabled";
-        proxySub.textContent = `Local proxy is disabled. Re-enable it, then ${quitReopenSentence(platform)} to use your models.`;
+        proxySub.textContent = isHybrid
+          ? "Enabled models still work in this session, but won't load after you reopen Antigravity."
+          : `Local proxy is disabled. Re-enable it, then ${quitReopenSentence(platform)} to use your models.`;
         recheckProxyBtn.hidden = true;
         disableProxyBtn.hidden = true;
         enableProxyBtn.hidden = false;

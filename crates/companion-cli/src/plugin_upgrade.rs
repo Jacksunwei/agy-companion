@@ -331,6 +331,7 @@ fn probe_binary_version_with_timeout(candidate: &Path, timeout: Duration) -> Opt
     cmd.env_remove("CLOUD_CODE_URL")
         .env_remove("GOOGLE_GEMINI_BASE_URL")
         .env_remove("AGY_COMPANION_HOOK_ACTIVE")
+        .env_remove(companion_core::integration::PARENT_HYBRID_ACTIVE_ENV)
         .env_remove("AGY_COMPANION_INJECTED_URL")
         .env_remove("JETSKI_MCP_ENV_RESTORE_PREFIX")
         .env_remove("JETSKI_MCP_ENV_RESTORE_VARS")
