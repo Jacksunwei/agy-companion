@@ -243,6 +243,35 @@ impl ProviderAdapter for CodexProvider {
             let session_id = translated
                 .get("prompt_cache_key")
                 .and_then(serde_json::Value::as_str);
+            let reasoning_effort = translated
+                .get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    if translated.get("reasoning").is_some() {
+                        "default"
+                    } else {
+                        "disabled"
+                    }
+                });
+            let reasoning_summary = translated
+                .get("reasoning")
+                .and_then(|r| r.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("none");
+            let replayed_reasoning_items = translated
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("reasoning")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
             let codex_body = Bytes::from(serde_json::to_vec(&translated).map_err(|_| {
                 ProviderError::InvalidRequest(
                     "failed to serialize translated Codex request".to_string(),
@@ -254,6 +283,9 @@ impl ProviderAdapter for CodexProvider {
                 model = %model,
                 is_streaming,
                 body_len = codex_body.len(),
+                reasoning_effort,
+                reasoning_summary,
+                replayed_reasoning_items,
                 "forwarding Gemini request to OpenAI Codex Responses API"
             );
 
@@ -868,6 +900,7 @@ mod tests {
     fn sse_ok_response() -> Response {
         let payload = concat!(
             "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Plan step 1.\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_mock_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Plan step 1.\"}],\"encrypted_content\":\"gAAAAAB_mock_encrypted_1\"}}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"world!\"}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":500,\"input_tokens_details\":{\"cached_tokens\":300},\"output_tokens\":40,\"output_tokens_details\":{\"reasoning_tokens\":15},\"total_tokens\":540}}}\n\n",
@@ -1044,9 +1077,23 @@ mod tests {
         let unary_bytes = collect_stream(unary_resp.stream).await;
         let unary_json: serde_json::Value =
             serde_json::from_slice(&unary_bytes).expect("valid unary json");
+        let sig = unary_json["candidates"][0]["content"]["parts"][0]["thoughtSignature"]
+            .as_str()
+            .expect("unary thoughtSignature");
+        assert!(
+            !sig.is_empty()
+                && sig
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+            "thoughtSignature must be proto3-compatible standard base64, got {sig}"
+        );
         assert_eq!(
-            unary_json["candidates"][0]["content"]["parts"][0],
-            json!({ "text": "Plan step 1.", "thought": true })
+            unary_json["candidates"][0]["content"]["parts"][0]["text"],
+            "Plan step 1."
+        );
+        assert_eq!(
+            unary_json["candidates"][0]["content"]["parts"][0]["thought"],
+            true
         );
         assert_eq!(
             unary_json["candidates"][0]["content"]["parts"][1],
@@ -1055,6 +1102,52 @@ mod tests {
         assert_eq!(unary_json["candidates"][0]["finishReason"], "STOP");
         assert_eq!(unary_json["usageMetadata"]["promptTokenCount"], 500);
         assert_eq!(unary_json["usageMetadata"]["cachedContentTokenCount"], 300);
+
+        // 3. Turn 2 with THINKING_LEVEL_HIGH + circulated thoughtSignature replays reasoning item.
+        let turn2_req = ForwardRequest {
+            path_and_query: "/v1beta/models/gpt-6.2-astra:streamGenerateContent?alt=sse"
+                .to_string(),
+            body: Bytes::from(
+                json!({
+                    "contents": [
+                        { "role": "user", "parts": [{ "text": "hi" }] },
+                        {
+                            "role": "model",
+                            "parts": [
+                                { "text": "Plan step 1.", "thought": true, "thoughtSignature": sig },
+                                { "text": "Hello world!" }
+                            ]
+                        },
+                        { "role": "user", "parts": [{ "text": "follow up" }] }
+                    ],
+                    "generationConfig": {
+                        "thinkingConfig": { "thinkingLevel": "THINKING_LEVEL_HIGH" }
+                    }
+                })
+                .to_string(),
+            ),
+            content_type: Some("application/json".to_string()),
+            api_key_override: None,
+            conversation_id: Some("conv-cache-test-1234".to_string()),
+        };
+        let turn2_resp = provider
+            .forward_gemini(turn2_req)
+            .await
+            .expect("forward turn 2");
+        assert_eq!(turn2_resp.status, 200);
+        let _ = collect_stream(turn2_resp.stream).await;
+        let body2 = mock.captured_bodies.lock().unwrap()[2].clone();
+        assert_eq!(
+            body2["reasoning"],
+            json!({ "effort": "high", "summary": "auto" })
+        );
+        assert_eq!(body2["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body2["input"][1]["type"], "reasoning");
+        assert_eq!(body2["input"][1]["id"], "rs_mock_1");
+        assert_eq!(
+            body2["input"][1]["encrypted_content"],
+            "gAAAAAB_mock_encrypted_1"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2713,7 +2713,7 @@ fn merge_available_models_multi_provider_allocates_31_of_32_slots_with_explicit_
         assert_eq!(entry["maxOutputTokens"], 128_000);
         assert_eq!(entry["supportsThinking"], true);
         assert_eq!(entry["thinkingLevel"], expected_level);
-        assert_eq!(entry["supportsThoughtCirculation"], false);
+        assert_eq!(entry["supportsThoughtCirculation"], true);
         assert_eq!(entry["supportsImages"], true);
         assert_eq!(entry["supportsVideo"], false);
         assert_eq!(entry["supportsPdf"], false);
