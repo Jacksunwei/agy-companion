@@ -3042,3 +3042,53 @@ fn merge_available_models_removes_snake_case_max_token_limit_and_clamps_token_th
     );
     assert_eq!(sync["is_sync"], true);
 }
+
+#[test]
+fn merge_available_models_caps_ai_studio_gemini_max_output_tokens_at_64k() {
+    let upstream = json!({
+        "models": {
+            "gemini-4-neon-high": {
+                "model": "MODEL_PLACEHOLDER_M467",
+                "displayName": "Gemini 4 Neon (High)",
+                "maxTokens": 1048576,
+                "maxOutputTokens": 262144
+            },
+            "gemini-3.8-flash-high": {
+                "model": "MODEL_PLACEHOLDER_M468",
+                "displayName": "Gemini 3.8 Flash (High)",
+                "maxTokens": 1048576,
+                "maxOutputTokens": 32768
+            }
+        },
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "modelIds": ["gemini-4-neon-high", "gemini-3.8-flash-high"] }]
+        }]
+    });
+
+    let merged_bytes = merge_available_models(
+        &serde_json::to_vec(&upstream).unwrap(),
+        &["gemini-4-neon".to_string(), "gemini-3.8-flash".to_string()],
+        "gemini-4-neon",
+    )
+    .expect("merge succeeds");
+    let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+
+    // Upstream 262,144 (long-decode) is capped to AI Studio's 65,536 streaming limit,
+    // yielding the 835,584 (~836K) compaction window instead of 668,467.
+    let neon = &merged["models"]["companion/gemini-4-neon-high"];
+    assert_eq!(neon["maxTokens"], 1_048_576);
+    assert_eq!(neon["maxOutputTokens"], 65_536);
+    let neon_ckpt: Value = serde_json::from_str(
+        neon["modelExperiments"]["experiments"]["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]
+            ["stringValue"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(neon_ckpt["maxTokenLimit"], 835_584);
+
+    // Smaller upstream maxOutputTokens (32,768) is preserved and not inflated.
+    let flash = &merged["models"]["companion/gemini-3.8-flash-high"];
+    assert_eq!(flash["maxOutputTokens"], 32_768);
+}
