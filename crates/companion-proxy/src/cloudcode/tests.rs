@@ -2969,3 +2969,76 @@ fn merge_available_models_overrides_gemini_checkpointer_across_shared_variants_a
     .expect("valid empty upstream checkpointer JSON");
     assert_eq!(empty_ckpt["maxTokenLimit"], 835_584);
 }
+
+#[test]
+fn merge_available_models_removes_snake_case_max_token_limit_and_clamps_token_threshold() {
+    let upstream = json!({
+        "models": {
+            "gemini-4-neon-high": {
+                "model": "MODEL_PLACEHOLDER_M467",
+                "displayName": "Gemini 4 Neon (High)",
+                "maxTokens": 1048576,
+                "maxOutputTokens": 65536,
+                "modelExperimentIds": ["shared_gemini4_checkpointer"],
+                "modelExperiments": {
+                    "experiments": {
+                        "CASCADE_USE_EXPERIMENT_CHECKPOINTER": {
+                            "stringValue": "{\"max_token_limit\":\"512000\",\"token_threshold\":\"840000\",\"max_overhead_ratio\":\"0.15\"}"
+                        }
+                    }
+                }
+            }
+        },
+        "sharedModelExperiments": {
+            "shared_gemini4_checkpointer": {
+                "experiments": {
+                    "CASCADE_USE_EXPERIMENT_CHECKPOINTER/sync": {
+                        "stringValue": "{\"max_token_limit\":\"512000\",\"is_sync\":true}"
+                    }
+                }
+            }
+        },
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "modelIds": ["gemini-4-neon-high"] }]
+        }]
+    });
+
+    let merged_bytes = merge_available_models(
+        &serde_json::to_vec(&upstream).unwrap(),
+        &["gemini-4-neon".to_string()],
+        "gemini-4-neon",
+    )
+    .expect("merge succeeds");
+    let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+    let exps = merged["models"]["companion/gemini-4-neon-high"]["modelExperiments"]["experiments"]
+        .as_object()
+        .expect("experiments object");
+
+    let base: Value = serde_json::from_str(
+        exps["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]["stringValue"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(base["maxTokenLimit"], 835_584);
+    assert!(
+        base.get("max_token_limit").is_none(),
+        "snake_case max_token_limit must be removed to avoid protojson duplicate-field error"
+    );
+    assert_eq!(base["max_overhead_ratio"], "0.15");
+    assert_eq!(base["token_threshold"], 835_584);
+
+    let sync: Value = serde_json::from_str(
+        exps["CASCADE_USE_EXPERIMENT_CHECKPOINTER/sync"]["stringValue"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sync["maxTokenLimit"], 835_584);
+    assert!(
+        sync.get("max_token_limit").is_none(),
+        "snake_case max_token_limit must be removed on /sync variant too"
+    );
+    assert_eq!(sync["is_sync"], true);
+}

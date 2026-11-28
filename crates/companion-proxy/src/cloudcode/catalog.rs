@@ -22,13 +22,29 @@ fn should_override_checkpointer_key(key: &str) -> bool {
             && !key.starts_with(CONTEXT_WINDOW_VARIANT_PREFIX))
 }
 
+fn parse_json_u64(val: &Value) -> Option<u64> {
+    val.as_u64()
+        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
 fn override_checkpointer_value(existing: Option<&Value>, compaction_window: u64) -> Value {
     if let Some(raw) = existing
         .and_then(|v| v.get("stringValue"))
         .and_then(Value::as_str)
         && let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(raw)
     {
+        // Remove both snake_case and camelCase spellings before inserting so protojson
+        // never rejects the payload with a duplicate-field error.
+        obj.remove("max_token_limit");
+        obj.remove("maxTokenLimit");
         obj.insert("maxTokenLimit".to_string(), json!(compaction_window));
+        for key in ["token_threshold", "tokenThreshold"] {
+            if let Some(v) = obj.get_mut(key)
+                && parse_json_u64(v).is_some_and(|n| n > compaction_window)
+            {
+                *v = json!(compaction_window);
+            }
+        }
         return json!({ "stringValue": Value::Object(obj).to_string() });
     }
     json!({ "stringValue": json!({ "maxTokenLimit": compaction_window }).to_string() })
