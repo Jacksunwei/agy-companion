@@ -1,11 +1,11 @@
 ---
 name: local-dev
-description: Build agy-companion locally, link ./plugin into Antigravity App with scripts/dev-install.sh, iterate on the Sidecar Web UI via AGY_COMPANION_UI_HTML, handle stale proxy sidecar takeover, inspect proxy/sidecar logs, and run isolated live E2E tests with agy CLI.
+description: Build agy-companion locally and deploy via scripts/dev-install.sh (compiled binary + embedded plugin via agy-companion install, no symlinks), iterate on the Sidecar Web UI via AGY_COMPANION_UI_HTML, handle stale proxy sidecar takeover, inspect proxy/sidecar logs, and run isolated live E2E tests with agy CLI.
 ---
 
 # Local Antigravity App Development & Testing Runbook
 
-Use this skill when building `agy-companion` locally, linking `./plugin` into the Antigravity App, iterating rapidly on the embedded Sidecar Web UI, replacing a stale proxy sidecar PID, inspecting proxy/sidecar logs, or running isolated live E2E tests with `agy` CLI.
+Use this skill when building and deploying `agy-companion` locally into the Antigravity App, iterating rapidly on the embedded Sidecar Web UI, replacing a stale proxy sidecar PID, inspecting proxy/sidecar logs, or running isolated live E2E tests with `agy` CLI.
 
 ## 1. Prerequisites & Local Build
 
@@ -21,29 +21,31 @@ cargo build -p companion-cli
 cargo build --release -p companion-cli
 ```
 
-## 2. Link `./plugin` into Antigravity App & Binary Resolution
+## 2. Build & Deploy Locally into Antigravity App
 
-Link `./plugin` into `~/.gemini/config/plugins/agy-companion` using the dev helper (safe symlink only; never overwrites a real directory and never touches user Antigravity settings):
+Build the latest UI + Rust binary and deploy the compiled binary and embedded 6-file plugin bundle using `scripts/dev-install.sh` (delegates directly to `agy-companion install` — deploys real files with zero repo symlinks so `git pull` never causes plugin-vs-binary version skew, automatically migrates any legacy repo symlink, and restarts the running proxy whenever the binary bytes change):
 
 ```bash
-./scripts/dev-install.sh              # builds UI + debug binary and symlinks ./plugin
-./scripts/dev-install.sh --release    # builds UI + release binary and symlinks ./plugin
-./scripts/dev-install.sh --no-build   # symlink only (skip UI and Cargo builds)
-./scripts/dev-install.sh --dry-run    # preview actions without touching disk
-./scripts/dev-install.sh --uninstall  # safely remove symlink if it points to this repo
+./scripts/dev-install.sh              # builds UI + debug binary and runs `agy-companion install`
+./scripts/dev-install.sh --release    # builds UI + release binary and runs `agy-companion install`
+./scripts/dev-install.sh --no-build   # skip builds; deploy existing compiled binary
+./scripts/dev-install.sh --dry-run    # preview build and install commands without touching disk
+./scripts/dev-install.sh --uninstall  # delegate to `agy-companion uninstall` (supports --purge)
 ```
 
-Alternatively, `agy plugin install ./plugin` installs the plugin through the Antigravity CLI (note that linking via `./scripts/dev-install.sh` keeps the plugin pointing directly at your working checkout so local Cargo builds are picked up automatically).
+Alternatively, `cargo run -p companion-cli -- install` runs the installer directly from source (rebuild `ui/` first if UI files changed).
 
 ### How `plugin/scripts/run-companion.sh` Resolves Binaries
 
 `plugin/scripts/run-companion.sh` resolves the native binary in strict 5-step order:
 
 1. **`AGY_COMPANION_BIN`** env var (highest precedence; fails hard if set to a non-executable/non-regular file or to the launcher script itself).
-2. **Linked dev checkout auto-detection** — follows symlinks on `$0` back to `<repo_root>` and checks `<repo_root>/target/debug/agy-companion` and `<repo_root>/target/release/agy-companion` (preferring whichever is newer via `-nt`). Because of this step, a linked dev checkout **never downloads from GitHub Releases**.
-3. **Version-matched cached binary** at `${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/agy-companion}/bin/agy-companion` (verifying `.version` matches `plugin/plugin.json`).
+2. **Legacy/manual symlinked checkout auto-detection** — if `~/.gemini/config/plugins/agy-companion` is manually symlinked to `<repo>/plugin`, follows symlinks on `$0` back to `<repo_root>` and checks `<repo_root>/target/{debug,release}/agy-companion` (preferring whichever is newer via `-nt`).
+3. **Version-matched installed/cached binary** — checks `${XDG_DATA_HOME:-${HOME}/.local/share}/agy-companion/bin/agy-companion` first (so `agy-companion install` / `dev-install.sh` always beats an older same-version auto-download), then `${ANTIGRAVITY_EXECUTABLE_DATA_DIR}/bin/agy-companion`, verifying `.version` matches `plugin/plugin.json`.
 4. **`command -v agy-companion`** on `$PATH` (with self-exec guard).
-5. **HTTPS + SHA-256 verified GitHub Releases download** (`sha256sum` or `shasum -a 256`, traversal-checked tarball extraction, atomic swap).
+5. **HTTPS + SHA-256 verified GitHub Releases download** (`sha256sum` or `shasum -a 256`, traversal-checked tarball extraction, atomic swap into `ANTIGRAVITY_EXECUTABLE_DATA_DIR/bin` or XDG `bin`).
+
+> **Same-version rebuild note:** `./scripts/dev-install.sh` restarts the running `:24141` proxy daemon whenever binary bytes change, even at the same version. However, an already-open Antigravity App standby Sidecar Web UI process keeps its in-memory baked HTML until you quit (`Cmd+Q`) and reopen Antigravity — or export `AGY_COMPANION_UI_HTML` for instant HTML reload below.
 
 ## 3. Aux Panel Surface & Instant UI Iteration
 

@@ -121,7 +121,7 @@ pub enum Commands {
         /// Skip starting or upgrading the background local proxy daemon.
         #[arg(long = "no-start-proxy")]
         no_start_proxy: bool,
-        /// Overwrite an existing symlinked plugin directory (e.g. from scripts/dev-install.sh).
+        /// Overwrite an existing symlinked plugin directory (e.g. a legacy dev symlink).
         #[arg(long)]
         force: bool,
         /// Emit machine-readable JSON install report to stdout.

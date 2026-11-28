@@ -3,8 +3,8 @@
 Exercises ONLY executable runtime shims (zero static repo source/doc grepping):
 - `plugin/scripts/run-companion.sh`: dev symlink discovery, env scrubbing, XDG cache precedence,
   bad override rejection, SHA-256 & tarball safety, and physical `cd -P` symlink loop guard
-- `scripts/dev-install.sh`: dry-run, link, idempotent uninstall, zero Antigravity settings mutation,
-  real-directory/foreign-symlink/physical-`cd -P` guards
+- `scripts/dev-install.sh`: dry-run, compiled deploy via `agy-companion install` (real plugin dir, no symlink),
+  legacy repo-symlink migration, idempotent uninstall, zero Antigravity settings mutation, and overwrite guards
 - `packages/npm/agy-companion/bin/agy-companion.js`: `NODE_PATH` stub dispatch, exit-code propagation,
   missing-package and unsupported-platform errors
 - `packages/python/python/agy_companion/__init__.py`: `find_binary()` in isolated child process
@@ -199,15 +199,43 @@ class TestShimRunCompanion(E2ETestCase):
         os.chmod(cache_bin, 0o755)
         ver_file = cache_dir / ".version"
 
-        # (a) Version-matched XDG cache beats $PATH.
+        # (a) Version-matched XDG cache beats $PATH and stale same-version ANTIGRAVITY_EXECUTABLE_DATA_DIR.
+        exec_cache_dir = env.root / "exec_data_cache"
+        exec_bin_dir = exec_cache_dir / "bin"
+        exec_bin_dir.mkdir(parents=True, exist_ok=True)
+        exec_bin = exec_bin_dir / "agy-companion"
+        exec_bin.write_text("#!/bin/sh\necho FROM_EXEC_CACHE\n", encoding="utf-8")
+        os.chmod(exec_bin, 0o755)
+        (exec_bin_dir / ".version").write_text(f"{version}\n", encoding="utf-8")
+
         ver_file.write_text(f"{version}\n", encoding="utf-8")
         r_hit = run_cli(
             ["/bin/bash", str(iso_script)],
-            env=env.build_env(extra={"PATH": str(safe_bin)}),
+            env=env.build_env(
+                extra={
+                    "PATH": str(safe_bin),
+                    "ANTIGRAVITY_EXECUTABLE_DATA_DIR": str(exec_cache_dir),
+                }
+            ),
             timeout=5.0,
         )
         self.assertEqual(r_hit.returncode, 0, r_hit.stderr)
         self.assertEqual(r_hit.stdout.strip(), "FROM_XDG_CACHE")
+
+        # (a2) When XDG cache version mismatches, matching ANTIGRAVITY_EXECUTABLE_DATA_DIR still wins over PATH.
+        ver_file.write_text("0.0.1\n", encoding="utf-8")
+        r_exec = run_cli(
+            ["/bin/bash", str(iso_script)],
+            env=env.build_env(
+                extra={
+                    "PATH": str(safe_bin),
+                    "ANTIGRAVITY_EXECUTABLE_DATA_DIR": str(exec_cache_dir),
+                }
+            ),
+            timeout=5.0,
+        )
+        self.assertEqual(r_exec.returncode, 0, r_exec.stderr)
+        self.assertEqual(r_exec.stdout.strip(), "FROM_EXEC_CACHE")
 
         # (b) Mismatched, missing, symlinked, and FIFO .version all skip cache cleanly -> PATH.
         ver_target = env.root / "ver_target.txt"
@@ -243,6 +271,29 @@ class TestShimRunCompanion(E2ETestCase):
             timeout=5.0,
         )
         self.assertNotEqual(r_bad.returncode, 0)
+
+        # (d) ANTIGRAVITY_EXECUTABLE_DATA_DIR containing '..' traversal fails closed without executing target.
+        trav_base = env.root / "exec_trav"
+        (trav_base / "sub").mkdir(parents=True)
+        evil_bin_dir = trav_base / "evil_exec" / "bin"
+        evil_bin_dir.mkdir(parents=True)
+        evil_bin = evil_bin_dir / "agy-companion"
+        evil_bin.write_text("#!/bin/sh\necho FROM_EVIL_EXEC\n", encoding="utf-8")
+        os.chmod(evil_bin, 0o755)
+        (evil_bin_dir / ".version").write_text(f"{version}\n", encoding="utf-8")
+        r_trav = run_cli(
+            ["/bin/bash", str(iso_script), "--version"],
+            env=env.build_env(
+                extra={
+                    "ANTIGRAVITY_EXECUTABLE_DATA_DIR": f"{trav_base}/sub/../evil_exec",
+                    "PATH": str(safe_bin),
+                }
+            ),
+            timeout=5.0,
+        )
+        self.assertNotEqual(r_trav.returncode, 0, f"stdout={r_trav.stdout}\nstderr={r_trav.stderr}")
+        self.assertNotIn("FROM_EVIL_EXEC", r_trav.stdout)
+        self.assertIn("..", r_trav.stderr)
 
     def test_shim_run_companion_sha256_tarball_and_physical_cd_security(self) -> None:
         """run-companion.sh enforces SHA-256 verification, tarball traversal/symlink guards, and physical cd -P."""
@@ -368,78 +419,242 @@ class TestShimDevInstall(E2ETestCase):
     SUITE = "shims"
     FEATURE = "SHIM_DEV_INSTALL"
 
-    def test_shim_dev_install_dry_run_link_and_idempotent_uninstall(self) -> None:
-        """dev-install.sh links/uninstalls idempotently, respects --dry-run, and never mutates Antigravity config.json."""
+    def test_shim_dev_install_dry_run_deploy_and_idempotent_uninstall(self) -> None:
+        """dev-install.sh deploys real plugin files via `agy-companion install`, respects AGY_PLUGINS_DIR & --dry-run, uninstalls cleanly, and never mutates Antigravity config.json."""
         if os.name == "nt":
             self.skipTest("POSIX dev-install.sh test")
+        binary = self.require_binary()
         script = self.repo_root / "scripts" / "dev-install.sh"
         env = self.make_env()
-        proc_env = env.build_env()
+        # Pre-write isolated config with ephemeral port so install never probes live port 24141.
+        env.write_config(env.make_config_dict())
+        proc_env = env.build_env(extra={"AGY_COMPANION_BIN": str(binary)})
         gemini_cfg = env.home_dir / ".gemini" / "config" / "config.json"
         gemini_cfg.parent.mkdir(parents=True, exist_ok=True)
         canary = '{"custom":"do-not-touch"}\n'
         gemini_cfg.write_text(canary, encoding="utf-8")
 
         pdir = env.root / "dev_plugins"
-        link = pdir / "agy-companion"
+        deployed = pdir / "agy-companion"
+        stable_bin = env.data_dir / "bin" / "agy-companion"
+        default_plugins_dir = env.home_dir / ".gemini" / "config" / "plugins"
 
-        r_dry = run_cli([str(script), "--no-build", "--dry-run", "--plugins-dir", str(pdir)], env=proc_env)
+        # (a) --dry-run prints planned install command without mutating disk; --dry-run --json fails with exit 2.
+        r_dry = run_cli(
+            [
+                str(script),
+                "--no-build",
+                "--dry-run",
+                "--no-launcher-hook",
+                "--no-start-proxy",
+                "--plugins-dir",
+                str(pdir),
+            ],
+            env=proc_env,
+        )
         self.assertEqual(r_dry.returncode, 0, r_dry.stderr)
-        self.assertFalse(link.exists() or link.is_symlink())
+        self.assertIn("[dry-run]", r_dry.stdout)
+        self.assertIn("install", r_dry.stdout)
+        self.assertFalse(deployed.exists() or deployed.is_symlink())
+        self.assertFalse(stable_bin.exists())
 
-        r_inst = run_cli([str(script), "--no-build", "--plugins-dir", str(pdir)], env=proc_env)
-        self.assertEqual(r_inst.returncode, 0, r_inst.stderr)
-        self.assertTrue(link.is_symlink())
-        self.assertEqual(link.resolve(), (self.repo_root / "plugin").resolve())
+        r_dry_json = run_cli(
+            [str(script), "--no-build", "--dry-run", "--json", "--plugins-dir", str(pdir)],
+            env=proc_env,
+        )
+        self.assertEqual(r_dry_json.returncode, 2, r_dry_json.stderr)
 
-        r_udry = run_cli([str(script), "--uninstall", "--dry-run", "--plugins-dir", str(pdir)], env=proc_env)
+        # (b) AGY_PLUGINS_DIR env override forwards --plugins-dir (leaves ~/.gemini/config/plugins untouched).
+        env_pdir = env.root / "env_plugins"
+        env_deployed = env_pdir / "agy-companion"
+        agy_pdir_env = env.build_env(
+            extra={"AGY_COMPANION_BIN": str(binary), "AGY_PLUGINS_DIR": str(env_pdir)}
+        )
+        r_env_inst = run_cli(
+            [str(script), "--no-build", "--no-launcher-hook", "--no-start-proxy", "--json"],
+            env=agy_pdir_env,
+        )
+        self.assertEqual(r_env_inst.returncode, 0, f"{r_env_inst.stdout}\n{r_env_inst.stderr}")
+        self.assertIs(r_env_inst.json_stdout().get("ok"), True)
+        self.assertTrue(env_deployed.is_dir() and not env_deployed.is_symlink())
+        self.assertFalse(default_plugins_dir.exists(), "AGY_PLUGINS_DIR must not mutate default plugins dir")
+
+        r_env_uninst = run_cli([str(script), "--uninstall", "--json"], env=agy_pdir_env)
+        self.assertEqual(r_env_uninst.returncode, 0, f"{r_env_uninst.stdout}\n{r_env_uninst.stderr}")
+        self.assertIs(r_env_uninst.json_stdout().get("plugin_dir_removed"), True)
+        self.assertFalse(env_deployed.exists() or env_deployed.is_symlink())
+
+        # (c) Explicit --plugins-dir deploy writes 6 real files + stable_bin + .version, and deployed run-companion.sh uses stable_bin.
+        r_inst = run_cli(
+            [
+                str(script),
+                "--no-build",
+                "--no-launcher-hook",
+                "--no-start-proxy",
+                "--plugins-dir",
+                str(pdir),
+                "--json",
+            ],
+            env=proc_env,
+        )
+        self.assertEqual(r_inst.returncode, 0, f"{r_inst.stdout}\n{r_inst.stderr}")
+        self.assertIs(r_inst.json_stdout().get("ok"), True)
+        self.assertTrue(deployed.is_dir() and not deployed.is_symlink())
+        deployed_files = [p for p in deployed.rglob("*") if p.is_file() and not p.is_symlink()]
+        self.assertEqual(len(deployed_files), 6, f"Expected 6 real plugin files, got {deployed_files}")
+        self.assertTrue(stable_bin.is_file() and os.access(stable_bin, os.X_OK))
+        self.assertTrue((env.data_dir / "bin" / ".version").is_file())
+
+        expected_version = json.loads((deployed / "plugin.json").read_text(encoding="utf-8"))["version"]
+        safe_bin = _build_safe_bin_dir(env)
+        r_launch = run_cli(
+            ["/bin/bash", str(deployed / "scripts" / "run-companion.sh"), "--version"],
+            env=env.build_env(extra={"PATH": str(safe_bin)}),
+            timeout=10.0,
+        )
+        self.assertEqual(r_launch.returncode, 0, f"{r_launch.stdout}\n{r_launch.stderr}")
+        self.assertEqual(r_launch.stdout.strip(), f"agy-companion {expected_version}")
+
+        # (d) --uninstall --dry-run preserves files; repeated --uninstall is idempotent; ~/.gemini/config/config.json untouched.
+        r_udry = run_cli(
+            [str(script), "--uninstall", "--dry-run", "--plugins-dir", str(pdir), "--json"],
+            env=proc_env,
+        )
         self.assertEqual(r_udry.returncode, 0, r_udry.stderr)
-        self.assertTrue(link.is_symlink())
+        self.assertIs(r_udry.json_stdout().get("dry_run"), True)
+        self.assertTrue(deployed.is_dir())
+        self.assertTrue(stable_bin.is_file())
 
-        r_un1 = run_cli([str(script), "--uninstall", "--plugins-dir", str(pdir)], env=proc_env)
-        self.assertEqual(r_un1.returncode, 0, r_un1.stderr)
-        self.assertFalse(link.exists() or link.is_symlink())
+        r_un1 = run_cli([str(script), "--uninstall", "--plugins-dir", str(pdir), "--json"], env=proc_env)
+        self.assertEqual(r_un1.returncode, 0, f"{r_un1.stdout}\n{r_un1.stderr}")
+        self.assertIs(r_un1.json_stdout().get("plugin_dir_removed"), True)
+        self.assertFalse(deployed.exists() or deployed.is_symlink())
+        self.assertFalse(stable_bin.exists())
 
-        r_un2 = run_cli([str(script), "--uninstall", "--plugins-dir", str(pdir)], env=proc_env)
-        self.assertEqual(r_un2.returncode, 0, r_un2.stderr)
-        self.assertIn("Nothing to uninstall", r_un2.stdout + r_un2.stderr)
+        r_un2 = run_cli([str(script), "--uninstall", "--plugins-dir", str(pdir), "--json"], env=proc_env)
+        self.assertEqual(r_un2.returncode, 0, f"{r_un2.stdout}\n{r_un2.stderr}")
+        self.assertIs(r_un2.json_stdout().get("ok"), True)
+        self.assertIs(r_un2.json_stdout().get("plugin_dir_removed"), False)
         self.assertEqual(gemini_cfg.read_text(encoding="utf-8"), canary)
 
-    def test_shim_dev_install_physical_symlink_and_overwrite_guards(self) -> None:
-        """dev-install.sh refuses overwriting/removing real directories, foreign symlinks, and logical-cd decoys."""
+        # (e) CARGO_TARGET_DIR override is respected when AGY_COMPANION_BIN is unset.
+        custom_target = env.root / "custom_cargo_target"
+        custom_bin = custom_target / "debug" / "agy-companion"
+        custom_bin.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(binary, custom_bin)
+        os.chmod(custom_bin, 0o755)
+        r_cargo_target = run_cli(
+            [str(script), "--no-build", "--dry-run", "--plugins-dir", str(pdir)],
+            env=env.build_env(extra={"CARGO_TARGET_DIR": str(custom_target)}),
+        )
+        self.assertEqual(r_cargo_target.returncode, 0, r_cargo_target.stderr)
+        self.assertIn(str(custom_bin), r_cargo_target.stdout)
+
+        # (f) Invalid AGY_COMPANION_BIN, blank CARGO_TARGET_DIR, XDG_DATA_HOME '..' traversal, and --config=-* fail closed.
+        for bad_label, extra_env, extra_args in (
+            ("blank_bin", {"AGY_COMPANION_BIN": "   "}, ["--uninstall", "--dry-run"]),
+            ("missing_bin", {"AGY_COMPANION_BIN": "/nonexistent/agy-companion"}, ["--uninstall", "--dry-run"]),
+            ("self_exec", {"AGY_COMPANION_BIN": str(script)}, ["--uninstall", "--dry-run"]),
+            ("empty_cargo_target", {"CARGO_TARGET_DIR": ""}, ["--no-build", "--dry-run"]),
+            ("blank_cargo_target", {"CARGO_TARGET_DIR": "   "}, ["--no-build", "--dry-run"]),
+            ("xdg_dotdot", {"AGY_COMPANION_BIN": str(binary), "XDG_DATA_HOME": "/tmp/../escape"}, ["--uninstall", "--dry-run"]),
+            ("dash_config_eq", {"AGY_COMPANION_BIN": str(binary)}, ["--config=-foo", "--no-build", "--dry-run"]),
+        ):
+            r_bad = run_cli(
+                [str(script), *extra_args, "--plugins-dir", str(pdir)],
+                env=env.build_env(extra=extra_env),
+            )
+            self.assertNotEqual(r_bad.returncode, 0, f"{bad_label} must fail closed")
+
+    def test_shim_dev_install_legacy_symlink_migration_and_overwrite_guards(self) -> None:
+        """dev-install.sh fails fast before builds and migrates legacy repo symlinks while refusing foreign symlinks, non-companion dirs, and logical-cd decoys."""
         if os.name == "nt":
             self.skipTest("POSIX dev-install.sh test")
+        binary = self.require_binary()
         script = self.repo_root / "scripts" / "dev-install.sh"
         env = self.make_env()
-        proc_env = env.build_env()
+        # Pre-write isolated config with ephemeral port so install never probes live port 24141.
+        env.write_config(env.make_config_dict())
+        proc_env = env.build_env(extra={"AGY_COMPANION_BIN": str(binary)})
 
-        # Real non-symlink directory preserved on both install & uninstall.
+        # (a) Non-companion real directory (missing or foreign plugin.json) fails fast before build and is preserved on --uninstall.
         pdir_real = env.root / "real_dir_case"
         real_plugin = pdir_real / "agy-companion"
         real_plugin.mkdir(parents=True, exist_ok=True)
         marker = real_plugin / "keep.txt"
         marker.write_text("keep\n", encoding="utf-8")
-        self.assertNotEqual(
-            run_cli([str(script), "--no-build", "--plugins-dir", str(pdir_real)], env=proc_env).returncode, 0
+        no_build_tools_env = env.build_env(
+            extra={"PATH": str(_build_safe_bin_dir(env)), "CARGO_TARGET_DIR": str(env.root / "empty_target")}
         )
-        self.assertNotEqual(
-            run_cli([str(script), "--uninstall", "--plugins-dir", str(pdir_real)], env=proc_env).returncode, 0
+        for extra_flag in (["--dry-run"], ["--no-build"]):
+            self.assertNotEqual(
+                run_cli(
+                    [
+                        str(script),
+                        *extra_flag,
+                        "--no-launcher-hook",
+                        "--no-start-proxy",
+                        "--plugins-dir",
+                        str(pdir_real),
+                    ],
+                    env=proc_env,
+                ).returncode,
+                0,
+                f"non-companion dir must fail with {extra_flag}",
+            )
+        (real_plugin / "plugin.json").write_text('{"name":"other-plugin"}\n', encoding="utf-8")
+        r_other = run_cli([str(script), "--plugins-dir", str(pdir_real)], env=no_build_tools_env)
+        self.assertNotEqual(r_other.returncode, 0)
+        self.assertNotIn("npm not found", r_other.stderr)
+        r_un_real = run_cli(
+            [str(script), "--uninstall", "--plugins-dir", str(pdir_real), "--json"],
+            env=proc_env,
         )
+        self.assertEqual(r_un_real.returncode, 0, f"{r_un_real.stdout}\n{r_un_real.stderr}")
+        self.assertIs(r_un_real.json_stdout().get("plugin_dir_removed"), False)
         self.assertTrue(marker.is_file())
 
-        # Foreign symlink refused on uninstall.
+        # (b) Foreign symlinks (valid + dangling) and symlinked PLUGINS_DIR fail fast before build without --force.
         pdir_foreign = env.root / "foreign_case"
         foreign_target = env.root / "foreign_plugin"
         pdir_foreign.mkdir()
         foreign_target.mkdir()
         foreign_link = pdir_foreign / "agy-companion"
         os.symlink(foreign_target, foreign_link)
-        self.assertNotEqual(
-            run_cli([str(script), "--uninstall", "--plugins-dir", str(pdir_foreign)], env=proc_env).returncode, 0
-        )
+        for extra_flag in (["--dry-run"], ["--no-build"]):
+            self.assertNotEqual(
+                run_cli(
+                    [
+                        str(script),
+                        *extra_flag,
+                        "--no-launcher-hook",
+                        "--no-start-proxy",
+                        "--plugins-dir",
+                        str(pdir_foreign),
+                    ],
+                    env=proc_env,
+                ).returncode,
+                0,
+                f"foreign symlink must fail with {extra_flag}",
+            )
         self.assertTrue(foreign_link.is_symlink())
 
-        # CF-1 Probe 1A (False Allow): logical-cd decoy must be refused, preserving victim symlink.
+        pdir_dangling = env.root / "dangling_foreign_case"
+        pdir_dangling.mkdir()
+        dangling_link = pdir_dangling / "agy-companion"
+        os.symlink(env.root / "nonexistent_target", dangling_link)
+        r_dangling = run_cli([str(script), "--plugins-dir", str(pdir_dangling)], env=no_build_tools_env)
+        self.assertNotEqual(r_dangling.returncode, 0)
+        self.assertNotIn("npm not found", r_dangling.stderr)
+        self.assertTrue(dangling_link.is_symlink())
+
+        sym_plugins_dir = env.root / "sym_plugins_dir"
+        os.symlink(pdir_foreign, sym_plugins_dir)
+        r_sym_dir = run_cli([str(script), "--plugins-dir", str(sym_plugins_dir)], env=no_build_tools_env)
+        self.assertNotEqual(r_sym_dir.returncode, 0)
+        self.assertNotIn("npm not found", r_sym_dir.stderr)
+
+        # (c) CF-1 Probe 1A (False Allow): logical-cd decoy must NOT trigger legacy symlink auto-migration.
         probe = env.root / "cf1_probe_1a"
         parent = probe / "parent"
         victim_sub = probe / "victim_dir" / "sub"
@@ -451,19 +666,79 @@ class TestShimDevInstall(E2ETestCase):
         os.symlink(victim_sub, parent / "link_dir")
         victim_link = victim_sub / "agy-companion"
         os.symlink("../plugin", victim_link)
-        r_1a = run_cli([str(script), "--uninstall", "--plugins-dir", str(parent / "link_dir")], env=proc_env)
+        r_1a = run_cli(
+            [
+                str(script),
+                "--no-build",
+                "--no-launcher-hook",
+                "--no-start-proxy",
+                "--plugins-dir",
+                str(parent / "link_dir"),
+            ],
+            env=proc_env,
+        )
         self.assertNotEqual(r_1a.returncode, 0, r_1a.stdout)
         self.assertTrue(victim_link.is_symlink())
 
-        # CF-1 Probe 1B (False Deny): valid relative symlink physically resolving to repo plugin must be removed.
-        good_sub = env.root / "cf1_probe_1b" / "good_dir" / "sub"
-        good_sub.mkdir(parents=True)
-        os.symlink(self.repo_root / "scripts", good_sub / "link_to_repo_scripts")
-        good_link = good_sub / "agy-companion"
-        os.symlink("./link_to_repo_scripts/../plugin", good_link)
-        r_1b = run_cli([str(script), "--uninstall", "--plugins-dir", str(good_sub)], env=proc_env)
-        self.assertEqual(r_1b.returncode, 0, r_1b.stderr)
-        self.assertFalse(good_link.exists() or good_link.is_symlink())
+        # (d) Legacy repo symlink (direct and CF-1 Probe 1B physical relative) migrates cleanly to real dir.
+        for case_name, setup_fn in (
+            ("direct", lambda sub: os.symlink(self.repo_root / "plugin", sub / "agy-companion")),
+            (
+                "physical_rel",
+                lambda sub: (
+                    os.symlink(self.repo_root / "scripts", sub / "link_to_repo_scripts"),
+                    os.symlink("./link_to_repo_scripts/../plugin", sub / "agy-companion"),
+                ),
+            ),
+        ):
+            mig_dir = env.root / f"migrate_{case_name}"
+            mig_dir.mkdir(parents=True)
+            setup_fn(mig_dir)
+            r_mig = run_cli(
+                [
+                    str(script),
+                    "--no-build",
+                    "--no-launcher-hook",
+                    "--no-start-proxy",
+                    "--plugins-dir",
+                    str(mig_dir),
+                    "--json",
+                ],
+                env=proc_env,
+            )
+            self.assertEqual(r_mig.returncode, 0, f"{case_name}: {r_mig.stdout}\n{r_mig.stderr}")
+            self.assertIs(r_mig.json_stdout().get("ok"), True)
+            target = mig_dir / "agy-companion"
+            self.assertTrue(target.is_dir() and not target.is_symlink(), f"{case_name} should be real dir")
+            self.assertTrue((self.repo_root / "plugin" / "plugin.json").is_file())
+
+        # (e) Legacy-symlink-only --uninstall (no compiled binary present): --dry-run keeps it; real uninstall removes it.
+        legacy_only_dir = env.root / "legacy_only_uninstall"
+        legacy_only_dir.mkdir()
+        legacy_only_link = legacy_only_dir / "agy-companion"
+        os.symlink(self.repo_root / "plugin", legacy_only_link)
+        no_bin_env = env.build_env(
+            extra={
+                "PATH": str(_build_safe_bin_dir(env, name="safe_bin_no_bin")),
+                "CARGO_TARGET_DIR": str(env.root / "empty_target_uninstall"),
+                "XDG_DATA_HOME": str(env.root / "empty_xdg_data"),
+            }
+        )
+        r_leg_dry = run_cli(
+            [str(script), "--uninstall", "--dry-run", "--plugins-dir", str(legacy_only_dir)],
+            env=no_bin_env,
+        )
+        self.assertEqual(r_leg_dry.returncode, 0, r_leg_dry.stderr)
+        self.assertIn("[dry-run]", r_leg_dry.stdout)
+        self.assertTrue(legacy_only_link.is_symlink())
+
+        r_leg_rm = run_cli(
+            [str(script), "--uninstall", "--plugins-dir", str(legacy_only_dir)],
+            env=no_bin_env,
+        )
+        self.assertEqual(r_leg_rm.returncode, 0, r_leg_rm.stderr)
+        self.assertFalse(legacy_only_link.exists() or legacy_only_link.is_symlink())
+        self.assertTrue((self.repo_root / "plugin" / "plugin.json").is_file())
 
 
 class TestShimNpmPackaging(E2ETestCase):

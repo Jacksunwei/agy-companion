@@ -45,7 +45,7 @@ The core artifact is a standalone, zero-dependency native Rust binary built once
 
 | Channel | Runtime Required | How It Works |
 | --- | --- | --- |
-| **Plugin launcher** *(zero-prereq default)* | None | POSIX launcher (`plugin/scripts/run-companion.sh`) used by `sidecar.json` (`serve`): checks (1) version-matched cached binary in `$ANTIGRAVITY_EXECUTABLE_DATA_DIR/bin/` or `${PLUGIN_DATA}/bin/`, (2) `agy-companion` on `$PATH`, or (3) auto-downloads the SHA-256-verified binary from GitHub Releases on first run. |
+| **Plugin launcher** *(zero-prereq default)* | None | POSIX launcher (`plugin/scripts/run-companion.sh`) used by `sidecar.json` (`serve`): checks (1) version-matched installed/cached binary in `${PLUGIN_DATA}/bin/` (`$XDG_DATA_HOME/agy-companion/bin/`) before `$ANTIGRAVITY_EXECUTABLE_DATA_DIR/bin/`, (2) `agy-companion` on `$PATH`, or (3) auto-downloads the SHA-256-verified binary from GitHub Releases on first run. |
 | **Direct binary / install script / Homebrew** | None | `curl -fsSL ... \| sh` (same pattern as `agy` CLI). |
 | **npm** (`esbuild` / `turbo` / `oxlint` pattern) | Node (only if chosen) | Unscoped meta-package `agy-companion` + scoped `@agy-companion/<os>-<arch>` `optionalDependencies` + thin `bin/agy-companion.js` `execFileSync` shim. |
 | **PyPI** (`ruff` / `uv` pattern) | Python / `uv` (only if chosen) | `maturin` (`bindings = "bin"`) platform wheels shipping the same binary + thin Python launcher. |

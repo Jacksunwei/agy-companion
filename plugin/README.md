@@ -114,7 +114,7 @@ export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:24141"
 | **Usage database** | `config.usage_dir` → `$XDG_DATA_HOME/agy-companion/usage` → Platform default (stores `usage.db`) | WAL-mode SQLite, Unix mode `0600` (`usage.db`, `-wal`, `-shm`); metadata only for built-in + BYOM requests (zero prompt text or keys); symlinks, FIFOs, NUL bytes, and `..` traversal rejected |
 | **Launcher hook & daemon files** | `$XDG_DATA_HOME/agy-companion/{env.sh,integration.lock,proxy.pid,proxy.log}` (default `~/.local/share/agy-companion/`) | `0600` zero-`eval` `env.sh`, `0600` cross-process `integration.lock`, structured `proxy.pid`, and rotating `5 MiB` `proxy.log` |
 | **Sidecar logs** | `~/.gemini/antigravity/sidecar_data/agy-companion/proxy/logs/` | Managed by Antigravity App for the `proxy` sidecar |
-| **Cached / installed binary** | `${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-${XDG_DATA_HOME:-~/.local/share}/agy-companion}/bin/agy-companion` | Version-matched cache checked **before** unversioned `$PATH` in `scripts/run-companion.sh` |
+| **Cached / installed binary** | `${XDG_DATA_HOME:-~/.local/share}/agy-companion/bin/agy-companion`, then `${ANTIGRAVITY_EXECUTABLE_DATA_DIR}/bin/agy-companion` | Version-matched installed/cached binary checked **before** unversioned `$PATH` in `scripts/run-companion.sh` (explicit XDG install precedes auto-download cache on same version) |
 
 **Platform Defaults:**
 
@@ -144,7 +144,8 @@ export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:24141"
 When developing from a local checkout:
 
 - **`AGY_COMPANION_BIN`**: Point directly to a local executable binary (highest precedence in `scripts/run-companion.sh`; fails fast with an error if set to a non-executable path).
-- **Linked dev checkout auto-detection**: If `./plugin` is symlinked into `~/.gemini/config/plugins/agy-companion`, `scripts/run-companion.sh` follows symlinks and automatically runs `<repo>/target/debug/agy-companion` or `<repo>/target/release/agy-companion` (preferring the newer build) without downloading from GitHub Releases. `scripts/run-companion.sh` scrubs inherited proxy env vars before `exec`ing `serve`.
+- **`./scripts/dev-install.sh`**: Builds the UI + Rust binary and deploys real plugin files and the stable binary via `agy-companion install` (zero repo symlinks, avoiding `git pull` version skew).
+- **Manual symlinked checkout auto-detection**: If `./plugin` is manually symlinked into `~/.gemini/config/plugins/agy-companion`, `scripts/run-companion.sh` follows symlinks and runs `<repo>/target/{debug,release}/agy-companion` (preferring the newer build) without downloading from GitHub Releases. `scripts/run-companion.sh` scrubs inherited proxy env vars before `exec`ing `serve`.
 - **`AGY_COMPANION_UI_HTML`**: Point the Sidecar Web UI (`agy-companion serve`) at a freshly built `ui/dist/index.html` file. The server re-reads the file on every `GET /`, allowing UI rebuilds (`npm --prefix ui run build`) without recompiling Rust.
 
 ## Troubleshooting

@@ -12,7 +12,7 @@ Thanks for helping improve `agy-companion`! For large changes or new provider ad
 ## Build from Source
 
 ```bash
-# Build UI + Rust debug binary and symlink ./plugin for local Antigravity testing
+# Build UI + Rust debug binary and deploy via `agy-companion install` (real files, no symlinks)
 ./scripts/dev-install.sh
 
 # Or run the full installer directly from source

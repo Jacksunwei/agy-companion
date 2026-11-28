@@ -128,7 +128,7 @@ pub enum PluginManifestRead {
 
 /// Reads and validates `<plugin_dir>/plugin.json` fail-closed per S6.
 ///
-/// Permits a symlinked `plugin_dir` parent (e.g. `scripts/dev-install.sh`), but rejects
+/// Permits a symlinked `plugin_dir` parent (e.g. a legacy/manual symlinked checkout), but rejects
 /// symlinked/FIFO/non-regular or oversized (`> 64 KiB`) leaf `plugin.json`, non-matching
 /// `"name"`, or invalid `"version"` as `PluginManifestRead::Invalid`.
 pub fn read_plugin_manifest_version(plugin_dir: &Path) -> PluginManifestRead {
@@ -239,8 +239,8 @@ pub(crate) struct CandidateDiscoveryInputs<'a> {
 /// 1. `AGY_COMPANION_BIN`
 /// 2. Dev sibling `<repo>/target/{debug,release}/agy-companion` (newer mtime first)
 /// 3. Startup-captured `current_exe()`
-/// 4. `${ANTIGRAVITY_EXECUTABLE_DATA_DIR}/bin/agy-companion`
-/// 5. `companion_core::default_data_dir()/bin/agy-companion`
+/// 4. `companion_core::default_data_dir()/bin/agy-companion`
+/// 5. `${ANTIGRAVITY_EXECUTABLE_DATA_DIR}/bin/agy-companion`
 /// 6. `$PATH`
 pub(crate) fn collect_candidate_binaries_from(
     inputs: CandidateDiscoveryInputs<'_>,
@@ -269,14 +269,14 @@ pub(crate) fn collect_candidate_binaries_from(
         push_unique(exe.to_path_buf());
     }
 
+    if let Some(data_dir) = inputs.default_data_dir {
+        push_unique(data_dir.join("bin").join(BIN_FILENAME));
+    }
+
     if let Some(raw) = inputs.executable_data_dir_env
         && let Some(dir) = validate_env_path(raw)
     {
         push_unique(dir.join("bin").join(BIN_FILENAME));
-    }
-
-    if let Some(data_dir) = inputs.default_data_dir {
-        push_unique(data_dir.join("bin").join(BIN_FILENAME));
     }
 
     if let Some(path_var) = inputs.path_env {
@@ -630,7 +630,7 @@ mod tests {
                 PluginManifestRead::Invalid
             );
 
-            // Symlinked plugin_dir parent with regular leaf plugin.json -> allowed (dev-install)
+            // Symlinked plugin_dir parent with regular leaf plugin.json -> allowed (legacy/manual symlink)
             let real_dir = temp.path().join("real_plugin_dir");
             fs::create_dir(&real_dir).expect("create real_dir");
             fs::write(
@@ -721,11 +721,11 @@ mod tests {
         assert_eq!(candidates[1], expected_debug);
         assert_eq!(candidates[2], expected_release);
         assert_eq!(candidates[3], startup_exe);
-        assert_eq!(candidates[4], exec_data_dir.join("bin").join(BIN_FILENAME));
         assert_eq!(
-            candidates[5],
+            candidates[4],
             default_data_dir.join("bin").join(BIN_FILENAME)
         );
+        assert_eq!(candidates[5], exec_data_dir.join("bin").join(BIN_FILENAME));
         assert_eq!(candidates[6], path_dir.join(BIN_FILENAME));
 
         #[cfg(unix)]

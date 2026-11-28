@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use bundle::install_local_bin_symlink;
 use bundle::{
-    STABLE_BIN_NAME, is_companion_plugin_dir, is_same_file_path, select_fresh_install_port,
-    stage_binary_copy, stage_version_file, swap_plugin_dir_two_step,
-    swap_staged_binary_and_version, write_staged_plugin_dir,
+    STABLE_BIN_NAME, files_have_identical_bytes, is_companion_plugin_dir, is_same_file_path,
+    is_stable_bin_ready_exact, select_fresh_install_port, stage_binary_copy, stage_version_file,
+    swap_plugin_dir_two_step, swap_staged_binary_and_version, write_staged_plugin_dir,
 };
 use format::format_install_report;
 use proxy::{InstallProxyContext, InstallProxyOutcome, ensure_installed_proxy_running};
@@ -145,7 +145,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
             Ok(PathLeafKind::Symlink) => {
                 if !opts.force {
                     return Err(CliError::Install(format!(
-                        "plugin path '{}' is a symlink (likely linked via scripts/dev-install.sh); re-run with --force to replace the symlink without deleting its target",
+                        "plugin path '{}' is a symlink (e.g. a legacy dev symlink); re-run with --force to replace the symlink without deleting its target",
                         plugin_target.display()
                     )));
                 }
@@ -293,7 +293,10 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let version_file = bin_dir.join(".version");
 
     let current_exe = std::env::current_exe()?;
-    let staged_bin = if cfg!(windows) && is_same_file_path(&current_exe, &stable_bin) {
+    let binary_changed = !files_have_identical_bytes(&current_exe, &stable_bin);
+    let skip_binary_rewrite = (cfg!(windows) && is_same_file_path(&current_exe, &stable_bin))
+        || (!binary_changed && is_stable_bin_ready_exact(&stable_bin));
+    let staged_bin = if skip_binary_rewrite {
         None
     } else {
         Some(stage_binary_copy(&current_exe, &bin_dir)?)
@@ -345,6 +348,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
                 runtime_data_dir: &runtime_data_dir,
                 listen_port,
                 version: &version,
+                binary_changed,
             },
             &mut warnings,
         )
