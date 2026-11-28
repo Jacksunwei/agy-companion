@@ -398,19 +398,53 @@ class TestCheckPrVersionBump(unittest.TestCase):
                 runner = check.CheckRunner(root, verify_ui_build=False, with_e2e=False)
                 self.assertIsNone(runner._check_pr_version_bump("0.2.0-dev.3"))
 
-                # Downgrade is still rejected even for .github/-only PRs
+                # Combined .github/ + .agents/ change also passes without version bump
+                rules_dir = root / ".agents" / "rules"
+                rules_dir.mkdir(parents=True, exist_ok=True)
+                (rules_dir / "workflow.md").write_text("# Workflow\n", encoding="utf-8")
+                _git(root, "add", ".agents/rules/workflow.md")
+                _git(root, "commit", "-m", "docs(agents): update workflow rule")
+                self.assertIsNone(runner._check_pr_version_bump("0.2.0-dev.3"))
+
+                # Downgrade is still rejected even for exempt PRs
                 self.assertIsNotNone(runner._check_pr_version_bump("0.2.0-dev.2"))
 
-                # Uncommitted file outside .github/ alongside .github/ commit fails
+                # Uncommitted file outside .github/ and .agents/ fails
                 (root / "notes.txt").write_text("oops\n", encoding="utf-8")
                 err = runner._check_pr_version_bump("0.2.0-dev.3")
                 self.assertIsNotNone(err)
                 assert err is not None
                 self.assertIn("PR version bump required", err)
 
-                # Committed mixed change (.github/ + non-.github/) fails
+                # Committed mixed change (.github/ + .agents/ + non-exempt) fails
                 _git(root, "add", "notes.txt")
                 _git(root, "commit", "-m", "feat: also touch notes")
+                err = runner._check_pr_version_bump("0.2.0-dev.3")
+                self.assertIsNotNone(err)
+                assert err is not None
+                self.assertIn("PR version bump required", err)
+        finally:
+            self._restore_ci_env(saved)
+
+    def test_exempts_agents_only_prs_and_rejects_mixed_or_downgrade(self) -> None:
+        saved = self._clean_ci_env()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = pathlib.Path(td)
+                _init_git_repo_with_origin_main(root, version="0.2.0-dev.3")
+                _git(root, "checkout", "-b", "docs/agents-rule")
+
+                rules_dir = root / ".agents" / "rules"
+                rules_dir.mkdir(parents=True, exist_ok=True)
+                (rules_dir / "workflow.md").write_text("# Workflow\n", encoding="utf-8")
+                _git(root, "add", ".agents/rules/workflow.md")
+                _git(root, "commit", "-m", "docs(agents): update workflow rule")
+
+                runner = check.CheckRunner(root, verify_ui_build=False, with_e2e=False)
+                self.assertIsNone(runner._check_pr_version_bump("0.2.0-dev.3"))
+                self.assertIsNotNone(runner._check_pr_version_bump("0.2.0-dev.2"))
+
+                (root / "README.md").write_text("changed\n", encoding="utf-8")
                 err = runner._check_pr_version_bump("0.2.0-dev.3")
                 self.assertIsNotNone(err)
                 assert err is not None
