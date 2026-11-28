@@ -212,12 +212,12 @@ Routing via ChatGPT Plus/Pro OAuth uses the same consumer-subscription endpoint 
 
 Verified directly against OpenAI's official `openai/codex` `codex-rs/models-manager/models.json` (Nov 2026) — shipping only the current GPT-6.x generation tiers (omitting previous-gen / legacy `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6-astra`, and `gpt-5.*` entries):
 
-| Chip Label | Model ID | Default | Context Window | Reasoning Efforts | Slot Cost | Best-For Tooltip |
-| --- | --- | :---: | ---: | --- | :---: | --- |
-| **`6.2 Astra`** | `gpt-6.2-astra` | **ON** | `1.05M` | `Low`, `Medium`, `High`, `XHigh` | 4 | `Best for complex coding, hard debugging, architecture, and deep professional work.` |
-| **`6.2 Sol`** | `gpt-6.2-sol` | **ON** | `1.05M` | `Low`, `Medium`, `High`, `XHigh` | 4 | `Best as the fast, go-to model for everyday coding and large-context repositories.` |
-| **`6.1 Terra`** | `gpt-6.1-terra` | OFF | `1.05M` | `Low`, `Medium`, `High` | 3 | `Best for visual understanding, screenshots, and efficient computer-use workflows.` |
-| **`6 Luna`** | `gpt-6-luna` | OFF | `1.05M` | `Low`, `Medium`, `High` | 3 | `Best for fast, lightweight edits and preserving ChatGPT subscription quota.` |
+| Chip Label | Model ID | Default | Context Window | Compaction Window | Reasoning Efforts | Slot Cost | Best-For Tooltip |
+| --- | --- | :---: | ---: | ---: | --- | :---: | --- |
+| **`6.2 Astra`** | `gpt-6.2-astra` | **ON** | `1.05M` | `783.7K` | `Low`, `Medium`, `High`, `XHigh` | 4 | `Best for complex coding, hard debugging, architecture, and deep professional work.` |
+| **`6.2 Sol`** | `gpt-6.2-sol` | **ON** | `1.05M` | `783.7K` | `Low`, `Medium`, `High`, `XHigh` | 4 | `Best as the fast, go-to model for everyday coding and large-context repositories.` |
+| **`6.1 Terra`** | `gpt-6.1-terra` | OFF | `1.05M` | `783.7K` | `Low`, `Medium`, `High` | 3 | `Best for visual understanding, screenshots, and efficient computer-use workflows.` |
+| **`6 Luna`** | `gpt-6-luna` | OFF | `1.05M` | `783.7K` | `Low`, `Medium`, `High` | 3 | `Best for fast, lightweight edits and preserving ChatGPT subscription quota.` |
 
 All four models are available on ChatGPT Plus, Pro, Team, and Enterprise plans (`available_in_plans`). Custom GPT-6+ model IDs remain valid when configured in `config.json` via `validate_codex_model()` (strict ASCII slug `[a-zA-Z0-9._-]`, `<= 128` chars, non-empty, rejecting Gemini prefix collisions).
 
@@ -234,8 +234,9 @@ In `crates/companion-proxy/src/cloudcode/slots.rs`, Antigravity provides **32 de
   - `modelUrl`: `"gemini-api://<codex-model-id>"` (routes exclusively through `GOOGLE_GEMINI_BASE_URL` → `http://127.0.0.1:<port>/v1beta/models/<codex-model-id>:streamGenerateContent?alt=sse`).
   - `displayName`: `"GPT-6.2 Astra (Codex) (High)"` (collapses into `"GPT-6.2 Astra (Codex)"` with native Low/Medium/High/Extra effort flyout via Antigravity's `EFFORT_LABEL_RE`).
   - **Do NOT blindly copy Gemini `modelExperimentIds`** from upstream Gemini templates. Set explicit Codex metadata:
-    - `maxTokens`: `1_050_000` for all four curated models
+    - `maxTokens`: `1_050_000` for all four curated models (`272_000` fallback for uncurated custom Codex slugs)
     - `maxOutputTokens`: `128_000`
+    - `modelExperiments`: Injects `experiments.CASCADE_USE_EXPERIMENT_CHECKPOINTER.stringValue = "{\"maxTokenLimit\":<compaction_window>}"` (guarded on `compaction_window > 0`) so Antigravity uses each model's catalog compaction window instead of falling back to its default `256K` limit. Each model's compaction window is derived via `companion_core::compute_compaction_window(context_window, max_output_tokens)` to satisfy `compaction_window + overflow + compact_prompt <= maxTokens - maxOutputTokens` (`922K` for curated `1.05M / 128K` Codex models, `144K` for `272K / 128K` fallback): taking `85%` of `maxTokens - maxOutputTokens` yields `783,700` for curated Codex models and `122,400` for fallback models, leaving `15%` headroom for turn overflow, the compaction summary prompt, and tokenizer variance.
     - `supportsThinking`: `true`, `thinkingLevel`: `1 | 2 | 3 | 7`, `supportsThoughtCirculation`: `true` *(circulates standard-base64 `agyc:codex:v1:<json>` encrypted reasoning envelopes — valid proto3 `bytes` — across turns; foreign Gemini signatures are ignored by Codex and Codex signatures are stripped on Gemini retry if switching providers mid-conversation)*
     - `supportsImages`: `true`, `supportsVideo`: `false`, `supportsPdf`: `false`
     - `supportedMimeTypes`: `text/plain`, `image/png`, `image/jpeg`, `image/webp`

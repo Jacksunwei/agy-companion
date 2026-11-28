@@ -1208,6 +1208,171 @@ describe("buildMonitorView empty states & active mixed session", () => {
     );
   });
 
+  it("renders compaction-window info button and ultra-concise tooltip only when live compaction window is smaller than model full context", () => {
+    const base = loadActiveSnapshot();
+    const makeModelSnap = (
+      provider: string,
+      source: string,
+      model: string,
+      maxContextTokens: number | null,
+    ): SettingsSnapshot => ({
+      ...base,
+      ls_telemetry_active: true,
+      stats: {
+        usage: {
+          requests: 1,
+          prompt_tokens: 77_000,
+          cached_tokens: 64_000,
+          output_tokens: 3_000,
+          reasoning_tokens: 0,
+          cache_hit_ratio: 64_000 / 77_000,
+        },
+        proxy_rss_bytes: 25_165_824,
+        max_context_tokens: maxContextTokens,
+        recent_calls: [
+          {
+            timestamp_ms: 1747300300000,
+            provider,
+            source,
+            model,
+            input_tokens: 77_000,
+            cached_tokens: 64_000,
+            output_tokens: 3_000,
+            reasoning_tokens: 0,
+            latency_ms: 400,
+            cold_start: false,
+            cache_break: false,
+          },
+        ],
+        by_model: [
+          {
+            provider,
+            source,
+            model,
+            requests: 1,
+            input_tokens: 77_000,
+            cached_tokens: 64_000,
+            output_tokens: 3_000,
+            reasoning_tokens: 0,
+            total_latency_ms: 400,
+          },
+        ],
+      },
+    });
+
+    const container = env.document.createElement("div");
+    const monitorPanel = env.document.createElement("div");
+    const otherPanel = env.document.createElement("div");
+    const outsideBtn = env.document.createElement("button");
+    otherPanel.append(outsideBtn);
+    container.append(monitorPanel, otherPanel);
+    env.document.body.append(container);
+    const tooltip = createTooltipController(container as unknown as HTMLElement);
+
+    // 1. Codex 1.05M model with 783,700 live compaction window -> renders info button & "784K / 1.05M" badge
+    monitorPanel.replaceChildren(
+      buildMonitorView(
+        makeState({
+          snapshot: makeModelSnap("openai-codex", "proxy", "gpt-6.2-sol", 783_700),
+        }),
+        tooltip,
+      ) as unknown as FakeElement,
+    );
+    const heroLeft = monitorPanel.querySelector(".hero-left");
+    assert.ok(heroLeft, "expected .hero-left wrapper");
+    const infoBtn = heroLeft.querySelector(".ctx-info-btn");
+    assert.ok(infoBtn, "expected .ctx-info-btn when liveMaxCtx < modelMaxCtx");
+    assert.equal(infoBtn.getAttribute("type"), "button");
+    assert.equal(
+      infoBtn.getAttribute("aria-label"),
+      "Why the compaction window is smaller than the full context window",
+    );
+    assert.ok(infoBtn.querySelector("svg"), "expected SVG info icon inside button");
+
+    const tipEl = container.querySelector("#model-tooltip");
+    assert.ok(tipEl, "expected #model-tooltip");
+
+    // Hover opens tooltip with ultra-concise copy (no .tip-meta formula block)
+    infoBtn.dispatchEvent(new FakeEvent("mouseenter"));
+    assert.ok(tipEl.classList.contains("visible"));
+    assert.equal(infoBtn.getAttribute("aria-describedby"), "model-tooltip");
+    assert.ok(tipEl.querySelector(".tip-title")?.textContent.includes("Compaction window"));
+    assert.equal(tipEl.querySelector(".tip-id")?.textContent, "784K / 1.05M");
+    assert.equal(
+      tipEl.querySelector(".tip-desc")?.textContent,
+      "Compacts early to reserve room for max output, turn overflow, and the summary prompt.",
+    );
+    assert.equal(tipEl.querySelector(".tip-meta"), null, "tooltip must omit .tip-meta formula block");
+
+    // Mouseleave schedules hide
+    infoBtn.dispatchEvent(new FakeEvent("mouseleave"));
+    env.flushTimers();
+    assert.equal(tipEl.classList.contains("visible"), false);
+    assert.equal(infoBtn.getAttribute("aria-describedby"), null);
+
+    // Clicking does NOT open or pin the tooltip (hover/focus only)
+    infoBtn.dispatchEvent(new FakeEvent("click"));
+    assert.equal(tipEl.classList.contains("visible"), false);
+    assert.equal(infoBtn.getAttribute("aria-describedby"), null);
+
+    // Focus opens, blur closes immediately
+    infoBtn.dispatchEvent(new FakeEvent("focus"));
+    assert.ok(tipEl.classList.contains("visible"));
+    // Clicking while visible does NOT toggle it off
+    infoBtn.dispatchEvent(new FakeEvent("click"));
+    assert.ok(tipEl.classList.contains("visible"));
+    infoBtn.dispatchEvent(new FakeEvent("blur"));
+    assert.equal(tipEl.classList.contains("visible"), false);
+
+    // hideIfInside hides when anchor is inside monitorPanel, but preserves when outside
+    infoBtn.dispatchEvent(new FakeEvent("mouseenter"));
+    assert.ok(tipEl.classList.contains("visible"));
+    tooltip.hideIfInside(otherPanel as unknown as HTMLElement);
+    assert.ok(tipEl.classList.contains("visible"));
+    tooltip.hideIfInside(monitorPanel as unknown as HTMLElement);
+    assert.equal(tipEl.classList.contains("visible"), false);
+    assert.equal(infoBtn.getAttribute("aria-describedby"), null);
+
+    // 2. Gemini 1M model with 512K live compaction window -> badge "512K / 1M"
+    monitorPanel.replaceChildren(
+      buildMonitorView(
+        makeState({
+          snapshot: makeModelSnap("antigravity", "builtin", "gemini-4-neon", 512_000),
+        }),
+        tooltip,
+      ) as unknown as FakeElement,
+    );
+    const geminiBtn = monitorPanel.querySelector(".ctx-info-btn");
+    assert.ok(geminiBtn, "expected .ctx-info-btn for 512K / 1M Gemini");
+    geminiBtn.dispatchEvent(new FakeEvent("focus"));
+    assert.equal(tipEl.querySelector(".tip-id")?.textContent, "512K / 1M");
+    tooltip.hideNow();
+
+    // 3. Omitted when liveMaxCtx is null/invalid or >= modelMaxCtx (e.g., Claude 200K at 200K, Gemini 1M at 1M)
+    for (const [model, maxCtx] of [
+      ["gemini-4-neon", null],
+      ["gemini-4-neon", 0],
+      ["gemini-4-neon", 1_000_000],
+      ["claude-sonnet-4-6", 200_000],
+    ] as const) {
+      monitorPanel.replaceChildren(
+        buildMonitorView(
+          makeState({
+            snapshot: makeModelSnap("antigravity", "builtin", model, maxCtx),
+          }),
+          tooltip,
+        ) as unknown as FakeElement,
+      );
+      assert.equal(
+        monitorPanel.querySelector(".ctx-info-btn"),
+        null,
+        `expected no .ctx-info-btn for ${model} with max_context_tokens=${String(maxCtx)}`,
+      );
+    }
+
+    tooltip.destroy();
+  });
+
   it("renders main vs sub-agent two-tone stacked bars, conditional legend, tooltips, and meta copy", () => {
     const base = loadActiveSnapshot();
 

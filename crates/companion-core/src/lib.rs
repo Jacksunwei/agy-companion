@@ -41,10 +41,12 @@ pub use integration::{
     status_with_hybrid_active,
 };
 pub use models::{
-    CURATED_CODEX_MODELS, CURATED_GEMINI_MODELS, CuratedCodexModel, CuratedGeminiModel,
-    DEFAULT_CODEX_MODEL, DEFAULT_ENABLED_CODEX_MODELS, DEFAULT_ENABLED_GEMINI_MODELS,
-    DEFAULT_GEMINI_MODEL, MAX_CODEX_MODEL_LEN, MAX_GEMINI_MODEL_LEN, ModelPreset,
-    StaticPlaceholderMapping, UpstreamModelCatalog, UpstreamModelEntry,
+    COMPACTION_WINDOW_PERCENT, CURATED_CODEX_MODELS, CURATED_GEMINI_MODELS, CuratedCodexModel,
+    CuratedGeminiModel, DEFAULT_CODEX_MODEL, DEFAULT_ENABLED_CODEX_MODELS,
+    DEFAULT_ENABLED_GEMINI_MODELS, DEFAULT_GEMINI_CONTEXT_WINDOW, DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+    DEFAULT_GEMINI_MODEL, FALLBACK_CODEX_CONTEXT_WINDOW, FALLBACK_CODEX_MAX_OUTPUT_TOKENS,
+    MAX_CODEX_MODEL_LEN, MAX_GEMINI_MODEL_LEN, ModelPreset, StaticPlaceholderMapping,
+    UpstreamModelCatalog, UpstreamModelEntry, compute_compaction_window,
     curated_codex_model_presets, curated_model_presets, default_enabled_codex_models,
     default_enabled_gemini_models, find_curated_codex_model, is_codex_model,
     is_discoverable_chat_model, is_supported_gemini_model, lookup_static_placeholder,

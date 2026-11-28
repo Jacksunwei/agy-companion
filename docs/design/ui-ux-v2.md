@@ -108,7 +108,7 @@ Rendered above the active tab's content whenever attention is needed, in strict 
 - **Active state (`requests > 0`):** Tracks built-in Antigravity models (`provider = "antigravity"`, `source = "builtin"`, plus `vertex_claude` / `vertex_openai`), Google AI Studio BYOM models (`provider = "gemini"`, `source = "proxy"` | `"direct"`), and OpenAI Codex BYOM models (`provider = "openai-codex"`, `source = "proxy"`).
   1. **Live Session Card:**
      - Header: Provider badge (`Antigravity`, `Anthropic`, `OpenAI`, `AI Studio`, `AI Studio (Direct)`, or `OpenAI Codex`) + latest active model + latest call time (`HH:MM`).
-     - **Latest prompt bar:** Hero input token count (`148K of 1M` · `15%`) + proportional stacked bar (**from cache** green · **new input** amber · **output** blue) + concise legend.
+     - **Latest prompt bar:** Hero input token count (`148K of 1M` · `15%`) + proportional stacked bar (**from cache** green · **new input** amber · **output** blue) + concise legend. When the live compaction window (`stats.max_context_tokens`) is smaller than the model's full context window, an accessible hover/focus info icon appears inline after `of <maxCtx>` explaining why context compacts early (reserving room for max output, turn overflow, and the summary prompt).
      - **Call health strip:** `Last N calls` + compact pill strip (green = cache hit, amber = cold prompt / cache break) + summary (`no breaks` or `N breaks`).
      - **3 borderless recessed `.tile` cells (`tabular-nums`):**
        - `Session cache`: overall cache hit % + `latest XX%`
