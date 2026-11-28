@@ -12,6 +12,107 @@ use super::slots::{
 
 const GEMINI_BACKEND_LABEL: &str = "AI Studio";
 const CODEX_BACKEND_LABEL: &str = "Codex";
+const CHECKPOINTER_EXPERIMENT_KEY: &str = "CASCADE_USE_EXPERIMENT_CHECKPOINTER";
+const CHECKPOINTER_VARIANT_PREFIX: &str = "CASCADE_USE_EXPERIMENT_CHECKPOINTER/";
+const CONTEXT_WINDOW_VARIANT_PREFIX: &str = "CASCADE_USE_EXPERIMENT_CHECKPOINTER/context-window_";
+
+fn should_override_checkpointer_key(key: &str) -> bool {
+    key == CHECKPOINTER_EXPERIMENT_KEY
+        || (key.starts_with(CHECKPOINTER_VARIANT_PREFIX)
+            && !key.starts_with(CONTEXT_WINDOW_VARIANT_PREFIX))
+}
+
+fn override_checkpointer_value(existing: Option<&Value>, compaction_window: u64) -> Value {
+    if let Some(raw) = existing
+        .and_then(|v| v.get("stringValue"))
+        .and_then(Value::as_str)
+        && let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(raw)
+    {
+        obj.insert("maxTokenLimit".to_string(), json!(compaction_window));
+        return json!({ "stringValue": Value::Object(obj).to_string() });
+    }
+    json!({ "stringValue": json!({ "maxTokenLimit": compaction_window }).to_string() })
+}
+
+fn apply_compaction_window_override(
+    details_map: &mut Map<String, Value>,
+    shared_experiments: Option<&Map<String, Value>>,
+    compaction_window: u64,
+) {
+    if compaction_window == 0 {
+        return;
+    }
+
+    let mut targets: std::collections::BTreeMap<String, Option<Value>> =
+        std::collections::BTreeMap::new();
+    targets.insert(CHECKPOINTER_EXPERIMENT_KEY.to_string(), None);
+
+    if let Some(shared) = shared_experiments
+        && let Some(ids) = details_map
+            .get("modelExperimentIds")
+            .and_then(Value::as_array)
+    {
+        for id in ids.iter().filter_map(Value::as_str) {
+            if let Some(exps) = shared
+                .get(id)
+                .and_then(|entry| entry.get("experiments"))
+                .and_then(Value::as_object)
+            {
+                for (key, value) in exps {
+                    if should_override_checkpointer_key(key) {
+                        targets.insert(key.clone(), Some(value.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(exps) = details_map
+        .get("modelExperiments")
+        .and_then(|m| m.get("experiments"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in exps {
+            if should_override_checkpointer_key(key) {
+                targets.insert(key.clone(), Some(value.clone()));
+            }
+        }
+    }
+
+    let model_exps = details_map
+        .entry("modelExperiments".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !model_exps.is_object() {
+        *model_exps = Value::Object(Map::new());
+    }
+    if let Some(model_exps_obj) = model_exps.as_object_mut() {
+        let exps = model_exps_obj
+            .entry("experiments".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !exps.is_object() {
+            *exps = Value::Object(Map::new());
+        }
+        if let Some(exps_obj) = exps.as_object_mut() {
+            for (key, existing) in &targets {
+                exps_obj.insert(
+                    key.clone(),
+                    override_checkpointer_value(existing.as_ref(), compaction_window),
+                );
+            }
+        }
+    }
+
+    if let Some(ignored) = details_map
+        .get_mut("ignoreExperimentNames")
+        .and_then(Value::as_array_mut)
+    {
+        ignored.retain(|entry| {
+            entry
+                .as_str()
+                .is_none_or(|name| !targets.contains_key(name))
+        });
+    }
+}
 
 pub fn pretty_model_name(model_id: &str) -> String {
     model_id
@@ -116,18 +217,7 @@ fn build_injected_codex_variant_details(
         json!("TOOL_FORMATTER_TYPE_NONE"),
     );
     details_map.insert("quotaInfo".to_string(), json!({ "remainingFraction": 1.0 }));
-    if compaction_window > 0 {
-        details_map.insert(
-            "modelExperiments".to_string(),
-            json!({
-                "experiments": {
-                    "CASCADE_USE_EXPERIMENT_CHECKPOINTER": {
-                        "stringValue": json!({ "maxTokenLimit": compaction_window }).to_string()
-                    }
-                }
-            }),
-        );
-    }
+    apply_compaction_window_override(&mut details_map, None, compaction_window);
     Value::Object(details_map)
 }
 
@@ -200,6 +290,7 @@ fn find_upstream_model_template<'a>(
 
 fn build_injected_variant_details(
     upstream_models_snapshot: &Map<String, Value>,
+    upstream_shared_experiments: Option<&Map<String, Value>>,
     raw_id: &str,
     variant: &ThinkingVariant,
     enum_name: &str,
@@ -207,8 +298,8 @@ fn build_injected_variant_details(
 ) -> Value {
     // Inherit upstream model metadata (modelExperimentIds / modelExperiments /
     // ignoreExperimentNames / tokenizerType / supportsCumulativeContext /
-    // supportsThoughtCirculation / maxTokens / maxOutputTokens) so Antigravity
-    // applies the same compaction window and capabilities as the native model.
+    // supportsThoughtCirculation / maxTokens / maxOutputTokens), then override
+    // the checkpointer `maxTokenLimit` with the model's derived compaction window.
     let mut details_map =
         find_upstream_model_template(upstream_models_snapshot, raw_id, variant.suffix)
             .cloned()
@@ -226,26 +317,34 @@ fn build_injected_variant_details(
         details_map.remove(strip_key);
     }
 
-    let has_valid_max_tokens = details_map
+    let max_tokens = match details_map
         .get("maxTokens")
         .and_then(Value::as_u64)
-        .is_some_and(|v| v > 0);
-    if !has_valid_max_tokens {
-        details_map.insert(
-            "maxTokens".to_string(),
-            json!(DEFAULT_GEMINI_CONTEXT_WINDOW),
-        );
-    }
-    let has_valid_max_output = details_map
+        .filter(|&v| v > 0)
+    {
+        Some(v) => v,
+        None => {
+            details_map.insert(
+                "maxTokens".to_string(),
+                json!(DEFAULT_GEMINI_CONTEXT_WINDOW),
+            );
+            DEFAULT_GEMINI_CONTEXT_WINDOW
+        }
+    };
+    let max_output_tokens = match details_map
         .get("maxOutputTokens")
         .and_then(Value::as_u64)
-        .is_some_and(|v| v > 0);
-    if !has_valid_max_output {
-        details_map.insert(
-            "maxOutputTokens".to_string(),
-            json!(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS),
-        );
-    }
+        .filter(|&v| v > 0)
+    {
+        Some(v) => v,
+        None => {
+            details_map.insert(
+                "maxOutputTokens".to_string(),
+                json!(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS),
+            );
+            DEFAULT_GEMINI_MAX_OUTPUT_TOKENS
+        }
+    };
     if !details_map.contains_key("supportedMimeTypes") {
         details_map.insert(
             "supportedMimeTypes".to_string(),
@@ -274,6 +373,12 @@ fn build_injected_variant_details(
         json!("TOOL_FORMATTER_TYPE_NONE"),
     );
     details_map.insert("quotaInfo".to_string(), json!({ "remainingFraction": 1.0 }));
+    let compaction_window = compute_compaction_window(max_tokens, max_output_tokens);
+    apply_compaction_window_override(
+        &mut details_map,
+        upstream_shared_experiments,
+        compaction_window,
+    );
     Value::Object(details_map)
 }
 
@@ -422,6 +527,10 @@ pub fn merge_available_models_multi_provider(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let upstream_shared_experiments = root_obj
+        .get("sharedModelExperiments")
+        .and_then(Value::as_object)
+        .cloned();
 
     for raw_id in &selected_gemini {
         let variants = variants_for_model(raw_id);
@@ -439,6 +548,7 @@ pub fn merge_available_models_multi_provider(
             let display_name = format!("{display_base} ({})", variant.label_effort);
             let details = build_injected_variant_details(
                 &upstream_models_snapshot,
+                upstream_shared_experiments.as_ref(),
                 raw_id,
                 variant,
                 enum_name,

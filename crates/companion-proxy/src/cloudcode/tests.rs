@@ -1516,10 +1516,13 @@ fn merge_available_models_inherits_upstream_compaction_experiments_and_strips_ve
         neon_proxy["modelExperimentIds"],
         json!(["shared_gemini4_checkpointer"])
     );
-    assert_eq!(
-        neon_proxy["modelExperiments"]["experiments"]["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]["stringValue"],
-        "1m-window"
-    );
+    let checkpointer_raw = neon_proxy["modelExperiments"]["experiments"]
+        ["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]["stringValue"]
+        .as_str()
+        .expect("neon proxy checkpointer stringValue");
+    let checkpointer: Value =
+        serde_json::from_str(checkpointer_raw).expect("valid neon checkpointer JSON");
+    assert_eq!(checkpointer["maxTokenLimit"], 835_584);
     assert_eq!(
         neon_proxy["ignoreExperimentNames"],
         json!(["legacy_small_window"])
@@ -2849,4 +2852,120 @@ fn merge_available_models_multi_provider_fallback_codex_sets_computed_compaction
     let checkpointer: Value =
         serde_json::from_str(checkpointer_raw).expect("valid fallback checkpointer JSON");
     assert_eq!(checkpointer["maxTokenLimit"], 122_400);
+}
+
+#[test]
+fn merge_available_models_overrides_gemini_checkpointer_across_shared_variants_and_empty_upstream()
+{
+    // 1. Upstream Neon with 512K base + 512K /sync shared variant + context-window_512K option
+    //    + ignoreExperimentNames attempting to suppress CASCADE_USE_EXPERIMENT_CHECKPOINTER.
+    let upstream = json!({
+        "models": {
+            "gemini-4-neon-high": {
+                "model": "MODEL_PLACEHOLDER_M467",
+                "displayName": "Gemini 4 Neon (High)",
+                "maxTokens": 1048576,
+                "maxOutputTokens": 65536,
+                "modelExperimentIds": ["shared_gemini4_checkpointer"],
+                "modelExperiments": {
+                    "experiments": {
+                        "CASCADE_USE_EXPERIMENT_CHECKPOINTER": {
+                            "stringValue": "{\"maxTokenLimit\":512000,\"maxOverheadRatio\":0.15}"
+                        },
+                        "unrelated-exp": { "boolValue": true }
+                    }
+                },
+                "ignoreExperimentNames": [
+                    "CASCADE_USE_EXPERIMENT_CHECKPOINTER",
+                    "legacy_small_window"
+                ]
+            }
+        },
+        "sharedModelExperiments": {
+            "shared_gemini4_checkpointer": {
+                "experiments": {
+                    "CASCADE_USE_EXPERIMENT_CHECKPOINTER/sync": {
+                        "stringValue": "{\"maxTokenLimit\":512000,\"enableFallback\":true}"
+                    },
+                    "CASCADE_USE_EXPERIMENT_CHECKPOINTER/context-window_512K": {
+                        "stringValue": "{\"maxTokenLimit\":512000}"
+                    },
+                    "context-window-options": { "stringValue": "{\"options\":[{\"name\":\"512K\"}]}" }
+                }
+            }
+        },
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "modelIds": ["gemini-4-neon-high"] }]
+        }]
+    });
+
+    let merged_bytes = merge_available_models(
+        &serde_json::to_vec(&upstream).unwrap(),
+        &["gemini-4-neon".to_string()],
+        "gemini-4-neon",
+    )
+    .expect("gemini merge succeeds");
+    let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+    let neon = &merged["models"]["companion/gemini-4-neon-high"];
+    let exps = neon["modelExperiments"]["experiments"]
+        .as_object()
+        .expect("modelExperiments.experiments object");
+
+    // Base checkpointer overridden to 835,584 while preserving extra fields.
+    let base_ckpt: Value = serde_json::from_str(
+        exps["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]["stringValue"]
+            .as_str()
+            .expect("base checkpointer stringValue"),
+    )
+    .expect("valid base checkpointer JSON");
+    assert_eq!(base_ckpt["maxTokenLimit"], 835_584);
+    assert_eq!(base_ckpt["maxOverheadRatio"], 0.15);
+
+    // Shared `/sync` checkpointer variant overridden on modelExperiments too, preserving extra fields.
+    let sync_ckpt: Value = serde_json::from_str(
+        exps["CASCADE_USE_EXPERIMENT_CHECKPOINTER/sync"]["stringValue"]
+            .as_str()
+            .expect("sync checkpointer stringValue"),
+    )
+    .expect("valid sync checkpointer JSON");
+    assert_eq!(sync_ckpt["maxTokenLimit"], 835_584);
+    assert_eq!(sync_ckpt["enableFallback"], true);
+
+    // User-selectable `context-window_*` variant is not clobbered, and unrelated experiments remain.
+    assert!(!exps.contains_key("CASCADE_USE_EXPERIMENT_CHECKPOINTER/context-window_512K"));
+    assert_eq!(exps["unrelated-exp"]["boolValue"], true);
+
+    // `CASCADE_USE_EXPERIMENT_CHECKPOINTER` is scrubbed from `ignoreExperimentNames`, others kept.
+    assert_eq!(
+        neon["ignoreExperimentNames"],
+        json!(["legacy_small_window"])
+    );
+
+    // 2. Empty upstream (no template at all) still gets 835,584 instead of falling back to 256K.
+    let empty_upstream = json!({
+        "models": {},
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "displayName": "Models", "modelIds": [] }]
+        }]
+    });
+    let empty_merged_bytes = merge_available_models(
+        &serde_json::to_vec(&empty_upstream).unwrap(),
+        &["gemini-4-neon".to_string()],
+        "gemini-4-neon",
+    )
+    .expect("empty upstream gemini merge succeeds");
+    let empty_merged: Value = serde_json::from_slice(&empty_merged_bytes).unwrap();
+    let empty_neon = &empty_merged["models"]["companion/gemini-4-neon-high"];
+    assert_eq!(empty_neon["maxTokens"], 1_048_576);
+    assert_eq!(empty_neon["maxOutputTokens"], 65_536);
+    let empty_ckpt: Value = serde_json::from_str(
+        empty_neon["modelExperiments"]["experiments"]["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]
+            ["stringValue"]
+            .as_str()
+            .expect("empty upstream checkpointer stringValue"),
+    )
+    .expect("valid empty upstream checkpointer JSON");
+    assert_eq!(empty_ckpt["maxTokenLimit"], 835_584);
 }
