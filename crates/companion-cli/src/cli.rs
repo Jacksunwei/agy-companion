@@ -24,8 +24,9 @@ pub enum Commands {
         /// Path to config.json (overrides AGY_COMPANION_CONFIG).
         #[arg(long)]
         config: Option<PathBuf>,
-        /// If another healthy agy-companion proxy already occupies the port, monitor it
-        /// instead of failing with address-in-use (intended for sidecar startup).
+        /// Run in sidecar adopt/supervise mode: never bind the proxy port directly; monitor
+        /// `/health`, spawn a detached bootstrap daemon if unreachable or version-skewed,
+        /// and keep the Sidecar Web UI / LS collector alive (intended for sidecar startup).
         #[arg(long = "adopt-running")]
         adopt_running: bool,
         /// Auto-enable the login-shell launcher hook once on first run (intended for plugin sidecar startup).

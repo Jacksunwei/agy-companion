@@ -873,7 +873,7 @@ class TestCujDaemonAndCloudCode(E2ETestCase):
     FEATURE = "DAEMON_CLOUDCODE"
 
     def test_cuj_daemon_adopt_running_sigterm_and_idle_sse_guard(self) -> None:
-        """Active SSE guards --idle-shutdown-secs; SIGTERM triggers clean exit & --adopt-running takeover."""
+        """Active SSE guards --idle-shutdown-secs; SIGTERM triggers clean exit & --adopt-running detached bootstrap recovery."""
         if os.name == "nt":
             self.skipTest("POSIX SIGTERM / adopt-running test")
         binary = self.require_binary()
@@ -930,30 +930,72 @@ class TestCujDaemonAndCloudCode(E2ETestCase):
         self.assertEqual(body, b"".join(sse_chunks))
         self.assertIsNone(primary.returncode, "Primary must stay alive through active SSE")
 
-        # SIGTERM primary -> clean exit 0; secondary adopts port promptly.
+        # SIGTERM primary -> clean exit 0; secondary spawns a detached bootstrap daemon to recover port.
         assert primary.proc is not None
         primary.proc.send_signal(signal.SIGTERM)
         rc1 = primary.proc.wait(timeout=3.0)
         self.assertEqual(rc1, 0, f"Primary SIGTERM rc={rc1}\n{primary.stderr_text}")
 
-        secondary.wait_ready(timeout=4.0)
-        deadline = time.monotonic() + 2.5
-        adopted_pid = None
+        deadline = time.monotonic() + 4.0
+        recovered_pid: int | None = None
+        health_json: dict[str, Any] | None = None
         while time.monotonic() < deadline:
-            if pid_file.is_file():
-                try:
-                    adopted_pid = json.loads(pid_file.read_text(encoding="utf-8")).get("pid")
-                    if adopted_pid == secondary.pid:
+            self.assertIsNone(
+                secondary.returncode,
+                f"Secondary --adopt-running exited unexpectedly:\n{secondary.stderr_text}",
+            )
+            try:
+                resp = http_raw_request("127.0.0.1", port, "GET", "/health", timeout=0.5)
+                if resp.status == 200 and pid_file.is_file():
+                    payload = resp.json()
+                    pid_val = json.loads(pid_file.read_text(encoding="utf-8")).get("pid")
+                    if isinstance(pid_val, int) and pid_val not in (primary.pid, secondary.pid):
+                        recovered_pid = pid_val
+                        health_json = payload
                         break
-                except (OSError, json.JSONDecodeError):
-                    pass
-            time.sleep(0.02)
-        self.assertEqual(adopted_pid, secondary.pid)
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.05)
 
+        self.assertIsNotNone(
+            recovered_pid,
+            f"Expected --adopt-running to spawn detached bootstrap daemon:\n{secondary.stderr_text}",
+        )
+        assert recovered_pid is not None and health_json is not None
+
+        def _cleanup_recovered(pid: int = recovered_pid) -> None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        self.stack.callback(_cleanup_recovered)
+        self.assertEqual(health_json.get("status"), "ok")
+        self.assertEqual(health_json.get("role"), "bootstrap")
+        self.assertNotEqual(recovered_pid, secondary.pid)
+
+        # SIGTERM secondary sidecar -> clean exit 0 while detached bootstrap proxy stays alive.
         assert secondary.proc is not None
         secondary.proc.send_signal(signal.SIGTERM)
         rc2 = secondary.proc.wait(timeout=3.0)
         self.assertEqual(rc2, 0, f"Secondary SIGTERM rc={rc2}\n{secondary.stderr_text}")
+
+        health_after = http_raw_request("127.0.0.1", port, "GET", "/health", timeout=1.0)
+        self.assertEqual(health_after.status, 200, health_after.text)
+        self.assertEqual(health_after.json().get("role"), "bootstrap")
+        self.assertTrue(pid_file.is_file(), "proxy.pid must remain owned by detached bootstrap daemon")
+        self.assertEqual(json.loads(pid_file.read_text(encoding="utf-8")).get("pid"), recovered_pid)
+
+        # SIGTERM detached bootstrap daemon -> clean exit and proxy.pid cleanup.
+        os.kill(recovered_pid, signal.SIGTERM)
+        stop_deadline = time.monotonic() + 3.0
+        while time.monotonic() < stop_deadline:
+            if not pid_file.exists():
+                try:
+                    os.kill(recovered_pid, 0)
+                except ProcessLookupError:
+                    break
+            time.sleep(0.02)
         self.assertFalse(pid_file.exists(), "proxy.pid must be cleaned up on graceful SIGTERM")
 
     def test_cuj_cloudcode_day0_to_day1_catalog_and_403_lru(self) -> None:

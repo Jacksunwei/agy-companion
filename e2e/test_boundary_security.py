@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import socket
 import stat
 from pathlib import Path
@@ -28,6 +29,8 @@ from harness import (
     http_raw_request,
     poll_usage_events,
     read_usage_raw_bytes,
+    reap_env_daemons,
+    reap_port_daemons,
     run_cli,
 )
 from mock_gemini import EchoChecksumAction, JsonAction, RawBytesAction
@@ -549,6 +552,24 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
         binary = self.require_binary()
         env = self.make_env()
 
+        def _cleanup_detached_daemons() -> None:
+            reap_env_daemons(env.root, expected_binary=binary)
+            if os.name == "nt":
+                return
+            for pid_path in (
+                env.data_dir / "proxy.pid",
+                env.home_dir / ".local" / "share" / "agy-companion" / "proxy.pid",
+            ):
+                if pid_path.is_file():
+                    try:
+                        pid = json.loads(pid_path.read_text(encoding="utf-8")).get("pid")
+                        if isinstance(pid, int) and pid > 1:
+                            os.kill(pid, signal.SIGTERM)
+                    except (OSError, ValueError):
+                        pass
+
+        self.stack.callback(_cleanup_detached_daemons)
+
         # (a) Precedence: --config > AGY_COMPANION_CONFIG > XDG_CONFIG_HOME > $HOME/.config & relative/empty fallback.
         home_cfg = env.home_dir / ".config" / "agy-companion" / "config.json"
         xdg_cfg = env.config_root / "agy-companion" / "config.json"
@@ -579,10 +600,13 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             "gemini-4-xdg",
         )
         ui_xdg.close()
+        rel_port = find_free_port()
+        self.stack.callback(reap_port_daemons, rel_port, expected_binary=binary)
         ui_rel = self.start_sidecar_ui(
             env,
             pass_config_flag=False,
             set_config_env=False,
+            extra_args=("--port", str(rel_port)),
             extra_env={"XDG_CONFIG_HOME": "relative/xdg", "XDG_DATA_HOME": ""},
         )
         rel_model = ui_rel.call_tool("get_settings", {})["structuredContent"]["config"]["providers"]["gemini"][
@@ -610,9 +634,12 @@ class TestBoundaryS6FileSafetyAndXdg(E2ETestCase):
             ).returncode,
             0,
         )
+        no_usage_cfg_dict = env.make_config_dict()
+        no_usage_cfg_dict.pop("usage_dir", None)
+        no_usage_cfg = env.write_config(no_usage_cfg_dict, path=env.root / "no_usage_dir.json")
         self.assertNotEqual(
             run_cli(
-                [str(binary), "doctor", "--json", "--config", str(xdg_cfg)],
+                [str(binary), "serve", "--config", str(no_usage_cfg)],
                 env=env.build_env(extra={"XDG_DATA_HOME": "/tmp/../evil"}),
                 timeout=5.0,
             ).returncode,
