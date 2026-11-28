@@ -15,7 +15,7 @@ description: Product, UX, and model-catalog guardrails for agy-companion. Activa
 
 - **Latest models only:** Include only current-generation models users actively adopt (e.g., Gemini 3.8 Flash+ / 4.x; latest GPT 6.x). Drop legacy/older-generation models rather than padding catalogs.
 - **Capability ordering:** Order models from **most capable → least capable** in pickers and catalogs.
-- **Additive, clearly labeled proxy models:** Always preserve the user's original built-in Antigravity models alongside proxy-provided models, and suffix proxy-provided display names with `(Proxy)`.
+- **Additive, clearly labeled proxy models:** Always preserve the user's original built-in Antigravity models alongside proxy-provided models, and suffix proxy-provided display names with a short backend label in parentheses (e.g., `(AI Studio)` for Google AI Studio, `(Codex)` for OpenAI Codex).
 
 ## Zero AI Slop in Aux Panel UI
 

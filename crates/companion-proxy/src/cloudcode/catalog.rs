@@ -6,6 +6,9 @@ use super::slots::{
     collect_used_model_enums, select_multi_provider_models_for_available_slots, variants_for_model,
 };
 
+const GEMINI_BACKEND_LABEL: &str = "AI Studio";
+const CODEX_BACKEND_LABEL: &str = "Codex";
+
 pub fn pretty_model_name(model_id: &str) -> String {
     model_id
         .split('-')
@@ -319,11 +322,13 @@ fn append_injected_model_ids_to_sorts(
 ///    immediately after all original models.
 /// 2. `parseLabelSlug` collapses variants into the native secondary "Thinking effort"
 ///    flyout when `displayName` ends with `(Low|Medium|High|XHigh|Max)`. Using
-///    `"<Model> (Proxy) (<Effort>)"` gives base label `"<Model> (Proxy)"` with a
-///    working Low / Medium / High / Extra submenu.
+///    `"<Model> (AI Studio) (<Effort>)"` gives base label `"<Model> (AI Studio)"` with a
+///    working Low / Medium / High / Extra submenu (and likewise `(<Backend>)` for other
+///    providers such as `(Codex)`).
 /// 3. Each injected variant sets `modelUrl: "gemini-api://<model>"` so Antigravity's
-///    `RoutingClient` routes only `(Proxy)` models to `GOOGLE_GEMINI_BASE_URL`
-///    (`http://127.0.0.1:<port>`) while original Google models route untouched.
+///    `RoutingClient` routes only backend-labeled proxy models (e.g. `(AI Studio)`, `(Codex)`)
+///    to `GOOGLE_GEMINI_BASE_URL` (`http://127.0.0.1:<port>`) while original Google models
+///    route untouched.
 pub fn merge_available_models(
     upstream_body: &[u8],
     proxy_models: &[String],
@@ -394,7 +399,7 @@ pub fn merge_available_models_multi_provider(
     for raw_id in &selected_gemini {
         let variants = variants_for_model(raw_id);
         let base_id = format!("companion/{raw_id}");
-        let display_base = format!("{} (Proxy)", pretty_model_name(raw_id));
+        let display_base = format!("{} ({GEMINI_BACKEND_LABEL})", pretty_model_name(raw_id));
         let mut level_entries = Vec::with_capacity(variants.len());
 
         for variant in variants {
@@ -435,7 +440,10 @@ pub fn merge_available_models_multi_provider(
     for raw_id in &selected_codex {
         let variants = variants_for_model(raw_id);
         let base_id = format!("companion/{raw_id}");
-        let display_base = format!("{} (Codex)", pretty_codex_model_name(raw_id));
+        let display_base = format!(
+            "{} ({CODEX_BACKEND_LABEL})",
+            pretty_codex_model_name(raw_id)
+        );
         let mut level_entries = Vec::with_capacity(variants.len());
 
         for variant in variants {

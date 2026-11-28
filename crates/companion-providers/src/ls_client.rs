@@ -1194,7 +1194,7 @@ mod tests {
                         r#"{
                             "clientModelConfigs": [
                                 {
-                                    "label": "Gemini 4 Hydrogen (Proxy) (Medium)",
+                                    "label": "Gemini 4 Hydrogen (AI Studio) (Medium)",
                                     "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M335" },
                                     "provider": "MODEL_PROVIDER_GOOGLE",
                                     "modelUrl": "gemini-api://gemini-4-hydrogen",
