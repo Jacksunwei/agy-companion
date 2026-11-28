@@ -1498,9 +1498,9 @@ describe("buildMonitorView empty states & active mixed session", () => {
             },
           },
           {
-            provider: "openai-codex",
-            source: "proxy",
-            model: "gpt-6.2-sol",
+            provider: "antigravity",
+            source: "builtin",
+            model: "antigravity-builtin",
             requests: 2,
             input_tokens: 100_000,
             cached_tokens: 54_000,
