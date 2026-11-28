@@ -603,7 +603,7 @@ class CheckRunner:
             )
 
         if cur_parsed <= base_parsed:
-            if cur_parsed == base_parsed and self._is_github_meta_only_change(git, base_ref):
+            if cur_parsed == base_parsed and self._is_version_bump_exempt_change(git, base_ref):
                 return None
             if self._is_valid_dev_track_retarget(git, base_parsed, cur_parsed):
                 return None
@@ -654,8 +654,8 @@ class CheckRunner:
             return False
         return True
 
-    def _is_github_meta_only_change(self, git: str, base_ref: str) -> bool:
-        """Return True iff every changed/untracked path relative to base_ref is under .github/."""
+    def _is_version_bump_exempt_change(self, git: str, base_ref: str) -> bool:
+        """Return True iff every changed/untracked path relative to base_ref is under .github/ or .agents/."""
         diff_proc = self.run_capture(
             [git, "diff", "-z", "--name-only", f"{base_ref}...HEAD"],
             c_locale=True,
@@ -699,7 +699,7 @@ class CheckRunner:
 
         for raw_path in changed:
             norm = raw_path.replace("\\", "/")
-            if not norm.startswith(".github/"):
+            if not norm.startswith((".github/", ".agents/")):
                 return False
             if ".." in norm.split("/"):
                 return False
