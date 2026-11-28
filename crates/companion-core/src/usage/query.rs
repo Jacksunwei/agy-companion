@@ -391,16 +391,16 @@ mod tests {
         assert_eq!(s0.totals.requests, 0);
         assert!(s0.buckets.is_empty());
 
-        // user_version == 3 fails closed
-        let v3_dir = tmp.path().join("v3");
-        fs::create_dir_all(&v3_dir).expect("mkdir");
+        // user_version == 4 fails closed (future schema version)
+        let v4_dir = tmp.path().join("v4");
+        fs::create_dir_all(&v4_dir).expect("mkdir");
         {
-            let conn = Connection::open(v3_dir.join(USAGE_DB_FILENAME)).expect("create v3 db");
-            conn.execute_batch("PRAGMA user_version = 3;").expect("v3");
+            let conn = Connection::open(v4_dir.join(USAGE_DB_FILENAME)).expect("create v4 db");
+            conn.execute_batch("PRAGMA user_version = 4;").expect("v4");
         }
-        let err_v3 = query_usage_summary_at(&v3_dir, UsageRange::Days7, now)
-            .expect_err("v3 must fail closed");
-        assert!(matches!(err_v3, CoreError::UsageDatabase { .. }));
+        let err_v4 = query_usage_summary_at(&v4_dir, UsageRange::Days7, now)
+            .expect_err("v4 must fail closed");
+        assert!(matches!(err_v4, CoreError::UsageDatabase { .. }));
 
         // negative user_version fails closed
         let neg_dir = tmp.path().join("neg");

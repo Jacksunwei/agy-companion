@@ -287,7 +287,7 @@ class TestCujGeminiProxy(E2ETestCase):
         with open_usage_db_readonly(files[0]) as conn:
             user_ver = conn.execute("PRAGMA user_version").fetchone()[0]
             jmode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-        self.assertEqual(user_ver, 2)
+        self.assertEqual(user_ver, 3)
         self.assertEqual(jmode, "wal")
         if os.name != "nt":
             for sf in usage_storage_files(env.usage_dir):

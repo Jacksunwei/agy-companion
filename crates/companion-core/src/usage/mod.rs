@@ -16,7 +16,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub const USAGE_DB_FILENAME: &str = "usage.db";
-pub const USAGE_DB_SCHEMA_VERSION: u32 = 2;
+pub const USAGE_DB_SCHEMA_VERSION: u32 = 3;
 pub const MAX_RESPONSE_ID_LEN: usize = 128;
 pub const MIN_CONVERSATION_ID_LEN: usize = 6;
 pub const MAX_CONVERSATION_ID_LEN: usize = 64;
@@ -124,6 +124,14 @@ pub struct LsSyncWatermark {
     pub trajectory_id: String,
     pub step_offset: u32,
     pub last_modified_utc: String,
+    pub updated_at_utc: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedModel {
+    pub provider: String,
+    pub model: String,
+    pub compaction_limit_tokens: Option<u64>,
     pub updated_at_utc: String,
 }
 
