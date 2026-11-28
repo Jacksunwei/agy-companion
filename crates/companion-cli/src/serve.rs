@@ -29,6 +29,9 @@ const REPLACE_STALE_BIND_TIMEOUT: Duration = Duration::from_secs(3);
 const REPLACE_STALE_HEALTH_RECHECK_INTERVAL: Duration = Duration::from_millis(150);
 const REPLACE_STALE_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const ADOPT_REPLACE_COOLDOWN: Duration = Duration::from_secs(10);
+const ADOPT_RECOVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+const ADOPT_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const ADOPT_RECOVERY_HANDOFF_GRACE: Duration = Duration::from_secs(2);
 
 pub const CODEX_OAUTH_ISSUER_ENV: &str = "AGY_COMPANION_CODEX_OAUTH_ISSUER";
 pub const CODEX_CALLBACK_PORT_ENV: &str = "AGY_COMPANION_CODEX_CALLBACK_PORT";
@@ -46,10 +49,7 @@ fn resolve_test_health_version_override() -> Option<String> {
 }
 
 fn resolve_proxy_role(options: &ServeOptions) -> &'static str {
-    if options.adopt_running || std::env::var_os(crate::sidecar_ui::SIDECAR_WEB_PORT_ENV).is_some()
-    {
-        "sidecar"
-    } else if options.watch_pid.is_some()
+    if options.watch_pid.is_some()
         || options.replace_stale
         || options.idle_shutdown_secs.is_some_and(|secs| secs > 0)
     {
@@ -93,6 +93,42 @@ fn exec_self_upgrade(target_exe: &std::path::Path) -> std::io::Error {
     cmd.exec()
 }
 
+#[derive(Debug, Default)]
+struct AdoptRecoveryBackoff {
+    consecutive_attempts: u32,
+    last_attempt: Option<Instant>,
+}
+
+impl AdoptRecoveryBackoff {
+    fn reset(&mut self) {
+        self.consecutive_attempts = 0;
+        self.last_attempt = None;
+    }
+
+    fn current_cooldown(&self) -> Duration {
+        if self.consecutive_attempts == 0 {
+            Duration::ZERO
+        } else {
+            let shift = (self.consecutive_attempts - 1).min(4);
+            ADOPT_RECOVERY_INITIAL_BACKOFF
+                .saturating_mul(1u32 << shift)
+                .min(ADOPT_RECOVERY_MAX_BACKOFF)
+        }
+    }
+
+    fn is_ready(&self, now: Instant) -> bool {
+        match self.last_attempt {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.current_cooldown(),
+        }
+    }
+
+    fn record_attempt(&mut self, now: Instant) {
+        self.consecutive_attempts = self.consecutive_attempts.saturating_add(1);
+        self.last_attempt = Some(now);
+    }
+}
+
 struct AdoptUpgradeController {
     config_path: PathBuf,
     listen_port: u16,
@@ -106,6 +142,7 @@ struct AdoptUpgradeController {
     has_seen_valid_manifest: bool,
     probe_cache: Arc<Mutex<BinaryVersionProbeCache>>,
     last_replace_attempt: Option<Instant>,
+    recovery_backoff: AdoptRecoveryBackoff,
     replacement_children: Vec<std::process::Child>,
     #[cfg(unix)]
     pending_self_exec: Option<(String, PathBuf)>,
@@ -131,6 +168,7 @@ impl AdoptUpgradeController {
             has_seen_valid_manifest: false,
             probe_cache: Arc::new(Mutex::new(BinaryVersionProbeCache::new())),
             last_replace_attempt: None,
+            recovery_backoff: AdoptRecoveryBackoff::default(),
             replacement_children: Vec::new(),
             #[cfg(unix)]
             pending_self_exec: None,
@@ -140,6 +178,10 @@ impl AdoptUpgradeController {
     fn reap_children(&mut self) {
         self.replacement_children
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+    }
+
+    fn on_healthy(&mut self) {
+        self.recovery_backoff.reset();
     }
 
     async fn resolve_watch_pid(&mut self) -> Option<u32> {
@@ -175,9 +217,7 @@ impl AdoptUpgradeController {
         .flatten()
     }
 
-    async fn tick(&mut self, active_health_version: &str) -> Option<PathBuf> {
-        self.reap_children();
-
+    async fn poll_plugin_manifest_if_due(&mut self, active_health_version: Option<&str>) -> bool {
         let plugin_poll_due = self
             .last_plugin_poll
             .is_none_or(|last| last.elapsed() >= self.plugin_poll_interval);
@@ -195,14 +235,14 @@ impl AdoptUpgradeController {
                     PluginManifestRead::Invalid => {
                         tracing::warn!(
                             plugin_dir = ?self.plugin_dir,
-                            active_version = %active_health_version,
+                            active_version = ?active_health_version,
                             "plugin.json failed S6 or schema validation; failing closed without spawning replacement"
                         );
                     }
                     PluginManifestRead::Absent if self.has_seen_valid_manifest => {
                         tracing::debug!(
                             plugin_dir = ?self.plugin_dir,
-                            active_version = %active_health_version,
+                            active_version = ?active_health_version,
                             "plugin.json is transiently absent after previously valid manifest; failing closed"
                         );
                     }
@@ -211,6 +251,87 @@ impl AdoptUpgradeController {
                 self.cached_manifest = manifest;
             }
         }
+        plugin_poll_due
+    }
+
+    async fn recover_unreachable(&mut self) {
+        self.reap_children();
+
+        let now = Instant::now();
+        // Avoid spawning a duplicate bootstrap daemon during an in-flight `--replace-stale` swap.
+        if self
+            .last_replace_attempt
+            .is_some_and(|last| now.saturating_duration_since(last) < ADOPT_RECOVERY_HANDOFF_GRACE)
+        {
+            return;
+        }
+        if !self.recovery_backoff.is_ready(now) {
+            return;
+        }
+
+        self.poll_plugin_manifest_if_due(None).await;
+
+        let target_exe = match resolve_desired_version(
+            &self.cached_manifest,
+            self.has_seen_valid_manifest,
+            &self.running_version,
+        ) {
+            Some(desired) if desired != self.running_version => self
+                .find_matching_exe(desired)
+                .await
+                .or_else(|| self.startup_exe.clone())
+                .or_else(|| std::env::current_exe().ok()),
+            _ => self
+                .startup_exe
+                .clone()
+                .or_else(|| std::env::current_exe().ok()),
+        };
+
+        let Some(target_exe) = target_exe else {
+            self.recovery_backoff.record_attempt(now);
+            return;
+        };
+
+        let watch_pid = self.resolve_watch_pid().await;
+        match spawn_detached_proxy_daemon_with_exe_configured(
+            &target_exe,
+            &self.config_path,
+            DetachedDaemonOptions {
+                port: self.listen_port,
+                idle_shutdown_secs: DEFAULT_IDLE_SHUTDOWN_SECS,
+                watch_pid,
+                replace_stale: false,
+            },
+        ) {
+            Ok(child) => {
+                tracing::info!(
+                    port = self.listen_port,
+                    bootstrap_exe = %target_exe.display(),
+                    bootstrap_pid = child.id(),
+                    ?watch_pid,
+                    "proxy /health unreachable; spawned detached bootstrap daemon"
+                );
+                self.replacement_children.push(child);
+                self.recovery_backoff.record_attempt(now);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    port = self.listen_port,
+                    bootstrap_exe = %target_exe.display(),
+                    "failed to spawn detached bootstrap daemon for unreachable proxy; backing off"
+                );
+                self.recovery_backoff.record_attempt(now);
+            }
+        }
+    }
+
+    async fn tick(&mut self, active_health_version: &str) -> Option<PathBuf> {
+        self.reap_children();
+
+        let plugin_poll_due = self
+            .poll_plugin_manifest_if_due(Some(active_health_version))
+            .await;
 
         let desired_version = resolve_desired_version(
             &self.cached_manifest,
@@ -489,7 +610,6 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         }
     }
     let sidecar_shutdown_guard = SidecarShutdownGuard(sidecar_shutdown_tx);
-    let plugin_upgrade_shutdown_rx = sidecar_shutdown_rx.clone();
     let upstream_catalog = Arc::new(companion_core::UpstreamModelCatalog::new());
     let ls_collector = crate::ls_collector::spawn_ls_collector_from_env_with_catalog(
         Arc::clone(&sqlite_sink),
@@ -533,122 +653,111 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
     #[cfg(not(debug_assertions))]
     let expected_version = env!("CARGO_PKG_VERSION").to_string();
 
-    let proxy_role = resolve_proxy_role(&options);
     let listen_port = config.proxy.port.get();
-    let bind_config = config.clone();
 
-    let build_proxy_state = || -> Result<ProxyState, CliError> {
-        #[allow(unused_mut)]
-        let mut state_opts = ProxyStateOptions {
-            config_path: Some(config_path.clone()),
-            auth_store: Some(Arc::clone(&auth_store)),
-            role: Some(proxy_role.to_string()),
-            upstream_catalog: Some(Arc::clone(&upstream_catalog)),
-            ..Default::default()
-        };
-        #[cfg(debug_assertions)]
-        {
-            state_opts.health_version_override = health_version_override.clone();
-        }
-        Ok(ProxyState::from_config_with_codex_auth(
-            config.clone(),
-            Arc::clone(&usage_sink),
-            state_opts,
-            Arc::clone(&codex_auth) as Arc<dyn CodexAuth>,
-        )?)
-    };
-
-    // Pre-initialize ProxyState before any `--replace-stale` SIGTERM so TLS roots and
-    // HTTP clients are warm before the old daemon drops its listener (~10-20ms handoff).
-    let mut prebuilt_state = if !options.adopt_running {
-        Some(build_proxy_state()?)
-    } else {
-        None
-    };
-
-    let probe_client = if options.adopt_running || options.replace_stale {
-        Some(LoopbackProxyClient::with_default_timeouts()?)
-    } else {
-        None
-    };
-    let startup_exe = std::env::current_exe().ok();
-    let mut logged_adopt = false;
-    let mut takeover_retry_used = false;
-    let mut adopt_controller = if options.adopt_running {
-        Some(AdoptUpgradeController::new(
+    // Pure adopt/supervise mode for plugin sidecars: NEVER bind `listen_port`, NEVER prebuild
+    // `ProxyState`, and NEVER write `proxy.pid` / `proxy.log`. Port ownership belongs exclusively
+    // to a detached `bootstrap` daemon (or manual `standalone` `agy-companion serve`).
+    if options.adopt_running {
+        let probe = LoopbackProxyClient::with_default_timeouts()?;
+        let startup_exe = std::env::current_exe().ok();
+        let mut adopt_controller = AdoptUpgradeController::new(
             config_path.clone(),
             listen_port,
             expected_version.clone(),
             startup_exe,
-        ))
+        );
+        let mut logged_adopt = false;
+
+        loop {
+            adopt_controller.reap_children();
+
+            if let Some(health) = probe.probe_healthy_companion(listen_port, None).await {
+                adopt_controller.on_healthy();
+                if !logged_adopt {
+                    tracing::info!(
+                        port = listen_port,
+                        running_version = %health.version,
+                        role = ?health.role,
+                        "detected running agy-companion proxy; supervising in adopt mode"
+                    );
+                    logged_adopt = true;
+                }
+                if let Some(target_exe) = adopt_controller.tick(&health.version).await {
+                    #[cfg(unix)]
+                    {
+                        tracing::info!(
+                            running_version = %expected_version,
+                            active_version = %health.version,
+                            target_exe = %target_exe.display(),
+                            "bootstrap converged to upgraded version; self-execing upgraded sidecar binary"
+                        );
+                        drop(sidecar_shutdown_guard);
+                        if let Some(handle) = sidecar_ui_handle.take() {
+                            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+                        }
+                        let err = exec_self_upgrade(&target_exe);
+                        tracing::warn!(
+                            error = %err,
+                            target_exe = %target_exe.display(),
+                            "self-exec of upgraded sidecar binary failed"
+                        );
+                        return Err(CliError::Io(err));
+                    }
+                    #[cfg(not(unix))]
+                    let _ = target_exe;
+                }
+            } else {
+                logged_adopt = false;
+                adopt_controller.recover_unreachable().await;
+            }
+
+            tokio::select! {
+                _ = &mut signal_shutdown_fut => {
+                    drop(sidecar_shutdown_guard);
+                    if let Some(handle) = sidecar_ui_handle.take() {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+                    }
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(ADOPT_RUNNING_POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    let proxy_role = resolve_proxy_role(&options);
+    let bind_config = config.clone();
+
+    // Pre-initialize ProxyState before any `--replace-stale` SIGTERM so TLS roots and
+    // HTTP clients are warm before the old daemon drops its listener (~10-20ms handoff).
+    #[allow(unused_mut)]
+    let mut state_opts = ProxyStateOptions {
+        config_path: Some(config_path.clone()),
+        auth_store: Some(Arc::clone(&auth_store)),
+        role: Some(proxy_role.to_string()),
+        upstream_catalog: Some(Arc::clone(&upstream_catalog)),
+        ..Default::default()
+    };
+    #[cfg(debug_assertions)]
+    {
+        state_opts.health_version_override = health_version_override.clone();
+    }
+    let state = ProxyState::from_config_with_codex_auth(
+        config.clone(),
+        Arc::clone(&usage_sink),
+        state_opts,
+        Arc::clone(&codex_auth) as Arc<dyn CodexAuth>,
+    )?;
+
+    let probe_client = if options.replace_stale {
+        Some(LoopbackProxyClient::with_default_timeouts()?)
     } else {
         None
     };
 
-    let listener = 'bind_loop: loop {
-        if let Some(controller) = adopt_controller.as_mut() {
-            controller.reap_children();
-        }
-
+    let listener = 'bind_block: {
         match companion_proxy::bind_loopback_listener(&bind_config).await {
-            Ok(listener) => break 'bind_loop listener,
-            Err(ProxyError::Bind { addr, source })
-                if options.adopt_running && source.kind() == ErrorKind::AddrInUse =>
-            {
-                let probe = probe_client
-                    .as_ref()
-                    .expect("adopt_running guarantees LoopbackProxyClient");
-                if let Some(health) = probe.probe_healthy_companion(listen_port, None).await {
-                    takeover_retry_used = false;
-                    if !logged_adopt {
-                        tracing::info!(
-                            addr = %addr,
-                            running_version = %health.version,
-                            "detected running agy-companion proxy; monitoring until shutdown or takeover"
-                        );
-                        logged_adopt = true;
-                    }
-                    if let Some(controller) = adopt_controller.as_mut()
-                        && let Some(target_exe) = controller.tick(&health.version).await
-                    {
-                        #[cfg(unix)]
-                        {
-                            tracing::info!(
-                                running_version = %expected_version,
-                                active_version = %health.version,
-                                target_exe = %target_exe.display(),
-                                "bootstrap converged to upgraded version; self-execing upgraded sidecar binary"
-                            );
-                            drop(sidecar_shutdown_guard);
-                            if let Some(handle) = sidecar_ui_handle.take() {
-                                let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-                            }
-                            let err = exec_self_upgrade(&target_exe);
-                            tracing::warn!(
-                                error = %err,
-                                target_exe = %target_exe.display(),
-                                "self-exec of upgraded sidecar binary failed"
-                            );
-                            return Err(CliError::Io(err));
-                        }
-                        #[cfg(not(unix))]
-                        let _ = target_exe;
-                    }
-                    tokio::select! {
-                        _ = &mut signal_shutdown_fut => {
-                            return Ok(());
-                        }
-                        _ = tokio::time::sleep(ADOPT_RUNNING_POLL_INTERVAL) => {}
-                    }
-                    continue;
-                }
-                if logged_adopt && !takeover_retry_used {
-                    takeover_retry_used = true;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-                return Err(CliError::Proxy(ProxyError::Bind { addr, source }));
-            }
+            Ok(listener) => break 'bind_block listener,
             Err(ProxyError::Bind { addr, source })
                 if options.replace_stale && source.kind() == ErrorKind::AddrInUse =>
             {
@@ -668,10 +777,9 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
                         return Ok(());
                     }
                     Some(stale_health) => {
-                        if let Some(ref state) = prebuilt_state
-                            && let Ok(stale_stats) = probe
-                                .probe_stats(listen_port, Some(REPLACE_STALE_PROBE_TIMEOUT))
-                                .await
+                        if let Ok(stale_stats) = probe
+                            .probe_stats(listen_port, Some(REPLACE_STALE_PROBE_TIMEOUT))
+                            .await
                             && let Some(ts) = stale_stats.cloudcode.last_catalog_refresh_at_ms
                         {
                             state.stats().record_catalog_refresh(
@@ -808,7 +916,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
                                     match companion_proxy::bind_loopback_listener(&bind_config)
                                         .await
                                     {
-                                        Ok(listener) => break 'bind_loop listener,
+                                        Ok(listener) => break 'bind_block listener,
                                         Err(ProxyError::Bind {
                                             source: retry_source,
                                             ..
@@ -845,7 +953,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
                         };
                         loop {
                             match companion_proxy::bind_loopback_listener(&bind_config).await {
-                                Ok(listener) => break 'bind_loop listener,
+                                Ok(listener) => break 'bind_block listener,
                                 Err(ProxyError::Bind {
                                     source: retry_source,
                                     ..
@@ -898,7 +1006,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
                             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                         }
                         match companion_proxy::bind_loopback_listener(&bind_config).await {
-                            Ok(listener) => break 'bind_loop listener,
+                            Ok(listener) => break 'bind_block listener,
                             Err(ProxyError::Bind {
                                 source: retry_source,
                                 ..
@@ -940,10 +1048,6 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
             expected_version.clone(),
         ),
     )?;
-    let state = match prebuilt_state.take() {
-        Some(state) => state,
-        None => build_proxy_state()?,
-    };
 
     tracing::info!(
         addr = %bound_addr,
@@ -1028,80 +1132,92 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
         }
     };
 
-    #[cfg(unix)]
-    let pending_active_exec: Arc<Mutex<Option<(String, PathBuf)>>> = Arc::new(Mutex::new(None));
-    let plugin_upgrade_watcher = if let Some(mut controller) = adopt_controller {
-        let mut shutdown_rx = plugin_upgrade_shutdown_rx;
-        #[cfg(unix)]
-        let pending_exec_slot = Arc::clone(&pending_active_exec);
-        Some(tokio::spawn(async move {
-            let interval = controller.plugin_poll_interval;
-            loop {
-                let active_version = controller.running_version.clone();
-                let _ = controller.tick(&active_version).await;
-                #[cfg(unix)]
-                if let Some(pending) = controller.pending_self_exec.clone()
-                    && let Ok(mut guard) = pending_exec_slot.lock()
-                {
-                    *guard = Some(pending);
-                }
-                tokio::select! {
-                    _ = shutdown_rx.wait_for(|&stopped| stopped) => break,
-                    _ = tokio::time::sleep(interval) => {}
-                }
-            }
-        }))
-    } else {
-        None
-    };
-
     companion_proxy::serve_on_listener(listener, state, graceful_shutdown).await?;
     drop(pid_guard);
-    if let Some(watcher) = plugin_upgrade_watcher {
-        watcher.abort();
-    }
-
-    #[cfg(unix)]
-    if let Some((desired_version, target_exe)) =
-        pending_active_exec.lock().ok().and_then(|mut g| g.take())
-        && let Some(probe) = probe_client.as_ref()
-    {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let mut converged = false;
-        while Instant::now() < deadline {
-            if let Some(health) = probe
-                .probe_healthy_companion(listen_port, Some(REPLACE_STALE_PROBE_TIMEOUT))
-                .await
-                && health.version == desired_version
-            {
-                converged = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        if converged {
-            tracing::info!(
-                running_version = %expected_version,
-                active_version = %desired_version,
-                target_exe = %target_exe.display(),
-                "active-listener handoff converged; self-execing upgraded sidecar binary"
-            );
-            drop(sidecar_shutdown_guard);
-            if let Some(handle) = sidecar_ui_handle.take() {
-                let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-            }
-            let err = exec_self_upgrade(&target_exe);
-            tracing::warn!(
-                error = %err,
-                target_exe = %target_exe.display(),
-                "self-exec of upgraded sidecar binary failed"
-            );
-            return Err(CliError::Io(err));
-        }
-    }
-
-    #[cfg(not(unix))]
     drop(sidecar_shutdown_guard);
+    if let Some(handle) = sidecar_ui_handle.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_proxy_role_never_returns_sidecar() {
+        assert_eq!(resolve_proxy_role(&ServeOptions::default()), "standalone");
+        assert_eq!(
+            resolve_proxy_role(&ServeOptions {
+                adopt_running: true,
+                ..Default::default()
+            }),
+            "standalone"
+        );
+        assert_eq!(
+            resolve_proxy_role(&ServeOptions {
+                idle_shutdown_secs: Some(1800),
+                ..Default::default()
+            }),
+            "bootstrap"
+        );
+        assert_eq!(
+            resolve_proxy_role(&ServeOptions {
+                watch_pid: Some(42),
+                ..Default::default()
+            }),
+            "bootstrap"
+        );
+        assert_eq!(
+            resolve_proxy_role(&ServeOptions {
+                replace_stale: true,
+                ..Default::default()
+            }),
+            "bootstrap"
+        );
+    }
+
+    #[test]
+    fn adopt_recovery_backoff_is_immediate_then_bounded_exponential_and_resets_on_healthy() {
+        let t0 = Instant::now();
+        let mut backoff = AdoptRecoveryBackoff::default();
+
+        assert!(backoff.is_ready(t0));
+        assert_eq!(backoff.current_cooldown(), Duration::ZERO);
+
+        backoff.record_attempt(t0);
+        assert_eq!(backoff.current_cooldown(), Duration::from_secs(2));
+        assert!(!backoff.is_ready(t0 + Duration::from_millis(1999)));
+        assert!(backoff.is_ready(t0 + Duration::from_secs(2)));
+
+        let t1 = t0 + Duration::from_secs(2);
+        backoff.record_attempt(t1);
+        assert_eq!(backoff.current_cooldown(), Duration::from_secs(4));
+        assert!(!backoff.is_ready(t1 + Duration::from_secs(3)));
+        assert!(backoff.is_ready(t1 + Duration::from_secs(4)));
+
+        let t2 = t1 + Duration::from_secs(4);
+        backoff.record_attempt(t2);
+        assert_eq!(backoff.current_cooldown(), Duration::from_secs(8));
+
+        let t3 = t2 + Duration::from_secs(8);
+        backoff.record_attempt(t3);
+        assert_eq!(backoff.current_cooldown(), Duration::from_secs(16));
+
+        let t4 = t3 + Duration::from_secs(16);
+        backoff.record_attempt(t4);
+        assert_eq!(backoff.current_cooldown(), Duration::from_secs(30));
+
+        // Further consecutive failures stay capped at ADOPT_RECOVERY_MAX_BACKOFF (30s).
+        let t5 = t4 + Duration::from_secs(30);
+        backoff.record_attempt(t5);
+        assert_eq!(backoff.current_cooldown(), Duration::from_secs(30));
+
+        // Healthy /health resets backoff so future crashes recover immediately.
+        backoff.reset();
+        assert_eq!(backoff.current_cooldown(), Duration::ZERO);
+        assert!(backoff.is_ready(t5));
+    }
 }

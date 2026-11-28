@@ -46,10 +46,10 @@ When Antigravity App starts from macOS Dock/Spotlight or a Linux desktop launche
          |-- T+839ms: POST /v1internal:fetchAvailableModels -> local proxy (ALREADY WARM)
          |              |-- Day-0 (no real API key saved): returns upstream JSON UNTOUCHED
          |              `-- Key saved: preserves ALL native Google models + appends (AI Studio) models
-         |-- T+2.2s:  SidecarManager runs `serve --adopt-running` (500ms health poll; owns Aux Panel UI)
-         |              |-- Adopts warm bootstrap daemon (toggling plugin off never breaks :24141)
+         |-- T+2.2s:  SidecarManager runs `serve --adopt-running` (500ms health poll; owns Aux Panel UI; NEVER binds :24141)
+         |              |-- Adopts warm bootstrap daemon (toggling/restarting plugin never breaks :24141)
          |              |-- Watches `<plugin_dir>/plugin.json` (`AGY_COMPANION_PLUGIN_DIR` -> `AGY_PLUGINS_DIR`
-         |              |     -> default plugins dir) across both standby & active-listener states
+         |              |     -> default plugins dir) in standby
          |              |-- Converges toward `desired_version = plugin.json.version ?? running_version`:
          |              |     * Direct skew (`health != running == desired`): spawns `current_exe()` `--replace-stale`
          |              |     * Plugin advance/rollback (`health != desired != running`): passively polls local
@@ -58,7 +58,8 @@ When Antigravity App starts from macOS Dock/Spotlight or a Linux desktop launche
          |              |       and spawns the matching binary with `--replace-stale` (+ `--watch-pid`, sidecar
          |              |       UI/LS/plugin env scrubbed) for ~10-20ms zero-drop SSE handoff; old sidecar stays
          |              |       alive and goes idle once `/health.version == desired_version`
-         |              `-- Takes over in <1s on any mid-session crash
+         |              `-- Recovers :24141 in <1s on any mid-session crash by spawning a detached `bootstrap`
+         |                  daemon (sidecar UI/LS/plugin env scrubbed; killing the sidecar leaves :24141 alive)
          |-- MCP servers (gemini-api, ui-mcp, 3P): restored via JETSKI_MCP_ENV_RESTORE_* + run-companion.sh scrub
          `-- Integrated terminals ($SHELL -l): env.sh value-guarded ${VAR+x} 3-state scrub restores clean env
 ```
@@ -97,7 +98,7 @@ Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionPr
 - On Day-0 (`!has_configured_api_key`), `POST /v1internal:fetchAvailableModels` returns upstream JSON and headers untouched (hiding `(AI Studio)` models until a real API key is saved).
 - `GET /api/stats` exposes structured `StatsSnapshot` JSON (`{ "usage": { ... }, "cloudcode": { "mode", "resolved_upstream", "last_catalog_refresh_at_ms", "last_catalog_included_proxy_models" } }`).
 - Unsupported non-Gemini-3.8+/4+ `400` responses include the actionable hint `unset GOOGLE_GEMINI_BASE_URL to reach Gemini API directly`.
-- Managed On-Demand Daemon primitives: `--watch-pid <PID>` (zombie- and PID-reuse-safe parent tracking that exits cleanly within ~1–2s after `Antigravity.app` quits once `in_flight_requests == 0`), `--idle-shutdown-secs 1800` fallback guarded by active in-flight requests and open SSE streams (passive `/health` and `/api/stats` probes do not reset idle time), `--replace-stale` smooth version-skew handoff (pre-initialized `ProxyState`, carrying over `last_catalog_refresh_at_ms` / `last_catalog_included_proxy_models` from the outgoing daemon's `/api/stats` so Hybrid Mode detection never resets across handoffs, 4-layer OS-verified non-blocking `SIGTERM` without `SIGKILL`, `10ms` bind tight-poll while the old daemon drains active SSE streams, and idempotent exit `0` when a matching version already owns the port), `64 KiB`-capped `/health` probe with optional `role` (`"bootstrap"` | `"sidecar"` | `"standalone"`), `500ms` `--adopt-running` polling with plugin-manifest self-upgrade watching (`plugin/scripts/run-companion.sh` exports `AGY_COMPANION_PLUGIN_DIR`; `serve --adopt-running` fail-closed reads `plugin.json` across both standby and active-listener states, passively polls local candidate binaries gated by `(len, mtime)` + exact `--version` match whenever `/health` differs from `plugin.json`, spawns the matching binary with `--replace-stale` + `--watch-pid` while scrubbing `ANTIGRAVITY_SIDECAR_WEB_PORT`, `ANTIGRAVITY_SIDECAR_UI_TOKEN`, `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`, and `AGY_COMPANION_PLUGIN_DIR`, and once `/health` converges self-`exec`s the upgraded binary in-place on Unix — preserving PID and re-binding the Sidecar Web UI with zero version skew — while staying alive without downgrading on Windows), atomic `0600` structured `proxy.pid` (PID-matched `ProxyPidGuard::drop` race safety), and `0600` rotating `5 MiB` `proxy.log`.
+- Managed On-Demand Daemon primitives: `--watch-pid <PID>` (zombie- and PID-reuse-safe parent tracking that exits cleanly within ~1–2s after `Antigravity.app` quits once `in_flight_requests == 0`), `--idle-shutdown-secs 1800` fallback guarded by active in-flight requests and open SSE streams (passive `/health` and `/api/stats` probes do not reset idle time), `--replace-stale` smooth version-skew handoff (pre-initialized `ProxyState`, carrying over `last_catalog_refresh_at_ms` / `last_catalog_included_proxy_models` from the outgoing daemon's `/api/stats` so Hybrid Mode detection never resets across handoffs, 4-layer OS-verified non-blocking `SIGTERM` without `SIGKILL`, `10ms` bind tight-poll while the old daemon drains active SSE streams, and idempotent exit `0` when a matching version already owns the port), `64 KiB`-capped `/health` probe with optional `role` (`"bootstrap"` | `"standalone"` — port `24141` is exclusively owned by a detached `bootstrap` daemon or manual `standalone` `agy-companion serve`, never a sidecar), `500ms` `--adopt-running` standby polling with detached-bootstrap crash recovery and plugin-manifest self-upgrade watching (`plugin/scripts/run-companion.sh` exports `AGY_COMPANION_PLUGIN_DIR`; `serve --adopt-running` never binds the proxy port in-process, recovers an unreachable `listen_port` in `<1s` by spawning a detached `bootstrap` daemon with sidecar UI/LS/plugin env scrubbed so killing or restarting the sidecar leaves `:24141` alive, fail-closed reads `plugin.json`, passively polls local candidate binaries gated by `(len, mtime)` + exact `--version` match whenever `/health` differs from `plugin.json`, spawns the matching binary with `--replace-stale` + `--watch-pid` while scrubbing `ANTIGRAVITY_SIDECAR_WEB_PORT`, `ANTIGRAVITY_SIDECAR_UI_TOKEN`, `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`, and `AGY_COMPANION_PLUGIN_DIR`, and once `/health` converges self-`exec`s the upgraded binary in-place on Unix — preserving PID and re-binding the Sidecar Web UI with zero version skew — while staying alive without downgrading on Windows), atomic `0600` structured `proxy.pid` (PID-matched `ProxyPidGuard::drop` race safety), and `0600` rotating `5 MiB` `proxy.log`.
 
 | Criterion | OS User Service (`launchd` / `systemd --user`) | Managed On-Demand Daemon + `SidecarManager` (Chosen) |
 | --- | --- | --- |
@@ -105,7 +106,7 @@ Consumer Google AI Pro accounts populate a non-empty managed `cloudaicompanionPr
 | macOS Login Items alert | Triggers "Background Items Added" popup | Zero OS popups |
 | Idle footprint after `Cmd+Q` | Runs 24/7 | Exits cleanly within ~1–2s via `--watch-pid` (with `--idle-shutdown-secs 1800` fallback) |
 | Version bump / rebuild handoff | Manual restart drops active streams | ~10–20ms zero-drop SSE handoff via sidecar `--adopt-running` -> detached `--replace-stale` |
-| Mid-session crash recovery | Fast, but fights `SIGTERM` / port changes | `<1s` takeover via `SidecarManager` `serve --adopt-running` (`500ms` poll) |
+| Mid-session crash recovery | Fast, but fights `SIGTERM` / port changes | `<1s` detached `bootstrap` respawn via `SidecarManager` `serve --adopt-running` (`500ms` poll; sidecar never binds `:24141`) |
 | Cross-platform portability | Divergent (`launchd` / `systemd` / Windows Task) | One unified lifecycle across macOS, Linux, WSL, containers, Windows |
 
 ---

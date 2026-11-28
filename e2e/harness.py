@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import csv
 import dataclasses
 import errno
 import http.client
+import io
 import json
 import os
 import shutil
@@ -208,6 +210,101 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
+def _windows_process_image_name(pid: int) -> str | None:
+    """Return the Windows image name (e.g. `agy-companion.exe`) for `pid`, or None if gone."""
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    text = completed.stdout.decode("utf-8", errors="replace")
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) >= 2 and row[1].strip() == str(pid):
+            image = row[0].strip()
+            return image or None
+    return None
+
+
+def _windows_matches_expected_daemon(
+    image_name: str,
+    *,
+    expected_binary: Path | None,
+    expected_cmdline_substr: str | None,
+) -> bool:
+    """Verify Windows image name matches the expected companion binary."""
+    img = image_name.strip().lower()
+    if not img:
+        return False
+    if expected_cmdline_substr is not None:
+        tok = expected_cmdline_substr.strip().lower()
+        return bool(tok) and tok in img
+    if expected_binary is not None:
+        exp = expected_binary.name.lower()
+        exp_exe = exp if exp.endswith(".exe") else f"{exp}.exe"
+        return img in (exp, exp_exe)
+    return "agy-companion" in img
+
+
+def _windows_terminate_pid(pid: int) -> bool:
+    """Terminate a verified Windows PID via `taskkill /F /PID`, falling back to `os.kill`."""
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+            check=False,
+        )
+        if completed.returncode == 0:
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _list_windows_companion_processes() -> list[tuple[int, str]]:
+    """Return `(pid, cmdline)` pairs for running Windows `agy-companion*` processes."""
+    if os.name != "nt":
+        return []
+    ps_cmd = (
+        "Get-CimInstance Win32_Process -Filter \"Name LIKE 'agy-companion%'\" | "
+        "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    results: list[tuple[int, str]] = []
+    for line in completed.stdout.decode("utf-8", errors="replace").splitlines():
+        if "\t" not in line:
+            continue
+        pid_str, cmdline = line.split("\t", 1)
+        pid_str = pid_str.strip()
+        cmdline = cmdline.strip()
+        if pid_str.isdigit() and cmdline:
+            results.append((int(pid_str), cmdline))
+    return results
+
+
 def reap_pidfile_daemon(
     pid_path: Path,
     *,
@@ -218,15 +315,15 @@ def reap_pidfile_daemon(
     """Safely terminate a detached daemon referenced by a JSON `proxy.pid` file.
 
     Enforces 5 safety layers before signalling:
-      1. `pid_path` must open with `O_NOFOLLOW | O_NONBLOCK` and `fstat` as a regular file (<= 64 KiB).
+      1. `pid_path` must open with `O_NOFOLLOW | O_NONBLOCK` (symlink-checked on Windows) and `fstat` as a regular file (<= 64 KiB).
       2. JSON `"pid"` must be a strict int in `2..=0x7FFFFFFF` and neither current PID nor parent PID.
-      3. Process must be alive and accessible via `os.kill(pid, 0)`.
-      4. Live OS cmdline (`/proc/<pid>/cmdline` or `/bin/ps`) must match expected daemon.
-      5. Safe PGID-or-PID `SIGTERM` -> poll -> re-verify cmdline -> `SIGKILL`.
+      3. Process must be alive and accessible.
+      4. Live OS identity (`/proc/<pid>/cmdline` or `/bin/ps` on POSIX; `tasklist` image name on Windows) must match expected daemon.
+      5. Safe PGID-or-PID `SIGTERM` -> poll -> re-verify cmdline -> `SIGKILL` (POSIX) or `taskkill /F /PID` + stale `proxy.pid` cleanup (Windows).
     """
-    if os.name == "nt":
-        return False
     path = Path(pid_path)
+    if os.name == "nt" and path.is_symlink():
+        return False
     open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path, open_flags)
@@ -268,12 +365,38 @@ def reap_pidfile_daemon(
     if pid <= 1 or pid > 0x7FFFFFFF or pid == os.getpid() or pid == os.getppid():
         return False
 
+    exp_bin = Path(expected_binary) if expected_binary is not None else None
+    if os.name == "nt":
+        image_name = _windows_process_image_name(pid)
+        if not image_name:
+            with contextlib.suppress(OSError):
+                path.unlink()
+            return False
+        if not _windows_matches_expected_daemon(
+            image_name,
+            expected_binary=exp_bin,
+            expected_cmdline_substr=expected_cmdline_substr,
+        ):
+            return False
+        _windows_terminate_pid(pid)
+        deadline = time.monotonic() + max(0.05, timeout)
+        while time.monotonic() < deadline:
+            if _windows_process_image_name(pid) is None:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                return True
+            time.sleep(0.05)
+        gone = _windows_process_image_name(pid) is None
+        if gone:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        return gone
+
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError, OSError, OverflowError, ValueError):
         return False
 
-    exp_bin = Path(expected_binary) if expected_binary is not None else None
     cmdline = _read_process_cmdline(pid)
     if not cmdline or not _matches_expected_daemon(
         cmdline,
@@ -360,13 +483,12 @@ def reap_env_daemons(
     expected_cmdline_substr: str | None = None,
     timeout: float = 3.0,
 ) -> int:
-    """Safely terminate detached daemons whose command line references `env_root` (POSIX only).
+    """Safely terminate detached daemons whose command line or `proxy.pid` belongs to `env_root`.
 
-    Catches detached replacement daemons (e.g., `serve --adopt-running` spawning
-    `serve --replace-stale --config <env_root>/...`) even before they write `proxy.pid`.
+    Catches detached replacement/bootstrap daemons (e.g., `serve --adopt-running` spawning
+    `serve --replace-stale --config <env_root>/...` or detached `serve --config <env_root>/...`)
+    even if `proxy.pid` was overwritten or not yet written.
     """
-    if os.name == "nt":
-        return 0
     raw_root = str(env_root)
     real_root = os.path.realpath(raw_root)
     root_tokens = tuple(dict.fromkeys(tok for tok in (raw_root, real_root) if len(tok) >= 8))
@@ -376,6 +498,40 @@ def reap_env_daemons(
     self_pid = os.getpid()
     parent_pid = os.getppid()
     exp_bin = Path(expected_binary) if expected_binary is not None else None
+    if os.name == "nt":
+        reaped = 0
+        try:
+            pid_files = list(Path(env_root).rglob("proxy.pid"))
+        except OSError:
+            pid_files = []
+        for pid_path in pid_files:
+            if not pid_path.is_symlink() and reap_pidfile_daemon(
+                pid_path,
+                expected_binary=exp_bin,
+                expected_cmdline_substr=expected_cmdline_substr,
+                timeout=timeout,
+            ):
+                reaped += 1
+        lower_tokens = tuple(tok.lower() for tok in root_tokens)
+        matched_pids: list[int] = []
+        for pid, cmdline in _list_windows_companion_processes():
+            if pid <= 1 or pid > 0x7FFFFFFF or pid == self_pid or pid == parent_pid:
+                continue
+            cmd_lower = cmdline.lower()
+            if not any(tok in cmd_lower for tok in lower_tokens):
+                continue
+            if not _matches_expected_daemon(
+                cmdline,
+                expected_binary=exp_bin,
+                expected_cmdline_substr=expected_cmdline_substr,
+            ):
+                continue
+            matched_pids.append(pid)
+        for pid in matched_pids:
+            if _windows_terminate_pid(pid):
+                reaped += 1
+        return reaped
+
     matched_pids: list[int] = []
     for pid, cmdline in _list_posix_processes():
         if pid <= 1 or pid > 0x7FFFFFFF or pid == self_pid or pid == parent_pid:
@@ -423,6 +579,76 @@ def reap_env_daemons(
             if remaining:
                 time.sleep(0.015)
 
+    return sum(1 for pid in matched_pids if not _is_pid_alive(pid))
+
+
+def reap_port_daemons(
+    port: int,
+    *,
+    expected_binary: str | Path | None = None,
+    timeout: float = 3.0,
+) -> int:
+    """Safely terminate detached `agy-companion serve` daemons started with `--port <port>`."""
+    port_str = str(int(port))
+    self_pid = os.getpid()
+    parent_pid = os.getppid()
+    exp_bin = Path(expected_binary) if expected_binary is not None else None
+
+    if os.name == "nt":
+        reaped = 0
+        for pid, cmdline in _list_windows_companion_processes():
+            if pid <= 1 or pid > 0x7FFFFFFF or pid == self_pid or pid == parent_pid:
+                continue
+            cmd_lower = cmdline.lower()
+            if "--port" not in cmd_lower or port_str not in cmd_lower:
+                continue
+            if not _matches_expected_daemon(
+                cmdline,
+                expected_binary=exp_bin,
+                expected_cmdline_substr=None,
+            ):
+                continue
+            if _windows_terminate_pid(pid):
+                reaped += 1
+        return reaped
+
+    matched_pids: list[int] = []
+    for pid, cmdline in _list_posix_processes():
+        if pid <= 1 or pid > 0x7FFFFFFF or pid == self_pid or pid == parent_pid:
+            continue
+        if "--port" not in cmdline or port_str not in cmdline:
+            continue
+        if not _matches_expected_daemon(
+            cmdline,
+            expected_binary=exp_bin,
+            expected_cmdline_substr=None,
+        ):
+            continue
+        matched_pids.append(pid)
+
+    if not matched_pids:
+        return 0
+    for pid in matched_pids:
+        _signal_pid_safely(pid, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.05, timeout)
+    remaining = list(matched_pids)
+    while remaining and time.monotonic() < deadline:
+        remaining = [pid for pid in remaining if _is_pid_alive(pid)]
+        if remaining:
+            time.sleep(0.015)
+    for pid in remaining:
+        recheck_cmdline = _read_process_cmdline(pid)
+        if (
+            recheck_cmdline
+            and "--port" in recheck_cmdline
+            and port_str in recheck_cmdline
+            and _matches_expected_daemon(
+                recheck_cmdline,
+                expected_binary=exp_bin,
+                expected_cmdline_substr=None,
+            )
+        ):
+            _signal_pid_safely(pid, signal.SIGKILL)
     return sum(1 for pid in matched_pids if not _is_pid_alive(pid))
 
 
@@ -611,6 +837,7 @@ class IsolatedEnv:
         self.usage_dir = self.data_dir / "usage"
         self.cache_root = self.root / "cache"
         self.tmp_dir = self.root / "tmp"
+        self._spawned_sidecar = False
         for d in (self.home_dir, self.config_dir, self.usage_dir, self.cache_root, self.tmp_dir):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -807,14 +1034,29 @@ class IsolatedEnv:
 
     def close(self) -> None:
         if os.name == "nt":
+            pid_file = self.data_dir / "proxy.pid"
+            has_pid = pid_file.exists() and not pid_file.is_symlink()
+            has_log = (self.data_dir / "proxy.log").exists()
+            if has_pid:
+                reap_pidfile_daemon(pid_file, timeout=2.0)
+            if (
+                self._spawned_sidecar
+                or has_pid
+                or has_log
+                or any(self.root.rglob("proxy.pid"))
+                or any(self.root.rglob("proxy.log"))
+            ):
+                reap_env_daemons(self.root, timeout=2.0)
             for attempt in range(10):
                 try:
                     self._tempdir.cleanup()
                     return
                 except PermissionError:
                     if attempt == 9:
+                        reap_env_daemons(self.root, timeout=1.0)
                         shutil.rmtree(self._tempdir.name, ignore_errors=True)
                         return
+                    reap_env_daemons(self.root, timeout=1.0)
                     time.sleep(0.05)
             return
 
@@ -824,7 +1066,7 @@ class IsolatedEnv:
         has_log = log_file.exists() or log_file.is_symlink()
         if has_pid:
             reap_pidfile_daemon(pid_file, timeout=2.0)
-        if has_pid or has_log:
+        if self._spawned_sidecar or has_pid or has_log:
             reap_env_daemons(self.root, timeout=2.0)
 
         for attempt in range(10):
@@ -1322,6 +1564,8 @@ class CompanionProcess:
         self._lock = threading.Lock()
         self._stdout_lines: list[str] = []
         self._stderr_lines: list[str] = []
+        self._stdout_file: Any | None = None
+        self._stderr_file: Any | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._stopped = False
@@ -1349,11 +1593,25 @@ class CompanionProcess:
     @property
     def stdout_text(self) -> str:
         with self._lock:
+            if self._stdout_file is not None:
+                try:
+                    self._stdout_file.flush()
+                    self._stdout_file.seek(0)
+                    return self._stdout_file.read().decode("utf-8", errors="replace")
+                except (OSError, ValueError):
+                    pass
             return "".join(self._stdout_lines)
 
     @property
     def stderr_text(self) -> str:
         with self._lock:
+            if self._stderr_file is not None:
+                try:
+                    self._stderr_file.flush()
+                    self._stderr_file.seek(0)
+                    return self._stderr_file.read().decode("utf-8", errors="replace")
+                except (OSError, ValueError):
+                    pass
             return "".join(self._stderr_lines)
 
     def _build_cmd(self) -> list[str]:
@@ -1374,6 +1632,23 @@ class CompanionProcess:
         self._stdout_lines = []
         self._stderr_lines = []
         self._stopped = False
+        if os.name == "nt":
+            # Avoid Windows CRT pipe-close deadlocks when detached grandchild daemons
+            # inherit stdout/stderr handles (bInheritHandles=TRUE).
+            self._stdout_file = tempfile.TemporaryFile()
+            self._stderr_file = tempfile.TemporaryFile()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=self._stdout_file,
+                stderr=self._stderr_file,
+                env=self._env,
+                cwd=self._cwd,
+            )
+            self._proc = proc
+            with _ACTIVE_COMPANION_LOCK:
+                _ACTIVE_COMPANION_PIDS.add(proc.pid)
+            return
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1515,6 +1790,23 @@ class CompanionProcess:
                     pipe.close()
                 except OSError:
                     pass
+        with self._lock:
+            if self._stdout_file is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._stdout_file.flush()
+                    self._stdout_file.seek(0)
+                    self._stdout_lines = [self._stdout_file.read().decode("utf-8", errors="replace")]
+                with contextlib.suppress(OSError):
+                    self._stdout_file.close()
+                self._stdout_file = None
+            if self._stderr_file is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    self._stderr_file.flush()
+                    self._stderr_file.seek(0)
+                    self._stderr_lines = [self._stderr_file.read().decode("utf-8", errors="replace")]
+                with contextlib.suppress(OSError):
+                    self._stderr_file.close()
+                self._stderr_file = None
 
         with _ACTIVE_COMPANION_LOCK:
             _ACTIVE_COMPANION_PIDS.discard(proc.pid)
@@ -1803,6 +2095,7 @@ class E2ETestCase(unittest.TestCase):
     ) -> SidecarUiClient:
         """Start `agy-companion serve --adopt-running` with the Sidecar Web UI enabled."""
         binary = self.require_binary()
+        env_obj._spawned_sidecar = True
         sidecar_port = find_free_port()
         cmd = [str(binary), "serve", "--adopt-running"]
         if pass_config_flag:
@@ -1845,6 +2138,7 @@ class SidecarUiClient:
         self.ready_timeout = float(ready_timeout)
         self._proc: subprocess.Popen[bytes] | None = None
         self._stderr_chunks: list[bytes] = []
+        self._stderr_file: Any | None = None
         self._stderr_thread: threading.Thread | None = None
 
     @staticmethod
@@ -1857,35 +2151,51 @@ class SidecarUiClient:
 
     @property
     def stderr_text(self) -> str:
+        if self._stderr_file is not None:
+            with contextlib.suppress(OSError, ValueError):
+                self._stderr_file.flush()
+                self._stderr_file.seek(0)
+                return self._stderr_file.read().decode("utf-8", errors="replace")
         return b"".join(self._stderr_chunks).decode("utf-8", errors="replace")
 
     def start(self) -> SidecarUiClient:
-        kwargs: dict[str, Any] = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.PIPE,
-            "env": self.env,
-        }
-        if os.name != "nt":
-            kwargs["start_new_session"] = True
-        self._proc = subprocess.Popen(self.cmd, **kwargs)
-        stderr_pipe = self._proc.stderr
-        assert stderr_pipe is not None
+        if os.name == "nt":
+            # Avoid Windows CRT pipe-close deadlocks when detached bootstrap daemons
+            # inherit stderr handles (bInheritHandles=TRUE).
+            self._stderr_file = tempfile.TemporaryFile()
+            kwargs: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": self._stderr_file,
+                "env": self.env,
+            }
+            self._proc = subprocess.Popen(self.cmd, **kwargs)
+        else:
+            kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.PIPE,
+                "env": self.env,
+                "start_new_session": True,
+            }
+            self._proc = subprocess.Popen(self.cmd, **kwargs)
+            stderr_pipe = self._proc.stderr
+            assert stderr_pipe is not None
 
-        def _drain_stderr() -> None:
-            if stderr_pipe is None:
-                return
-            try:
-                while True:
-                    chunk = stderr_pipe.read(4096)
-                    if not chunk:
-                        break
-                    self._stderr_chunks.append(chunk)
-            except (OSError, ValueError):
-                pass
+            def _drain_stderr() -> None:
+                if stderr_pipe is None:
+                    return
+                try:
+                    while True:
+                        chunk = stderr_pipe.read(4096)
+                        if not chunk:
+                            break
+                        self._stderr_chunks.append(chunk)
+                except (OSError, ValueError):
+                    pass
 
-        self._stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-        self._stderr_thread.start()
+            self._stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            self._stderr_thread.start()
 
         deadline = time.monotonic() + self.ready_timeout
         last_err: str = "not ready"
@@ -2041,6 +2351,14 @@ class SidecarUiClient:
         if proc is not None and proc.stderr is not None:
             with contextlib.suppress(OSError):
                 proc.stderr.close()
+        if self._stderr_file is not None:
+            with contextlib.suppress(OSError, ValueError):
+                self._stderr_file.flush()
+                self._stderr_file.seek(0)
+                self._stderr_chunks = [self._stderr_file.read()]
+            with contextlib.suppress(OSError):
+                self._stderr_file.close()
+            self._stderr_file = None
 
     def __enter__(self) -> SidecarUiClient:
         return self.start()

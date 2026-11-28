@@ -653,72 +653,98 @@ async fn sidecar_plugin_manifest_version_change_triggers_binary_poll_handoff_and
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sidecar_owning_listener_hands_off_to_upgraded_bootstrap_when_plugin_version_advances() {
+async fn sidecar_starts_without_bootstrap_spawns_detached_bootstrap_and_survives_sidecar_exit() {
     let temp = TempDir::new().expect("tempdir");
     let cfg_path = write_test_config_with_upstream(&temp, None);
     let pid_path = temp.path().join("proxy.pid");
-    let plugin_dir = temp.path().join("plugin");
-    std::fs::create_dir_all(&plugin_dir).expect("mkdir plugin");
-    let manifest_path = plugin_dir.join("plugin.json");
-    std::fs::write(
-        &manifest_path,
-        r#"{"name":"agy-companion","version":"0.0.2-old"}"#,
-    )
-    .expect("write initial manifest");
-
+    let port = free_loopback_port();
+    let sidecar_web_port = free_loopback_port();
     let client = loopback_http_client();
     let _detached_cleanup = DetachedPidFileGuard::new(pid_path.clone());
 
-    // Start vOld sidecar with no existing bootstrap, so sidecar itself owns :port (serve_on_listener).
-    let (sidecar_guard, port, initial_resp) =
-        spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
-            let mut cmd = isolated_cli_command(temp.path());
-            cmd.env("AGY_COMPANION_TEST_HEALTH_VERSION", "0.0.2-old")
-                .env("AGY_COMPANION_PLUGIN_DIR", &plugin_dir)
-                .env("AGY_COMPANION_TEST_PLUGIN_POLL_MS", "100")
-                .args(["serve", "--port", &port.to_string(), "--config"])
-                .arg(&cfg_path)
-                .arg("--adopt-running");
-            cmd
-        })
-        .await;
+    // Start sidecar (--adopt-running) on Day-0 with no existing bootstrap on :port.
+    // Sidecar must NEVER bind :port itself; it must spawn a detached bootstrap daemon
+    // with scrubbed sidecar Web UI env.
+    let mut sidecar_cmd = isolated_cli_command(temp.path());
+    sidecar_cmd
+        .env("ANTIGRAVITY_SIDECAR_WEB_PORT", sidecar_web_port.to_string())
+        .env("ANTIGRAVITY_SIDECAR_UI_TOKEN", "day0-sidecar-token")
+        .args(["serve", "--port", &port.to_string(), "--config"])
+        .arg(&cfg_path)
+        .arg("--adopt-running");
+    let sidecar_guard = ChildGuard::new(sidecar_cmd.spawn().expect("spawn sidecar"));
     let sidecar_pid = sidecar_guard.id();
-    let initial_health: HealthResponse = initial_resp.json().await.expect("parse initial health");
-    assert_eq!(initial_health.version, "0.0.2-old");
-    assert_eq!(initial_health.role.as_deref(), Some("sidecar"));
 
-    // Advance plugin.json to CARGO_PKG_VERSION -> active-listener watcher spawns upgraded bootstrap.
-    std::fs::write(
-        &manifest_path,
-        format!(
-            r#"{{"name":"agy-companion","version":"{}"}}"#,
-            env!("CARGO_PKG_VERSION")
-        ),
-    )
-    .expect("write upgraded manifest");
-
-    let upgrade_deadline = Instant::now() + Duration::from_secs(6);
-    let mut upgraded_health = None;
-    while Instant::now() < upgrade_deadline {
-        if let Some(health) = poll_health(client, port).await
-            && health.version == env!("CARGO_PKG_VERSION")
-        {
-            upgraded_health = Some(health);
+    let recovery_deadline = Instant::now() + Duration::from_millis(1500);
+    let mut recovered_health = None;
+    while Instant::now() < recovery_deadline {
+        if let Some(health) = poll_health(client, port).await {
+            recovered_health = Some(health);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let upgraded_health = upgraded_health
-        .expect("active-listener sidecar watcher should hand off to upgraded bootstrap");
-    assert_eq!(upgraded_health.role.as_deref(), Some("bootstrap"));
+    let recovered_health = recovered_health
+        .expect("sidecar --adopt-running must recover unreachable port within 1.5s");
+    assert_eq!(recovered_health.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        recovered_health.role.as_deref(),
+        Some("bootstrap"),
+        "recovered proxy must report role=bootstrap, never role=sidecar"
+    );
 
-    let new_pid = read_proxy_pid(&pid_path)
-        .expect("read new pid")
-        .expect("new pid present")
+    let bootstrap_pid = read_proxy_pid(&pid_path)
+        .expect("read bootstrap pid")
+        .expect("bootstrap pid present")
         .pid;
-    assert_ne!(new_pid, sidecar_pid);
+    assert_ne!(
+        bootstrap_pid, sidecar_pid,
+        "proxy.pid must belong to detached bootstrap daemon, never the sidecar"
+    );
 
-    drop(sidecar_guard);
+    // Sidecar Web UI should be serving on sidecar_web_port.
+    let ui_resp = client
+        .get(format!("http://127.0.0.1:{sidecar_web_port}/"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .expect("sidecar Web UI must respond");
+    assert_eq!(ui_resp.status(), reqwest::StatusCode::OK);
+
+    // Killing the sidecar must close the Web UI port while leaving the detached bootstrap alive.
+    sidecar_guard.kill_and_wait().expect("kill sidecar");
+
+    let web_close_deadline = Instant::now() + Duration::from_secs(3);
+    let mut web_port_closed = false;
+    while Instant::now() < web_close_deadline {
+        if client
+            .get(format!("http://127.0.0.1:{sidecar_web_port}/"))
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await
+            .is_err()
+        {
+            web_port_closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        web_port_closed,
+        "sidecar Web UI port must close when sidecar exits"
+    );
+
+    let surviving_health = poll_health(client, port)
+        .await
+        .expect("detached bootstrap proxy must remain alive after sidecar exits");
+    assert_eq!(surviving_health.role.as_deref(), Some("bootstrap"));
+    assert_eq!(
+        read_proxy_pid(&pid_path)
+            .expect("read surviving pid")
+            .expect("surviving pid present")
+            .pid,
+        bootstrap_pid
+    );
 }
 
 #[cfg(unix)]
@@ -1222,6 +1248,17 @@ async fn sidecar_self_execs_in_place_after_bootstrap_upgrade_preserving_pid_and_
     assert_eq!(
         settings.pointer("/proxy/version").and_then(|v| v.as_str()),
         Some(env!("CARGO_PKG_VERSION"))
+    );
+    let converged_health = poll_health(client, port)
+        .await
+        .expect("upgraded bootstrap must be healthy after sidecar self-exec");
+    assert_eq!(converged_health.role.as_deref(), Some("bootstrap"));
+    assert_ne!(
+        read_proxy_pid(&pid_path)
+            .expect("read converged pid")
+            .expect("converged pid present")
+            .pid,
+        sidecar_pid
     );
 
     drop(sidecar_guard);

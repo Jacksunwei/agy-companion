@@ -725,7 +725,7 @@ async fn serve_writes_0600_proxy_pid_and_proxy_log_in_isolated_dir_and_cleans_pi
 
 #[cfg(unix)]
 #[tokio::test]
-async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms() {
+async fn serve_adopt_running_does_not_clobber_pid_and_recovers_detached_bootstrap_within_1500ms() {
     let temp = TempDir::new().expect("tempdir");
     let cfg_path = temp.path().join("config.json");
     let usage_dir = temp.path().join("usage");
@@ -733,6 +733,9 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
     let mut cfg = config_with_port(free_loopback_port());
     cfg.usage_dir = Some(usage_dir);
     cfg.save_secure(&cfg_path).expect("save_secure");
+
+    let pid_path = temp.path().join("proxy.pid");
+    let _detached_cleanup = crate::common::DetachedPidFileGuard::new(pid_path.clone());
 
     let client = loopback_http_client();
     let (primary_guard, port, _resp) = spawn_serve_and_wait_healthy(client, &cfg_path, |port| {
@@ -745,32 +748,31 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
     let primary_pid = primary_guard.id();
     let health_url = format!("http://127.0.0.1:{port}/health");
 
-    let pid_path = temp.path().join("proxy.pid");
     let primary_pid_json: Value =
         serde_json::from_str(&fs::read_to_string(&pid_path).expect("read pid")).expect("parse");
     assert_eq!(primary_pid_json["pid"], primary_pid);
 
-    // Start standby with --adopt-running.
-    let standby_child = isolated_cli_command(temp.path())
+    // Start sidecar with --adopt-running.
+    let sidecar_child = isolated_cli_command(temp.path())
         .args(["serve", "--port", &port.to_string(), "--config"])
         .arg(&cfg_path)
         .arg("--adopt-running")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn standby");
-    let mut standby_guard = ChildGuard::new(standby_child);
-    let standby_pid = standby_guard.id();
+        .expect("spawn sidecar");
+    let mut sidecar_guard = ChildGuard::new(sidecar_child);
+    let sidecar_pid = sidecar_guard.id();
 
-    // Standby must NOT clobber primary's proxy.pid while parked.
+    // Sidecar must NOT clobber primary's proxy.pid while supervising.
     tokio::time::sleep(Duration::from_millis(250)).await;
-    if let Some(status) = standby_guard.try_wait().expect("try_wait standby") {
-        let output = tokio::task::spawn_blocking(move || standby_guard.wait_with_output())
+    if let Some(status) = sidecar_guard.try_wait().expect("try_wait sidecar") {
+        let output = tokio::task::spawn_blocking(move || sidecar_guard.wait_with_output())
             .await
-            .expect("join standby")
-            .expect("wait standby");
+            .expect("join sidecar")
+            .expect("wait sidecar");
         panic!(
-            "standby exited prematurely while parked (status={status}): stderr={}",
+            "sidecar exited prematurely while supervising (status={status}): stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -778,8 +780,9 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
         serde_json::from_str(&fs::read_to_string(&pid_path).expect("read pid")).expect("parse");
     assert_eq!(parked_pid_json["pid"], primary_pid);
 
-    // Stop primary; standby must take over within ~1.5s and update proxy.pid to standby_pid.
-    let takeover_start = Instant::now();
+    // Stop primary; sidecar must recover within 1.5s by spawning a detached bootstrap daemon
+    // (never binding the port itself or writing its own PID to proxy.pid).
+    let recovery_start = Instant::now();
     let kill_primary = Command::new("kill")
         .args(["-TERM", &primary_pid.to_string()])
         .status()
@@ -791,46 +794,70 @@ async fn serve_adopt_running_does_not_clobber_pid_and_takes_over_within_1500ms()
         .expect("wait primary");
     assert_eq!(primary_out.status.code(), Some(0));
 
-    let takeover_deadline = Instant::now() + Duration::from_millis(2000);
-    loop {
-        if let Some(status) = standby_guard.try_wait().expect("try_wait standby") {
-            let output = tokio::task::spawn_blocking(move || standby_guard.wait_with_output())
+    let recovery_deadline = Instant::now() + Duration::from_millis(1500);
+    let bootstrap_pid: u32 = loop {
+        if let Some(status) = sidecar_guard.try_wait().expect("try_wait sidecar") {
+            let output = tokio::task::spawn_blocking(move || sidecar_guard.wait_with_output())
                 .await
-                .expect("join standby")
-                .expect("wait standby");
+                .expect("join sidecar")
+                .expect("wait sidecar");
             panic!(
-                "standby exited prematurely during takeover (status={status}): stderr={}",
+                "sidecar exited prematurely during recovery (status={status}): stderr={}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
         if let Ok(raw) = fs::read_to_string(&pid_path)
             && let Ok(parsed) = serde_json::from_str::<Value>(&raw)
-            && parsed["pid"] == standby_pid
+            && let Some(pid) = parsed["pid"].as_u64().and_then(|p| u32::try_from(p).ok())
+            && pid != primary_pid
             && let Ok(resp) = client.get(&health_url).send().await
             && resp.status().is_success()
+            && let Ok(health) = resp.json::<HealthResponse>().await
         {
-            break;
+            assert_ne!(
+                pid, sidecar_pid,
+                "proxy.pid must belong to detached bootstrap daemon, never the sidecar"
+            );
+            assert_eq!(
+                health.role.as_deref(),
+                Some("bootstrap"),
+                "recovered proxy must report role=bootstrap, never role=sidecar"
+            );
+            break pid;
         }
         assert!(
-            Instant::now() < takeover_deadline,
-            "standby failed to take over within 2s (elapsed={:?})",
-            takeover_start.elapsed()
+            Instant::now() < recovery_deadline,
+            "sidecar failed to recover detached bootstrap within 1.5s (elapsed={:?})",
+            recovery_start.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
 
-    // Stop standby cleanly and verify proxy.pid is removed.
-    let kill_standby = Command::new("kill")
-        .args(["-TERM", &standby_pid.to_string()])
+    // Stop sidecar cleanly; the detached bootstrap daemon MUST survive and stay healthy.
+    let kill_sidecar = Command::new("kill")
+        .args(["-TERM", &sidecar_pid.to_string()])
         .status()
-        .expect("kill standby");
-    assert!(kill_standby.success());
-    let standby_out = tokio::task::spawn_blocking(move || standby_guard.wait_with_output())
+        .expect("kill sidecar");
+    assert!(kill_sidecar.success());
+    let sidecar_out = tokio::task::spawn_blocking(move || sidecar_guard.wait_with_output())
         .await
-        .expect("join standby")
-        .expect("wait standby");
-    assert_eq!(standby_out.status.code(), Some(0));
-    assert!(!pid_path.exists());
+        .expect("join sidecar")
+        .expect("wait sidecar");
+    assert_eq!(sidecar_out.status.code(), Some(0));
+
+    let surviving_health: HealthResponse = client
+        .get(&health_url)
+        .send()
+        .await
+        .expect("detached bootstrap must survive sidecar exit")
+        .json()
+        .await
+        .expect("parse surviving health");
+    assert_eq!(surviving_health.role.as_deref(), Some("bootstrap"));
+    let surviving_pid_json: Value =
+        serde_json::from_str(&fs::read_to_string(&pid_path).expect("proxy.pid must survive"))
+            .expect("parse surviving pid");
+    assert_eq!(surviving_pid_json["pid"], bootstrap_pid);
 }
 
 #[tokio::test]

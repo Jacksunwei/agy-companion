@@ -116,8 +116,8 @@ pub(super) fn classify_proxy_replacement(
 /// Verifies that a newly spawned replacement child actually claimed `listen_port` by
 /// confirming the child is still alive and `runtime_pid_path` records its PID on `listen_port`.
 ///
-/// Prevents a stale standby `--adopt-running` sidecar of the same version stealing `listen_port`
-/// during the port-release gap from producing a false-positive `proxy_replaced = true`.
+/// Prevents a concurrent same-version proxy (such as an older recovery bootstrap daemon
+/// spawned during the port-release gap) from producing a false-positive `proxy_replaced = true`.
 pub(super) fn verify_same_version_replacement_owner(
     child: &mut std::process::Child,
     runtime_pid_path: &Path,
