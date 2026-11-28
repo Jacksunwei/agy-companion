@@ -88,7 +88,14 @@ export function buildMonitorView(state: AppState): DocumentFragment {
   const activeProvider = latest?.provider ?? topModel?.provider ?? "antigravity";
   const activeSource = latest?.source ?? topModel?.source ?? "builtin";
   const activeModelId = latest?.model ?? topModel?.model ?? "antigravity-builtin";
-  const activeModelLabel = formatModelLabel(activeModelId, presets);
+  const activeModelDisplayName =
+    byModel.find(
+      (m) =>
+        m.provider === activeProvider &&
+        m.source === activeSource &&
+        m.model === activeModelId,
+    )?.model_display_name ?? null;
+  const activeModelLabel = formatModelLabel(activeModelId, presets, activeModelDisplayName);
   const providerBadgeText = formatProviderBadge(activeProvider, activeSource);
   const badgeClass = isBuiltinProvider(activeProvider, activeSource)
     ? "tag"
@@ -313,7 +320,7 @@ export function buildMonitorView(state: AppState): DocumentFragment {
         : "tag tag-brand";
       left.append(
         el("span", rowBadgeCls, formatProviderBadge(row.provider, row.source)),
-        el("span", "bk-name-text", formatModelLabel(row.model, presets)),
+        el("span", "bk-name-text", formatModelLabel(row.model, presets, row.model_display_name)),
       );
       top.append(left, el("span", "bk-val num", rightVal));
 

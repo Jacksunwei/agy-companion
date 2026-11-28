@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sqlite3
 import stat
 import urllib.parse
 from typing import Any
@@ -143,15 +144,34 @@ class TestCujCodex(E2ETestCase):
         )
         refresh_token = "rt_e2e_codex_secret_refresh_01"
 
-        codex_sse_bytes = (
-            'data: {"type":"response.reasoning_summary_text.delta","delta":"Plan step 1"}\n\n'
-            'data: {"type":"response.output_text.delta","delta":"Hello from Codex!"}\n\n'
-            'data: {"type":"response.completed","response":{"id":"resp_codex_e2e_1","status":"completed","usage":{"input_tokens":1500,"input_tokens_details":{"cached_tokens":900},"output_tokens":240,"output_tokens_details":{"reasoning_tokens":60}}}}\n\n'
-        ).encode("utf-8")
+        codex_stream_seq = 0
+
+        def make_codex_sse_bytes(resp_id: str) -> bytes:
+            completed = json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": resp_id,
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": 1500,
+                            "input_tokens_details": {"cached_tokens": 900},
+                            "output_tokens": 240,
+                            "output_tokens_details": {"reasoning_tokens": 60},
+                        },
+                    },
+                }
+            )
+            return (
+                'data: {"type":"response.reasoning_summary_text.delta","delta":"Plan step 1"}\n\n'
+                'data: {"type":"response.output_text.delta","delta":"Hello from Codex!"}\n\n'
+                f"data: {completed}\n\n"
+            ).encode("utf-8")
 
         mock = self.start_mock_gemini()
 
         def handler(req: CapturedRequest) -> Any:
+            nonlocal codex_stream_seq
             if req.path.startswith("/oauth/token"):
                 return JsonAction(
                     200,
@@ -166,7 +186,12 @@ class TestCujCodex(E2ETestCase):
                     req.header("authorization") == f"Bearer {access_jwt}"
                     and req.header("chatgpt-account-id") == "acct_e2e_codex_9876"
                 ):
-                    return SseStreamAction([codex_sse_bytes], status=200)
+                    if b"Conversation ID:" not in req.body:
+                        resp_id = "resp_codex_e2e_ping"
+                    else:
+                        codex_stream_seq += 1
+                        resp_id = f"resp_codex_e2e_{codex_stream_seq}"
+                    return SseStreamAction([make_codex_sse_bytes(resp_id)], status=200)
                 return JsonAction(401, {"error": {"message": "unauthorized"}})
             if ":fetchAvailableModels" in req.path:
                 return JsonAction(200, _sample_catalog())
@@ -296,6 +321,7 @@ class TestCujCodex(E2ETestCase):
         self.assertIn('"thought":true', stream_resp.text.replace(" ", ""))
         self.assertIn("Hello from Codex!", stream_resp.text)
         self.assertIn("usageMetadata", stream_resp.text)
+        self.assertIn('"responseId":"resp_codex_e2e_1"', stream_resp.text.replace(" ", ""))
 
         # Verify outbound Codex request carries prompt_cache_key + session_id + developer SI placement.
         codex_reqs = [r for r in mock.requests if r.path.startswith("/responses")]
@@ -376,6 +402,17 @@ class TestCujCodex(E2ETestCase):
         self.assertEqual(len(codex_events), 2, f"Expected 2 openai-codex usage events, got {events}")
         self.assertEqual(codex_events[0]["source"], "proxy")
         self.assertEqual(codex_events[0]["model"], "gpt-6.2-sol")
+        conn = sqlite3.connect(str(_files[0]))
+        try:
+            resp_ids = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT response_id FROM usage_events WHERE provider = 'openai-codex'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        self.assertEqual(resp_ids, {"resp_codex_e2e_1", "resp_codex_e2e_2"})
         self.assertEqual(int(codex_events[0]["input_tokens"]), 1500)
         self.assertEqual(int(codex_events[0]["cached_tokens"]), 900)
         self.assertEqual(int(codex_events[0]["output_tokens"]), 240)

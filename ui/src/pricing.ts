@@ -221,6 +221,79 @@ export const CODEX_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "gpt-6-luna": 1_050_000,
 };
 
+const STATIC_PLACEHOLDER_MAP: Readonly<
+  Record<number, { id: string; displayName: string }>
+> = {
+  // Gemini 4 Hydrogen
+  432: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  433: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  434: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  525: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  526: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  527: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  528: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  529: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  530: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  531: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  669: { id: "gemini-4-hydrogen", displayName: "Gemini 4 Hydrogen" },
+  // Gemini 4 Neon
+  465: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  466: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  467: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  468: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  532: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  533: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  534: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  535: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  536: { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+  // Gemini 4 Carbon
+  427: { id: "gemini-4-carbon", displayName: "Gemini 4 Carbon" },
+  437: { id: "gemini-4-carbon", displayName: "Gemini 4 Carbon" },
+  438: { id: "gemini-4-carbon", displayName: "Gemini 4 Carbon" },
+  // Gemini 4 Argon
+  417: { id: "gemini-4-argon", displayName: "Gemini 4 Argon" },
+  418: { id: "gemini-4-argon", displayName: "Gemini 4 Argon" },
+  419: { id: "gemini-4-argon", displayName: "Gemini 4 Argon" },
+  420: { id: "gemini-4-argon", displayName: "Gemini 4 Argon" },
+  421: { id: "gemini-4-argon", displayName: "Gemini 4 Argon" },
+  670: { id: "gemini-4-argon", displayName: "Gemini 4 Argon" },
+  // Gemini 3.8 Flash
+  318: { id: "gemini-3.8-flash", displayName: "Gemini 3.8 Flash" },
+  319: { id: "gemini-3.8-flash", displayName: "Gemini 3.8 Flash" },
+  320: { id: "gemini-3.8-flash", displayName: "Gemini 3.8 Flash" },
+  322: { id: "gemini-3.8-flash", displayName: "Gemini 3.8 Flash" },
+  // Claude Opus 5.5 / Sonnet 5.5
+  400: { id: "claude-opus-5-5", displayName: "Claude Opus 5.5" },
+  401: { id: "claude-opus-5-5", displayName: "Claude Opus 5.5" },
+  402: { id: "claude-opus-5-5", displayName: "Claude Opus 5.5" },
+  403: { id: "claude-sonnet-5-5", displayName: "Claude Sonnet 5.5" },
+  404: { id: "claude-sonnet-5-5", displayName: "Claude Sonnet 5.5" },
+  405: { id: "claude-sonnet-5-5", displayName: "Claude Sonnet 5.5" },
+  // Gemini 2.5 Flash & Orchestrators
+  50: { id: "gemini-2.5-flash", displayName: "Gemini 2.5 Flash" },
+  198: { id: "gemini-2.5-flash", displayName: "Gemini 2.5 Flash" },
+  537: { id: "gemini-pro-orchestrator-neon", displayName: "Orchestrator (Neon)" },
+  667: { id: "gemini-pro-orchestrator", displayName: "Orchestrator (Carbon)" },
+  668: { id: "gemini-pro-orchestrator", displayName: "Orchestrator (Carbon)" },
+  681: { id: "gemini-pro-orchestrator-argon", displayName: "Orchestrator (Argon)" },
+};
+
+const EXTRA_MODEL_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  "claude-opus-5-5": "Claude Opus 5.5",
+  "claude-sonnet-5-5": "Claude Sonnet 5.5",
+  "gemini-2.5-flash": "Gemini 2.5 Flash",
+  "gemini-pro-orchestrator": "Orchestrator (Carbon)",
+  "gemini-pro-orchestrator-neon": "Orchestrator (Neon)",
+  "gemini-pro-orchestrator-argon": "Orchestrator (Argon)",
+};
+
+function lookupStaticPlaceholder(norm: string): { id: string; displayName: string } | null {
+  const m = /^(?:model_placeholder_m)?(\d+)$/i.exec(norm.trim());
+  if (!m) return null;
+  const num = Number.parseInt(m[1], 10);
+  return STATIC_PLACEHOLDER_MAP[num] ?? null;
+}
+
 function normalizeModelId(modelId: string): string {
   return modelId
     .trim()
@@ -233,14 +306,16 @@ function normalizeModelId(modelId: string): string {
 function canonicalizeForPricing(norm: string): string {
   let s = norm.replace(/@\d{8}$/, "");
   s = s.replace(/-(?:low|medium|high|max|xhigh)$/, "");
+  s = s.replace(/-tiered$/, "");
   s = s.replace(/-(?:\d{8}|\d{4}-\d{2}-\d{2})$/, "");
   s = s.replace(/-(?:preview|latest|thinking)$/, "");
   return s;
 }
 
 export function getModelListPrice(modelId: string): ModelListPrice | null {
-  const norm = normalizeModelId(modelId);
-  if (!norm) return null;
+  const rawNorm = normalizeModelId(modelId);
+  if (!rawNorm) return null;
+  const norm = lookupStaticPlaceholder(rawNorm)?.id ?? rawNorm;
 
   const exact = MODEL_LIST_PRICES[norm];
   if (exact) return exact;
@@ -263,7 +338,8 @@ export function getModelContextWindow(modelId: string): number {
   const priced = getModelListPrice(modelId);
   if (priced) return priced.contextWindow;
 
-  const norm = normalizeModelId(modelId);
+  const rawNorm = normalizeModelId(modelId);
+  const norm = lookupStaticPlaceholder(rawNorm)?.id ?? rawNorm;
   const codexExact = CODEX_CONTEXT_WINDOWS[norm];
   if (codexExact !== undefined) return codexExact;
 
@@ -452,33 +528,58 @@ export function estimateUsageSummaryCosts(summary: UsageSummary): UsageCostSumma
   };
 }
 
+function findKnownModelDisplayName(
+  candidate: string,
+  presets: ReadonlyArray<ModelPreset>,
+): string | null {
+  const preset = presets.find((p) => normalizeModelId(p.id) === candidate);
+  if (preset) return preset.display_name;
+
+  const curated = CURATED_MODEL_CATALOG.find((m) => m.id === candidate);
+  if (curated) return curated.displayName;
+
+  const curatedCodex = CURATED_CODEX_MODEL_CATALOG.find((m) => m.id === candidate);
+  if (curatedCodex) return curatedCodex.displayName;
+
+  if (candidate === "antigravity-builtin") return "Antigravity Built-in";
+  return EXTRA_MODEL_DISPLAY_NAMES[candidate] ?? null;
+}
+
 export function formatModelLabel(
   modelId: string,
   presets: ReadonlyArray<ModelPreset>,
+  displayName?: string | null,
 ): string {
   const norm = normalizeModelId(modelId);
-  const preset = presets.find((p) => normalizeModelId(p.id) === norm);
-  if (preset) return preset.display_name;
+  const exactKnown = findKnownModelDisplayName(norm, presets);
+  if (exactKnown) return exactKnown;
 
-  const curated = CURATED_MODEL_CATALOG.find((m) => m.id === norm);
-  if (curated) return curated.displayName;
+  const canonical = canonicalizeForPricing(norm);
+  if (canonical !== norm) {
+    const canonicalKnown = findKnownModelDisplayName(canonical, presets);
+    if (canonicalKnown) return canonicalKnown;
+  }
 
-  const curatedCodex = CURATED_CODEX_MODEL_CATALOG.find((m) => m.id === norm);
-  if (curatedCodex) return curatedCodex.displayName;
+  const staticEntry = lookupStaticPlaceholder(norm);
+  if (staticEntry) {
+    return findKnownModelDisplayName(staticEntry.id, presets) ?? staticEntry.displayName;
+  }
 
-  if (norm === "antigravity-builtin") return "Antigravity Built-in";
+  const trimmedDisplay = (displayName ?? "").trim();
+  if (trimmedDisplay) return trimmedDisplay;
+
   return modelId.trim() || "Unknown model";
 }
 
 export function formatProviderBadge(provider: string, source: string | null): string {
   const p = provider.trim().toLowerCase();
   const s = (source ?? "").trim().toLowerCase();
-  if (p === "vertex_claude") return "Claude";
+  if (p === "vertex_claude") return "Anthropic";
   if (p === "vertex_openai") return "OpenAI";
-  if (p === "gemini" && s === "direct") return "Direct";
+  if (p === "gemini" && s === "direct") return "AI Studio (Direct)";
   if (p === "antigravity" || s === "builtin") return "Antigravity";
-  if (p === "gemini") return "Gemini";
-  if (p === "openai-codex" || p === "codex") return "Codex";
+  if (p === "gemini") return "AI Studio";
+  if (p === "openai-codex" || p === "codex") return "OpenAI Codex";
   if (!p) return "Antigravity";
   return p.charAt(0).toUpperCase() + p.slice(1);
 }

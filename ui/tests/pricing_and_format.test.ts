@@ -335,21 +335,28 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     assert.equal(formatModelLabel("gpt-6.2-sol", []), "GPT-6.2 Sol");
     assert.equal(formatModelLabel("gpt-6.1-terra", []), "GPT-6.1 Terra");
     assert.equal(formatModelLabel("gpt-6-luna", []), "GPT-6 Luna");
+    assert.equal(formatModelLabel("gemini-4-hydrogen-tiered-high", DEFAULT_MODEL_PRESETS), "Gemini 4 Hydrogen");
+    assert.equal(formatModelLabel("MODEL_PLACEHOLDER_M530", DEFAULT_MODEL_PRESETS), "Gemini 4 Hydrogen");
+    assert.equal(formatModelLabel("MODEL_PLACEHOLDER_M400", []), "Claude Opus 5.5");
+    assert.equal(formatModelLabel("gemini-5-nova", [], "Gemini 5 Nova (High)"), "Gemini 5 Nova (High)");
     assert.equal(formatModelLabel("antigravity-builtin", []), "Antigravity Built-in");
     assert.equal(formatModelLabel("  custom-model-v1  ", []), "custom-model-v1");
     assert.equal(formatModelLabel("   ", []), "Unknown model");
 
-    assert.equal(formatProviderBadge("vertex_claude", "builtin"), "Claude");
-    assert.equal(formatProviderBadge("vertex_claude", null), "Claude");
+    assert.ok(getModelListPrice("gemini-4-hydrogen-tiered-high") !== null);
+    assert.ok(getModelListPrice("MODEL_PLACEHOLDER_M530") !== null);
+
+    assert.equal(formatProviderBadge("vertex_claude", "builtin"), "Anthropic");
+    assert.equal(formatProviderBadge("vertex_claude", null), "Anthropic");
     assert.equal(formatProviderBadge("vertex_openai", "builtin"), "OpenAI");
     assert.equal(formatProviderBadge("vertex_openai", null), "OpenAI");
-    assert.equal(formatProviderBadge("gemini", "direct"), "Direct");
+    assert.equal(formatProviderBadge("gemini", "direct"), "AI Studio (Direct)");
     assert.equal(formatProviderBadge("antigravity", null), "Antigravity");
     assert.equal(formatProviderBadge("gemini", "builtin"), "Antigravity");
     assert.equal(formatProviderBadge("", null), "Antigravity");
-    assert.equal(formatProviderBadge("gemini", "proxy"), "Gemini");
-    assert.equal(formatProviderBadge("openai-codex", "proxy"), "Codex");
-    assert.equal(formatProviderBadge("codex", "proxy"), "Codex");
+    assert.equal(formatProviderBadge("gemini", "proxy"), "AI Studio");
+    assert.equal(formatProviderBadge("openai-codex", "proxy"), "OpenAI Codex");
+    assert.equal(formatProviderBadge("codex", "proxy"), "OpenAI Codex");
     assert.equal(formatProviderBadge("openai", "proxy"), "Openai");
 
     assert.equal(isBuiltinProvider("vertex_claude", "builtin"), true);

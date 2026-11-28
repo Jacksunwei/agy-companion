@@ -473,6 +473,26 @@ describe("parseSettingsSnapshot defensive invariants", () => {
     assert.equal(parsed.stats.by_model.length, 1);
     assert.equal(parsed.stats.by_model[0].reasoning_tokens, 0);
     assert.equal(parsed.stats.by_model[0].total_latency_ms, 0);
+    assert.equal(parsed.stats.by_model[0].model_display_name, null);
+
+    const withDisplay = cloneJson(activeBase) as { stats: { by_model: unknown[] } };
+    withDisplay.stats.by_model = [
+      {
+        provider: "antigravity",
+        source: "builtin",
+        model: "gemini-5-nova",
+        model_display_name: "Gemini 5 Nova (High)",
+        requests: 2,
+        input_tokens: 1000,
+        cached_tokens: 800,
+        output_tokens: 100,
+      },
+    ];
+    const parsedWithDisplay = parseSettingsSnapshot(withDisplay);
+    assert.equal(
+      parsedWithDisplay?.stats?.by_model[0].model_display_name,
+      "Gemini 5 Nova (High)",
+    );
   });
 
   it("parses ls_telemetry_active true, false, omitted, and non-boolean safely", () => {

@@ -44,10 +44,12 @@ pub use models::{
     CURATED_CODEX_MODELS, CURATED_GEMINI_MODELS, CuratedCodexModel, CuratedGeminiModel,
     DEFAULT_CODEX_MODEL, DEFAULT_ENABLED_CODEX_MODELS, DEFAULT_ENABLED_GEMINI_MODELS,
     DEFAULT_GEMINI_MODEL, MAX_CODEX_MODEL_LEN, MAX_GEMINI_MODEL_LEN, ModelPreset,
+    StaticPlaceholderMapping, UpstreamModelCatalog, UpstreamModelEntry,
     curated_codex_model_presets, curated_model_presets, default_enabled_codex_models,
     default_enabled_gemini_models, find_curated_codex_model, is_codex_model,
-    is_discoverable_chat_model, is_supported_gemini_model, model_capability_sort_key,
-    normalize_enabled_codex_models, normalize_enabled_gemini_models, parse_gemini_version_pair,
+    is_discoverable_chat_model, is_supported_gemini_model, lookup_static_placeholder,
+    model_capability_sort_key, normalize_enabled_codex_models, normalize_enabled_gemini_models,
+    normalize_placeholder_enum_key, parse_gemini_version_pair, placeholder_numeric_alias,
     validate_codex_model, validate_gemini_model,
 };
 pub use protocol::{

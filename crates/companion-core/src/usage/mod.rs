@@ -382,6 +382,8 @@ pub struct UsageBreakdownRow {
     pub key: String,
     pub provider: String,
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_display_name: Option<String>,
     pub model_count: Option<u64>,
     pub requests: u64,
     pub input_tokens: u64,

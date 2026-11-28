@@ -82,6 +82,8 @@ pub struct ModelSessionStats {
     pub provider: String,
     pub source: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_display_name: Option<String>,
     pub requests: u64,
     pub input_tokens: u64,
     pub cached_tokens: u64,
@@ -317,6 +319,7 @@ mod tests {
                 provider: "gemini".to_string(),
                 source: "proxy".to_string(),
                 model: "gemini-4-carbon".to_string(),
+                model_display_name: None,
                 requests: 5,
                 input_tokens: 1000,
                 cached_tokens: 600,
@@ -422,6 +425,7 @@ mod tests {
                     provider: "antigravity".to_string(),
                     source: "builtin".to_string(),
                     model: long_model.clone(),
+                    model_display_name: None,
                     requests: u64::MAX,
                     input_tokens: u64::MAX,
                     cached_tokens: u64::MAX,
@@ -568,5 +572,35 @@ mod tests {
         assert!(serde_json::from_str::<HostPlatform>("\"darwin\"").is_err());
         assert!(serde_json::from_str::<HostPlatform>("\"win32\"").is_err());
         assert_eq!(HostPlatform::default(), HostPlatform::current());
+    }
+
+    #[test]
+    fn model_session_stats_optional_display_name_is_backwards_compatible() {
+        let legacy_json = r#"{
+            "provider": "antigravity",
+            "source": "builtin",
+            "model": "gemini-5-nova",
+            "requests": 2,
+            "input_tokens": 1000,
+            "cached_tokens": 800,
+            "output_tokens": 100,
+            "reasoning_tokens": 0,
+            "total_latency_ms": 250
+        }"#;
+        let parsed: ModelSessionStats =
+            serde_json::from_str(legacy_json).expect("deserialize without model_display_name");
+        assert_eq!(parsed.model_display_name, None);
+        let serialized = serde_json::to_value(&parsed).expect("serialize");
+        assert!(serialized.get("model_display_name").is_none());
+
+        let with_display = ModelSessionStats {
+            model_display_name: Some("Gemini 5 Nova (High)".to_string()),
+            ..parsed
+        };
+        let ser_with = serde_json::to_value(&with_display).expect("serialize with display name");
+        assert_eq!(
+            ser_with.get("model_display_name").and_then(|v| v.as_str()),
+            Some("Gemini 5 Nova (High)")
+        );
     }
 }

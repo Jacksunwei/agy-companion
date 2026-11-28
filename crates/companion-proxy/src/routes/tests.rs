@@ -4013,3 +4013,124 @@ async fn cloudcode_fetch_available_models_gates_day0_codex_only_and_both_provide
 
     cc_handle.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_available_models_captures_upstream_and_injected_entries_into_shared_catalog() {
+    use axum::routing::post;
+    use companion_core::{
+        AuthStore, CloudCodeUpstream, Config, MemoryAuthStore, UpstreamModelCatalog,
+    };
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::net::TcpListener;
+
+    let raw_upstream_payload = br#"{
+        "models": {
+            "gemini-4-hydrogen-tiered-high": {
+                "model": "MODEL_PLACEHOLDER_M530",
+                "displayName": "Gemini 4 Hydrogen (High)",
+                "modelProvider": "MODEL_PROVIDER_GOOGLE",
+                "apiProvider": "API_PROVIDER_GOOGLE_GEMINI"
+            }
+        }
+    }"#;
+    let mock_cc = axum::Router::new().route(
+        "/v1internal:fetchAvailableModels",
+        post(move || async move {
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(raw_upstream_payload.as_slice()))
+                .unwrap()
+        }),
+    );
+
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .expect("bind mock cloudcode");
+    let port = listener.local_addr().unwrap().port();
+    let cc_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_cc).await;
+    });
+    tokio::task::yield_now().await;
+
+    let mut cfg = Config::default();
+    cfg.cloudcode.upstream = CloudCodeUpstream::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+
+    // 1. Day-0 unmerged still captures upstream M530 into shared UpstreamModelCatalog
+    let shared_catalog = Arc::new(UpstreamModelCatalog::new());
+    let day0_state = ProxyState::from_config_with_options(
+        cfg.clone(),
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: None,
+            auth_store: Some(Arc::new(MemoryAuthStore::new())),
+            env_fallback: false,
+            upstream_catalog: Some(Arc::clone(&shared_catalog)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let resp0 = build_router(day0_state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:fetchAvailableModels")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp0.status(), StatusCode::OK);
+    let snap0 = shared_catalog.snapshot();
+    assert_eq!(
+        snap0
+            .get("MODEL_PLACEHOLDER_M530")
+            .and_then(|e| e.model_id.as_deref()),
+        Some("gemini-4-hydrogen-tiered-high")
+    );
+
+    // 2. With Codex enabled, merged response also captures injected companion/gpt-* placeholders
+    let codex_store = Arc::new(MemoryAuthStore::new());
+    codex_store
+        .save_codex(&sample_codex_creds_for_route_test("tok_cat"))
+        .unwrap();
+    let shared_catalog_2 = Arc::new(UpstreamModelCatalog::new());
+    let codex_state = ProxyState::from_config_with_options(
+        cfg,
+        Arc::new(NoopUsageSink),
+        ProxyStateOptions {
+            config_path: None,
+            auth_store: Some(codex_store),
+            env_fallback: false,
+            upstream_catalog: Some(Arc::clone(&shared_catalog_2)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let resp1 = build_router(codex_state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1internal:fetchAvailableModels")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let snap1 = codex_state.upstream_catalog().snapshot();
+    assert_eq!(
+        snap1
+            .get("MODEL_PLACEHOLDER_M530")
+            .and_then(|e| e.model_id.as_deref()),
+        Some("gemini-4-hydrogen-tiered-high")
+    );
+    assert!(
+        snap1
+            .values()
+            .any(|e| { e.model_url.as_deref() == Some("gemini-api://gpt-6.2-sol") }),
+        "expected injected Codex modelUrl in shared upstream catalog: {snap1:?}"
+    );
+
+    cc_handle.abort();
+}

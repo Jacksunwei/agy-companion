@@ -434,7 +434,7 @@ export function buildUsageView(
         : "tag tag-brand";
       nameWrap.append(
         el("span", badgeCls, formatProviderBadge(row.provider, row.source)),
-        el("span", "bk-name-text", formatModelLabel(row.key, presets)),
+        el("span", "bk-name-text", formatModelLabel(row.key, presets, row.model_display_name)),
       );
       top.append(nameWrap, el("span", "bk-val num", rightVal));
 
