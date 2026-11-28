@@ -1894,3 +1894,123 @@ async fn codex_oauth_lifecycle_and_test_connection_via_ui_server() {
 
     mock_handle.abort();
 }
+
+#[tokio::test]
+async fn get_settings_latches_hybrid_active_in_production_and_respects_override() {
+    let tmp = TempDir::new().expect("tmp");
+    let cfg_path = tmp.path().join("config.json");
+    let stats_hits = Arc::new(AtomicUsize::new(0));
+    let stats_hits_clone = Arc::clone(&stats_hits);
+
+    let router = Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({
+                    "status": "ok",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "protocol_version": 1
+                }))
+            }),
+        )
+        .route(
+            "/api/stats",
+            get(move || {
+                let hits = Arc::clone(&stats_hits_clone);
+                async move {
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    // Calls 0 and 2 return Some(ts); calls 1 and 3 return None (simulating proxy restart).
+                    let refresh_ts = if n.is_multiple_of(2) {
+                        json!(1700000000000_u64)
+                    } else {
+                        Value::Null
+                    };
+                    axum::Json(json!({
+                        "usage": {
+                            "requests": 0,
+                            "prompt_tokens": 0,
+                            "cached_tokens": 0,
+                            "output_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "cache_hit_ratio": 0.0
+                        },
+                        "cloudcode": {
+                            "mode": "auto",
+                            "resolved_upstream": "https://cloudcode-pa.googleapis.com",
+                            "last_catalog_refresh_at_ms": refresh_ts,
+                            "last_catalog_included_proxy_models": false
+                        },
+                        "proxy_rss_bytes": 1048576_u64,
+                        "recent_calls": [],
+                        "by_model": []
+                    }))
+                }
+            }),
+        );
+
+    let (port, handle) = spawn_mock_http(router).await;
+    let cfg = config_with_port(port);
+    cfg.save_secure(&cfg_path).expect("save");
+
+    // Pass an explicit Enabled + hybrid_active=false IntegrationStatus to
+    // build_snapshot_with_session so the test is 100% hermetic even when cargo
+    // runs inside a Hybrid-Mode terminal with CLOUD_CODE_URL / HOOK_ACTIVE set.
+    let make_non_hybrid_enabled = || {
+        companion_core::integration::IntegrationStatus::enabled(
+            companion_core::integration::IntegrationPaths {
+                shell: companion_core::ShellKind::Zsh,
+                rc_path: tmp.path().join(".zlogin"),
+                env_script_path: Some(tmp.path().join("data/env.sh")),
+                binary_path: tmp.path().join("agy-companion"),
+            },
+            None,
+            false,
+        )
+    };
+
+    // 1. Production mode (`hybrid_active_override: None`): latch survives proxy restart
+    //    when `last_catalog_refresh_at_ms` drops back to `None`.
+    let prod_server = isolated_ui_server_with(&tmp, cfg_path.clone(), |opts| {
+        opts.hybrid_active_override = None;
+    });
+    let snap1 = prod_server
+        .build_snapshot_with_session(&cfg, None, None, Some(make_non_hybrid_enabled()), None)
+        .await;
+    assert_eq!(snap1.last_catalog_refresh_at_ms, Some(1_700_000_000_000));
+    assert!(snap1.launcher_integration.hybrid_active);
+    assert_eq!(snap1.launcher_integration.state, IntegrationState::Active);
+
+    let snap2 = prod_server
+        .build_snapshot_with_session(&cfg, None, None, Some(make_non_hybrid_enabled()), None)
+        .await;
+    assert_eq!(snap2.last_catalog_refresh_at_ms, None);
+    assert!(
+        snap2.launcher_integration.hybrid_active,
+        "latched_hybrid_active must persist after last_catalog_refresh_at_ms drops to None"
+    );
+    assert_eq!(snap2.launcher_integration.state, IntegrationState::Active);
+
+    // 2. Test-override mode (`hybrid_active_override: Some(false)`): latch is bypassed
+    //    so deterministic tests stay unaffected across snapshots.
+    let override_server = isolated_ui_server_with(&tmp, cfg_path, |opts| {
+        opts.hybrid_active_override = Some(false);
+    });
+    let ov1 = override_server
+        .build_snapshot_with_session(&cfg, None, None, Some(make_non_hybrid_enabled()), None)
+        .await;
+    assert_eq!(ov1.last_catalog_refresh_at_ms, Some(1_700_000_000_000));
+    assert!(ov1.launcher_integration.hybrid_active);
+    assert_eq!(ov1.launcher_integration.state, IntegrationState::Active);
+
+    let ov2 = override_server
+        .build_snapshot_with_session(&cfg, None, None, Some(make_non_hybrid_enabled()), None)
+        .await;
+    assert_eq!(ov2.last_catalog_refresh_at_ms, None);
+    assert!(
+        !ov2.launcher_integration.hybrid_active,
+        "hybrid_active_override must bypass latch reads/writes for test determinism"
+    );
+    assert_eq!(ov2.launcher_integration.state, IntegrationState::Enabled);
+
+    handle.abort();
+}

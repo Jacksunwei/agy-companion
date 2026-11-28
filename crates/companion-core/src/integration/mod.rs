@@ -41,6 +41,7 @@ pub(crate) const MAX_RC_FILE_BYTES: u64 = 1024 * 1024;
 pub const ENV_SCRIPT_FILENAME: &str = "env.sh";
 pub(crate) const FISH_DROPIN_FILENAME: &str = "agy-companion.fish";
 pub const DEFAULT_RESTORE_PREFIX: &str = "AGY_COMPANION_ORIG_";
+pub const PARENT_HYBRID_ACTIVE_ENV: &str = "AGY_COMPANION_PARENT_HYBRID_ACTIVE";
 pub(crate) const PORTABLE_ENV_SCRIPT_EXPR: &str =
     "${XDG_DATA_HOME:-$HOME/.local/share}/agy-companion/env.sh";
 
@@ -302,19 +303,28 @@ pub(crate) fn is_loopback_hybrid_url(raw: &str) -> bool {
     host_is_loopback && parsed.port().is_some_and(|port| port > 0)
 }
 
-fn detect_hybrid_active_from(cloud_code_url: Option<&str>, hook_active: Option<&str>) -> bool {
+fn detect_hybrid_active_from(
+    cloud_code_url: Option<&str>,
+    hook_active: Option<&str>,
+    parent_hybrid_active: Option<&str>,
+) -> bool {
     if let Some(raw) = cloud_code_url
         && !raw.trim().is_empty()
     {
         return is_loopback_hybrid_url(raw);
     }
-    hook_active.map(str::trim) == Some("1")
+    hook_active.map(str::trim) == Some("1") || parent_hybrid_active.map(str::trim) == Some("1")
 }
 
 pub fn detect_hybrid_active() -> bool {
     let cloud_code_url = std::env::var("CLOUD_CODE_URL").ok();
     let hook_active = std::env::var("AGY_COMPANION_HOOK_ACTIVE").ok();
-    detect_hybrid_active_from(cloud_code_url.as_deref(), hook_active.as_deref())
+    let parent_hybrid_active = std::env::var(PARENT_HYBRID_ACTIVE_ENV).ok();
+    detect_hybrid_active_from(
+        cloud_code_url.as_deref(),
+        hook_active.as_deref(),
+        parent_hybrid_active.as_deref(),
+    )
 }
 
 fn is_executable_regular_file(path: &Path) -> bool {

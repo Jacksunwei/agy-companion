@@ -1147,14 +1147,30 @@ fn is_loopback_hybrid_url_validates_loopback_ports_only() {
 
     assert!(detect_hybrid_active_from(
         Some("http://127.0.0.1:4141"),
-        None
+        None,
+        None,
     ));
     assert!(!detect_hybrid_active_from(
         Some("https://cloudcode-pa.googleapis.com"),
-        Some("1")
+        Some("1"),
+        None,
     ));
-    assert!(detect_hybrid_active_from(None, Some("1")));
-    assert!(!detect_hybrid_active_from(None, None));
+    assert!(!detect_hybrid_active_from(
+        Some("https://cloudcode-pa.googleapis.com"),
+        None,
+        Some("1"),
+    ));
+    assert!(!detect_hybrid_active_from(
+        Some("https://cloudcode-pa.googleapis.com"),
+        Some("1"),
+        Some("1"),
+    ));
+    assert!(detect_hybrid_active_from(None, Some("1"), None));
+    assert!(detect_hybrid_active_from(None, None, Some("1")));
+    assert!(detect_hybrid_active_from(Some("   "), None, Some(" 1 ")));
+    assert!(!detect_hybrid_active_from(None, None, Some("0")));
+    assert!(!detect_hybrid_active_from(None, None, Some("true")));
+    assert!(!detect_hybrid_active_from(None, None, None));
 }
 
 #[test]
