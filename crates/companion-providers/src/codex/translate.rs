@@ -28,6 +28,8 @@ pub const DEFAULT_MAX_TOOL_CALL_ARGS_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_MAX_TOTAL_TOOL_CALL_ARGS_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum simultaneously open tool calls in a single Codex response stream.
 pub const MAX_CONCURRENT_TOOL_CALLS: usize = 128;
+/// Maximum simultaneously tracked in-flight reasoning items for summary deduplication.
+const MAX_TRACKED_REASONING_ITEMS: usize = 128;
 /// Maximum aggregated payload budget for unary `:generateContent` translation.
 pub const DEFAULT_MAX_UNARY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -1278,6 +1280,12 @@ struct PendingFunctionCall {
     arguments: String,
 }
 
+#[derive(Debug)]
+struct StreamedReasoningItem {
+    item_id: Option<String>,
+    output_index: Option<u64>,
+}
+
 /// Bounded incremental SSE parser and translator (`Codex Responses SSE → Gemini SSE JSON chunks`).
 #[derive(Debug)]
 pub struct CodexSseTranslator {
@@ -1293,7 +1301,7 @@ pub struct CodexSseTranslator {
     pending_calls: Vec<PendingFunctionCall>,
     total_tool_args_bytes: usize,
     synthetic_call_seq: u64,
-    emitted_reasoning_summary_in_item: bool,
+    streamed_reasoning_items: Vec<StreamedReasoningItem>,
     needs_reasoning_part_separator: bool,
     reasoning_trailing_newlines: u8,
 }
@@ -1330,7 +1338,7 @@ impl CodexSseTranslator {
             pending_calls: Vec::new(),
             total_tool_args_bytes: 0,
             synthetic_call_seq: 0,
-            emitted_reasoning_summary_in_item: false,
+            streamed_reasoning_items: Vec::new(),
             needs_reasoning_part_separator: false,
             reasoning_trailing_newlines: 0,
         }
@@ -1538,6 +1546,64 @@ impl CodexSseTranslator {
         None
     }
 
+    fn reset_reasoning_part_separator(&mut self) {
+        self.needs_reasoning_part_separator = false;
+        self.reasoning_trailing_newlines = 0;
+    }
+
+    fn find_streamed_reasoning_index(
+        &self,
+        item_id: Option<&str>,
+        output_index: Option<u64>,
+    ) -> Option<usize> {
+        if let Some(id) = item_id
+            && let Some(pos) = self
+                .streamed_reasoning_items
+                .iter()
+                .position(|item| item.item_id.as_deref() == Some(id))
+        {
+            return Some(pos);
+        }
+        if let Some(idx) = output_index
+            && let Some(pos) = self.streamed_reasoning_items.iter().position(|item| {
+                item.output_index == Some(idx) && (item_id.is_none() || item.item_id.is_none())
+            })
+        {
+            return Some(pos);
+        }
+        if let Some(pos) = self
+            .streamed_reasoning_items
+            .iter()
+            .position(|item| item.item_id.is_none() && item.output_index.is_none())
+        {
+            return Some(pos);
+        }
+        if item_id.is_none() && output_index.is_none() {
+            return self.streamed_reasoning_items.len().checked_sub(1);
+        }
+        None
+    }
+
+    fn record_streamed_reasoning_item(&mut self, item_id: Option<&str>, output_index: Option<u64>) {
+        if let Some(pos) = self.find_streamed_reasoning_index(item_id, output_index) {
+            let entry = &mut self.streamed_reasoning_items[pos];
+            if entry.item_id.is_none() {
+                entry.item_id = item_id.map(str::to_owned);
+            }
+            if entry.output_index.is_none() {
+                entry.output_index = output_index;
+            }
+            return;
+        }
+        if self.streamed_reasoning_items.len() >= MAX_TRACKED_REASONING_ITEMS {
+            self.streamed_reasoning_items.remove(0);
+        }
+        self.streamed_reasoning_items.push(StreamedReasoningItem {
+            item_id: item_id.map(str::to_owned),
+            output_index,
+        });
+    }
+
     fn translate_event_payload(
         &mut self,
         payload: &[u8],
@@ -1552,7 +1618,12 @@ impl CodexSseTranslator {
 
         match event_type {
             "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
-                if self.emitted_reasoning_summary_in_item {
+                let item_id = non_empty_str(event.get("item_id"));
+                let output_index = event.get("output_index").and_then(Value::as_u64);
+                if self
+                    .find_streamed_reasoning_index(item_id, output_index)
+                    .is_some()
+                {
                     self.needs_reasoning_part_separator = true;
                 }
             }
@@ -1579,18 +1650,12 @@ impl CodexSseTranslator {
                     } else {
                         delta.to_string()
                     };
-                    self.emitted_reasoning_summary_in_item = true;
+                    let item_id = non_empty_str(event.get("item_id"));
+                    let output_index = event.get("output_index").and_then(Value::as_u64);
+                    self.record_streamed_reasoning_item(item_id, output_index);
                     self.reasoning_trailing_newlines =
                         update_trailing_newlines(self.reasoning_trailing_newlines, &emitted);
-                    out.push(json!({
-                        "candidates": [{
-                            "content": {
-                                "role": "model",
-                                "parts": [{ "text": emitted, "thought": true }]
-                            },
-                            "index": 0
-                        }]
-                    }));
+                    out.push(gemini_thought_chunk(&emitted));
                 }
             }
             "response.output_text.delta" => {
@@ -1611,9 +1676,7 @@ impl CodexSseTranslator {
             "response.output_item.added" => {
                 if let Some(item) = event.get("item").and_then(Value::as_object) {
                     if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                        self.emitted_reasoning_summary_in_item = false;
-                        self.needs_reasoning_part_separator = false;
-                        self.reasoning_trailing_newlines = 0;
+                        self.reset_reasoning_part_separator();
                     } else if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
                         let output_index = event.get("output_index").and_then(Value::as_u64);
@@ -1720,36 +1783,43 @@ impl CodexSseTranslator {
                 if let Some(item) = event.get("item").and_then(Value::as_object) {
                     match item.get("type").and_then(Value::as_str) {
                         Some("reasoning") => {
-                            self.emitted_reasoning_summary_in_item = false;
-                            self.needs_reasoning_part_separator = false;
-                            self.reasoning_trailing_newlines = 0;
+                            let id = non_empty_str(item.get("id"));
+                            let output_index = event.get("output_index").and_then(Value::as_u64);
+                            let summary = item.get("summary").and_then(Value::as_array);
+                            if let Some(pos) = self.find_streamed_reasoning_index(id, output_index)
+                            {
+                                self.streamed_reasoning_items.remove(pos);
+                                if pos == self.streamed_reasoning_items.len() {
+                                    self.reset_reasoning_part_separator();
+                                }
+                            } else if let Some(summary) = summary {
+                                let text = join_reasoning_summary_parts(summary);
+                                if !text.is_empty() {
+                                    out.push(gemini_thought_chunk(&text));
+                                }
+                            }
                             if let Some(encrypted_content) =
                                 item.get("encrypted_content").and_then(Value::as_str)
                                 && !encrypted_content.trim().is_empty()
+                                && let Some(sig) = encode_codex_reasoning_signature(
+                                    id,
+                                    summary.cloned().unwrap_or_default(),
+                                    encrypted_content,
+                                )
                             {
-                                let id = item.get("id").and_then(Value::as_str);
-                                let summary = item
-                                    .get("summary")
-                                    .and_then(Value::as_array)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                if let Some(sig) =
-                                    encode_codex_reasoning_signature(id, summary, encrypted_content)
-                                {
-                                    out.push(json!({
-                                        "candidates": [{
-                                            "content": {
-                                                "role": "model",
-                                                "parts": [{
-                                                    "text": "",
-                                                    "thought": true,
-                                                    "thoughtSignature": sig
-                                                }]
-                                            },
-                                            "index": 0
-                                        }]
-                                    }));
-                                }
+                                out.push(json!({
+                                    "candidates": [{
+                                        "content": {
+                                            "role": "model",
+                                            "parts": [{
+                                                "text": "",
+                                                "thought": true,
+                                                "thoughtSignature": sig
+                                            }]
+                                        },
+                                        "index": 0
+                                    }]
+                                }));
                             }
                         }
                         Some("function_call") => {
@@ -1959,6 +2029,45 @@ impl CodexSseTranslator {
         }
         Ok(())
     }
+}
+
+fn non_empty_str(val: Option<&Value>) -> Option<&str> {
+    val.and_then(Value::as_str).filter(|s| !s.is_empty())
+}
+
+fn join_reasoning_summary_parts(summary: &[Value]) -> String {
+    let mut combined = String::new();
+    let mut trailing_newlines = 0u8;
+    for text in summary
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("summary_text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+    {
+        if !combined.is_empty() {
+            let leading_newlines = text.bytes().take_while(|&b| b == b'\n').count();
+            let existing_newlines = usize::from(trailing_newlines).saturating_add(leading_newlines);
+            let needed = 2usize.saturating_sub(existing_newlines);
+            for _ in 0..needed {
+                combined.push('\n');
+            }
+        }
+        combined.push_str(text);
+        trailing_newlines = update_trailing_newlines(trailing_newlines, text);
+    }
+    combined
+}
+
+fn gemini_thought_chunk(text: &str) -> Value {
+    json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{ "text": text, "thought": true }]
+            },
+            "index": 0
+        }]
+    })
 }
 
 fn update_trailing_newlines(prev: u8, emitted: &str) -> u8 {
@@ -3161,6 +3270,147 @@ mod tests {
             parts[0]["text"],
             "**Step 1** Checking files.\n\n**Step 2** Applying fix.\n\n**Step 3** Running tests."
         );
+    }
+
+    #[test]
+    fn emits_final_reasoning_summary_without_deltas_or_encrypted_content() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_final\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_final\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Planning edit.\"}]}}\n\n"
+        );
+        let mut tr = CodexSseTranslator::new();
+        let chunks = tr.push_chunk(sse.as_bytes()).expect("push");
+
+        assert_eq!(
+            chunks,
+            vec![json!({
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{ "text": "Planning edit.", "thought": true }]
+                    },
+                    "index": 0
+                }]
+            })],
+            "final reasoning summary should emit a Gemini thought without a signature"
+        );
+    }
+
+    #[test]
+    fn final_reasoning_summary_deduplicates_by_item_and_precedes_its_signature() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_streamed\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_streamed\",\"output_index\":0,\"delta\":\"Streamed.\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"rs_final\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"rs_final\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"First.\\n\"},{\"type\":\"summary_text\",\"text\":\" \"},{\"type\":\"other\",\"text\":\"Ignore.\"},{\"type\":\"summary_text\",\"text\":\"Second.\"}],\"encrypted_content\":\"encrypted_fixture\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_streamed\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Streamed.\"}]}}\n\n"
+        );
+        let mut tr = CodexSseTranslator::new();
+        let chunks = tr.push_chunk(sse.as_bytes()).expect("push");
+        let parts: Vec<_> = chunks
+            .iter()
+            .map(|chunk| &chunk["candidates"][0]["content"]["parts"][0])
+            .collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(*parts[0], json!({ "text": "Streamed.", "thought": true }));
+        assert_eq!(
+            *parts[1],
+            json!({ "text": "First.\n\nSecond.", "thought": true })
+        );
+        assert_eq!(parts[2]["text"], "");
+        assert_eq!(parts[2]["thought"], true);
+        assert!(parts[2]["thoughtSignature"].is_string());
+    }
+
+    #[test]
+    fn deduplicates_multiple_concurrently_streamed_reasoning_items() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_0\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_0\",\"output_index\":0,\"delta\":\"First reasoning.\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"output_index\":1,\"delta\":\"Second reasoning.\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Second reasoning.\"}]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_0\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"First reasoning.\"}]}}\n\n"
+        );
+        let mut tr = CodexSseTranslator::new();
+        let chunks = tr.push_chunk(sse.as_bytes()).expect("push");
+        let parts: Vec<_> = chunks
+            .iter()
+            .map(|chunk| &chunk["candidates"][0]["content"]["parts"][0])
+            .collect();
+        assert_eq!(parts.len(), 2, "neither streamed item should be duplicated");
+        assert_eq!(
+            *parts[0],
+            json!({ "text": "First reasoning.", "thought": true })
+        );
+        assert_eq!(
+            *parts[1],
+            json!({ "text": "Second reasoning.", "thought": true })
+        );
+    }
+
+    #[test]
+    fn empty_reasoning_item_id_falls_back_to_output_index_for_dedup() {
+        let sse = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"\",\"output_index\":0,\"delta\":\"Streamed without id.\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Streamed without id.\"}]}}\n\n"
+        );
+        let mut tr = CodexSseTranslator::new();
+        let chunks = tr.push_chunk(sse.as_bytes()).expect("push");
+        let parts: Vec<_> = chunks
+            .iter()
+            .map(|chunk| &chunk["candidates"][0]["content"]["parts"][0])
+            .collect();
+        assert_eq!(parts.len(), 1, "empty item_id should match by output_index");
+        assert_eq!(
+            *parts[0],
+            json!({ "text": "Streamed without id.", "thought": true })
+        );
+    }
+
+    #[test]
+    fn unary_aggregator_merges_fallback_reasoning_summary_and_signature_and_handles_empty_summary()
+    {
+        // Case 1: Fallback summary + encrypted_content merges into one thought part in unary mode.
+        let sse_with_summary = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_fallback\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Final only.\"}],\"encrypted_content\":\"gAAAAAB_fallback_sig\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Answer.\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"
+        );
+        let mut tr = CodexSseTranslator::new();
+        let mut chunks = tr.push_chunk(sse_with_summary.as_bytes()).expect("push");
+        chunks.extend(tr.finish().expect("finish"));
+
+        let mut agg = UnaryGeminiAggregator::new();
+        for c in chunks {
+            agg.push_chunk(c).expect("agg push");
+        }
+        let (status, unary) = agg.finish().expect("agg finish");
+        assert_eq!(status, 200);
+        let parts = unary["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "Final only.");
+        assert_eq!(parts[0]["thought"], true);
+        assert!(parts[0]["thoughtSignature"].is_string());
+        assert_eq!(parts[1], json!({ "text": "Answer." }));
+
+        // Case 2: includeThoughts: false -> summary: [] + encrypted_content emits signature-only thought part.
+        let sse_no_summary = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_hidden\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"gAAAAAB_hidden_sig\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Visible.\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n"
+        );
+        let mut tr2 = CodexSseTranslator::new();
+        let mut chunks2 = tr2.push_chunk(sse_no_summary.as_bytes()).expect("push");
+        chunks2.extend(tr2.finish().expect("finish"));
+        // Chunk 0: signature-only thought, Chunk 1: text delta, Chunk 2: completed.
+        assert_eq!(chunks2.len(), 3);
+        let sig_part = &chunks2[0]["candidates"][0]["content"]["parts"][0];
+        assert_eq!(sig_part["text"], "");
+        assert_eq!(sig_part["thought"], true);
+        assert!(sig_part["thoughtSignature"].is_string());
     }
 
     #[test]
