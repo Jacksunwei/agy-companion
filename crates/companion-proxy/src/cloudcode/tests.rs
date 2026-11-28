@@ -76,7 +76,7 @@ fn detects_prod_vs_daily_from_load_code_assist_response() {
 }
 
 #[test]
-fn merge_available_models_appends_to_recommended_group0_with_proxy_suffix_and_effort_labels() {
+fn merge_available_models_appends_to_recommended_group0_with_ai_studio_suffix_and_effort_labels() {
     let upstream = json!({
         "models": {
             "gemini-4-carbon-low": {
@@ -142,16 +142,19 @@ fn merge_available_models_appends_to_recommended_group0_with_proxy_suffix_and_ef
         "Gemini 4 Carbon"
     );
 
-    // Proxy models use "(Proxy) (Low|Medium|High|XHigh)" labels so Antigravity's
-    // parseLabelSlug collapses them into one "(Proxy)" row with Thinking effort submenu.
+    // Google AI Studio models use "(AI Studio) (Low|Medium|High|XHigh)" labels so Antigravity's
+    // parseLabelSlug collapses them into one "(AI Studio)" row with Thinking effort submenu.
     let h_low = &merged["models"]["companion/gemini-4-hydrogen-low"];
     let h_xhigh = &merged["models"]["companion/gemini-4-hydrogen-xhigh"];
     assert_eq!(h_low["modelUrl"], "gemini-api://gemini-4-hydrogen");
     assert_eq!(h_low["thinkingLevel"], 1);
-    assert_eq!(h_low["displayName"], "Gemini 4 Hydrogen (Proxy) (Low)");
+    assert_eq!(h_low["displayName"], "Gemini 4 Hydrogen (AI Studio) (Low)");
     assert_eq!(h_xhigh["modelUrl"], "gemini-api://gemini-4-hydrogen");
     assert_eq!(h_xhigh["thinkingLevel"], 7);
-    assert_eq!(h_xhigh["displayName"], "Gemini 4 Hydrogen (Proxy) (XHigh)");
+    assert_eq!(
+        h_xhigh["displayName"],
+        "Gemini 4 Hydrogen (AI Studio) (XHigh)"
+    );
 
     // Existing MODEL_PLACEHOLDER_M334 in upstream must NOT be reused.
     assert_eq!(h_low["model"], "MODEL_PLACEHOLDER_M335");
@@ -163,9 +166,9 @@ fn merge_available_models_appends_to_recommended_group0_with_proxy_suffix_and_ef
             .is_none()
     );
 
-    // groupedModels stays in sync with "(Proxy)" base name and "Extra" display label.
+    // groupedModels stays in sync with "(AI Studio)" base name and "Extra" display label.
     let h_group = &merged["groupedModels"]["companion/gemini-4-hydrogen"];
-    assert_eq!(h_group["displayName"], "Gemini 4 Hydrogen (Proxy)");
+    assert_eq!(h_group["displayName"], "Gemini 4 Hydrogen (AI Studio)");
     assert_eq!(
         h_group["supportedThinkingLevels"][0]["thinkingSuffix"],
         "low"
@@ -180,7 +183,7 @@ fn merge_available_models_appends_to_recommended_group0_with_proxy_suffix_and_ef
     );
 
     let f_group = &merged["groupedModels"]["companion/gemini-3.8-flash"];
-    assert_eq!(f_group["displayName"], "Gemini 3.8 Flash (Proxy)");
+    assert_eq!(f_group["displayName"], "Gemini 3.8 Flash (AI Studio)");
     assert_eq!(
         f_group["supportedThinkingLevels"].as_array().unwrap().len(),
         3
@@ -331,7 +334,7 @@ fn merge_available_models_omits_grouped_models_when_upstream_omits_or_empties_it
         // Proxy variants are still present in models & groups[0] with label-parser-compatible names.
         assert_eq!(
             merged["models"]["companion/gemini-4-hydrogen-xhigh"]["displayName"],
-            "Gemini 4 Hydrogen (Proxy) (XHigh)"
+            "Gemini 4 Hydrogen (AI Studio) (XHigh)"
         );
         let group0 = merged["agentModelSorts"][0]["groups"][0]["modelIds"]
             .as_array()
@@ -1408,7 +1411,10 @@ fn merge_available_models_assigns_deterministic_slots_independent_of_default_mod
     // gemini-4-neon must include XHigh (thinkingLevel: 7).
     let neon_xhigh = &m_hydrogen["models"]["companion/gemini-4-neon-xhigh"];
     assert_eq!(neon_xhigh["thinkingLevel"], 7);
-    assert_eq!(neon_xhigh["displayName"], "Gemini 4 Neon (Proxy) (XHigh)");
+    assert_eq!(
+        neon_xhigh["displayName"],
+        "Gemini 4 Neon (AI Studio) (XHigh)"
+    );
     assert_eq!(neon_xhigh["modelUrl"], "gemini-api://gemini-4-neon");
 }
 
@@ -1490,7 +1496,10 @@ fn merge_available_models_inherits_upstream_compaction_experiments_and_strips_ve
     let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
 
     let neon_proxy = &merged["models"]["companion/gemini-4-neon-high"];
-    assert_eq!(neon_proxy["displayName"], "Gemini 4 Neon (Proxy) (High)");
+    assert_eq!(
+        neon_proxy["displayName"],
+        "Gemini 4 Neon (AI Studio) (High)"
+    );
     assert_eq!(neon_proxy["modelUrl"], "gemini-api://gemini-4-neon");
     assert_eq!(neon_proxy["apiProvider"], "API_PROVIDER_GOOGLE_GEMINI");
     assert_eq!(neon_proxy["maxTokens"], 1048576);

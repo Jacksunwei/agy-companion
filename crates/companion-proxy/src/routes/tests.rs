@@ -1747,7 +1747,7 @@ async fn cloudcode_fetch_available_models_merges_and_v1internal_streams_passthro
     );
     assert_eq!(
         parsed["models"]["companion/gemini-4-hydrogen-xhigh"]["displayName"],
-        "Gemini 4 Hydrogen (Proxy) (XHigh)"
+        "Gemini 4 Hydrogen (AI Studio) (XHigh)"
     );
     assert_eq!(
         parsed["groupedModels"]["gemini-4-carbon"]["displayName"],
@@ -1755,7 +1755,7 @@ async fn cloudcode_fetch_available_models_merges_and_v1internal_streams_passthro
     );
     assert_eq!(
         parsed["groupedModels"]["companion/gemini-4-hydrogen"]["displayName"],
-        "Gemini 4 Hydrogen (Proxy)"
+        "Gemini 4 Hydrogen (AI Studio)"
     );
     let group0_ids: Vec<&str> = parsed["agentModelSorts"][0]["groups"][0]["modelIds"]
         .as_array()

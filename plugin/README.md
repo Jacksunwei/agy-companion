@@ -56,7 +56,7 @@ The panel lands on **Monitor** automatically once Antigravity is connected or an
    - Unchecking all models pauses injection non-destructively and shows a one-click **`Restore defaults`** button.
 4. Expand **Advanced** only if you need to override **Antigravity plan** (`Auto` / `Personal` / `Organization`) or disable/re-enable the **Local proxy** hook on macOS/Linux (or run `agy-companion launch` directly at any time to launch Antigravity App in Hybrid Mode).
 
-> **Day-0 Behavior:** Until you save a real Google AI Studio API key, `agy-companion` leaves Antigravity's native model picker completely untouched — zero `(Proxy)` models appear and the local `"agy-companion-local"` placeholder is quarantined so it never leaks upstream — while **Monitor** and **Usage** still track your built-in Antigravity models passively.
+> **Day-0 Behavior:** Until you save a real Google AI Studio API key, `agy-companion` leaves Antigravity's native model picker completely untouched — zero `(AI Studio)` models appear and the local `"agy-companion-local"` placeholder is quarantined so it never leaks upstream — while **Monitor** and **Usage** still track your built-in Antigravity models passively.
 
 ### 3. Connect Antigravity CLI (`agy`)
 
