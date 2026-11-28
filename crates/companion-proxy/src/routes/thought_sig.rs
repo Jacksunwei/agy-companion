@@ -49,16 +49,34 @@ pub(super) async fn sniff_error_prefix(
     }
 }
 
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 pub(super) fn body_contains_thought_signature(body: &[u8]) -> bool {
     const CAMEL: &[u8] = b"thoughtSignature";
     const SNAKE: &[u8] = b"thought_signature";
-    body.windows(CAMEL.len()).any(|w| w == CAMEL) || body.windows(SNAKE.len()).any(|w| w == SNAKE)
+    contains_bytes(body, CAMEL) || contains_bytes(body, SNAKE)
 }
 
 pub(super) fn is_invalid_thought_signature_error(body: &[u8]) -> bool {
     const REASON: &[u8] = b"INVALID_THOUGHT_SIGNATURE";
     const MSG: &[u8] = b"Corrupted thought signature";
-    body.windows(REASON.len()).any(|w| w == REASON) || body.windows(MSG.len()).any(|w| w == MSG)
+    const TYPE_BYTES: &[u8] = b"TYPE_BYTES";
+    const BASE64_FAIL: &[u8] = b"Base64 decoding failed";
+    if contains_bytes(body, REASON) || contains_bytes(body, MSG) {
+        return true;
+    }
+    // Google's REST/proto3 JSON transcoder rejects non-base64 foreign thoughtSignature
+    // values (such as Codex's `agyc:codex:v1:...` namespace) with 400 INVALID_ARGUMENT
+    // mentioning `thought_signature`/`thoughtSignature` + `TYPE_BYTES` / `Base64 decoding failed`.
+    body_contains_thought_signature(body)
+        && (contains_bytes(body, TYPE_BYTES) || contains_bytes(body, BASE64_FAIL))
+}
+
+fn is_empty_or_thought_only_part(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.iter()
+        .all(|(k, v)| k == "thought" || (k == "text" && v.as_str().is_some_and(str::is_empty)))
 }
 
 fn strip_thought_signatures_value(value: &mut serde_json::Value) -> bool {
@@ -71,8 +89,37 @@ fn strip_thought_signatures_value(value: &mut serde_json::Value) -> bool {
             if map.remove("thought_signature").is_some() {
                 removed = true;
             }
-            for child in map.values_mut() {
-                if strip_thought_signatures_value(child) {
+            for (key, child) in map.iter_mut() {
+                if key == "parts"
+                    && let serde_json::Value::Array(parts) = child
+                {
+                    let mut retained = Vec::with_capacity(parts.len());
+                    for mut part in std::mem::take(parts) {
+                        let part_had_sig = if let serde_json::Value::Object(part_map) = &mut part {
+                            let direct_removed = part_map.remove("thoughtSignature").is_some()
+                                | part_map.remove("thought_signature").is_some();
+                            let nested_removed = part_map
+                                .values_mut()
+                                .fold(false, |acc, v| acc | strip_thought_signatures_value(v));
+                            if direct_removed || nested_removed {
+                                removed = true;
+                            }
+                            direct_removed
+                        } else {
+                            if strip_thought_signatures_value(&mut part) {
+                                removed = true;
+                            }
+                            false
+                        };
+
+                        let drop_part = part_had_sig
+                            && part.as_object().is_some_and(is_empty_or_thought_only_part);
+                        if !drop_part {
+                            retained.push(part);
+                        }
+                    }
+                    *parts = retained;
+                } else if strip_thought_signatures_value(child) {
                     removed = true;
                 }
             }

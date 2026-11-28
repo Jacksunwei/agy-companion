@@ -233,10 +233,10 @@ In `crates/companion-proxy/src/cloudcode/slots.rs`, Antigravity provides **32 de
 - **Important Antigravity metadata differences for Codex models (`catalog.rs`):**
   - `modelUrl`: `"gemini-api://<codex-model-id>"` (routes exclusively through `GOOGLE_GEMINI_BASE_URL` → `http://127.0.0.1:<port>/v1beta/models/<codex-model-id>:streamGenerateContent?alt=sse`).
   - `displayName`: `"GPT-6.2 Astra (Codex) (High)"` (collapses into `"GPT-6.2 Astra (Codex)"` with native Low/Medium/High/Extra effort flyout via Antigravity's `EFFORT_LABEL_RE`).
-  - **Do NOT blindly copy Gemini `modelExperimentIds` or `supportsThoughtCirculation: true`** from upstream Gemini templates (which would expect Gemini cryptographic `thoughtSignature` tokens). Set explicit Codex metadata:
+  - **Do NOT blindly copy Gemini `modelExperimentIds`** from upstream Gemini templates. Set explicit Codex metadata:
     - `maxTokens`: `1_050_000` for all four curated models
     - `maxOutputTokens`: `128_000`
-    - `supportsThinking`: `true`, `thinkingLevel`: `1 | 2 | 3 | 7`
+    - `supportsThinking`: `true`, `thinkingLevel`: `1 | 2 | 3 | 7`, `supportsThoughtCirculation`: `true` *(circulates standard-base64 `agyc:codex:v1:<json>` encrypted reasoning envelopes — valid proto3 `bytes` — across turns; foreign Gemini signatures are ignored by Codex and Codex signatures are stripped on Gemini retry if switching providers mid-conversation)*
     - `supportsImages`: `true`, `supportsVideo`: `false`, `supportsPdf`: `false`
     - `supportedMimeTypes`: `text/plain`, `image/png`, `image/jpeg`, `image/webp`
     - `quotaInfo`: `{ "remainingFraction": 1.0 }`
@@ -277,11 +277,11 @@ flowchart LR
 | `conversation_id` (or prefix hash) | `prompt_cache_key: String` (mirrored in `session_id` header) | Routes sequential turns of the same conversation to the same KV-cache shard. Validates `[0-9a-zA-Z_-]` (`<= 64` chars) or falls back to `agyc-<32 hex>` SHA-256 of `(model, developer_instructions, first_content_item)`. |
 | *(always)* | `store: false`, `stream: true` | Required by `chatgpt.com/backend-api/codex/responses`. If the inbound caller used unary `:generateContent`, the adapter still streams upstream and aggregates into a single Gemini JSON response. |
 | `contents[]` (`role: "user"`) | `input[]` `{ type: "message", role: "user", content: [...] }` | `text` → `{ type: "input_text", text }`; `inlineData` (`image/*`) → `{ type: "input_image", image_url: "data:<mime>;base64,<data>" }`; unsupported binary MIME types return a clean `400` instead of silent data loss. |
-| `contents[]` (`role: "model"`) | `input[]` assistant `message` + `function_call` items | Skip `thought: true` parts and Gemini `thoughtSignature` fields. Emit `text` as `{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }`. Emit each `functionCall` as `{ type: "function_call", call_id, name, arguments: json_str }`. |
+| `contents[]` (`role: "model"`) | `input[]` `reasoning` + assistant `message` + `function_call` items | Decode & replay our namespaced `agyc:codex:v1:` `thoughtSignature` envelope (base64-encoded `agyc:codex:v1:<json>`, valid proto3 `bytes`, from `thought: true` or sibling parts) as `{ type: "reasoning", id?, summary, encrypted_content }` in chronological order (deduplicated by `id`, bounded to `512 KiB`, safely ignoring foreign Gemini `thoughtSignature`s). Skip plain `thought: true` text. Emit `text` as `{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }`. Emit each `functionCall` as `{ type: "function_call", call_id, name, arguments: json_str }`. |
 | `contents[]` `functionResponse` | `input[]` `{ type: "function_call_output", call_id, output: json_str }` | **Deterministic `call_id` correlation:** Gemini may omit `functionCall.id` / `functionResponse.id`. Maintain a per-function FIFO queue of emitted `call_id`s (`call_<turn>_<idx>`, `<= 64` chars) across the history so every `functionResponse` matches its exact `function_call`. |
 | `tools[].functionDeclarations[]` | `tools: [{ type: "function", name, description, parameters }]` | Normalize Gemini Schema dialect: uppercase `type` (`OBJECT`, `STRING`, `ARRAY`, `INTEGER`, `NUMBER`, `BOOLEAN`) → lowercase; convert `nullable: true` → `type: [<t>, "null"]`; strip Gemini-only keys (`propertyOrdering`, `format` values rejected by strict schema validators). |
 | `toolConfig.functionCallingConfig` | `tool_choice` | `AUTO` → `"auto"`, `NONE` → `"none"`, `ANY` → `"required"`. |
-| `generationConfig.thinkingConfig` | `reasoning: { effort, summary: "auto" }` | Map `thinkingLevel`: `LOW`/`1` → `"low"`, `MEDIUM`/`2` → `"medium"`, `HIGH`/`3` → `"high"`, `XHIGH`/`7` → `"xhigh"`. If only `thinkingBudget` is present, bucket `<= 2048` → `"low"`, `<= 8192` → `"medium"`, `> 8192` → `"high"`. |
+| `generationConfig.thinkingConfig` | `reasoning: { effort?, summary: "auto" }` + `include: ["reasoning.encrypted_content"]` | Strip optional `THINKING_LEVEL_` proto prefix: `MINIMAL`/`LOW`/`1` → `"low"`, `MEDIUM`/`2` → `"medium"`, `HIGH`/`3` → `"high"`, `XHIGH`/`EXTRA_HIGH`/`VERY_HIGH`/`EXTRA`/`MAX`/`7` → `"xhigh"`. `MODEL_DEFAULT`/`UNSPECIFIED`/`0` or omitted `thinkingConfig` still emit `reasoning: { summary: "auto" }` + `include: ["reasoning.encrypted_content"]` so Antigravity UI receives thought summaries and encrypted reasoning tokens. `NONE`/`OFF` or `thinkingBudget <= 0` disable both `reasoning` and `include`; `thinkingBudget > 0` buckets `<= 2048` → `"low"`, `<= 8192` → `"medium"`, `> 8192` → `"high"`. `includeThoughts: false` omits `summary` while preserving `effort` and `include`. |
 | `temperature`, `topP`, `maxOutputTokens` | *(omitted by default)* | Codex backend rejects unsupported sampling/token params with HTTP `400`; omit them unless explicitly supported by the target model. |
 
 ### 6.3 Streaming Response Translation (`Codex Responses SSE → Gemini SSE`)
@@ -290,7 +290,9 @@ Every Codex SSE event (`data: { "type": "..." }`) is parsed incrementally with b
 
 | Codex SSE Event `type` | Emitted Gemini SSE Chunk | Notes |
 | --- | --- | --- |
+| `response.reasoning_summary_part.added` / `.done` | *(tracks paragraph boundary)* | Ensures subsequent `response.reasoning_summary_text.delta` parts in the same reasoning item are separated by `\n\n` without stray leading/trailing newlines. |
 | `response.reasoning_summary_text.delta` | `candidates[0].content.parts = [{ text: delta, thought: true }]` | Renders natively in Antigravity's collapsible thinking block. |
+| `response.output_item.done` (`type == "reasoning"`) | `candidates[0].content.parts = [{ text: "", thought: true, thoughtSignature: "<base64(agyc:codex:v1:<json>)>" }]` | Emitted as proto3-`bytes`-compatible standard base64 when non-empty `encrypted_content` is present (bounded to `512 KiB`); `UnaryGeminiAggregator` preserves `thoughtSignature` cleanly on the aggregated thought part. |
 | `response.output_text.delta` | `candidates[0].content.parts = [{ text: delta }]` | Zero-buffering token-by-token streaming. |
 | `response.output_item.added` (`type == "function_call"`) | *(buffer `call_id`, `name`)* | Never emit partial/unparseable JSON arguments. |
 | `response.function_call_arguments.delta` | *(append to item buffer, bounded)* | Bounds total argument size to prevent OOM. |

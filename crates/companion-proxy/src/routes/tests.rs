@@ -2225,6 +2225,118 @@ async fn retries_once_without_thought_signature_on_400_invalid_thought_signature
 }
 
 #[tokio::test]
+async fn retries_once_stripping_codex_thought_signatures_and_empty_thought_only_parts_on_codex_to_gemini_switch()
+ {
+    struct CodexToGeminiSwitchProvider {
+        first_error: Bytes,
+        seen: std::sync::Mutex<Vec<Bytes>>,
+    }
+
+    impl ProviderAdapter for CodexToGeminiSwitchProvider {
+        fn name(&self) -> &'static str {
+            "codex-to-gemini-switch-test"
+        }
+
+        fn forward_gemini(
+            &self,
+            req: ForwardRequest,
+        ) -> BoxFuture<'_, Result<ForwardResponse, ProviderError>> {
+            let attempt = {
+                let mut guard = self.seen.lock().unwrap();
+                guard.push(req.body.clone());
+                guard.len()
+            };
+            let first_error = self.first_error.clone();
+            Box::pin(async move {
+                if attempt == 1 {
+                    Ok(ForwardResponse {
+                        status: 400,
+                        content_type: Some("application/json".to_string()),
+                        stream: Box::pin(futures_util::stream::once(
+                            async move { Ok(first_error) },
+                        )),
+                    })
+                } else {
+                    let ok_body = Bytes::from_static(
+                        br#"{"candidates":[{"content":{"role":"model","parts":[{"text":"continued"}]}}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":6,"totalTokenCount":26}}"#,
+                    );
+                    Ok(ForwardResponse {
+                        status: 200,
+                        content_type: Some("application/json".to_string()),
+                        stream: Box::pin(futures_util::stream::once(async move { Ok(ok_body) })),
+                    })
+                }
+            })
+        }
+
+        fn health_check(&self) -> BoxFuture<'_, Result<(), ProviderError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    // Both Gemini backend INVALID_THOUGHT_SIGNATURE and Google OnePlatform proto3 JSON
+    // TYPE_BYTES / Base64 decoding failed errors (triggered by `agyc:codex:v1:...` colons)
+    // must recover cleanly on a single stripped retry.
+    let error_cases = [
+        Bytes::from_static(
+            br#"{"error":{"code":400,"message":"Corrupted thought signature.","status":"INVALID_ARGUMENT","details":[{"reason":"INVALID_THOUGHT_SIGNATURE"}]}}"#,
+        ),
+        Bytes::from_static(
+            br#"{"error":{"code":400,"message":"Invalid value at 'contents[0].parts[1].thought_signature' (TYPE_BYTES), Base64 decoding failed for \"agyc:codex:v1:eyJpZCI6InJzXzEifQ\"","status":"INVALID_ARGUMENT"}}"#,
+        ),
+    ];
+
+    let payload = br#"{"contents":[{"role":"model","parts":[{"thought":true,"text":"reasoning summary","thoughtSignature":"agyc:codex:v1:eyJpZCI6InJzXzAifQ"},{"text":"","thought":true,"thoughtSignature":"agyc:codex:v1:eyJpZCI6InJzXzEifQ"},{"thought":true,"thought_signature":"agyc:codex:v1:eyJpZCI6InJzXzIifQ"},{"thoughtSignature":"agyc:codex:v1:eyJpZCI6InJzXzMifQ"},{"text":"final answer"}]},{"role":"user","parts":[{"text":"follow up"}]}]}"#;
+
+    for err_body in error_cases {
+        let provider = Arc::new(CodexToGeminiSwitchProvider {
+            first_error: err_body,
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let sink = Arc::new(RecordingSink::default());
+        let app = build_router(test_proxy_state(
+            Arc::clone(&provider) as Arc<dyn companion_providers::ProviderAdapter>,
+            Arc::clone(&sink) as Arc<dyn UsageSink>,
+            true,
+        ));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1beta/models/gemini-4-neon:generateContent")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(Bytes::from_static(payload)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "expected initial attempt + 1 stripped retry");
+        assert_eq!(
+            seen[0].as_ref(),
+            payload,
+            "first attempt must be byte-for-byte untouched (S4)"
+        );
+
+        let retried: serde_json::Value = serde_json::from_slice(&seen[1]).unwrap();
+        let model_parts = retried["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(
+            model_parts.len(),
+            2,
+            "empty / thought-only carrier parts must be pruned after stripping signatures, got: {model_parts:?}"
+        );
+        assert_eq!(model_parts[0]["thought"], true);
+        assert_eq!(model_parts[0]["text"], "reasoning summary");
+        assert!(model_parts[0].get("thoughtSignature").is_none());
+        assert_eq!(model_parts[1]["text"], "final answer");
+        assert_eq!(retried["contents"][1]["parts"][0]["text"], "follow up");
+    }
+}
+
+#[tokio::test]
 async fn does_not_retry_unrelated_400_even_when_thought_signature_present() {
     let sink = Arc::new(RecordingSink::default());
     let err_body = Bytes::from_static(br#"{"error":{"code":400,"message":"Bad schema"}}"#);

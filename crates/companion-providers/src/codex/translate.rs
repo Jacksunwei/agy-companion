@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use ring::digest::{Context as DigestContext, SHA256};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::ProviderError;
@@ -9,6 +12,13 @@ use crate::ProviderError;
 pub const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are a helpful coding assistant.";
 pub const MAX_CODEX_CALL_ID_LEN: usize = 64;
 pub const MAX_CODEX_CACHE_KEY_LEN: usize = 64;
+/// Namespaced prefix identifying encrypted OpenAI Codex reasoning items serialized inside a
+/// Gemini `thoughtSignature` for stateless (`store: false`) multi-turn circulation.
+pub const CODEX_THOUGHT_SIGNATURE_PREFIX: &str = "agyc:codex:v1:";
+/// Maximum encoded byte length of a Codex `thoughtSignature` (OOM guard).
+pub const MAX_CODEX_REASONING_SIGNATURE_BYTES: usize = 512 * 1024;
+const MAX_CODEX_REASONING_ID_LEN: usize = 256;
+const MAX_CODEX_REASONING_SUMMARY_ITEMS: usize = 128;
 
 /// Maximum per-line / per-event byte buffer in [`CodexSseTranslator`] (S4/S7 OOM guard).
 pub const DEFAULT_MAX_CODEX_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
@@ -115,13 +125,20 @@ pub fn translate_gemini_to_codex_request_with_cache_key(
         out.insert("tool_choice".to_string(), Value::String(choice.to_string()));
     }
 
-    if let Some(effort) = extract_reasoning_effort(root) {
+    if let Some(reasoning_cfg) = extract_reasoning_config(root) {
+        let mut reasoning_obj = Map::new();
+        if let Some(effort) = reasoning_cfg.effort {
+            reasoning_obj.insert("effort".to_string(), Value::String(effort.to_string()));
+        }
+        if reasoning_cfg.include_summary {
+            reasoning_obj.insert("summary".to_string(), Value::String("auto".to_string()));
+        }
+        if !reasoning_obj.is_empty() {
+            out.insert("reasoning".to_string(), Value::Object(reasoning_obj));
+        }
         out.insert(
-            "reasoning".to_string(),
-            json!({
-                "effort": effort,
-                "summary": "auto"
-            }),
+            "include".to_string(),
+            json!(["reasoning.encrypted_content"]),
         );
     }
 
@@ -312,6 +329,7 @@ fn translate_contents(root: &Map<String, Value>) -> Result<Vec<Value>, ProviderE
 
     let mut input = Vec::new();
     let mut correlator = CallIdCorrelator::new();
+    let mut seen_reasoning_ids = HashSet::new();
 
     for (turn_idx, content) in contents.iter().enumerate() {
         let Some(content_obj) = content.as_object() else {
@@ -336,7 +354,13 @@ fn translate_contents(root: &Map<String, Value>) -> Result<Vec<Value>, ProviderE
 
         match role {
             "model" | "assistant" => {
-                translate_model_parts(parts, turn_idx, &mut correlator, &mut input)?;
+                translate_model_parts(
+                    parts,
+                    turn_idx,
+                    &mut correlator,
+                    &mut seen_reasoning_ids,
+                    &mut input,
+                )?;
             }
             "system" | "developer" => {
                 translate_user_like_parts(
@@ -417,6 +441,7 @@ fn translate_model_parts(
     parts: &[Value],
     turn_idx: usize,
     correlator: &mut CallIdCorrelator,
+    seen_reasoning_ids: &mut HashSet<String>,
     input: &mut Vec<Value>,
 ) -> Result<(), ProviderError> {
     let mut assistant_parts: Vec<Value> = Vec::new();
@@ -428,8 +453,36 @@ fn translate_model_parts(
             ));
         };
 
-        // Always skip Gemini reasoning/thought blocks; ignore sibling thoughtSignature fields
-        // without dropping non-thought text or functionCall parts.
+        // Replay stateless encrypted Codex reasoning items carried in our namespaced
+        // `agyc:codex:v1:` `thoughtSignature` (whether on a `thought: true` part or a sibling
+        // part). Foreign Gemini signatures and malformed payloads are safely ignored.
+        if let Some(sig) = part_obj
+            .get("thoughtSignature")
+            .or_else(|| part_obj.get("thought_signature"))
+            .and_then(Value::as_str)
+            && let Some(payload) = decode_codex_reasoning_signature(sig)
+        {
+            let dedup_key = payload.id.clone().unwrap_or_else(|| {
+                format!("ec:{:016x}", fnv1a_64(payload.encrypted_content.as_bytes()))
+            });
+            if seen_reasoning_ids.insert(dedup_key) {
+                flush_message("assistant", &mut assistant_parts, input);
+                let mut item = Map::new();
+                item.insert("type".to_string(), Value::String("reasoning".to_string()));
+                if let Some(id) = payload.id {
+                    item.insert("id".to_string(), Value::String(id));
+                }
+                item.insert("summary".to_string(), Value::Array(payload.summary));
+                item.insert(
+                    "encrypted_content".to_string(),
+                    Value::String(payload.encrypted_content),
+                );
+                input.push(Value::Object(item));
+            }
+        }
+
+        // Skip visible thought text blocks (Codex consumes encrypted reasoning items above,
+        // never plain assistant text for chain-of-thought summaries).
         if part_obj.get("thought").and_then(Value::as_bool) == Some(true) {
             continue;
         }
@@ -851,34 +904,107 @@ fn extract_tool_config(
     (mode, allowed)
 }
 
-fn extract_reasoning_effort(root: &Map<String, Value>) -> Option<&'static str> {
-    let gen_cfg = root
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReasoningRequest {
+    effort: Option<&'static str>,
+    include_summary: bool,
+}
+
+fn extract_reasoning_config(root: &Map<String, Value>) -> Option<ReasoningRequest> {
+    let thinking_cfg = root
         .get("generationConfig")
         .or_else(|| root.get("generation_config"))
-        .and_then(Value::as_object)?;
-    let thinking_cfg = gen_cfg
-        .get("thinkingConfig")
-        .or_else(|| gen_cfg.get("thinking_config"))
-        .and_then(Value::as_object)?;
+        .and_then(Value::as_object)
+        .and_then(|gen_cfg| {
+            gen_cfg
+                .get("thinkingConfig")
+                .or_else(|| gen_cfg.get("thinking_config"))
+                .and_then(Value::as_object)
+        });
+
+    let Some(thinking_cfg) = thinking_cfg else {
+        // Default for reasoning-capable Codex models when thinkingConfig is omitted:
+        // request model-default effort with auto thought summaries + encrypted reasoning.
+        return Some(ReasoningRequest {
+            effort: None,
+            include_summary: true,
+        });
+    };
+
+    let include_summary = thinking_cfg
+        .get("includeThoughts")
+        .or_else(|| thinking_cfg.get("include_thoughts"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
     if let Some(level) = thinking_cfg
         .get("thinkingLevel")
         .or_else(|| thinking_cfg.get("thinking_level"))
     {
         match level {
-            Value::String(s) => match s.trim().to_ascii_uppercase().as_str() {
-                "LOW" | "MINIMAL" => return Some("low"),
-                "MEDIUM" => return Some("medium"),
-                "HIGH" => return Some("high"),
-                "XHIGH" | "EXTRA" | "MAX" => return Some("xhigh"),
-                "NONE" | "OFF" => return None,
-                _ => {}
-            },
+            Value::String(s) => {
+                let normalized = s.trim().to_ascii_uppercase();
+                let bare = normalized
+                    .strip_prefix("THINKING_LEVEL_")
+                    .unwrap_or(normalized.as_str());
+                match bare {
+                    "NONE" | "OFF" => return None,
+                    "MINIMAL" | "LOW" => {
+                        return Some(ReasoningRequest {
+                            effort: Some("low"),
+                            include_summary,
+                        });
+                    }
+                    "MEDIUM" => {
+                        return Some(ReasoningRequest {
+                            effort: Some("medium"),
+                            include_summary,
+                        });
+                    }
+                    "HIGH" => {
+                        return Some(ReasoningRequest {
+                            effort: Some("high"),
+                            include_summary,
+                        });
+                    }
+                    "XHIGH" | "EXTRA_HIGH" | "VERY_HIGH" | "EXTRA" | "MAX" => {
+                        return Some(ReasoningRequest {
+                            effort: Some("xhigh"),
+                            include_summary,
+                        });
+                    }
+                    "MODEL_DEFAULT" | "UNSPECIFIED" => {
+                        // Fall through to optional thinkingBudget, or default effort with summary.
+                    }
+                    _ => {}
+                }
+            }
             Value::Number(n) => match n.as_i64() {
-                Some(1) => return Some("low"),
-                Some(2) => return Some("medium"),
-                Some(3) => return Some("high"),
-                Some(7) => return Some("xhigh"),
+                Some(1) => {
+                    return Some(ReasoningRequest {
+                        effort: Some("low"),
+                        include_summary,
+                    });
+                }
+                Some(2) => {
+                    return Some(ReasoningRequest {
+                        effort: Some("medium"),
+                        include_summary,
+                    });
+                }
+                Some(3) => {
+                    return Some(ReasoningRequest {
+                        effort: Some("high"),
+                        include_summary,
+                    });
+                }
+                Some(7) => {
+                    return Some(ReasoningRequest {
+                        effort: Some("xhigh"),
+                        include_summary,
+                    });
+                }
+                // 0 is THINKING_LEVEL_UNSPECIFIED in Antigravity's proto enum.
                 _ => {}
             },
             _ => {}
@@ -893,16 +1019,122 @@ fn extract_reasoning_effort(root: &Map<String, Value>) -> Option<&'static str> {
         if budget <= 0 {
             return None;
         }
-        return Some(if budget <= 2048 {
+        let effort = if budget <= 2048 {
             "low"
         } else if budget <= 8192 {
             "medium"
         } else {
             "high"
+        };
+        return Some(ReasoningRequest {
+            effort: Some(effort),
+            include_summary,
         });
     }
 
-    None
+    Some(ReasoningRequest {
+        effort: None,
+        include_summary,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexReasoningSignaturePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(default)]
+    summary: Vec<Value>,
+    encrypted_content: String,
+}
+
+fn encode_codex_reasoning_signature(
+    id: Option<&str>,
+    summary: Vec<Value>,
+    encrypted_content: &str,
+) -> Option<String> {
+    if encrypted_content.trim().is_empty() {
+        return None;
+    }
+    let clean_id = id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= MAX_CODEX_REASONING_ID_LEN)
+        .map(str::to_string);
+    let clean_summary: Vec<Value> = summary
+        .into_iter()
+        .filter(Value::is_object)
+        .take(MAX_CODEX_REASONING_SUMMARY_ITEMS)
+        .collect();
+
+    let payload = CodexReasoningSignaturePayload {
+        id: clean_id,
+        summary: clean_summary,
+        encrypted_content: encrypted_content.to_string(),
+    };
+    let json_bytes = serde_json::to_vec(&payload).ok()?;
+    let raw_len = CODEX_THOUGHT_SIGNATURE_PREFIX
+        .len()
+        .saturating_add(json_bytes.len());
+    let encoded_len = raw_len.div_ceil(3).saturating_mul(4);
+    if encoded_len > MAX_CODEX_REASONING_SIGNATURE_BYTES {
+        tracing::warn!(
+            encoded_len,
+            max_bytes = MAX_CODEX_REASONING_SIGNATURE_BYTES,
+            "dropping oversized Codex reasoning signature"
+        );
+        return None;
+    }
+    // Encode the entire `agyc:codex:v1:<json>` envelope as standard base64 so Gemini proto3
+    // `bytes thought_signature` decoders (e.g. Antigravity's Go `protojson`) accept and
+    // round-trip it cleanly without rejecting non-base64 separator characters.
+    let mut envelope = Vec::with_capacity(raw_len);
+    envelope.extend_from_slice(CODEX_THOUGHT_SIGNATURE_PREFIX.as_bytes());
+    envelope.extend_from_slice(&json_bytes);
+    let out = STANDARD.encode(&envelope);
+    if out.len() > MAX_CODEX_REASONING_SIGNATURE_BYTES {
+        return None;
+    }
+    Some(out)
+}
+
+fn decode_base64_tolerant(input: &str) -> Option<Vec<u8>> {
+    STANDARD
+        .decode(input)
+        .or_else(|_| STANDARD_NO_PAD.decode(input))
+        .or_else(|_| URL_SAFE.decode(input))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(input))
+        .ok()
+}
+
+fn decode_codex_reasoning_signature(sig: &str) -> Option<CodexReasoningSignaturePayload> {
+    if sig.is_empty() || sig.len() > MAX_CODEX_REASONING_SIGNATURE_BYTES {
+        return None;
+    }
+
+    let json_bytes = if let Some(encoded) = sig.strip_prefix(CODEX_THOUGHT_SIGNATURE_PREFIX) {
+        if encoded.is_empty() {
+            return None;
+        }
+        decode_base64_tolerant(encoded)?
+    } else {
+        let envelope = decode_base64_tolerant(sig)?;
+        let rest = envelope.strip_prefix(CODEX_THOUGHT_SIGNATURE_PREFIX.as_bytes())?;
+        rest.to_vec()
+    };
+
+    let mut payload: CodexReasoningSignaturePayload = serde_json::from_slice(&json_bytes).ok()?;
+    if payload.encrypted_content.trim().is_empty() {
+        return None;
+    }
+    if let Some(ref id) = payload.id
+        && (id.trim().is_empty() || id.len() > MAX_CODEX_REASONING_ID_LEN)
+    {
+        return None;
+    }
+    payload.summary.retain(Value::is_object);
+    if payload.summary.len() > MAX_CODEX_REASONING_SUMMARY_ITEMS {
+        payload.summary.truncate(MAX_CODEX_REASONING_SUMMARY_ITEMS);
+    }
+    Some(payload)
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -1061,6 +1293,9 @@ pub struct CodexSseTranslator {
     pending_calls: Vec<PendingFunctionCall>,
     total_tool_args_bytes: usize,
     synthetic_call_seq: u64,
+    emitted_reasoning_summary_in_item: bool,
+    needs_reasoning_part_separator: bool,
+    reasoning_trailing_newlines: u8,
 }
 
 impl Default for CodexSseTranslator {
@@ -1095,6 +1330,9 @@ impl CodexSseTranslator {
             pending_calls: Vec::new(),
             total_tool_args_bytes: 0,
             synthetic_call_seq: 0,
+            emitted_reasoning_summary_in_item: false,
+            needs_reasoning_part_separator: false,
+            reasoning_trailing_newlines: 0,
         }
     }
 
@@ -1313,15 +1551,42 @@ impl CodexSseTranslator {
         };
 
         match event_type {
+            "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
+                if self.emitted_reasoning_summary_in_item {
+                    self.needs_reasoning_part_separator = true;
+                }
+            }
             "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str)
                     && !delta.is_empty()
                 {
+                    let emitted = if self.needs_reasoning_part_separator {
+                        self.needs_reasoning_part_separator = false;
+                        let leading_newlines = delta.bytes().take_while(|&b| b == b'\n').count();
+                        let existing_newlines = usize::from(self.reasoning_trailing_newlines)
+                            .saturating_add(leading_newlines);
+                        let needed = 2usize.saturating_sub(existing_newlines);
+                        if needed == 0 {
+                            delta.to_string()
+                        } else {
+                            let mut combined = String::with_capacity(delta.len() + needed);
+                            for _ in 0..needed {
+                                combined.push('\n');
+                            }
+                            combined.push_str(delta);
+                            combined
+                        }
+                    } else {
+                        delta.to_string()
+                    };
+                    self.emitted_reasoning_summary_in_item = true;
+                    self.reasoning_trailing_newlines =
+                        update_trailing_newlines(self.reasoning_trailing_newlines, &emitted);
                     out.push(json!({
                         "candidates": [{
                             "content": {
                                 "role": "model",
-                                "parts": [{ "text": delta, "thought": true }]
+                                "parts": [{ "text": emitted, "thought": true }]
                             },
                             "index": 0
                         }]
@@ -1344,57 +1609,62 @@ impl CodexSseTranslator {
                 }
             }
             "response.output_item.added" => {
-                if let Some(item) = event.get("item").and_then(Value::as_object)
-                    && item.get("type").and_then(Value::as_str) == Some("function_call")
-                {
-                    let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
-                    let output_index = event.get("output_index").and_then(Value::as_u64);
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let initial_args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-                    self.check_args_budget(0, initial_args.len())?;
+                if let Some(item) = event.get("item").and_then(Value::as_object) {
+                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                        self.emitted_reasoning_summary_in_item = false;
+                        self.needs_reasoning_part_separator = false;
+                        self.reasoning_trailing_newlines = 0;
+                    } else if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                        let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
+                        let output_index = event.get("output_index").and_then(Value::as_u64);
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let initial_args =
+                            item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                        self.check_args_budget(0, initial_args.len())?;
 
-                    if let Some(pos) =
-                        self.find_pending_call_index(item_id.as_deref(), output_index)
-                    {
-                        let entry = &mut self.pending_calls[pos];
-                        if entry.call_id.is_empty() {
-                            entry.call_id = call_id;
-                        }
-                        if entry.name.is_empty() {
-                            entry.name = name;
-                        }
-                        if entry.arguments.is_empty() && !initial_args.is_empty() {
+                        if let Some(pos) =
+                            self.find_pending_call_index(item_id.as_deref(), output_index)
+                        {
+                            let entry = &mut self.pending_calls[pos];
+                            if entry.call_id.is_empty() {
+                                entry.call_id = call_id;
+                            }
+                            if entry.name.is_empty() {
+                                entry.name = name;
+                            }
+                            if entry.arguments.is_empty() && !initial_args.is_empty() {
+                                self.total_tool_args_bytes = self
+                                    .total_tool_args_bytes
+                                    .saturating_add(initial_args.len());
+                                entry.arguments.push_str(initial_args);
+                            }
+                        } else {
+                            if self.pending_calls.len() >= MAX_CONCURRENT_TOOL_CALLS {
+                                return Err(ProviderError::Upstream(
+                                    "upstream Codex stream exceeded maximum concurrent tool calls"
+                                        .to_string(),
+                                ));
+                            }
                             self.total_tool_args_bytes = self
                                 .total_tool_args_bytes
                                 .saturating_add(initial_args.len());
-                            entry.arguments.push_str(initial_args);
+                            self.pending_calls.push(PendingFunctionCall {
+                                item_id,
+                                output_index,
+                                call_id,
+                                name,
+                                arguments: initial_args.to_string(),
+                            });
                         }
-                    } else {
-                        if self.pending_calls.len() >= MAX_CONCURRENT_TOOL_CALLS {
-                            return Err(ProviderError::Upstream(
-                                "upstream Codex stream exceeded maximum concurrent tool calls"
-                                    .to_string(),
-                            ));
-                        }
-                        self.total_tool_args_bytes = self
-                            .total_tool_args_bytes
-                            .saturating_add(initial_args.len());
-                        self.pending_calls.push(PendingFunctionCall {
-                            item_id,
-                            output_index,
-                            call_id,
-                            name,
-                            arguments: initial_args.to_string(),
-                        });
                     }
                 }
             }
@@ -1447,100 +1717,138 @@ impl CodexSseTranslator {
                 }
             }
             "response.output_item.done" => {
-                if let Some(item) = event.get("item").and_then(Value::as_object)
-                    && item.get("type").and_then(Value::as_str) == Some("function_call")
-                {
-                    let item_id = item.get("id").and_then(Value::as_str);
-                    let output_index = event.get("output_index").and_then(Value::as_u64);
-                    let pending = self
-                        .find_pending_call_index(item_id, output_index)
-                        .map(|pos| self.pending_calls.remove(pos));
-                    if let Some(ref entry) = pending {
-                        self.total_tool_args_bytes = self
-                            .total_tool_args_bytes
-                            .saturating_sub(entry.arguments.len());
-                    }
+                if let Some(item) = event.get("item").and_then(Value::as_object) {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("reasoning") => {
+                            self.emitted_reasoning_summary_in_item = false;
+                            self.needs_reasoning_part_separator = false;
+                            self.reasoning_trailing_newlines = 0;
+                            if let Some(encrypted_content) =
+                                item.get("encrypted_content").and_then(Value::as_str)
+                                && !encrypted_content.trim().is_empty()
+                            {
+                                let id = item.get("id").and_then(Value::as_str);
+                                let summary = item
+                                    .get("summary")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if let Some(sig) =
+                                    encode_codex_reasoning_signature(id, summary, encrypted_content)
+                                {
+                                    out.push(json!({
+                                        "candidates": [{
+                                            "content": {
+                                                "role": "model",
+                                                "parts": [{
+                                                    "text": "",
+                                                    "thought": true,
+                                                    "thoughtSignature": sig
+                                                }]
+                                            },
+                                            "index": 0
+                                        }]
+                                    }));
+                                }
+                            }
+                        }
+                        Some("function_call") => {
+                            let item_id = item.get("id").and_then(Value::as_str);
+                            let output_index = event.get("output_index").and_then(Value::as_u64);
+                            let pending = self
+                                .find_pending_call_index(item_id, output_index)
+                                .map(|pos| self.pending_calls.remove(pos));
+                            if let Some(ref entry) = pending {
+                                self.total_tool_args_bytes = self
+                                    .total_tool_args_bytes
+                                    .saturating_sub(entry.arguments.len());
+                            }
 
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            pending
-                                .as_ref()
-                                .map(|p| p.call_id.clone())
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty())
-                        })
-                        .or_else(|| item_id.filter(|s| !s.is_empty()).map(str::to_string))
-                        .unwrap_or_else(|| {
-                            self.synthetic_call_seq = self.synthetic_call_seq.wrapping_add(1);
-                            format!("call_out_{}", self.synthetic_call_seq)
-                        });
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    pending
+                                        .as_ref()
+                                        .map(|p| p.call_id.clone())
+                                        .filter(|s| !s.is_empty())
+                                })
+                                .or_else(|| item_id.filter(|s| !s.is_empty()).map(str::to_string))
+                                .unwrap_or_else(|| {
+                                    self.synthetic_call_seq =
+                                        self.synthetic_call_seq.wrapping_add(1);
+                                    format!("call_out_{}", self.synthetic_call_seq)
+                                });
 
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            pending
-                                .as_ref()
-                                .map(|p| p.name.clone())
+                            let name = item
+                                .get("name")
+                                .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty())
-                        })
-                        .ok_or_else(|| {
-                            ProviderError::Upstream(
-                                "upstream Codex function_call item missing name".to_string(),
-                            )
-                        })?;
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    pending
+                                        .as_ref()
+                                        .map(|p| p.name.clone())
+                                        .filter(|s| !s.is_empty())
+                                })
+                                .ok_or_else(|| {
+                                    ProviderError::Upstream(
+                                        "upstream Codex function_call item missing name"
+                                            .to_string(),
+                                    )
+                                })?;
 
-                    let raw_args = pending
-                        .as_ref()
-                        .map(|p| p.arguments.as_str())
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| item.get("arguments").and_then(Value::as_str))
-                        .unwrap_or("");
-                    if raw_args.len() > self.max_tool_args_bytes {
-                        return Err(ProviderError::Upstream(
+                            let raw_args = pending
+                                .as_ref()
+                                .map(|p| p.arguments.as_str())
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| item.get("arguments").and_then(Value::as_str))
+                                .unwrap_or("");
+                            if raw_args.len() > self.max_tool_args_bytes {
+                                return Err(ProviderError::Upstream(
                             "upstream Codex function call arguments exceeded maximum size limit"
                                 .to_string(),
                         ));
-                    }
+                            }
 
-                    let parsed_args = if raw_args.trim().is_empty() {
-                        Value::Object(Map::new())
-                    } else {
-                        let val: Value = serde_json::from_str(raw_args).map_err(|_| {
-                            ProviderError::Upstream(
+                            let parsed_args = if raw_args.trim().is_empty() {
+                                Value::Object(Map::new())
+                            } else {
+                                let val: Value = serde_json::from_str(raw_args).map_err(|_| {
+                                    ProviderError::Upstream(
                                 "upstream Codex function call emitted malformed JSON arguments"
                                     .to_string(),
                             )
-                        })?;
-                        if !val.is_object() {
-                            return Err(ProviderError::Upstream(
+                                })?;
+                                if !val.is_object() {
+                                    return Err(ProviderError::Upstream(
                                 "upstream Codex function call arguments must be a JSON object"
                                     .to_string(),
                             ));
-                        }
-                        val
-                    };
+                                }
+                                val
+                            };
 
-                    out.push(json!({
-                        "candidates": [{
-                            "content": {
-                                "role": "model",
-                                "parts": [{
-                                    "functionCall": {
-                                        "id": call_id,
-                                        "name": name,
-                                        "args": parsed_args
-                                    }
+                            out.push(json!({
+                                "candidates": [{
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [{
+                                            "functionCall": {
+                                                "id": call_id,
+                                                "name": name,
+                                                "args": parsed_args
+                                            }
+                                        }]
+                                    },
+                                    "index": 0
                                 }]
-                            },
-                            "index": 0
-                        }]
-                    }));
+                            }));
+                        }
+                        _ => {}
+                    }
                 }
             }
             "response.completed" | "response.incomplete" => {
@@ -1653,6 +1961,18 @@ impl CodexSseTranslator {
     }
 }
 
+fn update_trailing_newlines(prev: u8, emitted: &str) -> u8 {
+    let mut count = prev;
+    for b in emitted.bytes() {
+        if b == b'\n' {
+            count = count.saturating_add(1).min(2);
+        } else {
+            count = 0;
+        }
+    }
+    count
+}
+
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
@@ -1756,21 +2076,41 @@ impl UnaryGeminiAggregator {
         };
 
         if let Some(text) = obj.get("text").and_then(Value::as_str) {
-            self.account_bytes(text.len())?;
+            let thought_sig = obj
+                .get("thoughtSignature")
+                .or_else(|| obj.get("thought_signature"))
+                .and_then(Value::as_str);
+            let added_bytes = text.len().saturating_add(thought_sig.map_or(0, str::len));
+            self.account_bytes(added_bytes)?;
             let is_thought = obj.get("thought").and_then(Value::as_bool) == Some(true);
             if let Some(last) = self.parts.last_mut().and_then(Value::as_object_mut)
                 && last.get("text").is_some()
                 && (last.get("thought").and_then(Value::as_bool) == Some(true)) == is_thought
-                && let Some(Value::String(existing)) = last.get_mut("text")
+                && !last.contains_key("thoughtSignature")
             {
-                existing.push_str(text);
+                if let Some(Value::String(existing)) = last.get_mut("text") {
+                    existing.push_str(text);
+                }
+                if let Some(sig) = thought_sig {
+                    last.insert(
+                        "thoughtSignature".to_string(),
+                        Value::String(sig.to_string()),
+                    );
+                }
                 return Ok(());
             }
+            let mut part_map = Map::new();
+            part_map.insert("text".to_string(), Value::String(text.to_string()));
             if is_thought {
-                self.parts.push(json!({ "text": text, "thought": true }));
-            } else {
-                self.parts.push(json!({ "text": text }));
+                part_map.insert("thought".to_string(), Value::Bool(true));
             }
+            if let Some(sig) = thought_sig {
+                part_map.insert(
+                    "thoughtSignature".to_string(),
+                    Value::String(sig.to_string()),
+                );
+            }
+            self.parts.push(Value::Object(part_map));
             return Ok(());
         }
 
@@ -2653,5 +2993,295 @@ mod tests {
         let (status, unary) = agg.finish().expect("agg finish");
         assert_eq!(status, 200);
         assert_eq!(unary["responseId"], "resp_codex_12345");
+    }
+
+    #[test]
+    fn maps_prefixed_thinking_levels_defaults_summary_auto_and_include_encrypted_reasoning() {
+        let effort_cases = [
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_MINIMAL" }),
+                Some("low"),
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_LOW" }),
+                Some("low"),
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_MEDIUM" }),
+                Some("medium"),
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_HIGH" }),
+                Some("high"),
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_XHIGH" }),
+                Some("xhigh"),
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_EXTRA_HIGH" }),
+                Some("xhigh"),
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_VERY_HIGH" }),
+                Some("xhigh"),
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_EXTRA" }),
+                Some("xhigh"),
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_MAX" }),
+                Some("xhigh"),
+            ),
+            (json!({ "thinkingLevel": "EXTRA_HIGH" }), Some("xhigh")),
+            (json!({ "thinkingLevel": "VERY_HIGH" }), Some("xhigh")),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_MODEL_DEFAULT" }),
+                None,
+            ),
+            (
+                json!({ "thinkingLevel": "THINKING_LEVEL_UNSPECIFIED" }),
+                None,
+            ),
+            (json!({ "thinkingLevel": 0 }), None),
+            (json!({ "includeThoughts": true }), None),
+        ];
+
+        for (thinking_cfg, expected_effort) in effort_cases {
+            let body = json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+                "generationConfig": { "thinkingConfig": thinking_cfg }
+            });
+            let out =
+                translate_gemini_to_codex_request("gpt-6.2-astra", body.to_string().as_bytes())
+                    .expect("thinking config translation");
+            assert_eq!(
+                out["reasoning"]["summary"], "auto",
+                "expected summary=auto for {thinking_cfg}"
+            );
+            match expected_effort {
+                Some(effort) => assert_eq!(
+                    out["reasoning"]["effort"], effort,
+                    "expected effort={effort} for {thinking_cfg}"
+                ),
+                None => assert!(
+                    out["reasoning"].get("effort").is_none(),
+                    "expected omitted effort for {thinking_cfg}, got {:?}",
+                    out["reasoning"]
+                ),
+            }
+            assert_eq!(
+                out["include"],
+                json!(["reasoning.encrypted_content"]),
+                "expected include encrypted_content for {thinking_cfg}"
+            );
+        }
+
+        // Absent thinkingConfig still requests summary=auto + include encrypted_content by default.
+        let bare = json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] });
+        let out_bare =
+            translate_gemini_to_codex_request("gpt-6.2-sol", bare.to_string().as_bytes())
+                .expect("bare request");
+        assert_eq!(out_bare["reasoning"], json!({ "summary": "auto" }));
+        assert_eq!(out_bare["include"], json!(["reasoning.encrypted_content"]));
+
+        // Explicitly disabled thinking omits both reasoning and include.
+        for disabled_cfg in [
+            json!({ "thinkingLevel": "NONE" }),
+            json!({ "thinkingLevel": "OFF" }),
+            json!({ "thinkingLevel": "THINKING_LEVEL_NONE" }),
+            json!({ "thinkingLevel": "THINKING_LEVEL_OFF" }),
+            json!({ "thinkingBudget": 0 }),
+            json!({ "thinkingBudget": -1 }),
+        ] {
+            let body = json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+                "generationConfig": { "thinkingConfig": disabled_cfg }
+            });
+            let out = translate_gemini_to_codex_request("gpt-6.2-sol", body.to_string().as_bytes())
+                .expect("disabled thinking");
+            assert!(
+                out.get("reasoning").is_none(),
+                "expected no reasoning for {disabled_cfg}, got {:?}",
+                out.get("reasoning")
+            );
+            assert!(
+                out.get("include").is_none(),
+                "expected no include for {disabled_cfg}, got {:?}",
+                out.get("include")
+            );
+        }
+
+        // includeThoughts: false keeps explicit effort + encrypted reasoning but omits summary.
+        let no_summary = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingLevel": "THINKING_LEVEL_HIGH", "includeThoughts": false }
+            }
+        });
+        let out_no_summary =
+            translate_gemini_to_codex_request("gpt-6.2-astra", no_summary.to_string().as_bytes())
+                .expect("no summary");
+        assert_eq!(out_no_summary["reasoning"], json!({ "effort": "high" }));
+        assert_eq!(
+            out_no_summary["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+    }
+
+    #[test]
+    fn separates_multiple_reasoning_summary_parts_with_paragraph_breaks() {
+        let stream = concat!(
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"**Step 1** Checking files.\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"**Step 1** Checking files.\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":1,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":1,\"delta\":\"**Step 2** Applying fix.\\n\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":1,\"part\":{\"type\":\"summary_text\",\"text\":\"**Step 2** Applying fix.\\n\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":2,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":2,\"delta\":\"**Step 3** Running tests.\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":2,\"part\":{\"type\":\"summary_text\",\"text\":\"**Step 3** Running tests.\"}}\n\n"
+        );
+        let mut tr = CodexSseTranslator::new();
+        let mut chunks = tr.push_chunk(stream.as_bytes()).expect("push");
+        chunks.extend(tr.finish().expect("finish"));
+
+        let mut agg = UnaryGeminiAggregator::new();
+        for c in chunks {
+            agg.push_chunk(c).expect("agg push");
+        }
+        let (_, unary) = agg.finish().expect("agg finish");
+        let parts = unary["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("parts");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(
+            parts[0]["text"],
+            "**Step 1** Checking files.\n\n**Step 2** Applying fix.\n\n**Step 3** Running tests."
+        );
+    }
+
+    #[test]
+    fn round_trips_encrypted_reasoning_signature_in_sse_unary_and_multi_turn_input() {
+        let sse = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Planning edit.\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_turn1_abc\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Planning edit.\"}],\"encrypted_content\":\"gAAAAAB_encrypted_blob_turn1\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Done!\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}}\n\n"
+        );
+
+        let mut tr = CodexSseTranslator::new();
+        let mut chunks = tr.push_chunk(sse.as_bytes()).expect("push");
+        chunks.extend(tr.finish().expect("finish"));
+
+        // Chunk 0: thought summary delta; Chunk 1: thoughtSignature part; Chunk 2: text delta; Chunk 3: completed.
+        assert_eq!(chunks.len(), 4);
+        let sig_part = &chunks[1]["candidates"][0]["content"]["parts"][0];
+        assert_eq!(sig_part["text"], "");
+        assert_eq!(sig_part["thought"], true);
+        let sig = sig_part["thoughtSignature"]
+            .as_str()
+            .expect("codex thoughtSignature")
+            .to_string();
+        // Emitted signature must be valid standard base64 (proto3 `bytes` compatible)
+        // whose decoded envelope carries the `agyc:codex:v1:` namespace prefix.
+        let decoded_sig = STANDARD
+            .decode(&sig)
+            .expect("thoughtSignature must be valid standard base64");
+        assert!(
+            decoded_sig.starts_with(CODEX_THOUGHT_SIGNATURE_PREFIX.as_bytes()),
+            "expected decoded {CODEX_THOUGHT_SIGNATURE_PREFIX} prefix"
+        );
+
+        // Unary aggregator merges thought text + thoughtSignature cleanly onto the thought part.
+        let mut agg = UnaryGeminiAggregator::new();
+        for c in chunks {
+            agg.push_chunk(c).expect("agg push");
+        }
+        let (status, unary) = agg.finish().expect("agg finish");
+        assert_eq!(status, 200);
+        let unary_parts = unary["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("unary parts");
+        assert_eq!(unary_parts.len(), 2);
+        assert_eq!(unary_parts[0]["text"], "Planning edit.");
+        assert_eq!(unary_parts[0]["thought"], true);
+        assert_eq!(unary_parts[0]["thoughtSignature"], sig);
+        assert_eq!(unary_parts[1], json!({ "text": "Done!" }));
+
+        // Turn 2: pass Turn 1's assistant response (plus duplicate sig on sibling part & foreign Gemini sig) back.
+        let turn2 = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": "Do task 1" }] },
+                {
+                    "role": "model",
+                    "parts": [
+                        { "text": "Planning edit.", "thought": true, "thoughtSignature": sig },
+                        { "text": "Done!", "thoughtSignature": sig },
+                        { "text": "Foreign sig part", "thoughtSignature": "foreign_gemini_sig_xyz" }
+                    ]
+                },
+                { "role": "user", "parts": [{ "text": "Now task 2" }] }
+            ]
+        });
+        let out_t2 =
+            translate_gemini_to_codex_request("gpt-6.2-astra", turn2.to_string().as_bytes())
+                .expect("turn 2 translation");
+        let input = out_t2["input"].as_array().expect("input array");
+        // Expect: user, reasoning (deduplicated!), assistant message, user.
+        assert_eq!(input.len(), 4, "got input: {input:?}");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(
+            input[1],
+            json!({
+                "type": "reasoning",
+                "id": "rs_turn1_abc",
+                "summary": [{ "type": "summary_text", "text": "Planning edit." }],
+                "encrypted_content": "gAAAAAB_encrypted_blob_turn1"
+            })
+        );
+        assert_eq!(input[2]["role"], "assistant");
+        assert_eq!(input[2]["content"][0]["text"], "Done!");
+        assert_eq!(input[2]["content"][1]["text"], "Foreign sig part");
+        assert_eq!(input[3]["role"], "user");
+    }
+
+    #[test]
+    fn enforces_size_cap_and_ignores_malformed_codex_thought_signatures() {
+        // Oversized encrypted_content in SSE output_item.done is dropped cleanly without error/OOM.
+        let huge_blob = "A".repeat(MAX_CODEX_REASONING_SIGNATURE_BYTES);
+        let sse = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"rs_huge\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"{huge_blob}\"}}}}\n\n"
+        );
+        let mut tr = CodexSseTranslator::new();
+        let chunks = tr
+            .push_chunk(sse.as_bytes())
+            .expect("oversized sig dropped");
+        assert!(
+            chunks.is_empty(),
+            "oversized reasoning signature must not be emitted"
+        );
+
+        // Malformed or oversized inbound agyc:codex:v1: signatures are ignored cleanly.
+        let bad_sig = format!("{CODEX_THOUGHT_SIGNATURE_PREFIX}!!!not-valid-base64!!!");
+        let body = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": "hi" }] },
+                {
+                    "role": "model",
+                    "parts": [
+                        { "text": "", "thought": true, "thoughtSignature": bad_sig },
+                        { "text": "Hello" }
+                    ]
+                }
+            ]
+        });
+        let out = translate_gemini_to_codex_request("gpt-6.2-sol", body.to_string().as_bytes())
+            .expect("malformed sig ignored");
+        let input = out["input"].as_array().expect("input");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["role"], "assistant");
     }
 }

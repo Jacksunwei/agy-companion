@@ -155,10 +155,11 @@ pub(super) async fn proxy_gemini_handler(
         }
     };
 
-    // Mid-conversation switching from Vertex/CloudCode to Gemini Developer API can carry
-    // foreign thoughtSignature tokens that generativelanguage.googleapis.com rejects with
-    // 400 INVALID_THOUGHT_SIGNATURE. Keep byte-for-byte pass-through on the normal path (S4),
-    // and only strip foreign thoughtSignature keys on an explicit 400 INVALID_THOUGHT_SIGNATURE.
+    // Mid-conversation switching from Vertex/CloudCode or Codex to Gemini Developer API can carry
+    // foreign thoughtSignature tokens (including Codex's `agyc:codex:v1:...` namespace) that
+    // generativelanguage.googleapis.com rejects with 400 INVALID_THOUGHT_SIGNATURE / TYPE_BYTES.
+    // Keep byte-for-byte pass-through on the normal path (S4), and only strip foreign
+    // thoughtSignature keys (plus any now-empty thought-only carrier parts) on an explicit 400.
     if is_gemini && upstream.status == StatusCode::BAD_REQUEST.as_u16() && has_thought_sig {
         let SniffedErrorPrefix {
             sniffed,

@@ -75,9 +75,9 @@ fn build_injected_codex_variant_details(
     let max_tokens = curated.map_or(272_000, |m| m.context_window);
     let max_output_tokens = curated.map_or(128_000, |m| m.max_output_tokens);
 
-    // Explicit Codex metadata: NEVER copy Gemini upstream templates, `modelExperimentIds`,
-    // or `supportsThoughtCirculation: true` (Codex does not use Gemini cryptographic
-    // thought signatures).
+    // Explicit Codex metadata: NEVER copy Gemini upstream templates or `modelExperimentIds`.
+    // Enable `supportsThoughtCirculation: true` so Antigravity circulates Codex's namespaced
+    // encrypted reasoning `thoughtSignature` (`agyc:codex:v1:...`) back across multi-turn chats.
     let mut details_map = Map::new();
     details_map.insert("model".to_string(), json!(enum_name));
     details_map.insert("displayName".to_string(), json!(display_name));
@@ -89,7 +89,7 @@ fn build_injected_codex_variant_details(
     details_map.insert("maxOutputTokens".to_string(), json!(max_output_tokens));
     details_map.insert("supportsThinking".to_string(), json!(true));
     details_map.insert("thinkingLevel".to_string(), json!(variant.thinking_level));
-    details_map.insert("supportsThoughtCirculation".to_string(), json!(false));
+    details_map.insert("supportsThoughtCirculation".to_string(), json!(true));
     details_map.insert("supportsImages".to_string(), json!(true));
     details_map.insert("supportsVideo".to_string(), json!(false));
     details_map.insert("supportsPdf".to_string(), json!(false));
