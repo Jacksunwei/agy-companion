@@ -464,6 +464,16 @@ fn translate_model_parts(
                 translate_function_call_part(func_call, turn_idx, part_idx, correlator)?;
             input.push(call_item);
         }
+
+        if let Some(func_resp) = part_obj
+            .get("functionResponse")
+            .or_else(|| part_obj.get("function_response"))
+        {
+            flush_message("assistant", &mut assistant_parts, input);
+            let output_item =
+                translate_function_response_part(func_resp, turn_idx, part_idx, correlator)?;
+            input.push(output_item);
+        }
     }
 
     flush_message("assistant", &mut assistant_parts, input);
@@ -904,6 +914,49 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// Extracts strictly sanitized `(error_code, error_type)` slug metadata from an upstream Codex
+/// error JSON payload (`error.{code,type}` or `response.error.{code,type}`) for safe logging (S2).
+/// Never returns `error.message`, secrets, whitespace, or strings longer than 64 ASCII slug chars.
+pub(crate) fn extract_safe_codex_error_fields(body: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
+        return (None, None);
+    };
+    extract_safe_codex_error_fields_from_value(&parsed)
+}
+
+fn extract_safe_codex_error_fields_from_value(v: &Value) -> (Option<String>, Option<String>) {
+    let Some(err_obj) = v
+        .get("error")
+        .or_else(|| v.get("response").and_then(|r| r.get("error")))
+    else {
+        return (None, None);
+    };
+    let code = sanitize_codex_error_slug(err_obj.get("code").and_then(Value::as_str));
+    let err_type = sanitize_codex_error_slug(err_obj.get("type").and_then(Value::as_str));
+    (code, err_type)
+}
+
+fn sanitize_codex_error_slug(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    if trimmed.starts_with("AIza")
+        || trimmed.starts_with("sk-")
+        || trimmed.starts_with("eyJ")
+        || trimmed.starts_with("ghp_")
+    {
+        return None;
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Maps an upstream Codex HTTP status and bounded error body (or SSE `response.failed`/`error`
@@ -1551,7 +1604,21 @@ impl CodexSseTranslator {
                 out.push(Value::Object(chunk));
             }
             "response.failed" | "error" => {
-                let (_status, err_json) = sanitize_codex_error_json(502, payload);
+                let (mapped_status, err_json) = sanitize_codex_error_json(502, payload);
+                let (error_code, error_type) = extract_safe_codex_error_fields_from_value(&event);
+                let grpc_status = err_json
+                    .get("error")
+                    .and_then(|e| e.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("INTERNAL");
+                tracing::warn!(
+                    event_type,
+                    mapped_status,
+                    grpc_status,
+                    error_code = error_code.as_deref().unwrap_or("none"),
+                    error_type = error_type.as_deref().unwrap_or("none"),
+                    "OpenAI Codex SSE stream reported error event"
+                );
                 out.push(err_json);
             }
             _ => {}
@@ -2314,5 +2381,236 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["error"]["code"], 429);
         assert!(!frames[0].to_string().contains("secret-refresh-tok-xyz"));
+    }
+
+    #[test]
+    fn translates_function_response_in_model_turn_explicit_id_and_fifo_fallback() {
+        // 1. Captured Antigravity pattern: standalone functionResponse inside role: "model"
+        //    with explicit call ID matching an earlier role: "model" functionCall.
+        let explicit_id = "call_12658be792e746a4a55dc9fd30d2e2f7";
+        let body_explicit = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": "Read Cargo.toml" }] },
+                {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": explicit_id,
+                            "name": "read_file",
+                            "args": { "path": "Cargo.toml" }
+                        }
+                    }]
+                },
+                {
+                    "role": "model",
+                    "parts": [{
+                        "functionResponse": {
+                            "id": explicit_id,
+                            "name": "read_file",
+                            "response": { "content": "[workspace]\n" }
+                        }
+                    }]
+                }
+            ]
+        });
+
+        let out_explicit =
+            translate_gemini_to_codex_request("gpt-6.2-sol", body_explicit.to_string().as_bytes())
+                .expect("model functionResponse explicit id");
+        let items_explicit = out_explicit["input"].as_array().expect("input array");
+        assert_eq!(
+            items_explicit.len(),
+            3,
+            "expected user + function_call + function_call_output, got {items_explicit:?}"
+        );
+        assert_eq!(items_explicit[0]["role"], "user");
+        assert_eq!(
+            items_explicit[1],
+            json!({
+                "type": "function_call",
+                "call_id": explicit_id,
+                "name": "read_file",
+                "arguments": "{\"path\":\"Cargo.toml\"}"
+            })
+        );
+        assert_eq!(
+            items_explicit[2],
+            json!({
+                "type": "function_call_output",
+                "call_id": explicit_id,
+                "output": "{\"content\":\"[workspace]\\n\"}"
+            })
+        );
+
+        // 2. Snake-case function_response inside role: "model" without explicit id correlates via FIFO.
+        let body_fifo = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": "Check version" }] },
+                {
+                    "role": "model",
+                    "parts": [{
+                        "function_call": {
+                            "name": "read_file",
+                            "args": { "path": "Cargo.toml" }
+                        }
+                    }]
+                },
+                {
+                    "role": "model",
+                    "parts": [{
+                        "function_response": {
+                            "name": "read_file",
+                            "response": "0.1.1-dev.5"
+                        }
+                    }]
+                }
+            ]
+        });
+
+        let out_fifo =
+            translate_gemini_to_codex_request("gpt-6.2-sol", body_fifo.to_string().as_bytes())
+                .expect("model function_response fifo");
+        let items_fifo = out_fifo["input"].as_array().expect("input array");
+        assert_eq!(items_fifo.len(), 3);
+        let call_id = items_fifo[1]["call_id"]
+            .as_str()
+            .expect("synthetic call_id");
+        assert_eq!(items_fifo[1]["type"], "function_call");
+        assert_eq!(
+            items_fifo[2],
+            json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "0.1.1-dev.5"
+            })
+        );
+    }
+
+    #[test]
+    fn translates_mixed_model_and_assistant_turns_preserving_order_and_stripping_thoughts() {
+        for role in ["model", "assistant"] {
+            let body = json!({
+                "contents": [
+                    { "role": "user", "parts": [{ "text": "Inspect file" }] },
+                    {
+                        "role": role,
+                        "parts": [
+                            { "text": "internal thought", "thought": true, "thoughtSignature": "sig-thought" },
+                            { "text": "Checking now.", "thoughtSignature": "sig-before" },
+                            {
+                                "functionCall": {
+                                    "name": "read_file",
+                                    "args": { "path": "lib.rs" }
+                                },
+                                "thoughtSignature": "sig-call"
+                            },
+                            {
+                                "functionResponse": {
+                                    "name": "read_file",
+                                    "response": { "ok": true }
+                                },
+                                "thoughtSignature": "sig-resp"
+                            },
+                            { "text": "All clear." }
+                        ]
+                    }
+                ]
+            });
+
+            let out = translate_gemini_to_codex_request("gpt-6.2-sol", body.to_string().as_bytes())
+                .expect("mixed model/assistant turn");
+            let serialized = out.to_string();
+            assert!(!serialized.contains("internal thought"));
+            assert!(!serialized.contains("thoughtSignature"));
+
+            let items = out["input"].as_array().expect("input array");
+            assert_eq!(items.len(), 5, "role={role} items={items:?}");
+            assert_eq!(items[0]["role"], "user");
+            assert_eq!(
+                items[1],
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Checking now." }]
+                })
+            );
+            let call_id = items[2]["call_id"].as_str().expect("call_id");
+            assert_eq!(items[2]["type"], "function_call");
+            assert_eq!(items[2]["name"], "read_file");
+            assert_eq!(
+                items[3],
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "{\"ok\":true}"
+                })
+            );
+            assert_eq!(
+                items[4],
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "All clear." }]
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_safe_codex_error_fields_and_rejects_secrets_and_malformed_slugs() {
+        // 1. Valid top-level and nested response.error slugs are extracted; message is ignored.
+        let top_level = br#"{"error":{"code":"invalid_request_error","type":"invalid_request","message":"Bearer eyJSECRET_TOKEN_HERE"}}"#;
+        assert_eq!(
+            extract_safe_codex_error_fields(top_level),
+            (
+                Some("invalid_request_error".to_string()),
+                Some("invalid_request".to_string())
+            )
+        );
+
+        let nested = br#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","type":"tokens-64_ok","message":"sk-secret"}}}"#;
+        assert_eq!(
+            extract_safe_codex_error_fields(nested),
+            (
+                Some("rate_limit_exceeded".to_string()),
+                Some("tokens-64_ok".to_string())
+            )
+        );
+
+        // 2. Boundary: 64 ASCII slug chars accepted, 65 rejected.
+        let exact_64 = "a".repeat(64);
+        let over_64 = "a".repeat(65);
+        assert_eq!(
+            sanitize_codex_error_slug(Some(&exact_64)),
+            Some(exact_64.clone())
+        );
+        assert_eq!(sanitize_codex_error_slug(Some(&over_64)), None);
+
+        // 3. Rejects secret prefixes, whitespace/newlines, punctuation, and empty strings.
+        for unsafe_val in [
+            "",
+            "   ",
+            "AIzaSyFakeSecretPrefix1234567890",
+            "sk-proj-secret123",
+            "eyJhbGciOiJSUzI1NiJ9",
+            "ghp_secret1234567890",
+            "bad\ncode",
+            "Bearer token",
+            "err.with.dot",
+            "err/slash",
+        ] {
+            assert_eq!(
+                sanitize_codex_error_slug(Some(unsafe_val)),
+                None,
+                "expected slug rejection for {unsafe_val:?}"
+            );
+        }
+
+        // 4. Malformed JSON or missing error object returns (None, None).
+        assert_eq!(extract_safe_codex_error_fields(b"not-json"), (None, None));
+        assert_eq!(
+            extract_safe_codex_error_fields(br#"{"message":"plain"}"#),
+            (None, None)
+        );
     }
 }

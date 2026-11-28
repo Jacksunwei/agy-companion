@@ -17,8 +17,8 @@ use url::{Origin, Url};
 
 use crate::codex::auth::CodexAuth;
 use crate::codex::translate::{
-    CodexSseTranslator, UnaryGeminiAggregator, sanitize_codex_error_json,
-    translate_gemini_to_codex_request_with_cache_key,
+    CodexSseTranslator, UnaryGeminiAggregator, extract_safe_codex_error_fields,
+    sanitize_codex_error_json, translate_gemini_to_codex_request_with_cache_key,
 };
 use crate::gemini::url::is_loopback_url;
 use crate::{
@@ -266,6 +266,17 @@ impl ProviderAdapter for CodexProvider {
                 let err_body = read_bounded_body(response, MAX_ERROR_BODY_BYTES).await;
                 let (mapped_status, err_json) =
                     sanitize_codex_error_json(status.as_u16(), &err_body);
+                let (error_code, error_type) = extract_safe_codex_error_fields(&err_body);
+                tracing::warn!(
+                    base_url = %self.normalized_base_url,
+                    model = %model,
+                    is_streaming,
+                    upstream_status = status.as_u16(),
+                    mapped_status,
+                    error_code = error_code.as_deref().unwrap_or("none"),
+                    error_type = error_type.as_deref().unwrap_or("none"),
+                    "OpenAI Codex returned non-2xx response"
+                );
                 let payload = Bytes::from(serde_json::to_vec(&err_json).unwrap_or_else(|_| {
                     br#"{"error":{"code":502,"message":"OpenAI Codex upstream service error","status":"INTERNAL"}}"#.to_vec()
                 }));
@@ -432,6 +443,10 @@ impl Stream for CodexSseByteStream {
                             match CodexSseTranslator::format_gemini_sse_frame(&item) {
                                 Ok(frame) => this.buffered_frames.push_back(frame),
                                 Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "OpenAI Codex SSE stream terminated with error"
+                                    );
                                     this.failed = true;
                                     return Poll::Ready(Some(Err(err)));
                                 }
@@ -439,13 +454,22 @@ impl Stream for CodexSseByteStream {
                         }
                     }
                     Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "OpenAI Codex SSE stream terminated with error"
+                        );
                         this.failed = true;
                         return Poll::Ready(Some(Err(err)));
                     }
                 },
                 Poll::Ready(Some(Err(req_err))) => {
+                    let err = sanitize_reqwest_error(req_err);
+                    tracing::warn!(
+                        error = %err,
+                        "OpenAI Codex SSE stream terminated with error"
+                    );
                     this.failed = true;
-                    return Poll::Ready(Some(Err(sanitize_reqwest_error(req_err))));
+                    return Poll::Ready(Some(Err(err)));
                 }
                 Poll::Ready(None) => {
                     this.inner_done = true;
@@ -455,6 +479,10 @@ impl Stream for CodexSseByteStream {
                                 match CodexSseTranslator::format_gemini_sse_frame(&item) {
                                     Ok(frame) => this.buffered_frames.push_back(frame),
                                     Err(err) => {
+                                        tracing::warn!(
+                                            error = %err,
+                                            "OpenAI Codex SSE stream terminated with error"
+                                        );
                                         this.failed = true;
                                         return Poll::Ready(Some(Err(err)));
                                     }
@@ -462,6 +490,10 @@ impl Stream for CodexSseByteStream {
                             }
                         }
                         Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "OpenAI Codex SSE stream terminated with error"
+                            );
                             this.failed = true;
                             return Poll::Ready(Some(Err(err)));
                         }
@@ -1149,5 +1181,129 @@ mod tests {
             .expect_err("302 must fail health check without following");
         assert!(matches!(err, ProviderError::Upstream(_)));
         assert_eq!(redir_mock.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingWarnSubscriber {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct FieldCollector(Vec<String>);
+
+    impl tracing::field::Visit for FieldCollector {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push(format!("{}={value}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for CapturingWarnSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() <= tracing::Level::WARN {
+                let mut collector = FieldCollector::default();
+                event.record(&mut collector);
+                self.events.lock().unwrap().push(collector.0.join(" "));
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn logs_sanitized_codex_upstream_warnings_without_leaking_secrets() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let sub = CapturingWarnSubscriber::default();
+        let captured = Arc::clone(&sub.events);
+
+        tracing::subscriber::with_default(sub, || {
+            rt.block_on(async {
+                // 1. Non-2xx HTTP response logs sanitized status + error_code without secret message.
+                let (base_url, _) = spawn_mock_codex(MockMode::RateLimitedWithSecret).await;
+                let auth = Arc::new(StubCodexAuth::with_tokens("tok_warn_1", "tok_warn_2"));
+                let provider = CodexProvider::new(&base_url, auth, 30).expect("provider");
+                let resp = provider
+                    .forward_gemini(ForwardRequest {
+                        path_and_query: "/v1beta/models/gpt-6.2-sol:streamGenerateContent?alt=sse"
+                            .to_string(),
+                        body: Bytes::from(
+                            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+                        ),
+                        content_type: None,
+                        api_key_override: None,
+                        conversation_id: None,
+                    })
+                    .await
+                    .expect("429 response");
+                assert_eq!(resp.status, 429);
+                let _ = collect_stream(resp.stream).await;
+
+                // 2. SSE response.failed logs event_type + mapped_status + error_code without secret message.
+                let mut tr = CodexSseTranslator::new();
+                let frames = tr
+                    .push_chunk(
+                        b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"insufficient_quota\",\"type\":\"quota_error\",\"message\":\"Bearer eyJSECRET_PAYLOAD_SHOULD_NOT_LOG\"}}}\n\n",
+                    )
+                    .expect("sse error translates");
+                assert_eq!(frames.len(), 1);
+
+                // 3. CodexSseByteStream::poll_next logs sanitized stream error on malformed SSE JSON.
+                let mut bad_stream = CodexSseByteStream::new(Box::pin(futures_util::stream::once(
+                    async { Ok(Bytes::from_static(b"data: {not-valid-json\n\n")) },
+                )));
+                let stream_item = bad_stream.next().await;
+                assert!(matches!(stream_item, Some(Err(ProviderError::Upstream(_)))));
+            });
+        });
+
+        let logged = captured.lock().unwrap();
+        assert!(
+            logged.iter().any(|line| {
+                line.contains("upstream_status=429")
+                    && line.contains("mapped_status=429")
+                    && line.contains("error_code=rate_limit_exceeded")
+            }),
+            "expected sanitized non-2xx warn log, got: {logged:?}"
+        );
+        assert!(
+            logged.iter().any(|line| {
+                line.contains("event_type=response.failed")
+                    && line.contains("mapped_status=429")
+                    && line.contains("error_code=insufficient_quota")
+                    && line.contains("error_type=quota_error")
+            }),
+            "expected sanitized SSE error warn log, got: {logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|line| { line.contains("error=") && line.contains("malformed JSON") }),
+            "expected CodexSseByteStream error warn log, got: {logged:?}"
+        );
+        let joined = logged.join("\n");
+        assert!(!joined.contains("secret-refresh-token-do-not-echo"));
+        assert!(!joined.contains("eyJSECRET_PAYLOAD_SHOULD_NOT_LOG"));
+        assert!(!joined.contains("Bearer"));
     }
 }
