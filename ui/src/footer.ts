@@ -245,7 +245,9 @@ export function createFooterController(container: HTMLElement): FooterController
     const endpointText = `${host}:${port}`;
 
     const reachable = snap ? snap.proxy.reachable : false;
-    const versionSkew = snap ? snap.version_skew : false;
+    const updateState = snap?.update?.state ?? null;
+    const suppressVersionSkew = updateState === "upgrading" || updateState === "upgraded";
+    const versionSkew = snap ? snap.version_skew && !suppressVersionSkew : false;
     const platform = snap?.platform ?? "macos";
     const li = snap?.launcher_integration ?? null;
     const isUnixDisabled =

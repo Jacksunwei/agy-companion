@@ -33,6 +33,7 @@ import {
   parseSettingsSnapshot,
   parseStartCodexLoginPayload,
   parseTestConnectionPayload,
+  parseUpdateStatusSnapshot,
   parseUsageSummary,
   validateApiKey,
   type AccountPlanChoice,
@@ -41,6 +42,7 @@ import {
   type InlineFeedback,
   type SaveSettingsArgs,
   type SettingsSnapshot,
+  type UpdateStatusSnapshot,
   type UsageGroup,
   type UsageRange,
   type UsageUnit,
@@ -51,6 +53,11 @@ import {
   inferThemeFromCssVars,
   isPluginHostProtocol,
 } from "./transport.ts";
+import {
+  buildUpdateHeaderRenderState,
+  createUpdateHeaderController,
+  createUpgradePoller,
+} from "./update_header.ts";
 import { buildUsageView, computeUsageSignature } from "./usage.ts";
 
 const FOCUS_RECHECK_MIN_GAP_MS = 2_000;
@@ -121,6 +128,8 @@ async function main(): Promise<void> {
   let lastBannerSig: string | null = null;
   let lastMonitorSig: string | null = null;
   let lastUsageSig: string | null = null;
+  let checkingUpdate = false;
+  let optimisticUpdate: UpdateStatusSnapshot | null = null;
 
   function setKeyFeedback(feedback: InlineFeedback | null, autoDismissMs?: number): void {
     keyFeedbackTimer.cancel();
@@ -164,8 +173,7 @@ async function main(): Promise<void> {
   const brand = el("div", "brand");
   const mark = el("span", "brand-mark");
   mark.append(createBrandMarkSvg());
-  const verEl = el("span", "hdr-ver", "");
-  brand.append(mark, el("h1", "brand-name", "Antigravity Companion"), verEl);
+  brand.append(mark, el("h1", "brand-name", "Antigravity Companion"));
 
   const nav = el("nav", "hdr-nav");
   nav.setAttribute("aria-label", "Companion views");
@@ -363,6 +371,35 @@ async function main(): Promise<void> {
 
   const footerCtrl = createFooterController(root);
   const toastCtrl = createToastController(root);
+  const updateHeaderCtrl = createUpdateHeaderController(brand, root, {
+    onCheckUpdate: () => {
+      void handleCheckUpdate();
+    },
+    onStartUpgrade: () => {
+      void handleStartUpgrade();
+    },
+    onReloadPanel: () => {
+      window.location.reload();
+    },
+    onToast: showToast,
+  });
+  const upgradePoller = createUpgradePoller({
+    pollUpdateStatus: () => callTool("get_update_status", {}, parseUpdateStatusSnapshot),
+    getPlatform: () => state.snapshot?.platform ?? "macos",
+    onUpdateStatus: (status) => {
+      applyUpdateStatus(status);
+    },
+    onHoldingChange: () => {
+      renderHeader();
+      footerCtrl.update(state);
+    },
+    onDisconnectTimeout: () => {
+      void refreshSettings(true);
+    },
+    reloadPage: () => {
+      window.location.reload();
+    },
+  });
   const themeCtrl = createThemeController(
     document.documentElement,
     root,
@@ -382,7 +419,14 @@ async function main(): Promise<void> {
   }
 
   function renderHeader(): void {
-    verEl.textContent = state.snapshot?.binary_version || "";
+    updateHeaderCtrl.update(
+      buildUpdateHeaderRenderState(
+        state,
+        checkingUpdate,
+        upgradePoller.isHoldingUpgrading(),
+        optimisticUpdate,
+      ),
+    );
     for (const [id, btn] of tabBtns.entries()) {
       const selected = state.activeTab === id;
       btn.setAttribute("aria-selected", String(selected));
@@ -544,7 +588,70 @@ async function main(): Promise<void> {
       state.initialTabApplied = true;
     }
 
+    if (snap.update !== undefined && snap.update !== null) {
+      optimisticUpdate = null;
+    }
+    upgradePoller.syncSettingsSnapshot(snap);
+
     renderAll();
+  }
+
+  function applyUpdateStatus(status: UpdateStatusSnapshot): void {
+    optimisticUpdate = status;
+    if (state.snapshot) {
+      state.snapshot = { ...state.snapshot, update: status };
+    }
+    renderHeader();
+    footerCtrl.update(state);
+  }
+
+  async function handleCheckUpdate(): Promise<void> {
+    if (!state.connected || state.standalone || checkingUpdate) return;
+    checkingUpdate = true;
+    renderHeader();
+
+    const outcome = await callTool("check_update", {}, parseUpdateStatusSnapshot);
+    checkingUpdate = false;
+
+    if (outcome.ok) {
+      applyUpdateStatus(outcome.data);
+      if (outcome.data.state === "upgrading") {
+        upgradePoller.notifyUpgradeStarted(outcome.data);
+      }
+    } else {
+      showToast(outcome.error);
+      renderHeader();
+    }
+  }
+
+  async function handleStartUpgrade(): Promise<void> {
+    if (!state.connected || state.standalone) return;
+    const currentUpdate = optimisticUpdate ?? state.snapshot?.update ?? null;
+    if (currentUpdate) {
+      applyUpdateStatus({ ...currentUpdate, state: "upgrading", error: null });
+    }
+
+    const outcome = await callTool("start_upgrade", {}, parseUpdateStatusSnapshot);
+    if (outcome.ok) {
+      applyUpdateStatus(outcome.data);
+      upgradePoller.notifyUpgradeStarted(outcome.data);
+    } else {
+      const base = currentUpdate ?? {
+        state: "failed" as const,
+        channel: "npx" as const,
+        current_version: state.snapshot?.binary_version || "",
+        latest_version: null,
+        can_one_click_upgrade: true,
+        fallback_command: "npx -y agy-companion@latest install",
+        checked_at_ms: null,
+        error: null,
+      };
+      applyUpdateStatus({
+        ...base,
+        state: "failed",
+        error: outcome.error,
+      });
+    }
   }
 
   /* =========================================================================
@@ -1201,17 +1308,22 @@ async function main(): Promise<void> {
 
   window.addEventListener("pagehide", () => {
     clearPollTimer();
+    upgradePoller.destroy();
     keyFeedbackTimer.cancel();
     codexFeedbackTimer.cancel();
     toastCtrl.destroy();
     themeCtrl.destroy();
     tooltip.destroy();
+    updateHeaderCtrl.destroy();
     footerCtrl.destroy();
   });
 
   document.addEventListener("keydown", (e: KeyboardEvent) => {
     if (e.key === "Escape") {
       tooltip.hideNow();
+      if (updateHeaderCtrl.isAnyPopoverOpen()) {
+        updateHeaderCtrl.closePopovers();
+      }
       if (footerCtrl.isPopoverOpen()) {
         footerCtrl.closePopover();
       }

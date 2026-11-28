@@ -68,7 +68,7 @@ uvx --refresh agy-companion install
 <details>
 <summary>Upgrade, Uninstall, Full Purge &amp; Troubleshooting</summary>
 
-- **Upgrade:** Re-run `npx -y agy-companion@latest install` (or `npm i -g agy-companion@latest && agy-companion install`).
+- **Upgrade:** Click the **Upgrade** pill in the Antigravity Companion panel header when a newer version is available (or click the version pill to check for updates anytime; set `AGY_COMPANION_NO_UPDATE_CHECK=1` to disable background checks). You can also upgrade from the terminal with `npx -y agy-companion@latest install` or `uvx --refresh agy-companion install`.
 - **Uninstall (keeps your config and usage history):**
   ```bash
   npx -y agy-companion@latest uninstall
