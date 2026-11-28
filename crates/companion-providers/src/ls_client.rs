@@ -149,6 +149,45 @@ where
     Ok(u32::try_from(val).unwrap_or(u32::MAX))
 }
 
+fn deserialize_vec_u32_from_str_or_num<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct U32Item(u32);
+    impl<'de> Deserialize<'de> for U32Item {
+        fn deserialize<D2: Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
+            deserialize_u32_from_str_or_num(d).map(Self)
+        }
+    }
+
+    struct VecU32Visitor;
+    impl<'de> Visitor<'de> for VecU32Visitor {
+        type Value = Vec<u32>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a sequence of u32 or numeric strings, or null")
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(U32Item(v)) = seq.next_element()? {
+                out.push(v);
+            }
+            Ok(out)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+    }
+
+    deserializer.deserialize_any(VecU32Visitor)
+}
+
 fn deserialize_i32_from_str_or_num<'de, D>(deserializer: D) -> Result<i32, D::Error>
 where
     D: Deserializer<'de>,
@@ -286,6 +325,10 @@ pub struct LsModelConfig {
 struct GetCascadeModelConfigDataResponse {
     #[serde(default)]
     client_model_configs: Vec<LsModelConfig>,
+    #[serde(default)]
+    cached_cascade_model_configs: Vec<LsModelConfig>,
+    #[serde(default)]
+    battle_mode_model_configs: Vec<LsModelConfig>,
 }
 
 /// Strictly allowlisted 3-way attribution fingerprint from `ModelUsageStats.response_header`.
@@ -507,6 +550,8 @@ pub struct LsChatModelMetadata {
 pub struct LsGeneratorMetadata {
     #[serde(default)]
     pub chat_model: Option<LsChatModelMetadata>,
+    #[serde(default, deserialize_with = "deserialize_vec_u32_from_str_or_num")]
+    pub step_indices: Vec<u32>,
 }
 
 impl LsGeneratorMetadata {
@@ -698,7 +743,67 @@ impl LsClient {
                 MAX_LS_MODEL_CONFIG_BYTES,
             )
             .await?;
-        Ok(resp.client_model_configs)
+        let total_cap = resp
+            .client_model_configs
+            .len()
+            .saturating_add(resp.cached_cascade_model_configs.len())
+            .saturating_add(resp.battle_mode_model_configs.len());
+        let mut merged: Vec<LsModelConfig> = Vec::with_capacity(total_cap);
+        let mut key_to_idx: HashMap<String, usize> = HashMap::with_capacity(total_cap);
+        let normalize_key = |raw: &str| {
+            let trimmed = raw.trim();
+            companion_core::normalize_placeholder_enum_key(trimmed)
+                .unwrap_or_else(|| trimmed.to_string())
+        };
+        let mut push_or_merge = |configs: Vec<LsModelConfig>| {
+            for cfg in configs {
+                let model_key = cfg
+                    .model_or_alias
+                    .as_ref()
+                    .and_then(|m| m.model.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(normalize_key);
+                let alias_key = cfg
+                    .model_or_alias
+                    .as_ref()
+                    .and_then(|m| m.alias.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(normalize_key);
+                let existing_idx = if let Some(ref k) = model_key {
+                    key_to_idx.get(k).copied()
+                } else {
+                    alias_key
+                        .as_deref()
+                        .and_then(|k| key_to_idx.get(k).copied())
+                };
+                if let Some(idx) = existing_idx {
+                    merge_ls_model_config(&mut merged[idx], cfg);
+                    if let Some(k) = model_key {
+                        key_to_idx.entry(k).or_insert(idx);
+                    }
+                    if let Some(k) = alias_key {
+                        key_to_idx.entry(k).or_insert(idx);
+                    }
+                } else {
+                    let idx = merged.len();
+                    if let Some(k) = model_key {
+                        key_to_idx.entry(k).or_insert(idx);
+                    }
+                    if let Some(k) = alias_key {
+                        key_to_idx.entry(k).or_insert(idx);
+                    }
+                    merged.push(cfg);
+                }
+            }
+        };
+        // clientModelConfigs takes precedence over cached and battle-mode configs,
+        // while backfilling any missing/empty fields from lower-precedence sections.
+        push_or_merge(resp.client_model_configs);
+        push_or_merge(resp.cached_cascade_model_configs);
+        push_or_merge(resp.battle_mode_model_configs);
+        Ok(merged)
     }
 
     pub async fn get_cascade_trajectory_steps(
@@ -920,6 +1025,69 @@ impl LsClient {
         }
 
         serde_json::from_slice::<T>(&buf).map_err(|_| LsError::InvalidJson { rpc })
+    }
+}
+
+fn is_unresolved_placeholder_model_id(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || trimmed.starts_with("MODEL_PLACEHOLDER_")
+        || trimmed.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_missing_model_provider(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("MODEL_PROVIDER_UNSPECIFIED")
+}
+
+fn merge_non_empty_opt_string(target: &mut Option<String>, fallback: Option<String>) {
+    if target.as_deref().is_none_or(|s| s.trim().is_empty())
+        && let Some(fb) = fallback
+        && !fb.trim().is_empty()
+    {
+        *target = Some(fb);
+    }
+}
+
+fn merge_ls_model_config(existing: &mut LsModelConfig, fallback: LsModelConfig) {
+    merge_non_empty_opt_string(&mut existing.label, fallback.label);
+    match (&mut existing.model_or_alias, fallback.model_or_alias) {
+        (None, Some(fb)) => existing.model_or_alias = Some(fb),
+        (Some(acc), Some(fb)) => {
+            merge_non_empty_opt_string(&mut acc.model, fb.model);
+            merge_non_empty_opt_string(&mut acc.alias, fb.alias);
+        }
+        _ => {}
+    }
+    if existing
+        .provider
+        .as_deref()
+        .is_none_or(is_missing_model_provider)
+        && let Some(fb) = fallback.provider
+        && !is_missing_model_provider(&fb)
+    {
+        existing.provider = Some(fb);
+    }
+    merge_non_empty_opt_string(&mut existing.model_url, fallback.model_url);
+
+    let existing_has_real_id = existing
+        .model_id
+        .as_deref()
+        .is_some_and(|s| !is_unresolved_placeholder_model_id(s));
+    if !existing_has_real_id {
+        if let Some(ref fb_id) = fallback.model_id
+            && !is_unresolved_placeholder_model_id(fb_id)
+        {
+            existing.model_id = Some(fb_id.clone());
+        } else {
+            merge_non_empty_opt_string(&mut existing.model_id, fallback.model_id);
+        }
+    }
+
+    if existing.context_window_options.is_empty() && !fallback.context_window_options.is_empty() {
+        existing.context_window_options = fallback.context_window_options;
     }
 }
 
@@ -2262,5 +2430,279 @@ mod tests {
             }
         );
         big_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_cascade_model_config_data_merges_cached_and_battle_mode_with_client_precedence() {
+        let app = Router::new().route(
+            RPC_GET_CASCADE_MODEL_CONFIG_DATA,
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{
+                        "clientModelConfigs": [
+                            {
+                                "label": "Client Hydrogen (High)",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M525" },
+                                "modelId": "gemini-4-hydrogen-high"
+                            }
+                        ],
+                        "cachedCascadeModelConfigs": [
+                            {
+                                "label": "Stale Cached Hydrogen (High)",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M525" },
+                                "modelId": "stale-cached-id"
+                            },
+                            {
+                                "label": "Cached Hydrogen Tiered (High)",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M530" },
+                                "modelId": "gemini-4-hydrogen-tiered-high"
+                            }
+                        ],
+                        "battleModeModelConfigs": [
+                            {
+                                "label": "Battle Mode Neon",
+                                "modelOrAlias": { "model": 532 },
+                                "modelId": "gemini-4-neon-high"
+                            }
+                        ]
+                    }"#,
+                )
+            }),
+        );
+
+        let (port, handle) = spawn_ipv4_router(app).await;
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).unwrap(),
+            CsrfToken::parse(TEST_CSRF_SECRET).unwrap(),
+        )
+        .unwrap();
+
+        let configs = client
+            .get_cascade_model_config_data()
+            .await
+            .expect("merged configs");
+        handle.abort();
+
+        let by_model: HashMap<String, LsModelConfig> = configs
+            .into_iter()
+            .filter_map(|cfg| {
+                let m = cfg.model_or_alias.as_ref()?.model.clone()?;
+                Some((m, cfg))
+            })
+            .collect();
+        assert_eq!(
+            by_model
+                .get("MODEL_PLACEHOLDER_M525")
+                .and_then(|c| c.model_id.as_deref()),
+            Some("gemini-4-hydrogen-high"),
+            "clientModelConfigs must take precedence over cachedCascadeModelConfigs"
+        );
+        assert_eq!(
+            by_model
+                .get("MODEL_PLACEHOLDER_M530")
+                .and_then(|c| c.model_id.as_deref()),
+            Some("gemini-4-hydrogen-tiered-high")
+        );
+        assert_eq!(
+            by_model.get("532").and_then(|c| c.model_id.as_deref()),
+            Some("gemini-4-neon-high")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_cascade_model_config_data_merges_missing_fields_under_partial_client_entry() {
+        let app = Router::new().route(
+            RPC_GET_CASCADE_MODEL_CONFIG_DATA,
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{
+                        "clientModelConfigs": [
+                            {
+                                "label": "",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M991" },
+                                "provider": null,
+                                "modelUrl": "",
+                                "modelId": null
+                            },
+                            {
+                                "label": "Client Override Label",
+                                "modelOrAlias": { "model": 992 },
+                                "provider": "MODEL_PROVIDER_UNSPECIFIED",
+                                "modelId": "MODEL_PLACEHOLDER_M992"
+                            },
+                            {
+                                "label": "Client M993",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M993" },
+                                "provider": "MODEL_PROVIDER_GOOGLE",
+                                "modelId": "gemini-5-epsilon-high"
+                            }
+                        ],
+                        "cachedCascadeModelConfigs": [
+                            {
+                                "label": "Gemini 5 Gamma (High)",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M991" },
+                                "provider": "API_PROVIDER_GOOGLE_GEMINI",
+                                "modelUrl": "gemini-api://gemini-5-gamma",
+                                "modelId": "gemini-5-gamma-high",
+                                "contextWindowOptions": [{"name": "1M", "expensive": false}]
+                            },
+                            {
+                                "label": "Stale Cached Label",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M992" },
+                                "provider": "MODEL_PROVIDER_GOOGLE",
+                                "modelId": "gemini-5-delta-high"
+                            },
+                            {
+                                "label": "Cached M993",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M993" },
+                                "provider": "MODEL_PROVIDER_OPENAI",
+                                "modelId": "stale-epsilon-id"
+                            }
+                        ],
+                        "battleModeModelConfigs": [
+                            {
+                                "label": "Battle Label",
+                                "modelOrAlias": { "model": "MODEL_PLACEHOLDER_M992", "alias": "ALIAS_M992" },
+                                "modelUrl": "gemini-api://gemini-5-delta",
+                                "modelId": "battle-delta-id",
+                                "contextWindowOptions": [{"name": "2M", "expensive": true}]
+                            },
+                            {
+                                "label": "Alias Fallback Should Not Override",
+                                "modelOrAlias": { "alias": "ALIAS_M992" },
+                                "modelId": "alias-should-not-override"
+                            }
+                        ]
+                    }"#,
+                )
+            }),
+        );
+
+        let (port, handle) = spawn_ipv4_router(app).await;
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).unwrap(),
+            CsrfToken::parse(TEST_CSRF_SECRET).unwrap(),
+        )
+        .unwrap();
+
+        let configs = client
+            .get_cascade_model_config_data()
+            .await
+            .expect("merged configs");
+        handle.abort();
+
+        assert_eq!(
+            configs.len(),
+            3,
+            "duplicate/partial keys across sections must merge into 3 entries"
+        );
+
+        let by_key: HashMap<String, LsModelConfig> = configs
+            .into_iter()
+            .filter_map(|cfg| {
+                let raw = cfg.model_or_alias.as_ref()?.model.as_deref()?;
+                let norm = companion_core::normalize_placeholder_enum_key(raw)
+                    .unwrap_or_else(|| raw.to_string());
+                Some((norm, cfg))
+            })
+            .collect();
+
+        let m991 = by_key.get("MODEL_PLACEHOLDER_M991").expect("M991 present");
+        assert_eq!(m991.model_id.as_deref(), Some("gemini-5-gamma-high"));
+        assert_eq!(m991.label.as_deref(), Some("Gemini 5 Gamma (High)"));
+        assert_eq!(m991.provider.as_deref(), Some("API_PROVIDER_GOOGLE_GEMINI"));
+        assert_eq!(
+            m991.model_url.as_deref(),
+            Some("gemini-api://gemini-5-gamma")
+        );
+        assert_eq!(m991.context_window_options.len(), 1);
+        assert_eq!(m991.context_window_options[0].name.as_deref(), Some("1M"));
+
+        let m992 = by_key.get("MODEL_PLACEHOLDER_M992").expect("M992 present");
+        assert_eq!(
+            m992.label.as_deref(),
+            Some("Client Override Label"),
+            "populated client label must take precedence"
+        );
+        assert_eq!(
+            m992.model_id.as_deref(),
+            Some("gemini-5-delta-high"),
+            "placeholder modelId in client entry must yield to resolved cached modelId"
+        );
+        assert_eq!(m992.provider.as_deref(), Some("MODEL_PROVIDER_GOOGLE"));
+        assert_eq!(
+            m992.model_url.as_deref(),
+            Some("gemini-api://gemini-5-delta"),
+            "missing modelUrl must backfill from battleModeModelConfigs"
+        );
+        assert_eq!(m992.context_window_options.len(), 1);
+        assert_eq!(m992.context_window_options[0].name.as_deref(), Some("2M"));
+        assert_eq!(
+            m992.model_or_alias
+                .as_ref()
+                .and_then(|m| m.alias.as_deref()),
+            Some("ALIAS_M992")
+        );
+
+        let m993 = by_key.get("MODEL_PLACEHOLDER_M993").expect("M993 present");
+        assert_eq!(m993.label.as_deref(), Some("Client M993"));
+        assert_eq!(m993.model_id.as_deref(), Some("gemini-5-epsilon-high"));
+        assert_eq!(m993.provider.as_deref(), Some("MODEL_PROVIDER_GOOGLE"));
+    }
+
+    #[test]
+    fn generator_metadata_deserializes_chat_model_fields_and_step_indices() {
+        let json_str = r#"{
+            "generatorMetadata": [
+                {
+                    "stepIndices": [26, "27"],
+                    "chatModel": {
+                        "model": "MODEL_PLACEHOLDER_M530",
+                        "responseModel": "gemini-4-hydrogen-tiered-high",
+                        "modelDisplayName": "Gemini 4 Hydrogen (High)",
+                        "chatStartMetadata": {
+                            "contextWindowMetadata": { "maxContextTokens": 512000 }
+                        }
+                    }
+                },
+                {
+                    "stepIndices": [30],
+                    "chatModel": {
+                        "model": 531,
+                        "responseModel": "gemini-4-hydrogen-tiered-medium",
+                        "modelDisplayName": "Gemini 4 Hydrogen (Medium)"
+                    }
+                }
+            ]
+        }"#;
+        let parsed: GetCascadeTrajectoryGeneratorMetadataResponse =
+            serde_json::from_str(json_str).expect("parse generator metadata");
+        assert_eq!(parsed.generator_metadata.len(), 2);
+        let g0 = &parsed.generator_metadata[0];
+        assert_eq!(g0.step_indices, vec![26, 27]);
+        let cm0 = g0.chat_model.as_ref().expect("chat_model 0");
+        assert_eq!(cm0.model.as_deref(), Some("MODEL_PLACEHOLDER_M530"));
+        assert_eq!(
+            cm0.response_model.as_deref(),
+            Some("gemini-4-hydrogen-tiered-high")
+        );
+        assert_eq!(
+            cm0.model_display_name.as_deref(),
+            Some("Gemini 4 Hydrogen (High)")
+        );
+        assert_eq!(g0.max_context_tokens(), Some(512_000));
+
+        let g1 = &parsed.generator_metadata[1];
+        assert_eq!(g1.step_indices, vec![30]);
+        let cm1 = g1.chat_model.as_ref().expect("chat_model 1");
+        assert_eq!(cm1.model.as_deref(), Some("531"));
+        assert_eq!(
+            cm1.response_model.as_deref(),
+            Some("gemini-4-hydrogen-tiered-medium")
+        );
     }
 }

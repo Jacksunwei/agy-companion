@@ -1,7 +1,11 @@
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::CoreError;
 
@@ -374,6 +378,283 @@ pub fn normalize_enabled_codex_models(models: Vec<String>) -> Result<Vec<String>
         }
     }
     Ok(normalized)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticPlaceholderMapping {
+    pub provider: &'static str,
+    pub model_id: &'static str,
+    pub display_name: &'static str,
+}
+
+/// Normalizes a placeholder enum key:
+/// - `"530"` -> `Some("MODEL_PLACEHOLDER_M530")`
+/// - `"MODEL_PLACEHOLDER_M530"` -> `Some("MODEL_PLACEHOLDER_M530")`
+/// - anything else -> `None`
+pub fn normalize_placeholder_enum_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(format!("MODEL_PLACEHOLDER_M{trimmed}"));
+    }
+    if let Some(rest) = trimmed.strip_prefix("MODEL_PLACEHOLDER_M")
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Returns the bare numeric alias for a placeholder enum key (e.g. `"MODEL_PLACEHOLDER_M530"` -> `Some("530")`).
+pub fn placeholder_numeric_alias(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("MODEL_PLACEHOLDER_M")
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some(rest.to_string());
+    }
+    None
+}
+
+/// Static fallback mapping for Antigravity `language_server` `MODEL_PLACEHOLDER_M*` enum slots
+/// when dynamic sources (`GetCascadeModelConfigData`, `fetchAvailableModels`,
+/// `GetCascadeTrajectoryGeneratorMetadata`, `meta.model_info`) did not resolve the slot.
+pub fn lookup_static_placeholder(raw: &str) -> Option<StaticPlaceholderMapping> {
+    let canonical = normalize_placeholder_enum_key(raw)?;
+    let num: u32 = canonical
+        .strip_prefix("MODEL_PLACEHOLDER_M")?
+        .parse()
+        .ok()?;
+    match num {
+        525..=531 | 432..=434 | 669 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-4-hydrogen",
+            display_name: "Gemini 4 Hydrogen",
+        }),
+        532..=536 | 465..=468 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-4-neon",
+            display_name: "Gemini 4 Neon",
+        }),
+        427 | 437 | 438 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-4-carbon",
+            display_name: "Gemini 4 Carbon",
+        }),
+        417..=421 | 670 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-4-argon",
+            display_name: "Gemini 4 Argon",
+        }),
+        318..=320 | 322 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-3.8-flash",
+            display_name: "Gemini 3.8 Flash",
+        }),
+        400..=402 => Some(StaticPlaceholderMapping {
+            provider: "vertex_claude",
+            model_id: "claude-opus-5-5",
+            display_name: "Claude Opus 5.5",
+        }),
+        403..=405 => Some(StaticPlaceholderMapping {
+            provider: "vertex_claude",
+            model_id: "claude-sonnet-5-5",
+            display_name: "Claude Sonnet 5.5",
+        }),
+        50 | 198 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-2.5-flash",
+            display_name: "Gemini 2.5 Flash",
+        }),
+        537 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-pro-orchestrator-neon",
+            display_name: "Orchestrator (Neon)",
+        }),
+        667 | 668 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-pro-orchestrator",
+            display_name: "Orchestrator (Carbon)",
+        }),
+        681 => Some(StaticPlaceholderMapping {
+            provider: "antigravity",
+            model_id: "gemini-pro-orchestrator-argon",
+            display_name: "Orchestrator (Argon)",
+        }),
+        _ => None,
+    }
+}
+
+fn deserialize_opt_string_or_i64<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptStringOrI64Visitor;
+
+    impl<'de> Visitor<'de> for OptStringOrI64Visitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string, integer enum value, or null")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            self.visit_str(&v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(self)
+        }
+    }
+
+    deserializer.deserialize_any(OptStringOrI64Visitor)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamModelEntry {
+    pub model_id: Option<String>,
+    pub display_name: Option<String>,
+    pub model_provider: Option<String>,
+    pub api_provider: Option<String>,
+    pub model_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchAvailableModelItemDto {
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_i64")]
+    model: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_i64")]
+    model_provider: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_i64")]
+    api_provider: Option<String>,
+    #[serde(default)]
+    model_url: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchAvailableModelsDto {
+    #[serde(default)]
+    models: HashMap<String, FetchAvailableModelItemDto>,
+}
+
+/// Shared in-process cache of `fetchAvailableModels` entries keyed by normalized placeholder enum
+/// (e.g. `MODEL_PLACEHOLDER_M530`), bridging `companion-proxy` and `LsCollector`.
+#[derive(Debug, Default)]
+pub struct UpstreamModelCatalog {
+    entries: Mutex<HashMap<String, UpstreamModelEntry>>,
+    version: AtomicU64,
+}
+
+impl UpstreamModelCatalog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, UpstreamModelEntry> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn update_from_fetch_available_models(&self, body: &[u8]) {
+        let Ok(parsed) = serde_json::from_slice::<FetchAvailableModelsDto>(body) else {
+            return;
+        };
+        if parsed.models.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut changed = false;
+        for (slug, item) in parsed.models {
+            let Some(raw_model) = item
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let key =
+                normalize_placeholder_enum_key(raw_model).unwrap_or_else(|| raw_model.to_string());
+            let model_id = item
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    let s = slug.trim();
+                    (!s.is_empty()).then(|| s.to_string())
+                });
+            let entry = UpstreamModelEntry {
+                model_id,
+                display_name: item
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                model_provider: item.model_provider,
+                api_provider: item.api_provider,
+                model_url: item
+                    .model_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            };
+            if guard.get(&key) != Some(&entry) {
+                guard.insert(key, entry);
+                changed = true;
+            }
+        }
+        if changed {
+            self.version.fetch_add(1, Ordering::Release);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -943,5 +1224,149 @@ mod tests {
                 Err(CoreError::InvalidModel { .. })
             ));
         }
+    }
+
+    #[test]
+    fn static_placeholder_lookup_maps_known_enums_and_numeric_aliases() {
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M530"),
+            Some(StaticPlaceholderMapping {
+                provider: "antigravity",
+                model_id: "gemini-4-hydrogen",
+                display_name: "Gemini 4 Hydrogen",
+            })
+        );
+        assert_eq!(
+            lookup_static_placeholder("530"),
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M530")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M432").map(|m| m.model_id),
+            Some("gemini-4-hydrogen")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M669").map(|m| m.model_id),
+            Some("gemini-4-hydrogen")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M535").map(|m| m.model_id),
+            Some("gemini-4-neon")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M468").map(|m| m.model_id),
+            Some("gemini-4-neon")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M427").map(|m| m.model_id),
+            Some("gemini-4-carbon")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M438").map(|m| m.model_id),
+            Some("gemini-4-carbon")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M417").map(|m| m.model_id),
+            Some("gemini-4-argon")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M670").map(|m| m.model_id),
+            Some("gemini-4-argon")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M318").map(|m| m.model_id),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M322").map(|m| m.model_id),
+            Some("gemini-3.8-flash")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M400"),
+            Some(StaticPlaceholderMapping {
+                provider: "vertex_claude",
+                model_id: "claude-opus-5-5",
+                display_name: "Claude Opus 5.5",
+            })
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M405"),
+            Some(StaticPlaceholderMapping {
+                provider: "vertex_claude",
+                model_id: "claude-sonnet-5-5",
+                display_name: "Claude Sonnet 5.5",
+            })
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M50").map(|m| m.model_id),
+            Some("gemini-2.5-flash")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M198").map(|m| m.model_id),
+            Some("gemini-2.5-flash")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M537").map(|m| m.model_id),
+            Some("gemini-pro-orchestrator-neon")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M667").map(|m| m.model_id),
+            Some("gemini-pro-orchestrator")
+        );
+        assert_eq!(
+            lookup_static_placeholder("MODEL_PLACEHOLDER_M681").map(|m| m.model_id),
+            Some("gemini-pro-orchestrator-argon")
+        );
+        assert_eq!(lookup_static_placeholder("MODEL_PLACEHOLDER_M9999"), None);
+        assert_eq!(
+            normalize_placeholder_enum_key("530").as_deref(),
+            Some("MODEL_PLACEHOLDER_M530")
+        );
+        assert_eq!(
+            placeholder_numeric_alias("MODEL_PLACEHOLDER_M530").as_deref(),
+            Some("530")
+        );
+    }
+
+    #[test]
+    fn upstream_model_catalog_tracks_placeholder_entries_and_versions() {
+        let catalog = UpstreamModelCatalog::new();
+        assert_eq!(catalog.version(), 0);
+        let payload = br#"{
+            "models": {
+                "gemini-4-hydrogen-tiered-high": {
+                    "model": "MODEL_PLACEHOLDER_M530",
+                    "displayName": "Gemini 4 Hydrogen (High)",
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE",
+                    "apiProvider": "API_PROVIDER_GOOGLE_GEMINI"
+                },
+                "companion/gpt-6.2-sol-medium": {
+                    "model": 356,
+                    "displayName": "GPT-6.2 Sol (Codex) (Medium)",
+                    "modelUrl": "gemini-api://gpt-6.2-sol",
+                    "modelProvider": "MODEL_PROVIDER_GOOGLE",
+                    "apiProvider": "API_PROVIDER_GOOGLE_GEMINI"
+                }
+            }
+        }"#;
+        catalog.update_from_fetch_available_models(payload);
+        assert!(catalog.version() > 0);
+        let snap = catalog.snapshot();
+        let m530 = snap.get("MODEL_PLACEHOLDER_M530").expect("M530 entry");
+        assert_eq!(
+            m530.model_id.as_deref(),
+            Some("gemini-4-hydrogen-tiered-high")
+        );
+        assert_eq!(
+            m530.display_name.as_deref(),
+            Some("Gemini 4 Hydrogen (High)")
+        );
+        let m356 = snap
+            .get("MODEL_PLACEHOLDER_M356")
+            .expect("M356 numeric normalized");
+        assert_eq!(
+            m356.model_id.as_deref(),
+            Some("companion/gpt-6.2-sol-medium")
+        );
+        assert_eq!(m356.model_url.as_deref(), Some("gemini-api://gpt-6.2-sol"));
     }
 }

@@ -13,6 +13,7 @@ use super::{
 };
 use crate::config::CoreError;
 use crate::fs_safe::{self, FsError, OpenRegularMode};
+use crate::models::lookup_static_placeholder;
 
 pub(super) const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const SQLITE_INIT_BUSY_RETRIES: u32 = 16;
@@ -478,6 +479,31 @@ fn execute_upsert_watermark(
     )
 }
 
+fn strip_tiered_historical_model_suffix(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let without_effort = if lower.ends_with("-medium") {
+        &trimmed[..trimmed.len() - 7]
+    } else if lower.ends_with("-xhigh") {
+        &trimmed[..trimmed.len() - 6]
+    } else if lower.ends_with("-high") {
+        &trimmed[..trimmed.len() - 5]
+    } else if lower.ends_with("-low") || lower.ends_with("-max") {
+        &trimmed[..trimmed.len() - 4]
+    } else {
+        trimmed
+    };
+    let lower_effort = without_effort.to_ascii_lowercase();
+    let stripped = lower_effort
+        .ends_with("-tiered")
+        .then(|| without_effort[..without_effort.len() - 7].trim())
+        .filter(|s| !s.is_empty())?;
+    (stripped != trimmed).then(|| stripped.to_string())
+}
+
 impl SqliteUsageSink {
     pub fn new(usage_dir: impl Into<PathBuf>) -> Result<Self, CoreError> {
         let usage_dir = usage_dir.into();
@@ -553,7 +579,7 @@ impl SqliteUsageSink {
         read_user_version_with_busy_retry(&self.db_path, conn)
     }
 
-    fn configure_and_migrate(&self, conn: &mut Connection) -> Result<(), CoreError> {
+    fn configure_and_migrate(&self, conn: &mut Connection) -> Result<usize, CoreError> {
         conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
             .map_err(|err| self.db_error(err))?;
 
@@ -624,10 +650,187 @@ impl SqliteUsageSink {
             tx.commit().map_err(|err| self.db_error(err))?;
         }
 
-        Ok(())
+        self.normalize_historical_rows_on_connection(conn)
+    }
+
+    fn normalize_historical_rows_on_connection(
+        &self,
+        conn: &mut Connection,
+    ) -> Result<usize, CoreError> {
+        let needs_work: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM usage_events
+                    WHERE (
+                        telemetry_source IN ('ls', 'reconciled')
+                        AND provider = 'gemini'
+                        AND (
+                            LOWER(model) LIKE 'gpt-%'
+                            OR LOWER(model) LIKE 'codex-%'
+                            OR LOWER(model) LIKE 'companion/gpt-%'
+                            OR LOWER(model) LIKE 'companion/codex-%'
+                        )
+                    )
+                    OR model LIKE 'MODEL_PLACEHOLDER_M%'
+                    OR (model != '' AND model NOT GLOB '*[^0-9]*')
+                    OR LOWER(model) LIKE '%-tiered'
+                    OR LOWER(model) LIKE '%-tiered-low'
+                    OR LOWER(model) LIKE '%-tiered-medium'
+                    OR LOWER(model) LIKE '%-tiered-high'
+                    OR LOWER(model) LIKE '%-tiered-xhigh'
+                    OR LOWER(model) LIKE '%-tiered-max'
+                )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .map_err(|err| self.db_error(err))?;
+
+        if !needs_work {
+            return Ok(0);
+        }
+
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| self.db_error(err))?;
+
+        let mut updated = tx
+            .execute(
+                "UPDATE usage_events
+                 SET provider = 'openai-codex'
+                 WHERE telemetry_source IN ('ls', 'reconciled')
+                   AND provider = 'gemini'
+                   AND (
+                       LOWER(model) LIKE 'gpt-%'
+                       OR LOWER(model) LIKE 'codex-%'
+                       OR LOWER(model) LIKE 'companion/gpt-%'
+                       OR LOWER(model) LIKE 'companion/codex-%'
+                   )",
+                [],
+            )
+            .map_err(|err| self.db_error(err))?;
+
+        let placeholder_models: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT model FROM usage_events
+                     WHERE model LIKE 'MODEL_PLACEHOLDER_M%'
+                        OR (model != '' AND model NOT GLOB '*[^0-9]*')",
+                )
+                .map_err(|err| self.db_error(err))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|err| self.db_error(err))?;
+            let mut list = Vec::new();
+            for row in rows {
+                list.push(row.map_err(|err| self.db_error(err))?);
+            }
+            list
+        };
+
+        if !placeholder_models.is_empty() {
+            let mut update_stmt = tx
+                .prepare(
+                    "UPDATE usage_events
+                     SET model = ?1,
+                         model_display_name = COALESCE(model_display_name, ?2),
+                         provider = CASE
+                             WHEN provider = 'antigravity' AND ?3 != 'antigravity' THEN ?3
+                             ELSE provider
+                         END
+                     WHERE model = ?4",
+                )
+                .map_err(|err| self.db_error(err))?;
+            for raw_model in placeholder_models {
+                if let Some(mapped) = lookup_static_placeholder(&raw_model) {
+                    let count = update_stmt
+                        .execute(params![
+                            mapped.model_id,
+                            mapped.display_name,
+                            mapped.provider,
+                            raw_model
+                        ])
+                        .map_err(|err| self.db_error(err))?;
+                    updated = updated.saturating_add(count);
+                }
+            }
+        }
+
+        let tiered_models: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT model FROM usage_events
+                     WHERE LOWER(model) LIKE '%-tiered'
+                        OR LOWER(model) LIKE '%-tiered-low'
+                        OR LOWER(model) LIKE '%-tiered-medium'
+                        OR LOWER(model) LIKE '%-tiered-high'
+                        OR LOWER(model) LIKE '%-tiered-xhigh'
+                        OR LOWER(model) LIKE '%-tiered-max'",
+                )
+                .map_err(|err| self.db_error(err))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|err| self.db_error(err))?;
+            let mut list = Vec::new();
+            for row in rows {
+                list.push(row.map_err(|err| self.db_error(err))?);
+            }
+            list
+        };
+
+        if !tiered_models.is_empty() {
+            let mut update_tiered_stmt = tx
+                .prepare("UPDATE usage_events SET model = ?1 WHERE model = ?2")
+                .map_err(|err| self.db_error(err))?;
+            for raw_model in tiered_models {
+                if let Some(canonical) = strip_tiered_historical_model_suffix(&raw_model) {
+                    let count = update_tiered_stmt
+                        .execute(params![canonical, raw_model])
+                        .map_err(|err| self.db_error(err))?;
+                    updated = updated.saturating_add(count);
+                }
+            }
+        }
+
+        tx.commit().map_err(|err| self.db_error(err))?;
+        Ok(updated)
+    }
+
+    pub fn normalize_historical_rows(&self) -> Result<usize, CoreError> {
+        let mut conn_guard = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(ref mut conn) = *conn_guard {
+            let updated = self.normalize_historical_rows_on_connection(conn)?;
+            if updated > 0 {
+                self.tighten_sqlite_file_permissions(true)?;
+            }
+            return Ok(updated);
+        }
+
+        if fs_safe::inspect_existing_dir(&self.usage_dir)?.is_none() {
+            return Ok(0);
+        }
+        if self.validate_sqlite_paths()?.is_none() {
+            return Ok(0);
+        }
+
+        let (conn, updated) = self.open_rw_connection_with_normalize_count()?;
+        *conn_guard = Some(conn);
+        if updated > 0 {
+            self.tighten_sqlite_file_permissions(true)?;
+        }
+        Ok(updated)
     }
 
     fn open_rw_connection(&self) -> Result<Connection, CoreError> {
+        self.open_rw_connection_with_normalize_count()
+            .map(|(conn, _)| conn)
+    }
+
+    fn open_rw_connection_with_normalize_count(&self) -> Result<(Connection, usize), CoreError> {
         fs_safe::ensure_dir_no_symlink(&self.usage_dir, 0o700)?;
         let _ = self.validate_sqlite_paths()?;
         let _ = fs_safe::open_verified_regular_file_0600(
@@ -640,9 +843,9 @@ impl SqliteUsageSink {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let mut conn =
             Connection::open_with_flags(&self.db_path, flags).map_err(|err| self.db_error(err))?;
-        self.configure_and_migrate(&mut conn)?;
+        let updated = self.configure_and_migrate(&mut conn)?;
         self.tighten_sqlite_file_permissions(false)?;
-        Ok(conn)
+        Ok((conn, updated))
     }
 
     fn query_all_from_connection_v1(
@@ -2610,5 +2813,151 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn historical_db_normalization_fixes_placeholders_and_codex_ls_rows_idempotently() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_dir = tmp.path().join("usage");
+        fs::create_dir_all(&db_dir).expect("mkdir");
+        let db_path = db_dir.join(USAGE_DB_FILENAME);
+
+        // Seed a v3 usage.db with historical unmapped placeholders and mis-classified Codex LS rows.
+        {
+            let conn = Connection::open(&db_path).expect("open raw db");
+            conn.execute_batch(SCHEMA_V3_DDL).expect("schema v3");
+            conn.execute(
+                "INSERT INTO usage_events (
+                    timestamp_utc, request_id, provider, model,
+                    input_tokens, output_tokens, cached_tokens, reasoning_tokens,
+                    latency_ms, source, response_id, model_display_name, telemetry_source
+                ) VALUES
+                ('2026-11-26T10:00:00Z', 'ls:c1:1:0', 'antigravity', 'MODEL_PLACEHOLDER_M530', 1000, 100, 800, 10, 200, 'builtin', 'r-m530', NULL, 'ls'),
+                ('2026-11-26T10:01:00Z', 'ls:c1:2:0', 'antigravity', 'MODEL_PLACEHOLDER_M400', 500, 50, 200, 0, 150, 'builtin', 'r-m400', NULL, 'ls'),
+                ('2026-11-26T10:02:00Z', 'ls:c1:3:0', 'gemini', 'gpt-6.2-sol', 700, 70, 300, 5, 180, 'proxy', 'r-codex-ls', 'GPT-6.2 Sol (Codex) (Medium)', 'ls'),
+                ('2026-11-26T10:03:00Z', 'ls:c1:4:0', 'gemini', 'codex-next', 300, 30, 0, 0, 120, 'proxy', 'r-codex-next', NULL, 'ls'),
+                ('2026-11-26T10:04:00Z', 'ls:c1:5:0', 'vertex_openai', 'gpt-5.2', 400, 40, 100, 0, 100, 'builtin', 'r-vertex-openai', NULL, 'ls'),
+                ('2026-11-26T10:05:00Z', 'ls:c1:6:0', 'gemini', 'gemini-4-neon', 600, 60, 400, 0, 90, 'proxy', 'r-gemini', NULL, 'ls')",
+                [],
+            )
+            .expect("seed historical rows");
+        }
+
+        let sink = SqliteUsageSink::new(&db_dir).expect("sink init");
+        // Opening/normalizing fixes historical rows without altering token totals.
+        let updated = sink.normalize_historical_rows().expect("normalize");
+        assert!(updated >= 4);
+
+        let events = sink.read_all_events().expect("read all");
+        assert_eq!(events.len(), 6);
+        let by_id: std::collections::HashMap<&str, &UsageEvent> =
+            events.iter().map(|e| (e.request_id.as_str(), e)).collect();
+
+        assert_eq!(by_id["ls:c1:1:0"].model, "gemini-4-hydrogen");
+        assert_eq!(by_id["ls:c1:1:0"].provider, "antigravity");
+        assert_eq!(
+            by_id["ls:c1:1:0"].model_display_name.as_deref(),
+            Some("Gemini 4 Hydrogen")
+        );
+        assert_eq!(by_id["ls:c1:1:0"].input_tokens, 1000);
+
+        assert_eq!(by_id["ls:c1:2:0"].model, "claude-opus-5-5");
+        assert_eq!(by_id["ls:c1:2:0"].provider, "vertex_claude");
+        assert_eq!(
+            by_id["ls:c1:2:0"].model_display_name.as_deref(),
+            Some("Claude Opus 5.5")
+        );
+
+        assert_eq!(by_id["ls:c1:3:0"].provider, "openai-codex");
+        assert_eq!(by_id["ls:c1:3:0"].model, "gpt-6.2-sol");
+
+        assert_eq!(by_id["ls:c1:4:0"].provider, "openai-codex");
+        assert_eq!(by_id["ls:c1:5:0"].provider, "vertex_openai");
+        assert_eq!(by_id["ls:c1:6:0"].provider, "gemini");
+
+        // Second run is a zero-row no-op (idempotent).
+        assert_eq!(sink.normalize_historical_rows().expect("idempotent"), 0);
+    }
+
+    #[test]
+    fn historical_db_normalization_strips_tiered_and_resolves_bare_numeric_placeholders_with_exact_token_sums()
+     {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_dir = tmp.path().join("usage");
+        fs::create_dir_all(&db_dir).expect("mkdir");
+        let db_path = db_dir.join(USAGE_DB_FILENAME);
+
+        {
+            let conn = Connection::open(&db_path).expect("open raw db");
+            conn.execute_batch(SCHEMA_V3_DDL).expect("schema v3");
+            conn.execute(
+                "INSERT INTO usage_events (
+                    timestamp_utc, request_id, provider, model,
+                    input_tokens, output_tokens, cached_tokens, reasoning_tokens,
+                    latency_ms, source, response_id, model_display_name, telemetry_source
+                ) VALUES
+                ('2026-11-26T10:00:00Z', 'ls:t1:1:0', 'antigravity', 'gemini-4-hydrogen-tiered', 1200, 120, 900, 15, 210, 'builtin', 'r-t1', 'Gemini 4 Hydrogen', 'ls'),
+                ('2026-11-26T10:01:00Z', 'ls:t1:2:0', 'antigravity', 'gemini-4-hydrogen-tiered-high', 800, 80, 600, 5, 190, 'builtin', 'r-t2', 'Gemini 4 Hydrogen (High)', 'ls'),
+                ('2026-11-26T10:02:00Z', 'ls:t1:3:0', 'antigravity', '530', 500, 50, 200, 0, 150, 'builtin', 'r-530', NULL, 'ls'),
+                ('2026-11-26T10:03:00Z', 'ls:t1:4:0', 'antigravity', '99999', 100, 10, 0, 0, 50, 'builtin', 'r-unk', NULL, 'ls'),
+                ('2026-11-26T10:04:00Z', 'ls:t1:5:0', 'gemini', 'gemini-4-neon-high', 300, 30, 100, 0, 90, 'proxy', 'r-non-tiered', NULL, 'ls')",
+                [],
+            )
+            .expect("seed tiered and numeric rows");
+        }
+
+        let sink = SqliteUsageSink::new(&db_dir).expect("sink init");
+        assert_eq!(sink.normalize_historical_rows().expect("normalize"), 3);
+        assert_eq!(sink.normalize_historical_rows().expect("idempotent"), 0);
+
+        let events = sink.read_all_events().expect("read all");
+        assert_eq!(events.len(), 5);
+        let by_id: std::collections::HashMap<&str, &UsageEvent> =
+            events.iter().map(|e| (e.request_id.as_str(), e)).collect();
+
+        assert_eq!(by_id["ls:t1:1:0"].model, "gemini-4-hydrogen");
+        assert_eq!(by_id["ls:t1:2:0"].model, "gemini-4-hydrogen");
+        assert_eq!(by_id["ls:t1:3:0"].model, "gemini-4-hydrogen");
+        assert_eq!(
+            by_id["ls:t1:3:0"].model_display_name.as_deref(),
+            Some("Gemini 4 Hydrogen")
+        );
+        // Unmapped all-digit placeholder and non-tiered effort suffix remain untouched.
+        assert_eq!(by_id["ls:t1:4:0"].model, "99999");
+        assert_eq!(by_id["ls:t1:5:0"].model, "gemini-4-neon-high");
+
+        // Exact token sums preserved across all rows.
+        assert_eq!(
+            events.iter().map(|e| e.input_tokens).sum::<u64>(),
+            1200 + 800 + 500 + 100 + 300
+        );
+        assert_eq!(
+            events.iter().map(|e| e.output_tokens).sum::<u64>(),
+            120 + 80 + 50 + 10 + 30
+        );
+        assert_eq!(
+            events.iter().map(|e| e.cached_tokens).sum::<u64>(),
+            900 + 600 + 200 + 100
+        );
+        assert_eq!(events.iter().map(|e| e.reasoning_tokens).sum::<u64>(), 20);
+
+        // Verify Usage -> By Model merges all three gemini-4-hydrogen rows into one row.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-26T12:00:00Z")
+            .expect("parse now")
+            .with_timezone(&chrono::Utc);
+        let summary =
+            crate::usage::query_usage_summary_at(&db_dir, crate::usage::UsageRange::Today, now)
+                .expect("query summary");
+        let hydrogen_rows: Vec<_> = summary
+            .by_model
+            .iter()
+            .filter(|r| r.key == "gemini-4-hydrogen")
+            .collect();
+        assert_eq!(hydrogen_rows.len(), 1);
+        assert_eq!(hydrogen_rows[0].requests, 3);
+        assert_eq!(hydrogen_rows[0].input_tokens, 2500);
+        assert_eq!(hydrogen_rows[0].output_tokens, 250);
+        assert_eq!(hydrogen_rows[0].cached_tokens, 1700);
+        assert_eq!(hydrogen_rows[0].reasoning_tokens, 20);
     }
 }

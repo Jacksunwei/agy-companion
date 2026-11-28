@@ -21,7 +21,8 @@ use std::time::Duration;
 use companion_core::{
     ApiKey, AuthStore, CloudCodeUpstream, Config, CoreError, DEFAULT_CLOUDCODE_UPSTREAM_URL,
     DEFAULT_CODEX_BASE_URL, DEFAULT_CODEX_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_TIMEOUT_SECS,
-    FileAuthStore, FsError, MemoryAuthStore, UsageSink, default_enabled_gemini_models,
+    FileAuthStore, FsError, MemoryAuthStore, UpstreamModelCatalog, UsageSink,
+    default_enabled_gemini_models,
 };
 use companion_providers::{
     CodexAuth, CodexAuthManager, CodexProvider, GeminiProvider, ProviderAdapter, ProviderError,
@@ -95,6 +96,7 @@ pub struct ProxyStateOptions {
     pub auth_store: Option<Arc<dyn AuthStore>>,
     pub env_fallback: bool,
     pub role: Option<String>,
+    pub upstream_catalog: Option<Arc<UpstreamModelCatalog>>,
     #[cfg(debug_assertions)]
     pub health_version_override: Option<String>,
 }
@@ -108,7 +110,8 @@ impl fmt::Debug for ProxyStateOptions {
                 &self.auth_store.as_ref().and_then(|s| s.auth_dir()),
             )
             .field("env_fallback", &self.env_fallback)
-            .field("role", &self.role);
+            .field("role", &self.role)
+            .field("has_upstream_catalog", &self.upstream_catalog.is_some());
         #[cfg(debug_assertions)]
         s.field("health_version_override", &self.health_version_override);
         s.finish()
@@ -122,6 +125,7 @@ impl Default for ProxyStateOptions {
             auth_store: None,
             env_fallback: true,
             role: None,
+            upstream_catalog: None,
             #[cfg(debug_assertions)]
             health_version_override: None,
         }
@@ -132,6 +136,7 @@ struct ProxyStateInner {
     source: ProviderSource,
     stats: Arc<ProxyStats>,
     usage_sink: Arc<dyn UsageSink>,
+    upstream_catalog: Arc<UpstreamModelCatalog>,
     activity: Arc<ActivityTracker>,
     rss: rss::RssSampler,
     role: Option<String>,
@@ -187,6 +192,7 @@ impl ProxyState {
                 }),
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
+                upstream_catalog: Arc::new(UpstreamModelCatalog::new()),
                 activity: Arc::new(ActivityTracker::new()),
                 rss: rss::RssSampler::new(),
                 role: None,
@@ -265,6 +271,9 @@ impl ProxyState {
                 source,
                 stats: Arc::new(ProxyStats::new()),
                 usage_sink,
+                upstream_catalog: options
+                    .upstream_catalog
+                    .unwrap_or_else(|| Arc::new(UpstreamModelCatalog::new())),
                 activity: Arc::new(ActivityTracker::new()),
                 rss: rss::RssSampler::new(),
                 role: options.role,
@@ -280,6 +289,10 @@ impl ProxyState {
 
     pub fn usage_sink(&self) -> &Arc<dyn UsageSink> {
         &self.inner.usage_sink
+    }
+
+    pub fn upstream_catalog(&self) -> &Arc<UpstreamModelCatalog> {
+        &self.inner.upstream_catalog
     }
 
     pub fn in_flight_requests(&self) -> usize {

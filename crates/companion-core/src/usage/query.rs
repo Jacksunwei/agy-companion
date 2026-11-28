@@ -222,7 +222,8 @@ fn query_by_model(
          COALESCE(SUM(cached_tokens), 0), \
          COALESCE(SUM(output_tokens), 0), \
          COALESCE(SUM(reasoning_tokens), 0), \
-         COALESCE(AVG(latency_ms), 0.0) \
+         COALESCE(AVG(latency_ms), 0.0), \
+         MAX(model_display_name) \
          FROM usage_events WHERE {WINDOW_FILTER_SQL} \
          GROUP BY provider, source, model \
          ORDER BY input_tokens DESC, requests DESC, model ASC \
@@ -235,6 +236,7 @@ fn query_by_model(
                 key: row.get(0)?,
                 provider: row.get(1)?,
                 source: Some(row.get(2)?),
+                model_display_name: row.get(9)?,
                 model_count: None,
                 requests: sqlite_i64_to_u64(row.get(3)?),
                 input_tokens: sqlite_i64_to_u64(row.get(4)?),
@@ -281,6 +283,7 @@ fn query_by_provider(
                 key: provider.clone(),
                 provider,
                 source: None,
+                model_display_name: None,
                 model_count: Some(sqlite_i64_to_u64(row.get(1)?)),
                 requests: sqlite_i64_to_u64(row.get(2)?),
                 input_tokens: sqlite_i64_to_u64(row.get(3)?),

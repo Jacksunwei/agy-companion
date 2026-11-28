@@ -854,7 +854,7 @@ describe("buildMonitorView empty states & active mixed session", () => {
     assert.equal(host3.querySelectorAll(".tile").length, 0);
   });
 
-  it("renders Vertex Claude session with Claude builtin badge, 200K context window, and est. list price", () => {
+  it("renders Vertex Claude session with Anthropic builtin badge, 200K context window, and est. list price", () => {
     const base = loadActiveSnapshot();
     const claudeSnap: SettingsSnapshot = {
       ...base,
@@ -903,7 +903,7 @@ describe("buildMonitorView empty states & active mixed session", () => {
     const host = env.document.createElement("div");
     host.append(buildMonitorView(makeState({ snapshot: claudeSnap })) as unknown as FakeElement);
     const hdrTag = host.querySelector(".mon-model-hdr .tag");
-    assert.equal(hdrTag?.textContent, "Claude");
+    assert.equal(hdrTag?.textContent, "Anthropic");
     assert.equal(hdrTag?.className, "tag");
     assert.ok(host.textContent.includes("of 200K"));
     assert.ok(host.textContent.includes("50%"));
@@ -1008,13 +1008,97 @@ describe("buildMonitorView empty states & active mixed session", () => {
     const costVal = cards[0].querySelector(".cost-foot-val");
     assert.ok(costVal && costVal.textContent.startsWith("\u2248 $"));
 
-    // Ranked breakdown rows with mixed Gemini (tag-brand) and Antigravity (tag) badges
+    // Ranked breakdown rows with mixed AI Studio (tag-brand) and Antigravity (tag) badges
     const tags = cards[1].querySelectorAll(".bk-name .tag");
     assert.equal(tags.length, 2);
-    assert.equal(tags[0].textContent, "Gemini");
+    assert.equal(tags[0].textContent, "AI Studio");
     assert.equal(tags[0].className, "tag tag-brand");
     assert.equal(tags[1].textContent, "Antigravity");
     assert.equal(tags[1].className, "tag");
+  });
+
+  it("renders provider pill tags, model_display_name, and static placeholder fallback in Usage by model", () => {
+    const base = loadActiveSnapshot();
+    const snap: SettingsSnapshot = {
+      ...base,
+      stats: {
+        ...base.stats!,
+        recent_calls: [
+          {
+            timestamp_ms: 1747300400000,
+            provider: "openai-codex",
+            source: "proxy",
+            model: "gpt-6.2-sol",
+            input_tokens: 89_000,
+            cached_tokens: 58_740,
+            output_tokens: 245,
+            reasoning_tokens: 0,
+            latency_ms: 500,
+            cold_start: false,
+            cache_break: false,
+          },
+        ],
+        by_model: [
+          {
+            provider: "antigravity",
+            source: "builtin",
+            model: "MODEL_PLACEHOLDER_M530",
+            requests: 60,
+            input_tokens: 7_300_000,
+            cached_tokens: 6_789_000,
+            output_tokens: 39_000,
+            reasoning_tokens: 0,
+            total_latency_ms: 12000,
+          },
+          {
+            provider: "gemini",
+            source: "proxy",
+            model: "gemini-4-neon",
+            requests: 37,
+            input_tokens: 4_400_000,
+            cached_tokens: 1_892_000,
+            output_tokens: 9_800,
+            reasoning_tokens: 0,
+            total_latency_ms: 9000,
+          },
+          {
+            provider: "openai-codex",
+            source: "proxy",
+            model: "gpt-6.2-sol",
+            requests: 3,
+            input_tokens: 89_000,
+            cached_tokens: 58_740,
+            output_tokens: 245,
+            reasoning_tokens: 0,
+            total_latency_ms: 1500,
+          },
+          {
+            provider: "antigravity",
+            source: "builtin",
+            model: "gemini-5-nova",
+            model_display_name: "Gemini 5 Nova (High)",
+            requests: 1,
+            input_tokens: 1_000,
+            cached_tokens: 0,
+            output_tokens: 50,
+            reasoning_tokens: 0,
+            total_latency_ms: 300,
+          },
+        ],
+      },
+    };
+    const host = env.document.createElement("div");
+    host.append(buildMonitorView(makeState({ snapshot: snap })) as unknown as FakeElement);
+    const cards = host.querySelectorAll(".card");
+    const rowTags = cards[1].querySelectorAll(".bk-name .tag").map((el) => el.textContent);
+    const rowNames = cards[1].querySelectorAll(".bk-name .bk-name-text").map((el) => el.textContent);
+    assert.deepEqual(rowTags, ["Antigravity", "AI Studio", "OpenAI Codex", "Antigravity"]);
+    assert.deepEqual(rowNames, [
+      "Gemini 4 Hydrogen",
+      "Gemini 4 Neon",
+      "GPT-6.2 Sol",
+      "Gemini 5 Nova (High)",
+    ]);
   });
 
   it("scales Latest prompt hero and bar to live compaction window with fallback, overflow, and zero-token guards", () => {

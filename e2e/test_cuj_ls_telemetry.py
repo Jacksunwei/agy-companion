@@ -703,3 +703,155 @@ class TestCujLsTelemetry(E2ETestCase):
             "structuredContent"
         ]
         self.assertFalse(snap_no_ls["ls_telemetry_active"])
+
+    def test_cuj_ls_resolves_placeholder_and_codex_provider(self) -> None:
+        """LS telemetry maps uncatalogued M998 via GeneratorMetadata, M530 via static fallback, and companion/gpt-* to openai-codex."""
+        env = self.make_env()
+        proxy_port = find_free_port()
+        env.write_config(env.make_config_dict(listen_port=proxy_port))
+
+        csrf_secret = "e2e-secret-csrf-ls-placeholder-codex-1122"
+        configs = list(_sample_ls_model_configs()) + [
+            {
+                "label": "GPT-6.2 Sol (Codex) (Medium)",
+                "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M356"},
+                "provider": "MODEL_PROVIDER_GOOGLE",
+                "modelUrl": "gemini-api://gpt-6.2-sol",
+                "modelId": "companion/gpt-6.2-sol-medium",
+            }
+        ]
+        mock_ls = self._start_mock_ls(
+            csrf_token=csrf_secret,
+            model_configs=configs,
+            initial_snapshot_frames=[{"updates": {}}],
+        )
+        sidecar = self.start_sidecar_ui(
+            env,
+            extra_env={
+                "ANTIGRAVITY_LS_ADDRESS": mock_ls.address,
+                "ANTIGRAVITY_CSRF_TOKEN": csrf_secret,
+            },
+        )
+        self.assertTrue(mock_ls.wait_for_stream_connected(timeout=5.0))
+        time.sleep(0.45)
+
+        conv_id = "conv-placeholder-codex-99"
+        t0 = _utc_now_rfc3339(-3)
+        t1 = _utc_now_rfc3339(-2)
+        t2 = _utc_now_rfc3339(-1)
+        t3 = _utc_now_rfc3339(0)
+        mock_ls.set_steps(
+            conv_id,
+            [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "CORTEX_STEP_STATUS_DONE",
+                    "metadata": {
+                        "createdAt": t0,
+                        "finishedGeneratingAt": t1,
+                        "generatorModel": "MODEL_PLACEHOLDER_M356",
+                        "modelUsage": {
+                            "model": "MODEL_PLACEHOLDER_M356",
+                            "inputTokens": "500",
+                            "cacheReadTokens": "200",
+                            "outputTokens": "50",
+                            "responseOutputTokens": "50",
+                            "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                            "responseId": "resp-ls-codex-m356",
+                            "responseHeader": {"responseId": "resp-ls-codex-m356"},
+                        },
+                    },
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "CORTEX_STEP_STATUS_DONE",
+                    "metadata": {
+                        "createdAt": t1,
+                        "finishedGeneratingAt": t2,
+                        "generatorModel": "MODEL_PLACEHOLDER_M530",
+                        "modelUsage": {
+                            "model": "MODEL_PLACEHOLDER_M530",
+                            "inputTokens": "1000",
+                            "cacheReadTokens": "800",
+                            "outputTokens": "80",
+                            "responseOutputTokens": "80",
+                            "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                            "responseId": "resp-ls-m530",
+                            "responseHeader": {"sessionID": "sess-m530"},
+                        },
+                    },
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "CORTEX_STEP_STATUS_DONE",
+                    "metadata": {
+                        "createdAt": t2,
+                        "finishedGeneratingAt": t3,
+                        "generatorModel": "MODEL_PLACEHOLDER_M998",
+                        "modelUsage": {
+                            "model": "MODEL_PLACEHOLDER_M998",
+                            "inputTokens": "400",
+                            "cacheReadTokens": "100",
+                            "outputTokens": "40",
+                            "responseOutputTokens": "40",
+                            "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                            "responseId": "resp-ls-m998",
+                            "responseHeader": {"sessionID": "sess-m998"},
+                        },
+                    },
+                },
+            ],
+        )
+        mock_ls.set_generator_metadata(
+            conv_id,
+            [
+                {
+                    "stepIndices": [2],
+                    "chatModel": {
+                        "model": "MODEL_PLACEHOLDER_M998",
+                        "responseModel": "gemini-5-nova-tiered-high",
+                        "modelDisplayName": "Gemini 5 Nova (High)",
+                        "chatStartMetadata": {
+                            "contextWindowMetadata": {"maxContextTokens": "512000"}
+                        },
+                    },
+                }
+            ],
+        )
+        mock_ls.push_summary_delta(
+            {
+                conv_id: {
+                    "trajectoryId": "traj-placeholder-codex-1",
+                    "stepCount": 3,
+                    "createdTime": t0,
+                    "lastModifiedTime": t3,
+                }
+            }
+        )
+
+        rows = _poll_usage_rows_v2(
+            env.usage_dir,
+            lambda rs: len(rs) == 3,
+            timeout=6.0,
+        )
+        self.assertEqual(len(rows), 3, f"expected 3 rows in usage.db, got: {rows}")
+        by_resp = {r["response_id"]: r for r in rows}
+
+        self.assertEqual(by_resp["resp-ls-codex-m356"]["provider"], "openai-codex")
+        self.assertEqual(by_resp["resp-ls-codex-m356"]["source"], "proxy")
+        self.assertEqual(by_resp["resp-ls-codex-m356"]["model"], "gpt-6.2-sol")
+
+        self.assertEqual(by_resp["resp-ls-m530"]["provider"], "antigravity")
+        self.assertEqual(by_resp["resp-ls-m530"]["source"], "builtin")
+        self.assertEqual(by_resp["resp-ls-m530"]["model"], "gemini-4-hydrogen")
+
+        self.assertEqual(by_resp["resp-ls-m998"]["provider"], "antigravity")
+        self.assertEqual(by_resp["resp-ls-m998"]["source"], "builtin")
+        self.assertEqual(by_resp["resp-ls-m998"]["model"], "gemini-5-nova")
+        self.assertEqual(by_resp["resp-ls-m998"]["model_display_name"], "Gemini 5 Nova (High)")
+
+        snap = sidecar.call_tool("get_settings", {"conversation_id": conv_id})["structuredContent"]
+        by_model = {m["model"]: m for m in snap["stats"]["by_model"]}
+        self.assertEqual(by_model["gpt-6.2-sol"]["provider"], "openai-codex")
+        self.assertEqual(by_model["gemini-4-hydrogen"]["provider"], "antigravity")
+        self.assertEqual(by_model["gemini-5-nova"]["model_display_name"], "Gemini 5 Nova (High)")
