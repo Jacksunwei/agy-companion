@@ -1387,6 +1387,7 @@ describe("buildMonitorView empty states & active mixed session", () => {
     );
     const geminiBtn = monitorPanel.querySelector(".ctx-info-btn");
     assert.ok(geminiBtn, "expected .ctx-info-btn for 512K / 1M Gemini");
+    assert.ok(monitorPanel.querySelector(".hero-sub")?.contains(geminiBtn), "info belongs with the window limit");
     geminiBtn.dispatchEvent(new FakeEvent("focus"));
     assert.equal(tipEl.querySelector(".tip-id")?.textContent, "512K / 1M");
     tooltip.hideNow();

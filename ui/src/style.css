@@ -872,6 +872,12 @@ input {
   flex-wrap: wrap;
 }
 
+.hero-sub:has(.ctx-info-btn) {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
 .ctx-info-btn {
   width: 18px;
   height: 18px;
@@ -885,7 +891,6 @@ input {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  align-self: center;
   flex: none;
   transition: background 0.12s, color 0.12s;
 }
