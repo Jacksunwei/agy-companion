@@ -414,6 +414,14 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
     }
 
     let sqlite_sink = Arc::new(SqliteUsageSink::new(usage_dir)?);
+    if usage_db.exists()
+        && let Err(err) = sqlite_sink.normalize_historical_rows()
+    {
+        tracing::warn!(
+            error = %err,
+            "failed to normalize historical usage.db rows at startup; continuing"
+        );
+    }
     let usage_sink: Arc<dyn UsageSink> = Arc::clone(&sqlite_sink) as Arc<dyn UsageSink>;
     let auth_store: Arc<dyn AuthStore> = Arc::new(FileAuthStore::for_config_path(&config_path)?);
     let codex_auth_options = codex_auth_options_from_env()?;
@@ -482,8 +490,10 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
     }
     let sidecar_shutdown_guard = SidecarShutdownGuard(sidecar_shutdown_tx);
     let plugin_upgrade_shutdown_rx = sidecar_shutdown_rx.clone();
-    let ls_collector = crate::ls_collector::spawn_ls_collector_from_env(
+    let upstream_catalog = Arc::new(companion_core::UpstreamModelCatalog::new());
+    let ls_collector = crate::ls_collector::spawn_ls_collector_from_env_with_catalog(
         Arc::clone(&sqlite_sink),
+        Some(Arc::clone(&upstream_catalog)),
         sidecar_shutdown_rx.clone(),
     );
     #[allow(unused_mut, unused_variables)]
@@ -533,6 +543,7 @@ pub async fn run_serve_configured(options: ServeOptions) -> Result<(), CliError>
             config_path: Some(config_path.clone()),
             auth_store: Some(Arc::clone(&auth_store)),
             role: Some(proxy_role.to_string()),
+            upstream_catalog: Some(Arc::clone(&upstream_catalog)),
             ..Default::default()
         };
         #[cfg(debug_assertions)]

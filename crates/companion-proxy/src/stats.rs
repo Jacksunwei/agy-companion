@@ -127,6 +127,7 @@ impl StatsBucket {
                     provider: provider.to_string(),
                     source: source.to_string(),
                     model: model.to_string(),
+                    model_display_name: None,
                     requests: 1,
                     input_tokens: usage.prompt_token_count,
                     cached_tokens: usage.cached_content_token_count,

@@ -105,9 +105,9 @@ Rendered above the active tab's content whenever attention is needed, in strict 
 - **Idle states (`requests === 0`):** Never asks the user to add a Google AI Studio API key and never shows an **`Open Settings`** button (live monitoring works for built-in Antigravity models even without an API key). No fake `0 / 0 / 0` tiles:
   - **`!hybrid_active`:** Single calm card titled **`Waiting for Antigravity to connect`** explaining to quit and reopen Antigravity (platform-aware: `⌘Q` on macOS only; Start Menu `"Antigravity (Companion)"` shortcut on Windows) so requests route through the local proxy, noting that live monitoring works for built-in Antigravity models even without an API key.
   - **`hybrid_active`:** Single calm card titled **`Waiting for requests`** explaining to send a message in Antigravity to see live context usage, cache hit health, and cost estimates (for built-in Antigravity models as well as your own API keys).
-- **Active state (`requests > 0`):** Tracks both built-in Antigravity models (`provider = "antigravity"`, `source = "builtin"`) passively teed on `/v1internal:*` pass-through and BYOM models (`provider = "gemini"`, `source = "proxy"`).
+- **Active state (`requests > 0`):** Tracks built-in Antigravity models (`provider = "antigravity"`, `source = "builtin"`, plus `vertex_claude` / `vertex_openai`), Google AI Studio BYOM models (`provider = "gemini"`, `source = "proxy"` | `"direct"`), and OpenAI Codex BYOM models (`provider = "openai-codex"`, `source = "proxy"`).
   1. **Live Session Card:**
-     - Header: Provider badge (`Antigravity` built-in / `Gemini` BYOM / future `Codex`) + latest active model + latest call time (`HH:MM`).
+     - Header: Provider badge (`Antigravity`, `Anthropic`, `OpenAI`, `AI Studio`, `AI Studio (Direct)`, or `OpenAI Codex`) + latest active model + latest call time (`HH:MM`).
      - **Latest prompt bar:** Hero input token count (`148K of 1M` · `15%`) + proportional stacked bar (**from cache** green · **new input** amber · **output** blue) + concise legend.
      - **Call health strip:** `Last N calls` + compact pill strip (green = cache hit, amber = cold prompt / cache break) + summary (`no breaks` or `N breaks`).
      - **3 borderless recessed `.tile` cells (`tabular-nums`):**

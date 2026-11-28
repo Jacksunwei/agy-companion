@@ -149,6 +149,11 @@ pub(super) async fn fetch_available_models_handler(
 
     let refresh_ts_ms = unix_timestamp_ms();
     if !gemini_ready && !codex_ready {
+        if upstream.response_is_uncompressed {
+            state
+                .upstream_catalog()
+                .update_from_fetch_available_models(&upstream.body);
+        }
         state.stats().record_catalog_refresh(refresh_ts_ms, false);
         let mut builder = Response::builder()
             .status(StatusCode::OK)
@@ -196,6 +201,11 @@ pub(super) async fn fetch_available_models_handler(
     state
         .stats()
         .record_catalog_refresh(refresh_ts_ms, was_merged);
+    if upstream.response_is_uncompressed || was_merged {
+        state
+            .upstream_catalog()
+            .update_from_fetch_available_models(&final_body);
+    }
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)

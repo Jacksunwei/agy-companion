@@ -8,9 +8,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use companion_core::fs_safe::{self, OpenRegularMode};
 use companion_core::{
     LsSyncWatermark, MAX_RECENT_CALLS, MAX_SESSION_MODELS, ModelSessionStats, ObservedModel,
-    RecentCallSnapshot, SqliteUsageSink, StatsSnapshot, TelemetrySource, UsageEvent,
-    UsageStatsSnapshot, normalize_utc_timestamp, sanitize_conversation_id,
-    sanitize_model_display_name, sanitize_response_id,
+    RecentCallSnapshot, SqliteUsageSink, StaticPlaceholderMapping, StatsSnapshot, TelemetrySource,
+    UpstreamModelCatalog, UsageEvent, UsageStatsSnapshot, lookup_static_placeholder,
+    normalize_placeholder_enum_key, normalize_utc_timestamp, placeholder_numeric_alias,
+    sanitize_conversation_id, sanitize_model_display_name, sanitize_response_id,
 };
 use companion_providers::{
     LsClient, LsError, LsGeneratorMetadata, LsModelConfig, LsModelUsage, LsStepMetadata,
@@ -136,16 +137,150 @@ pub struct CatalogEntry {
     pub model_url: Option<String>,
 }
 
+fn is_unresolved_placeholder_id(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || trimmed.starts_with("MODEL_PLACEHOLDER_")
+        || trimmed.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn insert_catalog_entry_with_aliases(
+    map: &mut HashMap<String, CatalogEntry>,
+    raw_key: &str,
+    entry: CatalogEntry,
+    overwrite: bool,
+) {
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut keys = vec![trimmed.to_string()];
+    if let Some(enum_key) = normalize_placeholder_enum_key(trimmed) {
+        if enum_key != trimmed {
+            keys.push(enum_key.clone());
+        }
+        if let Some(num_key) = placeholder_numeric_alias(&enum_key)
+            && num_key != trimmed
+        {
+            keys.push(num_key);
+        }
+    }
+    for k in keys {
+        if overwrite {
+            let merged = match map.get(&k) {
+                Some(existing) => merge_catalog_entry(Some(entry.clone()), existing),
+                None => entry.clone(),
+            };
+            map.insert(k, merged);
+        } else {
+            map.entry(k).or_insert_with(|| entry.clone());
+        }
+    }
+}
+
+fn lookup_map_with_aliases<'a>(
+    map: &'a HashMap<String, CatalogEntry>,
+    raw_key: &str,
+) -> Option<&'a CatalogEntry> {
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(hit) = map.get(trimmed) {
+        return Some(hit);
+    }
+    if let Some(enum_key) = normalize_placeholder_enum_key(trimmed) {
+        if let Some(hit) = map.get(&enum_key) {
+            return Some(hit);
+        }
+        if let Some(num_key) = placeholder_numeric_alias(&enum_key)
+            && let Some(hit) = map.get(&num_key)
+        {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn merge_catalog_entry(base: Option<CatalogEntry>, fallback: &CatalogEntry) -> CatalogEntry {
+    match base {
+        None => fallback.clone(),
+        Some(mut acc) => {
+            let acc_has_real_id = acc
+                .model_id
+                .as_deref()
+                .is_some_and(|s| !is_unresolved_placeholder_id(s));
+            if !acc_has_real_id
+                && let Some(ref fb_id) = fallback.model_id
+                && !is_unresolved_placeholder_id(fb_id)
+            {
+                acc.model_id = Some(fb_id.clone());
+            } else if acc.model_id.is_none() {
+                acc.model_id = fallback.model_id.clone();
+            }
+            if acc.label.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                acc.label = fallback.label.clone();
+            }
+            if acc.provider.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                acc.provider = fallback.provider.clone();
+            }
+            if acc.model_url.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                acc.model_url = fallback.model_url.clone();
+            }
+            acc
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ModelCatalog {
     entries: HashMap<String, CatalogEntry>,
+    upstream_entries: HashMap<String, CatalogEntry>,
+    learned_entries: HashMap<String, CatalogEntry>,
+    upstream_catalog: Option<Arc<UpstreamModelCatalog>>,
+    upstream_version: u64,
     last_refreshed: Option<Instant>,
 }
 
 impl ModelCatalog {
+    pub fn with_upstream_catalog(upstream_catalog: Option<Arc<UpstreamModelCatalog>>) -> Self {
+        let mut catalog = Self {
+            upstream_catalog,
+            ..Default::default()
+        };
+        catalog.sync_from_upstream();
+        catalog
+    }
+
+    pub fn sync_from_upstream(&mut self) {
+        let Some(ref uc) = self.upstream_catalog else {
+            return;
+        };
+        let ver = uc.version();
+        if ver == self.upstream_version {
+            return;
+        }
+        let snap = uc.snapshot();
+        let mut next = HashMap::with_capacity(snap.len() * 2);
+        for (key, item) in snap {
+            let entry = CatalogEntry {
+                model_id: item.model_id,
+                label: item.display_name,
+                provider: item.model_provider.or(item.api_provider),
+                model_url: item.model_url,
+            };
+            insert_catalog_entry_with_aliases(&mut next, &key, entry, true);
+        }
+        self.upstream_entries = next;
+        self.upstream_version = ver;
+    }
+
     pub fn update(&mut self, configs: Vec<LsModelConfig>, now: Instant) {
-        self.entries.clear();
-        for cfg in configs {
+        // Merge/upsert into self.entries (preserving previously seen session models even if
+        // removed from a subsequent GetCascadeModelConfigData response).
+        // Iterate in reverse so earlier configs (clientModelConfigs) take precedence over
+        // later configs (cached/battleMode) within the same refresh batch.
+        for cfg in configs.into_iter().rev() {
             let entry = CatalogEntry {
                 model_id: cfg.model_id,
                 label: cfg.label,
@@ -154,22 +289,98 @@ impl ModelCatalog {
             };
             if let Some(moa) = cfg.model_or_alias {
                 if let Some(model) = moa.model
-                    && !model.is_empty()
+                    && !model.trim().is_empty()
                 {
-                    self.entries.insert(model, entry.clone());
+                    insert_catalog_entry_with_aliases(
+                        &mut self.entries,
+                        &model,
+                        entry.clone(),
+                        true,
+                    );
                 }
                 if let Some(alias) = moa.alias
-                    && !alias.is_empty()
+                    && !alias.trim().is_empty()
                 {
-                    self.entries.entry(alias).or_insert(entry);
+                    insert_catalog_entry_with_aliases(&mut self.entries, &alias, entry, false);
                 }
             }
         }
         self.last_refreshed = Some(now);
     }
 
+    pub fn learn_from_generator_metadata(&mut self, metadata: &[LsGeneratorMetadata]) -> bool {
+        let mut learned_any = false;
+        for item in metadata {
+            let Some(ref chat_model) = item.chat_model else {
+                continue;
+            };
+            let Some(raw_enum) = chat_model
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let response_model = chat_model
+                .response_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let display_name = chat_model
+                .model_display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            if response_model.is_none() && display_name.is_none() {
+                continue;
+            }
+            let entry = CatalogEntry {
+                model_id: response_model,
+                label: display_name,
+                provider: None,
+                model_url: None,
+            };
+            insert_catalog_entry_with_aliases(&mut self.learned_entries, raw_enum, entry, true);
+            learned_any = true;
+        }
+        learned_any
+    }
+
     pub fn lookup(&self, key: &str) -> Option<&CatalogEntry> {
-        self.entries.get(key)
+        lookup_map_with_aliases(&self.entries, key)
+            .or_else(|| lookup_map_with_aliases(&self.upstream_entries, key))
+            .or_else(|| lookup_map_with_aliases(&self.learned_entries, key))
+    }
+
+    pub fn lookup_merged(&self, key: &str) -> Option<CatalogEntry> {
+        let mut acc: Option<CatalogEntry> = None;
+        if let Some(e) = lookup_map_with_aliases(&self.entries, key) {
+            acc = Some(merge_catalog_entry(acc, e));
+        }
+        if let Some(e) = lookup_map_with_aliases(&self.upstream_entries, key) {
+            acc = Some(merge_catalog_entry(acc, e));
+        }
+        if let Some(e) = lookup_map_with_aliases(&self.learned_entries, key) {
+            acc = Some(merge_catalog_entry(acc, e));
+        }
+        acc
+    }
+
+    pub fn has_resolved_entry(&self, key: &str) -> bool {
+        self.lookup_merged(key).is_some_and(|entry| {
+            entry
+                .model_id
+                .as_deref()
+                .is_some_and(|id| !is_unresolved_placeholder_id(id))
+                || entry
+                    .model_url
+                    .as_deref()
+                    .and_then(|u| u.strip_prefix("gemini-api://"))
+                    .is_some_and(|s| !s.trim().is_empty())
+        })
     }
 
     pub fn has_loaded(&self) -> bool {
@@ -190,10 +401,10 @@ impl ModelCatalog {
         let Some(key) = model_enum else {
             return false;
         };
-        if !key.starts_with("MODEL_PLACEHOLDER_") {
+        if !is_unresolved_placeholder_id(key) {
             return false;
         }
-        !self.entries.contains_key(key) && self.can_refresh(min_interval, now)
+        !self.has_resolved_entry(key) && self.can_refresh(min_interval, now)
     }
 }
 
@@ -219,6 +430,20 @@ fn sanitize_stats_model(raw: &str) -> String {
     }
 }
 
+fn sanitize_display_as_stats_model(raw: &str) -> Option<String> {
+    let cleaned: String = sanitize_model_display_name(raw)?
+        .chars()
+        .filter(|c| *c != '"' && *c != '\\')
+        .take(MAX_STATS_MODEL_LEN)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub fn canonicalize_model_id(raw: &str) -> String {
     let trimmed = raw.trim();
     let without_scheme = trimmed.strip_prefix("gemini-api://").unwrap_or(trimmed);
@@ -226,7 +451,7 @@ pub fn canonicalize_model_id(raw: &str) -> String {
         .strip_prefix("companion/")
         .unwrap_or(without_scheme);
     let lower = without_prefix.to_ascii_lowercase();
-    let stripped = if lower.ends_with("-medium") {
+    let without_effort = if lower.ends_with("-medium") {
         &without_prefix[..without_prefix.len() - 7]
     } else if lower.ends_with("-xhigh") {
         &without_prefix[..without_prefix.len() - 6]
@@ -237,7 +462,40 @@ pub fn canonicalize_model_id(raw: &str) -> String {
     } else {
         without_prefix
     };
+    let lower_effort = without_effort.to_ascii_lowercase();
+    let stripped = if lower_effort.ends_with("-tiered") {
+        &without_effort[..without_effort.len() - 7]
+    } else {
+        without_effort
+    };
     sanitize_stats_model(stripped)
+}
+
+fn non_placeholder_canonical(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if is_unresolved_placeholder_id(trimmed) {
+        return None;
+    }
+    let canon = canonicalize_model_id(trimmed);
+    if canon == "unknown" || is_unresolved_placeholder_id(&canon) {
+        None
+    } else {
+        Some(canon)
+    }
+}
+
+fn is_codex_model_candidate(raw_model_id: Option<&str>, display_name: Option<&str>) -> bool {
+    if let Some(mid) = raw_model_id {
+        let bare = canonicalize_model_id(mid);
+        if companion_core::is_codex_model(&bare) {
+            return true;
+        }
+        let lower = bare.to_ascii_lowercase();
+        if lower.starts_with("gpt-") || lower.starts_with("codex-") {
+            return true;
+        }
+    }
+    display_name.is_some_and(|d| d.to_ascii_lowercase().contains("(codex)"))
 }
 
 fn is_internal_byom_enum(model_enum: Option<&str>) -> bool {
@@ -247,12 +505,16 @@ fn is_internal_byom_enum(model_enum: Option<&str>) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn map_provider_from_api_provider(
     api_provider: Option<&str>,
     source: &str,
     model_enum: Option<&str>,
     catalog_provider: Option<&str>,
+    info_model_provider: Option<&str>,
     raw_model_id: Option<&str>,
+    display_name: Option<&str>,
+    static_entry: Option<StaticPlaceholderMapping>,
 ) -> String {
     if let Some(ap) = api_provider {
         match ap {
@@ -262,7 +524,11 @@ fn map_provider_from_api_provider(
             }
             "API_PROVIDER_GOOGLE_GEMINI" | "24" => {
                 return if source != "builtin" {
-                    "gemini".to_string()
+                    if is_codex_model_candidate(raw_model_id, display_name) {
+                        "openai-codex".to_string()
+                    } else {
+                        "gemini".to_string()
+                    }
                 } else {
                     "antigravity".to_string()
                 };
@@ -274,7 +540,11 @@ fn map_provider_from_api_provider(
             | "API_PROVIDER_INTERNAL"
             | "1" => {
                 return if source == "proxy" && is_internal_byom_enum(model_enum) {
-                    "gemini".to_string()
+                    if is_codex_model_candidate(raw_model_id, display_name) {
+                        "openai-codex".to_string()
+                    } else {
+                        "gemini".to_string()
+                    }
                 } else {
                     "antigravity".to_string()
                 };
@@ -284,10 +554,13 @@ fn map_provider_from_api_provider(
     }
 
     if source == "proxy" || source == "direct" {
+        if source == "proxy" && is_codex_model_candidate(raw_model_id, display_name) {
+            return "openai-codex".to_string();
+        }
         return "gemini".to_string();
     }
 
-    if let Some(cp) = catalog_provider {
+    for cp in catalog_provider.into_iter().chain(info_model_provider) {
         let upper = cp.to_ascii_uppercase();
         if upper.contains("ANTHROPIC") || upper.contains("CLAUDE") {
             return "vertex_claude".to_string();
@@ -312,30 +585,43 @@ fn map_provider_from_api_provider(
         }
     }
 
+    if let Some(mapped) = static_entry {
+        return mapped.provider.to_string();
+    }
+
     "antigravity".to_string()
 }
 
-/// Deterministic 3-tier attribution (`GetCascadeModelConfigData` + `responseHeader` 3-way
-/// wire fingerprint + `apiProvider`/`modelInfo` fallback).
+/// Deterministic 3-tier attribution (`GetCascadeModelConfigData` / `fetchAvailableModels` /
+/// `GeneratorMetadata` + `responseHeader` 3-way wire fingerprint + `apiProvider`/`modelInfo` +
+/// static placeholder fallback).
 pub fn resolve_attribution(
     meta: &LsStepMetadata,
     usage: &LsModelUsage,
     catalog: &ModelCatalog,
 ) -> AttributedModel {
     let model_enum = meta.generator_model.as_deref().or(usage.model.as_deref());
-    let catalog_entry = model_enum.and_then(|key| catalog.lookup(key));
+    let catalog_entry = model_enum.and_then(|key| catalog.lookup_merged(key));
+    let static_entry = model_enum.and_then(lookup_static_placeholder);
 
     let resp_hdr = usage.response_header.as_ref();
     let has_builtin_session = resp_hdr.is_some_and(|h| h.has_builtin_session_id());
     let has_direct_session = resp_hdr.is_some_and(|h| h.has_direct_session_id());
     let has_hdr_response_id = resp_hdr.is_some_and(|h| h.has_response_id());
 
-    let catalog_model_id = catalog_entry.and_then(|c| c.model_id.as_deref());
-    let catalog_model_url = catalog_entry.and_then(|c| c.model_url.as_deref());
+    let catalog_model_id = catalog_entry
+        .as_ref()
+        .and_then(|c| c.model_id.as_deref())
+        .filter(|s| !s.trim().is_empty());
+    let catalog_model_url = catalog_entry
+        .as_ref()
+        .and_then(|c| c.model_url.as_deref())
+        .filter(|s| !s.trim().is_empty());
     let info_model_url = meta
         .model_info
         .as_ref()
-        .and_then(|i| i.model_url.as_deref());
+        .and_then(|i| i.model_url.as_deref())
+        .filter(|s| !s.trim().is_empty());
 
     let is_companion_catalog = catalog_model_id.is_some_and(|id| id.starts_with("companion/"))
         || (catalog_model_url.is_some_and(|u| u.starts_with("gemini-api://"))
@@ -356,76 +642,104 @@ pub fn resolve_attribution(
         "builtin".to_string()
     };
 
-    let model = if is_companion_catalog {
-        if let Some(url_model) = catalog_model_url.and_then(|u| u.strip_prefix("gemini-api://"))
-            && !url_model.trim().is_empty()
-        {
-            canonicalize_model_id(url_model)
-        } else if let Some(mid) = catalog_model_id {
-            canonicalize_model_id(mid)
-        } else {
-            sanitize_stats_model(model_enum.unwrap_or("unknown"))
-        }
-    } else if let Some(mid) = catalog_model_id.filter(|s| !s.trim().is_empty()) {
-        canonicalize_model_id(mid)
-    } else if let Some(info) = meta.model_info.as_ref() {
-        let candidate = info
-            .model_url
-            .as_deref()
+    let dynamic_model = if is_companion_catalog {
+        catalog_model_url
             .and_then(|u| u.strip_prefix("gemini-api://"))
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                info.vertex_model_id
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .or_else(|| info.model_name.as_deref().filter(|s| !s.trim().is_empty()))
-            .or_else(|| info.model_id.as_deref().filter(|s| !s.trim().is_empty()));
-        candidate
-            .map(canonicalize_model_id)
-            .unwrap_or_else(|| sanitize_stats_model(model_enum.unwrap_or("unknown")))
+            .and_then(non_placeholder_canonical)
+            .or_else(|| catalog_model_id.and_then(non_placeholder_canonical))
     } else {
-        sanitize_stats_model(model_enum.unwrap_or("unknown"))
-    };
-
-    let api_provider = usage.api_provider.as_deref().or_else(|| {
-        meta.model_info
-            .as_ref()
-            .and_then(|i| i.api_provider.as_deref())
-    });
-    let provider = if is_companion_catalog {
-        if companion_core::is_codex_model(&model) {
-            "openai-codex".to_string()
-        } else {
-            "gemini".to_string()
-        }
-    } else if source == "proxy" && companion_core::is_codex_model(&model) {
-        "openai-codex".to_string()
-    } else {
-        map_provider_from_api_provider(
-            api_provider,
-            &source,
-            model_enum,
-            catalog_entry.and_then(|c| c.provider.as_deref()),
-            catalog_model_id.or_else(|| {
-                meta.model_info.as_ref().and_then(|i| {
-                    i.vertex_model_id
+        catalog_model_id.and_then(non_placeholder_canonical)
+    }
+    .or_else(|| {
+        meta.model_info.as_ref().and_then(|info| {
+            info.model_url
+                .as_deref()
+                .and_then(|u| u.strip_prefix("gemini-api://"))
+                .and_then(non_placeholder_canonical)
+                .or_else(|| {
+                    info.vertex_model_id
                         .as_deref()
-                        .or(i.model_name.as_deref())
-                        .or(i.model_id.as_deref())
+                        .and_then(non_placeholder_canonical)
                 })
-            }),
-        )
-    };
+                .or_else(|| {
+                    info.model_name
+                        .as_deref()
+                        .and_then(non_placeholder_canonical)
+                })
+                .or_else(|| info.model_id.as_deref().and_then(non_placeholder_canonical))
+        })
+    });
+
+    let used_static_model = dynamic_model.is_none() && static_entry.is_some();
 
     let model_display_name = catalog_entry
+        .as_ref()
         .and_then(|c| c.label.as_deref())
         .or_else(|| {
             meta.model_info
                 .as_ref()
                 .and_then(|i| i.display_name.as_deref())
         })
-        .and_then(sanitize_model_display_name);
+        .and_then(sanitize_model_display_name)
+        .or_else(|| {
+            if used_static_model {
+                static_entry.map(|s| s.display_name.to_string())
+            } else {
+                None
+            }
+        });
+
+    let model = dynamic_model
+        .or_else(|| static_entry.map(|s| s.model_id.to_string()))
+        .or_else(|| {
+            model_display_name
+                .as_deref()
+                .and_then(sanitize_display_as_stats_model)
+        })
+        .unwrap_or_else(|| sanitize_stats_model(model_enum.unwrap_or("unknown")));
+
+    let api_provider = usage.api_provider.as_deref().or_else(|| {
+        meta.model_info
+            .as_ref()
+            .and_then(|i| i.api_provider.as_deref())
+    });
+    let info_model_provider = meta
+        .model_info
+        .as_ref()
+        .and_then(|i| i.model_provider.as_deref());
+    let catalog_provider = catalog_entry.as_ref().and_then(|c| c.provider.as_deref());
+
+    let provider = if is_companion_catalog {
+        if is_codex_model_candidate(Some(&model), model_display_name.as_deref()) {
+            "openai-codex".to_string()
+        } else if companion_core::is_supported_gemini_model(&model)
+            || model.to_ascii_lowercase().starts_with("gemini-")
+        {
+            "gemini".to_string()
+        } else {
+            map_provider_from_api_provider(
+                api_provider,
+                &source,
+                model_enum,
+                catalog_provider,
+                info_model_provider,
+                Some(&model),
+                model_display_name.as_deref(),
+                static_entry,
+            )
+        }
+    } else {
+        map_provider_from_api_provider(
+            api_provider,
+            &source,
+            model_enum,
+            catalog_provider,
+            info_model_provider,
+            Some(&model),
+            model_display_name.as_deref(),
+            static_entry,
+        )
+    };
 
     let variant_key = model_enum
         .filter(|s| !s.trim().is_empty())
@@ -598,6 +912,7 @@ pub struct ProcessedStepsBatch {
     pub hit_non_terminal: bool,
     pub entries: Vec<NormalizedStepEntry>,
     pub unknown_model_enum: Option<String>,
+    pub unknown_model_enums: Vec<String>,
 }
 
 struct StepCallContext<'a> {
@@ -787,6 +1102,8 @@ pub fn process_steps_slice(
     let mut hit_non_terminal = false;
     let mut entries = Vec::new();
     let mut unknown_model_enum: Option<String> = None;
+    let mut unknown_model_enums: Vec<String> = Vec::new();
+    let mut seen_unknown_keys: HashSet<String> = HashSet::new();
 
     for (rel_idx, step) in steps.iter().enumerate() {
         let abs_idx = step_offset.saturating_add(rel_idx as u32);
@@ -819,16 +1136,21 @@ pub fn process_steps_slice(
             continue;
         }
 
-        if unknown_model_enum.is_none() {
-            let candidate_enum = meta
-                .generator_model
-                .as_deref()
-                .or_else(|| meta.model_usage.as_ref().and_then(|u| u.model.as_deref()));
-            if let Some(key) = candidate_enum
-                && key.starts_with("MODEL_PLACEHOLDER_")
-                && catalog.lookup(key).is_none()
-            {
+        let candidate_enum = meta
+            .generator_model
+            .as_deref()
+            .or_else(|| meta.model_usage.as_ref().and_then(|u| u.model.as_deref()));
+        if let Some(key) = candidate_enum
+            && is_unresolved_placeholder_id(key)
+            && !catalog.has_resolved_entry(key)
+        {
+            if unknown_model_enum.is_none() {
                 unknown_model_enum = Some(key.to_string());
+            }
+            let norm_key =
+                normalize_placeholder_enum_key(key).unwrap_or_else(|| key.trim().to_string());
+            if seen_unknown_keys.insert(norm_key.clone()) {
+                unknown_model_enums.push(norm_key);
             }
         }
 
@@ -851,6 +1173,7 @@ pub fn process_steps_slice(
         hit_non_terminal,
         entries,
         unknown_model_enum,
+        unknown_model_enums,
     }
 }
 
@@ -918,6 +1241,9 @@ impl CascadeFoldState {
             entry.output_tokens = entry.output_tokens.saturating_add(ev.output_tokens);
             entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(ev.reasoning_tokens);
             entry.total_latency_ms = entry.total_latency_ms.saturating_add(ev.latency_ms);
+            if entry.model_display_name.is_none() {
+                entry.model_display_name = ev.model_display_name.clone();
+            }
         } else {
             self.by_model.insert(
                 model_key,
@@ -925,6 +1251,7 @@ impl CascadeFoldState {
                     provider: ev.provider.clone(),
                     source: ev.source.clone(),
                     model: ev.model.clone(),
+                    model_display_name: ev.model_display_name.clone(),
                     requests: 1,
                     input_tokens: ev.input_tokens,
                     cached_tokens: ev.cached_tokens,
@@ -1014,6 +1341,9 @@ pub fn merge_cascade_folds(folds: &[&CascadeFoldState]) -> StatsSnapshot {
                 acc.output_tokens = acc.output_tokens.saturating_add(stats.output_tokens);
                 acc.reasoning_tokens = acc.reasoning_tokens.saturating_add(stats.reasoning_tokens);
                 acc.total_latency_ms = acc.total_latency_ms.saturating_add(stats.total_latency_ms);
+                if acc.model_display_name.is_none() {
+                    acc.model_display_name = stats.model_display_name.clone();
+                }
             } else {
                 by_model_map.insert(key.clone(), stats.clone());
             }
@@ -1087,6 +1417,7 @@ struct CollectorState {
     children_by_root: HashMap<String, HashSet<String>>,
     dirty_cascades: HashMap<String, DirtyCascade>,
     last_fetched: HashMap<String, Instant>,
+    last_gen_meta_lookup: HashMap<(String, String), Instant>,
     monitor_cache: HashMap<String, CascadeFoldState>,
 }
 
@@ -1095,6 +1426,7 @@ impl CollectorState {
         collector_boot_utc: DateTime<Utc>,
         watermarks: Vec<LsSyncWatermark>,
         observed_models: Vec<ObservedModel>,
+        upstream_catalog: Option<Arc<UpstreamModelCatalog>>,
     ) -> Self {
         let mut persisted_watermarks = HashMap::with_capacity(watermarks.len());
         for wm in watermarks {
@@ -1114,7 +1446,7 @@ impl CollectorState {
             unauthenticated: false,
             warned_unauthenticated: false,
             circuit_open_until: None,
-            catalog: ModelCatalog::default(),
+            catalog: ModelCatalog::with_upstream_catalog(upstream_catalog),
             persisted_watermarks,
             observed_compaction_limits,
             boot_baselines: HashMap::new(),
@@ -1122,8 +1454,22 @@ impl CollectorState {
             children_by_root: HashMap::new(),
             dirty_cascades: HashMap::new(),
             last_fetched: HashMap::new(),
+            last_gen_meta_lookup: HashMap::new(),
             monitor_cache: HashMap::new(),
         }
+    }
+
+    fn can_query_generator_metadata(
+        &self,
+        cid: &str,
+        normalized_enum: &str,
+        min_interval: Duration,
+        now: Instant,
+    ) -> bool {
+        self.last_gen_meta_lookup
+            .iter()
+            .find(|((c, e), _)| c == cid && e == normalized_enum)
+            .is_none_or(|(_, last)| now.saturating_duration_since(*last) >= min_interval)
     }
 
     fn is_circuit_open(&self, now: Instant) -> bool {
@@ -1175,6 +1521,7 @@ impl CollectorState {
         self.summaries.remove(cid);
         self.boot_baselines.remove(cid);
         self.dirty_cascades.remove(cid);
+        self.last_gen_meta_lookup.retain(|(c, _), _| c != cid);
         self.monitor_cache.remove(cid);
         self.children_by_root.remove(cid);
         for children in self.children_by_root.values_mut() {
@@ -1421,11 +1768,20 @@ pub fn spawn_ls_collector_from_env(
     sqlite_sink: Arc<SqliteUsageSink>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Option<LsCollectorHandle> {
+    spawn_ls_collector_from_env_with_catalog(sqlite_sink, None, shutdown_rx)
+}
+
+pub fn spawn_ls_collector_from_env_with_catalog(
+    sqlite_sink: Arc<SqliteUsageSink>,
+    upstream_catalog: Option<Arc<UpstreamModelCatalog>>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Option<LsCollectorHandle> {
     match LsClient::from_env() {
-        Ok(Some(client)) => Some(spawn_ls_collector(
+        Ok(Some(client)) => Some(spawn_ls_collector_with_catalog(
             client,
             sqlite_sink,
             LsCollectorConfig::default(),
+            upstream_catalog,
             shutdown_rx,
         )),
         Ok(None) => None,
@@ -1444,6 +1800,16 @@ pub fn spawn_ls_collector(
     client: LsClient,
     sqlite_sink: Arc<SqliteUsageSink>,
     config: LsCollectorConfig,
+    shutdown_rx: watch::Receiver<bool>,
+) -> LsCollectorHandle {
+    spawn_ls_collector_with_catalog(client, sqlite_sink, config, None, shutdown_rx)
+}
+
+pub fn spawn_ls_collector_with_catalog(
+    client: LsClient,
+    sqlite_sink: Arc<SqliteUsageSink>,
+    config: LsCollectorConfig,
+    upstream_catalog: Option<Arc<UpstreamModelCatalog>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> LsCollectorHandle {
     let ls_port = client.endpoint().port();
@@ -1498,6 +1864,7 @@ pub fn spawn_ls_collector(
             Utc::now(),
             initial_watermarks,
             initial_observed_models,
+            upstream_catalog,
         )),
         dirty_notify: Notify::new(),
     });
@@ -1669,6 +2036,7 @@ async fn refresh_catalog(inner: &LsCollectorInner, force_rate_limit: bool) -> bo
     match inner.client.get_cascade_model_config_data().await {
         Ok(configs) => {
             let mut guard = inner.state.lock().await;
+            guard.catalog.sync_from_upstream();
             guard.catalog.update(configs, Instant::now());
             true
         }
@@ -1790,6 +2158,94 @@ async fn fetch_generator_metadata_tail_seeking(
     Ok(None)
 }
 
+fn normalize_gen_meta_lookup_key(raw: &str) -> String {
+    normalize_placeholder_enum_key(raw).unwrap_or_else(|| raw.trim().to_string())
+}
+
+async fn resolve_unknown_model_enum_via_generator_metadata(
+    inner: &LsCollectorInner,
+    cascade_id: &str,
+    unknown_enums: &[String],
+) -> Option<Vec<LsGeneratorMetadata>> {
+    if unknown_enums.is_empty() {
+        return None;
+    }
+    let should_query = {
+        let mut guard = inner.state.lock().await;
+        guard.catalog.sync_from_upstream();
+        let unresolved: Vec<String> = unknown_enums
+            .iter()
+            .filter(|k| !guard.catalog.has_resolved_entry(k))
+            .map(|k| normalize_gen_meta_lookup_key(k))
+            .collect();
+        if unresolved.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let any_eligible = unresolved.iter().any(|norm_enum| {
+            guard.can_query_generator_metadata(
+                cascade_id,
+                norm_enum,
+                inner.config.catalog_refresh_min_interval,
+                now,
+            )
+        });
+        if !any_eligible {
+            return None;
+        }
+        for norm_enum in unresolved {
+            guard
+                .last_gen_meta_lookup
+                .insert((cascade_id.to_string(), norm_enum), now);
+        }
+        true
+    };
+    if !should_query {
+        return None;
+    }
+    match inner
+        .client
+        .get_cascade_trajectory_generator_metadata(cascade_id, 0)
+        .await
+    {
+        Ok(entries) => {
+            let mut guard = inner.state.lock().await;
+            guard.catalog.learn_from_generator_metadata(&entries);
+            Some(entries)
+        }
+        Err(err) => {
+            tracing::debug!(
+                cascade_id,
+                error = %err,
+                "on-demand LS generator metadata lookup for unknown model enum skipped"
+            );
+            None
+        }
+    }
+}
+
+fn upsert_monitor_fold<'a>(
+    monitor_cache: &'a mut HashMap<String, CascadeFoldState>,
+    cascade_id: &str,
+    traj_id: String,
+    start_offset: u32,
+    reset_fold: bool,
+) -> &'a mut CascadeFoldState {
+    if reset_fold {
+        monitor_cache.insert(
+            cascade_id.to_string(),
+            CascadeFoldState::new(traj_id, start_offset),
+        );
+        monitor_cache
+            .get_mut(cascade_id)
+            .expect("inserted immediately above")
+    } else {
+        monitor_cache
+            .entry(cascade_id.to_string())
+            .or_insert_with(|| CascadeFoldState::new(traj_id, start_offset))
+    }
+}
+
 async fn hydrate_cascade_for_monitor(
     inner: &LsCollectorInner,
     cascade_id: &str,
@@ -1829,41 +2285,45 @@ async fn hydrate_cascade_for_monitor(
         }
     };
 
-    if let Some((start_offset, reset_fold, summary_opt, traj_id)) = step_plan {
-        let _permit = match inner.step_semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
-        };
+    let mut prefetched_gen_entries: Option<Vec<LsGeneratorMetadata>> = None;
 
-        let steps = match inner
-            .client
-            .get_cascade_trajectory_steps(cascade_id, start_offset)
-            .await
-        {
-            Ok(steps) => steps,
-            Err(LsError::Unauthenticated { rpc }) => {
-                let should_warn = inner.state.lock().await.mark_unauthenticated();
-                if should_warn {
-                    tracing::warn!(
-                        rpc,
-                        "Antigravity LS returned 401 Unauthenticated during Monitor hydration; pausing LS collector"
-                    );
+    if let Some((start_offset, reset_fold, summary_opt, traj_id)) = step_plan {
+        let steps = {
+            let _permit = match inner.step_semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return Ok(()),
+            };
+            match inner
+                .client
+                .get_cascade_trajectory_steps(cascade_id, start_offset)
+                .await
+            {
+                Ok(steps) => steps,
+                Err(LsError::Unauthenticated { rpc }) => {
+                    let should_warn = inner.state.lock().await.mark_unauthenticated();
+                    if should_warn {
+                        tracing::warn!(
+                            rpc,
+                            "Antigravity LS returned 401 Unauthenticated during Monitor hydration; pausing LS collector"
+                        );
+                    }
+                    return Err(LsError::Unauthenticated { rpc });
                 }
-                return Err(LsError::Unauthenticated { rpc });
-            }
-            Err(err) => {
-                // Single-cascade 404/Unimplemented or transient error MUST NOT trip the circuit breaker.
-                tracing::debug!(
-                    cascade_id,
-                    error = %err,
-                    "on-demand LS step hydration skipped"
-                );
-                return Ok(());
+                Err(err) => {
+                    // Single-cascade 404/Unimplemented or transient error MUST NOT trip the circuit breaker.
+                    tracing::debug!(
+                        cascade_id,
+                        error = %err,
+                        "on-demand LS step hydration skipped"
+                    );
+                    return Ok(());
+                }
             }
         };
 
         let mut batch = {
-            let guard = inner.state.lock().await;
+            let mut guard = inner.state.lock().await;
+            guard.catalog.sync_from_upstream();
             process_steps_slice(
                 cascade_id,
                 summary_opt.as_ref(),
@@ -1875,35 +2335,39 @@ async fn hydrate_cascade_for_monitor(
             )
         };
 
-        if batch.unknown_model_enum.is_some() && refresh_catalog(inner, true).await {
-            let guard = inner.state.lock().await;
-            batch = process_steps_slice(
+        if !batch.unknown_model_enums.is_empty() {
+            let refreshed = refresh_catalog(inner, true).await;
+            let learned_entries = resolve_unknown_model_enum_via_generator_metadata(
+                inner,
                 cascade_id,
-                summary_opt.as_ref(),
-                start_offset,
-                &steps,
-                &guard.catalog,
-                None,
-                Utc::now(),
-            );
+                &batch.unknown_model_enums,
+            )
+            .await;
+            let learned_any = learned_entries.is_some();
+            prefetched_gen_entries = learned_entries;
+            if refreshed || learned_any {
+                let mut guard = inner.state.lock().await;
+                guard.catalog.sync_from_upstream();
+                batch = process_steps_slice(
+                    cascade_id,
+                    summary_opt.as_ref(),
+                    start_offset,
+                    &steps,
+                    &guard.catalog,
+                    None,
+                    Utc::now(),
+                );
+            }
         }
 
         let mut guard = inner.state.lock().await;
-        let fold = if reset_fold {
-            guard.monitor_cache.insert(
-                cascade_id.to_string(),
-                CascadeFoldState::new(traj_id, start_offset),
-            );
-            guard
-                .monitor_cache
-                .get_mut(cascade_id)
-                .expect("inserted immediately above")
-        } else {
-            guard
-                .monitor_cache
-                .entry(cascade_id.to_string())
-                .or_insert_with(|| CascadeFoldState::new(traj_id.clone(), start_offset))
-        };
+        let fold = upsert_monitor_fold(
+            &mut guard.monitor_cache,
+            cascade_id,
+            traj_id,
+            start_offset,
+            reset_fold,
+        );
         fold.apply_batch(&batch);
     }
 
@@ -1930,18 +2394,25 @@ async fn hydrate_cascade_for_monitor(
         };
 
         if let Some((req_offset, probed_step, summary_steps)) = gen_plan {
-            let _permit = match inner.step_semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return Ok(()),
-            };
-            match fetch_generator_metadata_tail_seeking(
-                &inner.client,
-                cascade_id,
-                req_offset,
-                summary_steps,
-            )
-            .await
+            let entries_res = if req_offset == 0
+                && let Some(entries) = prefetched_gen_entries.take()
             {
+                Ok(Some((0, entries)))
+            } else {
+                let _permit = match inner.step_semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return Ok(()),
+                };
+                fetch_generator_metadata_tail_seeking(
+                    &inner.client,
+                    cascade_id,
+                    req_offset,
+                    summary_steps,
+                )
+                .await
+            };
+
+            match entries_res {
                 Ok(Some((effective_offset, entries))) => {
                     let has_unknown_placeholder = {
                         let guard = inner.state.lock().await;
@@ -1960,6 +2431,7 @@ async fn hydrate_cascade_for_monitor(
                     let mut dirty_observed: HashMap<(String, String), u64> = HashMap::new();
                     {
                         let mut guard = inner.state.lock().await;
+                        guard.catalog.learn_from_generator_metadata(&entries);
                         let mut latest_tokens = None;
                         let mut observed_updates: Vec<(String, String, u64)> = Vec::new();
                         for entry in &entries {
@@ -2109,7 +2581,8 @@ async fn ingest_dirty_cascade(
 
     let now_utc = Utc::now();
     let mut batch = {
-        let guard = inner.state.lock().await;
+        let mut guard = inner.state.lock().await;
+        guard.catalog.sync_from_upstream();
         process_steps_slice(
             &cascade_id,
             summary_opt.as_ref(),
@@ -2121,17 +2594,28 @@ async fn ingest_dirty_cascade(
         )
     };
 
-    if batch.unknown_model_enum.is_some() && refresh_catalog(&inner, true).await {
-        let guard = inner.state.lock().await;
-        batch = process_steps_slice(
+    if !batch.unknown_model_enums.is_empty() {
+        let refreshed = refresh_catalog(&inner, true).await;
+        let learned = resolve_unknown_model_enum_via_generator_metadata(
+            &inner,
             &cascade_id,
-            summary_opt.as_ref(),
-            dirty.start_offset,
-            &steps,
-            &guard.catalog,
-            min_step_created_at,
-            now_utc,
-        );
+            &batch.unknown_model_enums,
+        )
+        .await
+        .is_some();
+        if refreshed || learned {
+            let mut guard = inner.state.lock().await;
+            guard.catalog.sync_from_upstream();
+            batch = process_steps_slice(
+                &cascade_id,
+                summary_opt.as_ref(),
+                dirty.start_offset,
+                &steps,
+                &guard.catalog,
+                min_step_created_at,
+                now_utc,
+            );
+        }
     }
 
     let events: Vec<UsageEvent> = batch
@@ -3309,6 +3793,7 @@ mod tests {
                 updated_at_utc: boot.to_rfc3339_opts(SecondsFormat::Secs, true),
             }],
             Vec::new(),
+            None,
         );
         state.boot_settled = true;
         state.monitor_cache.insert(
@@ -4204,6 +4689,7 @@ mod tests {
                     }),
                 }),
             }),
+            step_indices: Vec::new(),
         };
         assert_eq!(
             resolve_generator_metadata_model(&codex_gen_entry, &catalog),
@@ -4816,6 +5302,7 @@ mod tests {
                 model_display_name: None,
                 chat_start_metadata: None,
             }),
+            step_indices: Vec::new(),
         };
         assert_eq!(
             generator_metadata_model_enum(&entry),
@@ -4837,6 +5324,7 @@ mod tests {
                 model_display_name: None,
                 chat_start_metadata: None,
             }),
+            step_indices: Vec::new(),
         };
         assert_eq!(generator_metadata_model_enum(&all_empty), None);
         assert_eq!(resolve_generator_metadata_model(&all_empty, &catalog), None);
@@ -5439,6 +5927,786 @@ mod tests {
 
         drop(delta_tx);
         let _ = tx.send(true);
+        srv.abort();
+    }
+
+    #[test]
+    fn canonicalize_model_id_strips_xhigh_and_tiered_suffixes() {
+        assert_eq!(
+            canonicalize_model_id("gemini-4-hydrogen-tiered-high"),
+            "gemini-4-hydrogen"
+        );
+        assert_eq!(
+            canonicalize_model_id("gemini-4-hydrogen-tiered-xhigh"),
+            "gemini-4-hydrogen"
+        );
+        assert_eq!(
+            canonicalize_model_id("gemini-4-hydrogen-tiered"),
+            "gemini-4-hydrogen"
+        );
+        assert_eq!(
+            canonicalize_model_id("companion/gpt-6.2-sol-xhigh"),
+            "gpt-6.2-sol"
+        );
+        assert_eq!(
+            canonicalize_model_id("gemini-api://gpt-6.2-astra-medium"),
+            "gpt-6.2-astra"
+        );
+    }
+
+    #[test]
+    fn resolve_attribution_classifies_codex_companion_and_uncatalogued_codex_as_openai_codex() {
+        let mut catalog = make_catalog();
+        catalog.update(
+            vec![LsModelConfig {
+                label: Some("GPT-6.2 Sol (Codex) (Medium)".to_string()),
+                model_or_alias: Some(LsModelOrAlias {
+                    model: Some("MODEL_PLACEHOLDER_M356".to_string()),
+                    alias: None,
+                }),
+                provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                model_url: Some("gemini-api://gpt-6.2-sol".to_string()),
+                model_id: Some("companion/gpt-6.2-sol-medium".to_string()),
+                context_window_options: Vec::new(),
+            }],
+            Instant::now(),
+        );
+
+        // 1. Companion-injected Codex model with API_PROVIDER_GOOGLE_GEMINI must be openai-codex, NOT gemini.
+        let codex_cat = resolve_attribution(
+            &LsStepMetadata {
+                generator_model: Some("MODEL_PLACEHOLDER_M356".to_string()),
+                ..Default::default()
+            },
+            &LsModelUsage {
+                api_provider: Some("API_PROVIDER_GOOGLE_GEMINI".to_string()),
+                response_header: Some(LsResponseHeaderFingerprint {
+                    response_id: Some("resp_codex_cat".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &catalog,
+        );
+        assert_eq!(codex_cat.provider, "openai-codex");
+        assert_eq!(codex_cat.source, "proxy");
+        assert_eq!(codex_cat.model, "gpt-6.2-sol");
+
+        // 2. Uncatalogued Codex model with only model_info.model_url = gemini-api://gpt-6.2-astra
+        let codex_uncat = resolve_attribution(
+            &LsStepMetadata {
+                generator_model: Some("MODEL_PLACEHOLDER_M352".to_string()),
+                model_info: Some(LsModelInfo {
+                    model_url: Some("gemini-api://gpt-6.2-astra".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &LsModelUsage {
+                api_provider: Some("API_PROVIDER_GOOGLE_GEMINI".to_string()),
+                response_header: Some(LsResponseHeaderFingerprint {
+                    response_id: Some("resp_codex_uncat".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &catalog,
+        );
+        assert_eq!(codex_uncat.provider, "openai-codex");
+        assert_eq!(codex_uncat.source, "proxy");
+        assert_eq!(codex_uncat.model, "gpt-6.2-astra");
+
+        // 3. Built-in Vertex OpenAI (gpt-5.2) remains vertex_openai, NOT openai-codex.
+        let vertex_openai = resolve_attribution(
+            &LsStepMetadata {
+                generator_model: Some("MODEL_PLACEHOLDER_M601".to_string()),
+                ..Default::default()
+            },
+            &LsModelUsage {
+                api_provider: Some("32".to_string()),
+                response_header: Some(LsResponseHeaderFingerprint {
+                    session_id_upper: Some("sess-builtin".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &catalog,
+        );
+        assert_eq!(vertex_openai.provider, "vertex_openai");
+        assert_eq!(vertex_openai.source, "builtin");
+        assert_eq!(vertex_openai.model, "gpt-5.2");
+    }
+
+    #[test]
+    fn model_catalog_normalizes_numeric_preserves_learned_across_updates_and_merges_upstream() {
+        let upstream = Arc::new(companion_core::UpstreamModelCatalog::new());
+        upstream.update_from_fetch_available_models(
+            br#"{
+                "models": {
+                    "gemini-4-neon-tiered-high": {
+                        "model": "MODEL_PLACEHOLDER_M532",
+                        "displayName": "Gemini 4 Neon (High)",
+                        "modelProvider": "MODEL_PROVIDER_GOOGLE",
+                        "apiProvider": "API_PROVIDER_GOOGLE_GEMINI"
+                    }
+                }
+            }"#,
+        );
+
+        let mut catalog = ModelCatalog::with_upstream_catalog(Some(Arc::clone(&upstream)));
+        catalog.update(
+            vec![LsModelConfig {
+                label: Some("Initial Hydrogen".to_string()),
+                model_or_alias: Some(LsModelOrAlias {
+                    model: Some("525".to_string()),
+                    alias: None,
+                }),
+                provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                model_url: None,
+                model_id: Some("gemini-4-hydrogen-high".to_string()),
+                context_window_options: Vec::new(),
+            }],
+            Instant::now(),
+        );
+        // Numeric "525" resolves "MODEL_PLACEHOLDER_M525" and vice versa.
+        assert_eq!(
+            catalog
+                .lookup("MODEL_PLACEHOLDER_M525")
+                .and_then(|e| e.model_id.as_deref()),
+            Some("gemini-4-hydrogen-high")
+        );
+
+        // Learn M530 from GeneratorMetadata.
+        catalog.learn_from_generator_metadata(&[companion_providers::LsGeneratorMetadata {
+            step_indices: vec![26],
+            chat_model: Some(companion_providers::LsChatModelMetadata {
+                model: Some("MODEL_PLACEHOLDER_M530".to_string()),
+                usage: None,
+                response_model: Some("gemini-4-hydrogen-tiered-high".to_string()),
+                model_display_name: Some("Gemini 4 Hydrogen (High)".to_string()),
+                chat_start_metadata: None,
+            }),
+        }]);
+
+        // Subsequent update with a different config must NOT wipe M525 or learned M530.
+        catalog.update(
+            vec![LsModelConfig {
+                label: Some("Gemini 4 Carbon".to_string()),
+                model_or_alias: Some(LsModelOrAlias {
+                    model: Some("MODEL_PLACEHOLDER_M427".to_string()),
+                    alias: None,
+                }),
+                provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                model_url: None,
+                model_id: Some("gemini-4-carbon-high".to_string()),
+                context_window_options: Vec::new(),
+            }],
+            Instant::now(),
+        );
+
+        assert_eq!(
+            catalog
+                .lookup("MODEL_PLACEHOLDER_M525")
+                .and_then(|e| e.model_id.as_deref()),
+            Some("gemini-4-hydrogen-high")
+        );
+        assert_eq!(
+            catalog.lookup("530").and_then(|e| e.model_id.as_deref()),
+            Some("gemini-4-hydrogen-tiered-high")
+        );
+        // Upstream fetchAvailableModels entry is visible too.
+        assert_eq!(
+            catalog
+                .lookup("MODEL_PLACEHOLDER_M532")
+                .and_then(|e| e.model_id.as_deref()),
+            Some("gemini-4-neon-tiered-high")
+        );
+    }
+
+    #[test]
+    fn resolve_attribution_prioritizes_dynamic_sources_then_static_fallback_then_display_name() {
+        let mut catalog = ModelCatalog::default();
+
+        // 1. Static fallback resolves M530 & M400 & M537 even with empty catalog and null modelInfo.
+        let m530_static = resolve_attribution(
+            &LsStepMetadata {
+                generator_model: Some("MODEL_PLACEHOLDER_M530".to_string()),
+                ..Default::default()
+            },
+            &LsModelUsage {
+                api_provider: Some("API_PROVIDER_GOOGLE_GEMINI".to_string()),
+                response_header: Some(LsResponseHeaderFingerprint {
+                    session_id_upper: Some("builtin-sess".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &catalog,
+        );
+        assert_eq!(m530_static.provider, "antigravity");
+        assert_eq!(m530_static.source, "builtin");
+        assert_eq!(m530_static.model, "gemini-4-hydrogen");
+        assert_eq!(
+            m530_static.model_display_name.as_deref(),
+            Some("Gemini 4 Hydrogen")
+        );
+
+        let m400_static = resolve_attribution(
+            &LsStepMetadata {
+                generator_model: Some("MODEL_PLACEHOLDER_M400".to_string()),
+                ..Default::default()
+            },
+            &LsModelUsage::default(),
+            &catalog,
+        );
+        assert_eq!(m400_static.provider, "vertex_claude");
+        assert_eq!(m400_static.model, "claude-opus-5-5");
+
+        // 2. Dynamic catalog overrides static fallback if M530 points elsewhere dynamically.
+        catalog.update(
+            vec![LsModelConfig {
+                label: Some("Custom Dynamic Model".to_string()),
+                model_or_alias: Some(LsModelOrAlias {
+                    model: Some("MODEL_PLACEHOLDER_M530".to_string()),
+                    alias: None,
+                }),
+                provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                model_url: None,
+                model_id: Some("gemini-4-neon-tiered-high".to_string()),
+                context_window_options: Vec::new(),
+            }],
+            Instant::now(),
+        );
+        let m530_dynamic = resolve_attribution(
+            &LsStepMetadata {
+                generator_model: Some("MODEL_PLACEHOLDER_M530".to_string()),
+                ..Default::default()
+            },
+            &LsModelUsage {
+                response_header: Some(LsResponseHeaderFingerprint {
+                    session_id_upper: Some("builtin-sess".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &catalog,
+        );
+        assert_eq!(m530_dynamic.model, "gemini-4-neon");
+        assert_eq!(
+            m530_dynamic.model_display_name.as_deref(),
+            Some("Custom Dynamic Model")
+        );
+
+        // 3. Unknown future placeholder with label present & model_id missing/placeholder falls back to label.
+        catalog.update(
+            vec![LsModelConfig {
+                label: Some("Gemini 5 Nova (High)".to_string()),
+                model_or_alias: Some(LsModelOrAlias {
+                    model: Some("MODEL_PLACEHOLDER_M999".to_string()),
+                    alias: None,
+                }),
+                provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                model_url: None,
+                model_id: Some("MODEL_PLACEHOLDER_M999".to_string()),
+                context_window_options: Vec::new(),
+            }],
+            Instant::now(),
+        );
+        let m999 = resolve_attribution(
+            &LsStepMetadata {
+                generator_model: Some("MODEL_PLACEHOLDER_M999".to_string()),
+                ..Default::default()
+            },
+            &LsModelUsage::default(),
+            &catalog,
+        );
+        assert_eq!(m999.model, "Gemini 5 Nova (High)");
+        assert_eq!(
+            m999.model_display_name.as_deref(),
+            Some("Gemini 5 Nova (High)")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collector_learns_unresolved_placeholder_via_generator_metadata_with_rate_limit() {
+        let gen_meta_hits = Arc::new(AtomicUsize::new(0));
+        let gen_meta_hits_srv = Arc::clone(&gen_meta_hits);
+
+        let router = Router::new()
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                post(|| async {
+                    // Omit M998 completely from GetCascadeModelConfigData
+                    axum::Json(serde_json::json!({ "clientModelConfigs": [] }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "steps": [{
+                            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                            "status": "CORTEX_STEP_STATUS_DONE",
+                            "metadata": {
+                                "createdAt": "2026-11-26T10:00:00Z",
+                                "finishedGeneratingAt": "2026-11-26T10:00:01Z",
+                                "generatorModel": "MODEL_PLACEHOLDER_M998",
+                                "modelUsage": {
+                                    "model": "MODEL_PLACEHOLDER_M998",
+                                    "inputTokens": "1000",
+                                    "cacheReadTokens": "500",
+                                    "outputTokens": "100",
+                                    "responseOutputTokens": "100",
+                                    "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                                    "responseHeader": { "sessionID": "s-m998" }
+                                }
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                post(move || {
+                    let hits = Arc::clone(&gen_meta_hits_srv);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({
+                            "generatorMetadata": [{
+                                "stepIndices": [0],
+                                "chatModel": {
+                                    "model": "MODEL_PLACEHOLDER_M998",
+                                    "responseModel": "gemini-5-nova-tiered-high",
+                                    "modelDisplayName": "Gemini 5 Nova (High)",
+                                    "chatStartMetadata": {
+                                        "contextWindowMetadata": { "maxContextTokens": 512000 }
+                                    }
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                post(|| async {
+                    let mut resp = Response::new(Body::from(encode_connect_frame(0x00, b"{}")));
+                    *resp.status_mut() = StatusCode::OK;
+                    resp.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/connect+json"),
+                    );
+                    resp
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::task::yield_now().await;
+
+        let tmp = TempDir::new().expect("tmp");
+        let sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).expect("sink"));
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).expect("ep"),
+            CsrfToken::parse(TEST_CSRF).expect("csrf"),
+        )
+        .expect("client");
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn_ls_collector(client, sink, LsCollectorConfig::default(), rx);
+
+        let snap = handle
+            .session_stats(Some("conv-m998"))
+            .await
+            .expect("session stats");
+        assert_eq!(snap.by_model.len(), 1);
+        assert_eq!(snap.by_model[0].model, "gemini-5-nova");
+        assert_eq!(
+            snap.by_model[0].model_display_name.as_deref(),
+            Some("Gemini 5 Nova (High)")
+        );
+        assert_eq!(snap.by_model[0].provider, "antigravity");
+        assert_eq!(snap.max_context_tokens, Some(512_000));
+        assert_eq!(
+            gen_meta_hits.load(Ordering::SeqCst),
+            1,
+            "should reuse GeneratorMetadata result in the same hydration cycle without duplicate RPC"
+        );
+
+        let _ = tx.send(true);
+        srv.abort();
+    }
+
+    #[test]
+    fn model_catalog_update_preserves_existing_fields_when_subsequent_entry_has_none() {
+        let mut catalog = ModelCatalog::default();
+        catalog.update(
+            vec![LsModelConfig {
+                label: Some("Gemini 5 Alpha (High)".to_string()),
+                model_or_alias: Some(LsModelOrAlias {
+                    model: Some("MODEL_PLACEHOLDER_M901".to_string()),
+                    alias: None,
+                }),
+                provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                model_url: Some("https://example.invalid/m901".to_string()),
+                model_id: Some("gemini-5-alpha-high".to_string()),
+                context_window_options: Vec::new(),
+            }],
+            Instant::now(),
+        );
+
+        // Subsequent partial config omits model_id/provider/model_url (and even label) -> must not regress.
+        catalog.update(
+            vec![LsModelConfig {
+                label: None,
+                model_or_alias: Some(LsModelOrAlias {
+                    model: Some("MODEL_PLACEHOLDER_M901".to_string()),
+                    alias: None,
+                }),
+                provider: None,
+                model_url: None,
+                model_id: None,
+                context_window_options: Vec::new(),
+            }],
+            Instant::now(),
+        );
+
+        let entry = catalog
+            .lookup("MODEL_PLACEHOLDER_M901")
+            .expect("entry should remain present");
+        assert_eq!(entry.model_id.as_deref(), Some("gemini-5-alpha-high"));
+        assert_eq!(entry.provider.as_deref(), Some("MODEL_PROVIDER_GOOGLE"));
+        assert_eq!(entry.label.as_deref(), Some("Gemini 5 Alpha (High)"));
+        assert_eq!(
+            entry.model_url.as_deref(),
+            Some("https://example.invalid/m901")
+        );
+
+        // Partial update with a new label and None model_id updates label while keeping model_id/provider.
+        catalog.update(
+            vec![LsModelConfig {
+                label: Some("Gemini 5 Alpha (Updated)".to_string()),
+                model_or_alias: Some(LsModelOrAlias {
+                    model: Some("MODEL_PLACEHOLDER_M901".to_string()),
+                    alias: None,
+                }),
+                provider: None,
+                model_url: None,
+                model_id: None,
+                context_window_options: Vec::new(),
+            }],
+            Instant::now(),
+        );
+        let updated = catalog
+            .lookup("MODEL_PLACEHOLDER_M901")
+            .expect("entry after partial update");
+        assert_eq!(updated.model_id.as_deref(), Some("gemini-5-alpha-high"));
+        assert_eq!(updated.provider.as_deref(), Some("MODEL_PROVIDER_GOOGLE"));
+        assert_eq!(updated.label.as_deref(), Some("Gemini 5 Alpha (Updated)"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collector_resolves_sequential_uncatalogued_placeholders_within_rate_limit_for_sqlite_and_monitor()
+     {
+        let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let delta_rx = Arc::new(tokio::sync::Mutex::new(Some(delta_rx)));
+        let gen_meta_calls = Arc::new(AtomicUsize::new(0));
+        let gen_meta_calls_srv = Arc::clone(&gen_meta_calls);
+        let turn_phase = Arc::new(AtomicUsize::new(1));
+        let turn_phase_steps = Arc::clone(&turn_phase);
+        let turn_phase_gen = Arc::clone(&turn_phase);
+
+        let now_rfc3339 = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let created_at_steps = now_rfc3339.clone();
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StepsReq {
+            #[serde(default)]
+            step_offset: u32,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct GenMetaReq {
+            #[serde(default)]
+            generator_metadata_offset: u32,
+        }
+
+        let router = Router::new()
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+                post(|| async { axum::Json(serde_json::json!({ "clientModelConfigs": [] })) }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps",
+                post(move |axum::Json(req): axum::Json<StepsReq>| {
+                    let phase = turn_phase_steps.load(Ordering::SeqCst);
+                    let ts = created_at_steps.clone();
+                    async move {
+                        let step0 = serde_json::json!({
+                            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                            "status": "CORTEX_STEP_STATUS_DONE",
+                            "metadata": {
+                                "createdAt": ts,
+                                "finishedGeneratingAt": ts,
+                                "generatorModel": "MODEL_PLACEHOLDER_M997",
+                                "modelUsage": {
+                                    "model": "MODEL_PLACEHOLDER_M997",
+                                    "inputTokens": "1000",
+                                    "cacheReadTokens": "500",
+                                    "outputTokens": "100",
+                                    "responseOutputTokens": "100",
+                                    "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                                    "responseHeader": { "sessionID": "s-turn1" }
+                                }
+                            }
+                        });
+                        let step1 = serde_json::json!({
+                            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                            "status": "CORTEX_STEP_STATUS_DONE",
+                            "metadata": {
+                                "createdAt": ts,
+                                "finishedGeneratingAt": ts,
+                                "generatorModel": "MODEL_PLACEHOLDER_M999",
+                                "modelUsage": {
+                                    "model": "MODEL_PLACEHOLDER_M999",
+                                    "inputTokens": "2000",
+                                    "cacheReadTokens": "1000",
+                                    "outputTokens": "200",
+                                    "responseOutputTokens": "200",
+                                    "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                                    "responseHeader": { "sessionID": "s-turn2" }
+                                }
+                            }
+                        });
+                        let all_steps = if phase >= 2 {
+                            vec![step0, step1]
+                        } else {
+                            vec![step0]
+                        };
+                        let sliced: Vec<_> =
+                            all_steps.into_iter().skip(req.step_offset as usize).collect();
+                        axum::Json(serde_json::json!({ "steps": sliced }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+                post(move |axum::Json(req): axum::Json<GenMetaReq>| {
+                    let hits = Arc::clone(&gen_meta_calls_srv);
+                    let phase = turn_phase_gen.load(Ordering::SeqCst);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let gm0 = serde_json::json!({
+                            "stepIndices": [0],
+                            "chatModel": {
+                                "model": "MODEL_PLACEHOLDER_M997",
+                                "responseModel": "gemini-5-alpha-tiered-high",
+                                "modelDisplayName": "Gemini 5 Alpha (High)",
+                                "chatStartMetadata": {
+                                    "contextWindowMetadata": { "maxContextTokens": 512000 }
+                                }
+                            }
+                        });
+                        let gm1 = serde_json::json!({
+                            "stepIndices": [1],
+                            "chatModel": {
+                                "model": "MODEL_PLACEHOLDER_M999",
+                                "responseModel": "gemini-5-beta-tiered-high",
+                                "modelDisplayName": "Gemini 5 Beta (High)",
+                                "chatStartMetadata": {
+                                    "contextWindowMetadata": { "maxContextTokens": 512000 }
+                                }
+                            }
+                        });
+                        let all_gm = if phase >= 2 {
+                            vec![gm0, gm1]
+                        } else {
+                            vec![gm0]
+                        };
+                        let sliced: Vec<_> = all_gm
+                            .into_iter()
+                            .skip(req.generator_metadata_offset as usize)
+                            .collect();
+                        axum::Json(serde_json::json!({ "generatorMetadata": sliced }))
+                    }
+                }),
+            )
+            .route(
+                "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+                post(move || {
+                    let rx_holder = Arc::clone(&delta_rx);
+                    async move {
+                        let (tx, rx) =
+                            tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+                        let mut maybe_rx = rx_holder.lock().await.take();
+                        tokio::spawn(async move {
+                            let boot_frame = encode_connect_frame(0x00, b"{}");
+                            if tx.send(Ok(boot_frame)).await.is_err() {
+                                return;
+                            }
+                            if let Some(ref mut ext_rx) = maybe_rx {
+                                while let Some(payload) = ext_rx.recv().await {
+                                    let frame = encode_connect_frame(
+                                        0x00,
+                                        &serde_json::to_vec(&payload).unwrap(),
+                                    );
+                                    if tx.send(Ok(frame)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                            rx.recv().await.map(|item| (item, rx))
+                        });
+                        let mut resp = Response::new(Body::from_stream(stream));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/connect+json"),
+                        );
+                        resp
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::task::yield_now().await;
+
+        let tmp = TempDir::new().expect("tmp");
+        let sink = Arc::new(SqliteUsageSink::new(tmp.path().join("usage")).expect("sink"));
+        let client = LsClient::new(
+            LsEndpoint::parse(&format!("127.0.0.1:{port}")).expect("ep"),
+            CsrfToken::parse(TEST_CSRF).expect("csrf"),
+        )
+        .expect("client");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cfg = LsCollectorConfig {
+            snapshot_settle_idle: Duration::from_millis(40),
+            snapshot_settle_max: Duration::from_millis(200),
+            cascade_debounce: Duration::from_millis(10),
+            catalog_refresh_min_interval: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let handle = spawn_ls_collector(client, Arc::clone(&sink), cfg, shutdown_rx);
+
+        // Wait for boot settle.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !handle.inner.state.lock().await.boot_settled {
+            assert!(Instant::now() < deadline, "collector failed to settle");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Turn 1: M997
+        delta_tx
+            .send(serde_json::json!({
+                "updates": {
+                    "conv-1c": {
+                        "trajectoryId": "traj-1c",
+                        "stepCount": 1,
+                        "createdTime": now_rfc3339,
+                        "lastModifiedTime": now_rfc3339
+                    }
+                }
+            }))
+            .expect("send turn 1 delta");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if !sink.read_all_events().expect("read").is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "turn 1 event not ingested");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        let snap1 = handle
+            .session_stats(Some("conv-1c"))
+            .await
+            .expect("monitor snap 1");
+        assert_eq!(snap1.by_model.len(), 1);
+        assert_eq!(snap1.by_model[0].model, "gemini-5-alpha");
+
+        // Turn 2 (< 60s later): switches to M999 in the same cascade.
+        turn_phase.store(2, Ordering::SeqCst);
+        delta_tx
+            .send(serde_json::json!({
+                "updates": {
+                    "conv-1c": {
+                        "trajectoryId": "traj-1c",
+                        "stepCount": 2,
+                        "createdTime": now_rfc3339,
+                        "lastModifiedTime": now_rfc3339
+                    }
+                }
+            }))
+            .expect("send turn 2 delta");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if sink.read_all_events().expect("read").len() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "turn 2 event not ingested");
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        let events = sink.read_all_events().expect("read all events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].model, "gemini-5-alpha");
+        assert_eq!(
+            events[0].model_display_name.as_deref(),
+            Some("Gemini 5 Alpha (High)")
+        );
+        assert_eq!(events[1].model, "gemini-5-beta");
+        assert_eq!(
+            events[1].model_display_name.as_deref(),
+            Some("Gemini 5 Beta (High)")
+        );
+
+        let snap2 = handle
+            .session_stats(Some("conv-1c"))
+            .await
+            .expect("monitor snap 2");
+        let monitor_models: Vec<&str> = snap2.by_model.iter().map(|m| m.model.as_str()).collect();
+        assert!(
+            monitor_models.contains(&"gemini-5-alpha") && monitor_models.contains(&"gemini-5-beta"),
+            "Monitor must resolve both models instead of caching MODEL_PLACEHOLDER_M999: {monitor_models:?}"
+        );
+
+        // Repeated lookup for the SAME uncatalogued placeholder that fails to resolve remains rate-limited to 60s.
+        let before_repeat = gen_meta_calls.load(Ordering::SeqCst);
+        let first_unmapped = resolve_unknown_model_enum_via_generator_metadata(
+            &handle.inner,
+            "conv-1c",
+            &["MODEL_PLACEHOLDER_M994".to_string()],
+        )
+        .await;
+        assert!(first_unmapped.is_some());
+        assert_eq!(gen_meta_calls.load(Ordering::SeqCst), before_repeat + 1);
+
+        let second_unmapped = resolve_unknown_model_enum_via_generator_metadata(
+            &handle.inner,
+            "conv-1c",
+            &["MODEL_PLACEHOLDER_M994".to_string()],
+        )
+        .await;
+        assert!(
+            second_unmapped.is_none(),
+            "same (cascade_id, unknown_enum) must remain rate-limited within 60s"
+        );
+        assert_eq!(gen_meta_calls.load(Ordering::SeqCst), before_repeat + 1);
+
+        drop(delta_tx);
+        let _ = shutdown_tx.send(true);
         srv.abort();
     }
 }

@@ -1564,6 +1564,13 @@ impl CodexSseTranslator {
                         "index": 0
                     }]),
                 );
+                if let Some(resp_id) = resp
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(companion_core::sanitize_response_id)
+                {
+                    chunk.insert("responseId".to_string(), Value::String(resp_id));
+                }
 
                 if let Some(usage) = resp.get("usage").and_then(Value::as_object) {
                     let input_tokens = usage
@@ -1665,6 +1672,7 @@ pub struct UnaryGeminiAggregator {
     parts: Vec<Value>,
     finish_reason: Option<String>,
     usage_metadata: Option<Value>,
+    response_id: Option<String>,
     error_frame: Option<(u16, Value)>,
     accumulated_bytes: usize,
     max_bytes: usize,
@@ -1686,6 +1694,7 @@ impl UnaryGeminiAggregator {
             parts: Vec::new(),
             finish_reason: None,
             usage_metadata: None,
+            response_id: None,
             error_frame: None,
             accumulated_bytes: 0,
             max_bytes,
@@ -1701,6 +1710,14 @@ impl UnaryGeminiAggregator {
                 .unwrap_or(502);
             self.error_frame = Some((code, chunk));
             return Ok(());
+        }
+
+        if let Some(resp_id) = chunk
+            .get("responseId")
+            .and_then(Value::as_str)
+            .and_then(companion_core::sanitize_response_id)
+        {
+            self.response_id = Some(resp_id);
         }
 
         if let Some(usage) = chunk.get("usageMetadata")
@@ -1802,6 +1819,9 @@ impl UnaryGeminiAggregator {
         );
         if let Some(usage) = self.usage_metadata {
             root.insert("usageMetadata".to_string(), usage);
+        }
+        if let Some(resp_id) = self.response_id {
+            root.insert("responseId".to_string(), Value::String(resp_id));
         }
 
         Ok((200, Value::Object(root)))
@@ -2612,5 +2632,26 @@ mod tests {
             extract_safe_codex_error_fields(br#"{"message":"plain"}"#),
             (None, None)
         );
+    }
+
+    #[test]
+    fn propagates_response_id_into_sse_completed_and_unary_responses() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex_12345\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":40},\"output_tokens\":20}}}\n\n"
+        );
+        let mut tr = CodexSseTranslator::new();
+        let mut chunks = tr.push_chunk(stream.as_bytes()).expect("push");
+        chunks.extend(tr.finish().expect("finish"));
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1]["responseId"], "resp_codex_12345");
+
+        let mut agg = UnaryGeminiAggregator::new();
+        for chunk in chunks {
+            agg.push_chunk(chunk).expect("agg push");
+        }
+        let (status, unary) = agg.finish().expect("agg finish");
+        assert_eq!(status, 200);
+        assert_eq!(unary["responseId"], "resp_codex_12345");
     }
 }

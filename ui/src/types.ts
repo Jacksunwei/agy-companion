@@ -91,6 +91,7 @@ export interface ModelSessionStats {
   provider: string;
   source: string;
   model: string;
+  model_display_name?: string | null;
   requests: number;
   input_tokens: number;
   cached_tokens: number;
@@ -156,6 +157,7 @@ export interface UsageBreakdownRow {
   key: string;
   provider: string;
   source: string | null;
+  model_display_name?: string | null;
   model_count: number | null;
   requests: number;
   input_tokens: number;
@@ -729,6 +731,7 @@ function parseByModel(raw: unknown): ModelSessionStats[] {
       provider,
       source,
       model,
+      model_display_name: asOptionalNullableString(item.model_display_name),
       requests,
       input_tokens: inputTokens,
       cached_tokens: cachedTokens,
@@ -939,6 +942,7 @@ function parseUsageBreakdownRow(raw: unknown): UsageBreakdownRow | null {
     key,
     provider,
     source: asOptionalNullableString(raw.source),
+    model_display_name: asOptionalNullableString(raw.model_display_name),
     model_count: asOptionalNullableNumber(raw.model_count),
     requests,
     input_tokens: inputTokens,
