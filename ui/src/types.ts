@@ -16,6 +16,27 @@ export type IntegrationState =
   | "disabled"
   | "unsupported";
 
+export type InstallChannel = "npx" | "uvx";
+
+export type UpdateLifecycleState =
+  | "up_to_date"
+  | "available"
+  | "upgrading"
+  | "upgraded"
+  | "failed"
+  | "disabled";
+
+export interface UpdateStatusSnapshot {
+  state: UpdateLifecycleState;
+  channel: InstallChannel;
+  current_version: string;
+  latest_version: string | null;
+  can_one_click_upgrade: boolean;
+  fallback_command: string;
+  checked_at_ms: number | null;
+  error: string | null;
+}
+
 export interface AccountPlanStatus {
   mode: AccountPlanMode;
   resolved: ResolvedAccountPlan | null;
@@ -151,6 +172,7 @@ export interface SettingsSnapshot {
   proxy_rss_bytes: number | null;
   ls_telemetry_active: boolean;
   last_catalog_refresh_at_ms: number | null;
+  update?: UpdateStatusSnapshot | null;
 }
 
 export interface UsageBucket {
@@ -905,6 +927,10 @@ export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
   const proxyRssBytes = topRss !== null ? topRss : (stats?.proxy_rss_bytes ?? null);
   const lsTelemetryActive = asBoolean(raw.ls_telemetry_active) ?? false;
   const lastCatalogRefreshAtMs = asOptionalNullableNumber(raw.last_catalog_refresh_at_ms);
+  const update =
+    raw.update !== undefined && raw.update !== null
+      ? parseUpdateStatusSnapshot(raw.update)
+      : null;
 
   return {
     config,
@@ -921,7 +947,129 @@ export function parseSettingsSnapshot(raw: unknown): SettingsSnapshot | null {
     proxy_rss_bytes: proxyRssBytes,
     ls_telemetry_active: lsTelemetryActive,
     last_catalog_refresh_at_ms: lastCatalogRefreshAtMs,
+    update,
   };
+}
+
+function asUpdateLifecycleState(raw: unknown): UpdateLifecycleState | null {
+  if (
+    raw === "up_to_date" ||
+    raw === "available" ||
+    raw === "upgrading" ||
+    raw === "upgraded" ||
+    raw === "failed" ||
+    raw === "disabled"
+  ) {
+    return raw;
+  }
+  return null;
+}
+
+function asInstallChannel(raw: unknown): InstallChannel | null {
+  if (raw === "npx" || raw === "uvx") {
+    return raw;
+  }
+  return null;
+}
+
+export function parseUpdateStatusSnapshot(raw: unknown): UpdateStatusSnapshot | null {
+  if (!isRecord(raw)) return null;
+  const state = asUpdateLifecycleState(raw.state);
+  const channel = asInstallChannel(raw.channel);
+  const currentVersion = asString(raw.current_version)?.trim() ?? "";
+  const canOneClickUpgrade = asBoolean(raw.can_one_click_upgrade);
+  const fallbackCommand = asString(raw.fallback_command);
+
+  if (
+    state === null ||
+    channel === null ||
+    !currentVersion ||
+    canOneClickUpgrade === null ||
+    fallbackCommand === null
+  ) {
+    return null;
+  }
+
+  return {
+    state,
+    channel,
+    current_version: currentVersion,
+    latest_version: asOptionalNullableString(raw.latest_version),
+    can_one_click_upgrade: canOneClickUpgrade,
+    fallback_command: fallbackCommand,
+    checked_at_ms: asOptionalNullableNumber(raw.checked_at_ms),
+    error: asOptionalNullableString(raw.error),
+  };
+}
+
+interface ParsedSemVer {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: Array<number | string>;
+}
+
+function parseSemVerStrict(raw: string): ParsedSemVer | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const dashIdx = trimmed.indexOf("-");
+  const core = dashIdx === -1 ? trimmed : trimmed.slice(0, dashIdx);
+  const preRaw = dashIdx === -1 ? null : trimmed.slice(dashIdx + 1);
+  const parts = core.split(".");
+  if (parts.length !== 3) return null;
+  const nums: number[] = [];
+  for (const part of parts) {
+    if (!/^(0|[1-9][0-9]*)$/.test(part)) return null;
+    const n = Number(part);
+    if (!Number.isSafeInteger(n)) return null;
+    nums.push(n);
+  }
+  const prerelease: Array<number | string> = [];
+  if (preRaw !== null) {
+    if (!preRaw) return null;
+    for (const ident of preRaw.split(".")) {
+      if (!ident || !/^[0-9A-Za-z-]+$/.test(ident)) return null;
+      if (/^[0-9]+$/.test(ident)) {
+        if (ident.length > 1 && ident.startsWith("0")) return null;
+        const n = Number(ident);
+        if (!Number.isSafeInteger(n)) return null;
+        prerelease.push(n);
+      } else {
+        prerelease.push(ident);
+      }
+    }
+  }
+  return { major: nums[0], minor: nums[1], patch: nums[2], prerelease };
+}
+
+export function compareSemVer(a: string, b: string): number | null {
+  const pa = parseSemVerStrict(a);
+  const pb = parseSemVerStrict(b);
+  if (!pa || !pb) return null;
+  if (pa.major !== pb.major) return pa.major < pb.major ? -1 : 1;
+  if (pa.minor !== pb.minor) return pa.minor < pb.minor ? -1 : 1;
+  if (pa.patch !== pb.patch) return pa.patch < pb.patch ? -1 : 1;
+
+  const aPre = pa.prerelease;
+  const bPre = pb.prerelease;
+  if (aPre.length === 0 && bPre.length === 0) return 0;
+  if (aPre.length === 0) return 1;
+  if (bPre.length === 0) return -1;
+
+  const len = Math.min(aPre.length, bPre.length);
+  for (let i = 0; i < len; i += 1) {
+    const ai = aPre[i];
+    const bi = bPre[i];
+    if (ai === bi) continue;
+    if (typeof ai === "number" && typeof bi === "number") {
+      return ai < bi ? -1 : 1;
+    }
+    if (typeof ai === "number") return -1;
+    if (typeof bi === "number") return 1;
+    return ai < bi ? -1 : 1;
+  }
+  if (aPre.length === bPre.length) return 0;
+  return aPre.length < bPre.length ? -1 : 1;
 }
 
 function parseUsageBucket(raw: unknown): UsageBucket | null {

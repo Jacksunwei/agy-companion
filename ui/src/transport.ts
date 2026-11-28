@@ -14,7 +14,10 @@ export type AllowedSidecarTool =
   | "start_codex_login"
   | "cancel_codex_login"
   | "complete_codex_login"
-  | "disconnect_codex";
+  | "disconnect_codex"
+  | "get_update_status"
+  | "check_update"
+  | "start_upgrade";
 
 const ALLOWED_SIDECAR_TOOLS: ReadonlySet<string> = new Set<AllowedSidecarTool>([
   "get_settings",
@@ -26,6 +29,9 @@ const ALLOWED_SIDECAR_TOOLS: ReadonlySet<string> = new Set<AllowedSidecarTool>([
   "cancel_codex_login",
   "complete_codex_login",
   "disconnect_codex",
+  "get_update_status",
+  "check_update",
+  "start_upgrade",
 ]);
 
 const CONVERSATION_SCOPED_TOOLS: ReadonlySet<string> = new Set<AllowedSidecarTool>([
