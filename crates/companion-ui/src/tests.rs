@@ -42,6 +42,7 @@ fn isolated_ui_server_options(tmp: &TempDir) -> UiServerOptions {
         probe_timeout: companion_providers::DEFAULT_PROBE_TIMEOUT,
         auth_store_override: None,
         codex_auth_override: None,
+        update_status_provider: None,
     }
 }
 
@@ -863,6 +864,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         proxy_rss_bytes: Some(25_165_824),
         ls_telemetry_active: false,
         last_catalog_refresh_at_ms: Some(1_747_299_990_000),
+        update: None,
     };
     let expected_active: Value =
         serde_json::from_str(ACTIVE_FIXTURE).expect("parse active fixture");
@@ -915,6 +917,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
         proxy_rss_bytes: None,
         ls_telemetry_active: false,
         last_catalog_refresh_at_ms: None,
+        update: None,
     };
     let expected_day0: Value = serde_json::from_str(DAY0_FIXTURE).expect("parse day0 fixture");
     assert_eq!(
@@ -2013,4 +2016,62 @@ async fn get_settings_latches_hybrid_active_in_production_and_respects_override(
     assert_eq!(ov2.launcher_integration.state, IntegrationState::Enabled);
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn settings_snapshot_omits_update_when_none_and_includes_when_provider_set() {
+    let tmp = TempDir::new().expect("tmp");
+    let cfg_path = tmp.path().join("config.json");
+    let cfg = config_with_port(free_closed_port().await);
+    cfg.save_secure(&cfg_path).expect("save");
+
+    // Default (no provider): `update` is None and omitted from serialized JSON.
+    let default_server = isolated_ui_server(&tmp, cfg_path.clone());
+    let default_snap = default_server
+        .get_settings_snapshot(None)
+        .await
+        .expect("default snapshot");
+    assert_eq!(default_snap.update, None);
+    let default_json: Value = serde_json::to_value(&default_snap).expect("to value");
+    assert!(
+        default_json.get("update").is_none(),
+        "update key must be omitted when None to preserve golden fixture compatibility"
+    );
+
+    // With provider: `update` is populated with exact wire schema.
+    let expected_update = UpdateStatusSnapshot {
+        state: UpdateLifecycleState::Available,
+        channel: companion_core::InstallChannel::Npx,
+        current_version: "0.1.3-dev.2".to_string(),
+        latest_version: Some("0.1.3".to_string()),
+        can_one_click_upgrade: true,
+        fallback_command: companion_core::InstallChannel::Npx
+            .fallback_command()
+            .to_string(),
+        checked_at_ms: Some(1_760_000_000_000),
+        error: None,
+    };
+    let expected_clone = expected_update.clone();
+    let provider_server = isolated_ui_server_with(&tmp, cfg_path, move |opts| {
+        opts.update_status_provider = Some(Arc::new(move |_| Some(expected_clone.clone())));
+    });
+    let snap = provider_server
+        .get_settings_snapshot(None)
+        .await
+        .expect("snapshot with update");
+    assert_eq!(snap.update.as_ref(), Some(&expected_update));
+
+    let raw = serde_json::to_value(&snap).expect("serialize");
+    let upd = raw.get("update").expect("update field");
+    assert_eq!(upd["state"], "available");
+    assert_eq!(upd["channel"], "npx");
+    assert_eq!(upd["current_version"], "0.1.3-dev.2");
+    assert_eq!(upd["latest_version"], "0.1.3");
+    assert_eq!(upd["can_one_click_upgrade"], true);
+    assert_eq!(
+        upd["fallback_command"],
+        "npx -y agy-companion@latest install"
+    );
+    assert_eq!(upd["checked_at_ms"], 1_760_000_000_000u64);
+    assert!(upd.get("error").is_none());
 }

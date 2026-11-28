@@ -230,6 +230,12 @@ impl CompanionUiServer {
             }
         }
 
+        let update = self
+            .options
+            .update_status_provider
+            .as_ref()
+            .and_then(|provider| provider(cfg));
+
         SettingsSnapshot {
             config: cfg.redacted_with_auth(gemini_creds, codex_creds),
             binary_version,
@@ -246,6 +252,7 @@ impl CompanionUiServer {
             proxy_rss_bytes,
             ls_telemetry_active: false,
             last_catalog_refresh_at_ms,
+            update,
         }
     }
 }

@@ -510,7 +510,9 @@ pub(crate) fn build_detached_proxy_daemon_command(
     #[cfg(debug_assertions)]
     {
         cmd.env_remove(crate::serve::TEST_HEALTH_VERSION_ENV)
-            .env_remove(crate::plugin_upgrade::TEST_PLUGIN_POLL_MS_ENV);
+            .env_remove(crate::plugin_upgrade::TEST_PLUGIN_POLL_MS_ENV)
+            .env_remove(crate::update_manager::TEST_NPM_REGISTRY_URL_ENV)
+            .env_remove(crate::update_manager::TEST_PYPI_REGISTRY_URL_ENV);
     }
     if std::env::var("GEMINI_API_KEY")
         .ok()

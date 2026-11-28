@@ -10,9 +10,9 @@ use companion_core::config::{
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
 use companion_core::{
     AuthStore, CLOUDCODE_DAILY_UPSTREAM_URL, CLOUDCODE_PROD_UPSTREAM_URL, CloudCodeStatsSnapshot,
-    CloudCodeStatus, CloudCodeUpstream, DEFAULT_CLOUDCODE_UPSTREAM_URL, HostPlatform, ModelPreset,
-    ProxyHealthSummary, RedactedConfig, StatsSnapshot, UsageRange, api_key_hint,
-    curated_codex_model_presets, curated_model_presets,
+    CloudCodeStatus, CloudCodeUpstream, Config, DEFAULT_CLOUDCODE_UPSTREAM_URL, HostPlatform,
+    InstallChannel, ModelPreset, ProxyHealthSummary, RedactedConfig, StatsSnapshot, UsageRange,
+    api_key_hint, curated_codex_model_presets, curated_model_presets,
 };
 use companion_providers::{CodexAuthManager, DEFAULT_PROBE_TIMEOUT};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,34 @@ pub enum UiHtmlSource {
     Fixed(Option<PathBuf>),
 }
 
+pub type UpdateStatusProvider = Arc<dyn Fn(&Config) -> Option<UpdateStatusSnapshot> + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateLifecycleState {
+    UpToDate,
+    Available,
+    Upgrading,
+    Upgraded,
+    Failed,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateStatusSnapshot {
+    pub state: UpdateLifecycleState,
+    pub channel: InstallChannel,
+    pub current_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    pub can_one_click_upgrade: bool,
+    pub fallback_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct UiServerOptions {
     pub ui_html_source: UiHtmlSource,
@@ -43,6 +71,7 @@ pub struct UiServerOptions {
     pub probe_timeout: Duration,
     pub auth_store_override: Option<Arc<dyn AuthStore>>,
     pub codex_auth_override: Option<Arc<CodexAuthManager>>,
+    pub update_status_provider: Option<UpdateStatusProvider>,
 }
 
 impl fmt::Debug for UiServerOptions {
@@ -71,6 +100,13 @@ impl fmt::Debug for UiServerOptions {
                     .as_ref()
                     .map(|_| "<CodexAuthManager>"),
             )
+            .field(
+                "update_status_provider",
+                &self
+                    .update_status_provider
+                    .as_ref()
+                    .map(|_| "<UpdateStatusProvider>"),
+            )
             .finish()
     }
 }
@@ -86,6 +122,7 @@ impl Default for UiServerOptions {
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             auth_store_override: None,
             codex_auth_override: None,
+            update_status_provider: None,
         }
     }
 }
@@ -108,6 +145,11 @@ impl UiServerOptions {
 
     pub fn with_codex_auth_override(mut self, codex_auth: Arc<CodexAuthManager>) -> Self {
         self.codex_auth_override = Some(codex_auth);
+        self
+    }
+
+    pub fn with_update_status_provider(mut self, provider: UpdateStatusProvider) -> Self {
+        self.update_status_provider = Some(provider);
         self
     }
 }
@@ -223,6 +265,8 @@ pub struct SettingsSnapshot {
     pub ls_telemetry_active: bool,
     #[serde(default)]
     pub last_catalog_refresh_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateStatusSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

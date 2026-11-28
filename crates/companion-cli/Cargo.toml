@@ -21,6 +21,7 @@ companion-providers.workspace = true
 companion-proxy.workspace = true
 companion-ui = { workspace = true, features = ["sqlite"] }
 http.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

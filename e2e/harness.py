@@ -88,6 +88,8 @@ STRIPPED_ENV_VARS: tuple[str, ...] = (
     "AGY_COMPANION_E2E_BIN",
     "AGY_COMPANION_HOOK_ACTIVE",
     "AGY_COMPANION_ALLOW_REMOTE_SSH",
+    "AGY_COMPANION_NO_UPDATE_CHECK",
+    "AGY_COMPANION_INSTALL_CHANNEL",
     "JETSKI_MCP_ENV_RESTORE_PREFIX",
     "JETSKI_MCP_ENV_RESTORE_VARS",
     "ANTIGRAVITY_EXECUTABLE_DATA_DIR",
@@ -868,6 +870,7 @@ class IsolatedEnv:
         env["LOCALAPPDATA"] = str(self.data_root)
         env["USERPROFILE"] = str(self.home_dir)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["AGY_COMPANION_NO_UPDATE_CHECK"] = "1"
         if set_config_env:
             env["AGY_COMPANION_CONFIG"] = str(self.config_path)
 

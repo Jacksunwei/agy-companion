@@ -13,6 +13,7 @@ pub mod plugin_upgrade;
 pub mod process;
 pub mod serve;
 pub mod sidecar_ui;
+pub mod update_manager;
 
 use std::path::{Path, PathBuf};
 
