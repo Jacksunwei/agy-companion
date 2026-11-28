@@ -309,10 +309,71 @@ class TestCujCodex(E2ETestCase):
         self.assertIn("Be concise.", stream_codex_json["input"][0]["content"][0]["text"])
         self.assertEqual(stream_codex_json["input"][1]["role"], "user")
 
+        # 5b. Follow-up multi-turn tool-call continuation with functionResponse inside role="model".
+        tool_call_id = "call_12658be792e746a4a55dc9fd30d2e2f7"
+        followup_body = json.dumps(
+            {
+                "systemInstruction": {"parts": [{"text": f"Conversation ID: {conv_id}\nBe concise."}]},
+                "contents": [
+                    {"role": "user", "parts": [{"text": "Read Cargo.toml"}]},
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "id": tool_call_id,
+                                    "name": "read_file",
+                                    "args": {"path": "Cargo.toml"},
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "id": tool_call_id,
+                                    "name": "read_file",
+                                    "response": {"content": "[workspace]\n"},
+                                }
+                            }
+                        ],
+                    },
+                ],
+                "generationConfig": {"thinkingConfig": {"thinkingLevel": "HIGH"}},
+            }
+        ).encode("utf-8")
+        followup_resp = http_raw_request(
+            "127.0.0.1",
+            proxy_port,
+            "POST",
+            "/v1beta/models/gpt-6.2-sol:streamGenerateContent?alt=sse",
+            headers={"Content-Type": "application/json"},
+            body=followup_body,
+            timeout=10.0,
+        )
+        self.assertEqual(followup_resp.status, 200, f"Codex follow-up stream failed: {followup_resp.text}")
+        self.assertIn("Hello from Codex!", followup_resp.text)
+
+        codex_reqs_after = [r for r in mock.requests if r.path.startswith("/responses")]
+        self.assertGreaterEqual(len(codex_reqs_after), 3)
+        followup_codex_json = json.loads(codex_reqs_after[-1].body.decode("utf-8"))
+        followup_input = followup_codex_json["input"]
+        self.assertEqual(
+            [item.get("type") for item in followup_input],
+            ["message", "message", "function_call", "function_call_output"],
+            f"Expected developer + user + function_call + function_call_output, got: {followup_input}",
+        )
+        self.assertEqual(followup_input[2]["call_id"], tool_call_id)
+        self.assertEqual(followup_input[2]["name"], "read_file")
+        self.assertEqual(followup_input[3]["call_id"], tool_call_id)
+        self.assertIn("[workspace]", followup_input[3]["output"])
+
         # Verify SQLite usage & per-session /api/stats & Sidecar /_api/get_usage record provider="openai-codex".
-        _files, events = poll_usage_events(env.usage_dir, min_count=1, timeout=5.0, interval=0.02)
+        _files, events = poll_usage_events(env.usage_dir, min_count=2, timeout=5.0, interval=0.02)
         codex_events = [e for e in events if e["provider"] == "openai-codex"]
-        self.assertEqual(len(codex_events), 1, f"Expected 1 openai-codex usage event, got {events}")
+        self.assertEqual(len(codex_events), 2, f"Expected 2 openai-codex usage events, got {events}")
         self.assertEqual(codex_events[0]["source"], "proxy")
         self.assertEqual(codex_events[0]["model"], "gpt-6.2-sol")
         self.assertEqual(int(codex_events[0]["input_tokens"]), 1500)
@@ -329,12 +390,12 @@ class TestCujCodex(E2ETestCase):
         )
         self.assertEqual(stats_resp.status, 200)
         stats_json = stats_resp.json()
-        self.assertEqual(stats_json["usage"]["requests"], 1)
+        self.assertEqual(stats_json["usage"]["requests"], 2)
         self.assertEqual(stats_json["by_model"][0]["provider"], "openai-codex")
         self.assertEqual(stats_json["by_model"][0]["model"], "gpt-6.2-sol")
 
         usage_7d = self._sidecar_post(sidecar_port, token, "get_usage", {"range": "7d"})
-        self.assertEqual(usage_7d["totals"]["requests"], 1)
+        self.assertEqual(usage_7d["totals"]["requests"], 2)
         self.assertEqual(usage_7d["by_provider"][0]["provider"], "openai-codex")
 
         # 6. Disconnect via Sidecar API clears auth/codex.json and removes Codex slots on hot-reload.
