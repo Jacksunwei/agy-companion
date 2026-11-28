@@ -61,6 +61,8 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     }
 
     const claudeIds = [
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
       "claude-opus-4-6",
       "claude-opus-4-5",
       "claude-opus-4",
@@ -76,6 +78,15 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
       assert.equal(rate.contextWindow, 200_000);
       assert.equal(getModelContextWindow(id), 200_000);
     }
+    assert.equal(MODEL_LIST_PRICES["gemini-3.8-flash"].inputPerM, 0.75);
+    assert.equal(MODEL_LIST_PRICES["gemini-3.8-flash"].cachedPerM, 0.075);
+    assert.equal(MODEL_LIST_PRICES["gemini-3.8-flash"].outputPerM, 3.75);
+    assert.equal(MODEL_LIST_PRICES["claude-opus-5-5"].inputPerM, 4.0);
+    assert.equal(MODEL_LIST_PRICES["claude-opus-5-5"].cachedPerM, 0.2);
+    assert.equal(MODEL_LIST_PRICES["claude-opus-5-5"].outputPerM, 20.0);
+    assert.equal(MODEL_LIST_PRICES["claude-sonnet-5-5"].inputPerM, 2.0);
+    assert.equal(MODEL_LIST_PRICES["claude-sonnet-5-5"].cachedPerM, 0.1);
+    assert.equal(MODEL_LIST_PRICES["claude-sonnet-5-5"].outputPerM, 10.0);
     assert.equal(MODEL_LIST_PRICES["claude-opus-4-6"].inputPerM, 5.0);
     assert.equal(MODEL_LIST_PRICES["claude-opus-4-6"].cachedPerM, 0.5);
     assert.equal(MODEL_LIST_PRICES["claude-opus-4-6"].outputPerM, 25.0);
@@ -84,7 +95,11 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
     assert.equal(MODEL_LIST_PRICES["claude-haiku-4-5"].inputPerM, 1.0);
 
     const openaiExpectedCtx: ReadonlyArray<[string, number]> = [
-      ["gpt-5.4", 400_000],
+      ["gpt-6.2-astra", 1_050_000],
+      ["gpt-6.2-sol", 1_050_000],
+      ["gpt-6.1-terra", 1_050_000],
+      ["gpt-6-luna", 1_050_000],
+      ["gpt-5.4", 1_050_000],
       ["gpt-5.3-codex", 400_000],
       ["gpt-5", 400_000],
       ["gpt-4.1", 1_000_000],
@@ -98,6 +113,18 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
       assert.equal(rate.contextWindow, ctx);
       assert.equal(getModelContextWindow(id), ctx);
     }
+    assert.equal(MODEL_LIST_PRICES["gpt-6.2-astra"].inputPerM, 8.0);
+    assert.equal(MODEL_LIST_PRICES["gpt-6.2-astra"].cachedPerM, 0.4);
+    assert.equal(MODEL_LIST_PRICES["gpt-6.2-astra"].outputPerM, 40.0);
+    assert.equal(MODEL_LIST_PRICES["gpt-6.2-sol"].inputPerM, 2.0);
+    assert.equal(MODEL_LIST_PRICES["gpt-6.2-sol"].cachedPerM, 0.1);
+    assert.equal(MODEL_LIST_PRICES["gpt-6.2-sol"].outputPerM, 10.0);
+    assert.equal(MODEL_LIST_PRICES["gpt-6.1-terra"].inputPerM, 1.0);
+    assert.equal(MODEL_LIST_PRICES["gpt-6.1-terra"].cachedPerM, 0.05);
+    assert.equal(MODEL_LIST_PRICES["gpt-6.1-terra"].outputPerM, 5.0);
+    assert.equal(MODEL_LIST_PRICES["gpt-6-luna"].inputPerM, 0.1);
+    assert.equal(MODEL_LIST_PRICES["gpt-6-luna"].cachedPerM, 0.01);
+    assert.equal(MODEL_LIST_PRICES["gpt-6-luna"].outputPerM, 0.5);
 
     // Prefix, case, effort-suffix (-low/-medium/-high/-max), date-stamp & preview normalization
     assert.deepEqual(
@@ -133,15 +160,27 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
       MODEL_LIST_PRICES["o4-mini"],
     );
 
-    // Claude family fallback for future/versioned IDs (always 200K, never 1M)
+    // Claude 5.5 exact match & family fallback for future/versioned IDs (always 200K, never 1M)
     assert.deepEqual(
       getModelListPrice("claude-opus-5-5-high"),
-      MODEL_LIST_PRICES["claude-opus-4-6"],
+      MODEL_LIST_PRICES["claude-opus-5-5"],
     );
     assert.equal(getModelContextWindow("claude-opus-5-5-high"), 200_000);
     assert.deepEqual(
+      getModelListPrice("MODEL_PLACEHOLDER_M400"),
+      MODEL_LIST_PRICES["claude-opus-5-5"],
+    );
+    assert.deepEqual(
+      getModelListPrice("MODEL_PLACEHOLDER_M403"),
+      MODEL_LIST_PRICES["claude-sonnet-5-5"],
+    );
+    assert.deepEqual(
+      getModelListPrice("claude-opus-6-0"),
+      MODEL_LIST_PRICES["claude-opus-5-5"],
+    );
+    assert.deepEqual(
       getModelListPrice("claude-sonnet-5-0"),
-      MODEL_LIST_PRICES["claude-sonnet-4-6"],
+      MODEL_LIST_PRICES["claude-sonnet-5-5"],
     );
     assert.deepEqual(
       getModelListPrice("claude-haiku-5-0-low"),
@@ -152,22 +191,15 @@ describe("pricing.ts list prices, token cost math & rollups", () => {
 
     // Non-Claude context window fallbacks & unpriced models
     assert.equal(getModelContextWindow("gemini-5-future-pro"), 1_000_000);
+    assert.equal(getModelContextWindow("gpt-6.9-preview"), 1_050_000);
     assert.equal(getModelContextWindow("gpt-5.9-preview"), 400_000);
     assert.equal(getModelContextWindow("gpt-4.1-mini"), 1_000_000);
     assert.equal(getModelContextWindow("o3-pro"), 200_000);
     assert.equal(getModelContextWindow("o4-mini-high"), 200_000);
     assert.equal(getModelContextWindow("gpt-4o-mini"), 128_000);
-    assert.equal(getModelContextWindow("gpt-6.2-sol"), 1_050_000);
-    assert.equal(getModelContextWindow("gpt-6.2-astra"), 1_050_000);
     assert.equal(getModelListPrice("antigravity-builtin"), null);
-    assert.equal(getModelListPrice("gpt-6.2-astra"), null);
-    assert.equal(getModelListPrice("gpt-6.2-sol"), null);
     assert.equal(getModelListPrice("gemini-unpriced-preview"), null);
     assert.equal(getModelListPrice(""), null);
-    assert.equal(getModelContextWindow("gpt-6.2-astra"), 1_050_000);
-    assert.equal(getModelContextWindow("gpt-6.2-sol"), 1_050_000);
-    assert.equal(getModelContextWindow("gpt-6.1-terra"), 1_050_000);
-    assert.equal(getModelContextWindow("gpt-6-luna"), 1_050_000);
     assert.equal(getModelContextWindow("unknown-model"), 1_000_000);
   });
 

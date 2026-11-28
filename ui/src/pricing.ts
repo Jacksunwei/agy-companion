@@ -89,9 +89,10 @@ export const MODEL_LIST_PRICES: Readonly<Record<string, ModelListPrice>> = {
     contextWindow: 1_000_000,
   },
   "gemini-3.8-flash": {
-    inputPerM: 1.5,
-    cachedPerM: 0.15,
-    outputPerM: 7.5,
+    // Introductory rate through Dec 31, 2026 (standard $1.50 / $0.15 / $7.50 starting Jan 1, 2027)
+    inputPerM: 0.75,
+    cachedPerM: 0.075,
+    outputPerM: 3.75,
     contextWindow: 1_000_000,
   },
   "gemini-3.1-pro": {
@@ -120,6 +121,18 @@ export const MODEL_LIST_PRICES: Readonly<Record<string, ModelListPrice>> = {
   },
 
   // Vertex Claude (200K context window)
+  "claude-opus-5-5": {
+    inputPerM: 4.0,
+    cachedPerM: 0.2,
+    outputPerM: 20.0,
+    contextWindow: 200_000,
+  },
+  "claude-sonnet-5-5": {
+    inputPerM: 2.0,
+    cachedPerM: 0.1,
+    outputPerM: 10.0,
+    contextWindow: 200_000,
+  },
   "claude-opus-4-6": {
     inputPerM: 5.0,
     cachedPerM: 0.5,
@@ -169,12 +182,36 @@ export const MODEL_LIST_PRICES: Readonly<Record<string, ModelListPrice>> = {
     contextWindow: 200_000,
   },
 
-  // Vertex OpenAI
+  // OpenAI & Vertex OpenAI
+  "gpt-6.2-astra": {
+    inputPerM: 8.0,
+    cachedPerM: 0.4,
+    outputPerM: 40.0,
+    contextWindow: 1_050_000,
+  },
+  "gpt-6.2-sol": {
+    inputPerM: 2.0,
+    cachedPerM: 0.1,
+    outputPerM: 10.0,
+    contextWindow: 1_050_000,
+  },
+  "gpt-6.1-terra": {
+    inputPerM: 1.0,
+    cachedPerM: 0.05,
+    outputPerM: 5.0,
+    contextWindow: 1_050_000,
+  },
+  "gpt-6-luna": {
+    inputPerM: 0.1,
+    cachedPerM: 0.01,
+    outputPerM: 0.5,
+    contextWindow: 1_050_000,
+  },
   "gpt-5.4": {
     inputPerM: 2.5,
     cachedPerM: 0.25,
     outputPerM: 15.0,
-    contextWindow: 400_000,
+    contextWindow: 1_050_000,
   },
   "gpt-5.3-codex": {
     inputPerM: 1.75,
@@ -212,13 +249,6 @@ export const MODEL_LIST_PRICES: Readonly<Record<string, ModelListPrice>> = {
     outputPerM: 4.4,
     contextWindow: 200_000,
   },
-};
-
-export const CODEX_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
-  "gpt-6.2-astra": 1_050_000,
-  "gpt-6.2-sol": 1_050_000,
-  "gpt-6.1-terra": 1_050_000,
-  "gpt-6-luna": 1_050_000,
 };
 
 const STATIC_PLACEHOLDER_MAP: Readonly<
@@ -324,10 +354,10 @@ export function getModelListPrice(modelId: string): ModelListPrice | null {
   const canonicalMatch = MODEL_LIST_PRICES[canonical];
   if (canonicalMatch) return canonicalMatch;
 
-  // Claude family fallback for future/versioned Claude IDs (e.g. claude-opus-5-5-high)
+  // Claude family fallback for future/versioned Claude IDs
   if (canonical.startsWith("claude-")) {
-    if (canonical.includes("opus")) return MODEL_LIST_PRICES["claude-opus-4-6"];
-    if (canonical.includes("sonnet")) return MODEL_LIST_PRICES["claude-sonnet-4-6"];
+    if (canonical.includes("opus")) return MODEL_LIST_PRICES["claude-opus-5-5"];
+    if (canonical.includes("sonnet")) return MODEL_LIST_PRICES["claude-sonnet-5-5"];
     if (canonical.includes("haiku")) return MODEL_LIST_PRICES["claude-haiku-4-5"];
   }
 
@@ -340,18 +370,16 @@ export function getModelContextWindow(modelId: string): number {
 
   const rawNorm = normalizeModelId(modelId);
   const norm = lookupStaticPlaceholder(rawNorm)?.id ?? rawNorm;
-  const codexExact = CODEX_CONTEXT_WINDOWS[norm];
-  if (codexExact !== undefined) return codexExact;
-
   const canonical = canonicalizeForPricing(norm);
-  const codexCanonical = CODEX_CONTEXT_WINDOWS[canonical];
-  if (codexCanonical !== undefined) return codexCanonical;
 
   if (canonical.startsWith("claude-") || canonical === "claude") {
     return 200_000;
   }
   if (canonical.startsWith("gemini-")) {
     return 1_000_000;
+  }
+  if (canonical.startsWith("gpt-6")) {
+    return 1_050_000;
   }
   if (canonical.startsWith("gpt-5")) {
     return 400_000;
