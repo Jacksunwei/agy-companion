@@ -7,6 +7,7 @@ import {
 } from "./dom.ts";
 import {
   estimateSessionSummary,
+  estimateTokensCost,
   formatModelLabel,
   formatProviderBadge,
   getModelContextWindow,
@@ -276,16 +277,35 @@ export function buildMonitorView(state: AppState): DocumentFragment {
   if (byModel.length > 0) {
     const byModelCard = el("section", "card");
     const bmHdr = el("div", "sec-h");
-    bmHdr.append(
-      el("h2", "sec-t", "Usage by model"),
-      el("span", "sec-right sec-count", "this session"),
-    );
+    const hasAnySubagents = byModel.some((r) => (r.subagent?.requests ?? 0) > 0);
+    if (hasAnySubagents) {
+      const bmLegend = el("span", "sec-right bk-legend");
+      const mainLeg = el("span", "bk-legend-item");
+      const mainDot = el("span", "bk-legend-dot is-main");
+      mainDot.setAttribute("aria-hidden", "true");
+      mainLeg.append(mainDot, el("span", null, "Main"));
+
+      const subLeg = el("span", "bk-legend-item");
+      const subDot = el("span", "bk-legend-dot is-sub");
+      subDot.setAttribute("aria-hidden", "true");
+      subLeg.append(subDot, el("span", null, "Sub-agents"));
+
+      bmLegend.append(mainLeg, subLeg);
+      bmHdr.append(el("h2", "sec-t", "Usage by model"), bmLegend);
+    } else {
+      bmHdr.append(
+        el("h2", "sec-t", "Usage by model"),
+        el("span", "sec-right sec-count", "this session"),
+      );
+    }
     byModelCard.append(bmHdr);
 
     const totalSessionTokens = byModel.reduce(
       (acc, r) => acc + Math.max(0, r.input_tokens) + Math.max(0, r.output_tokens),
       0,
     );
+
+    const fmtCalls = (n: number): string => (n === 1 ? "1 call" : `${n} calls`);
 
     const list = el("div", "breakdown-list");
     for (const row of byModel) {
@@ -305,11 +325,25 @@ export function buildMonitorView(state: AppState): DocumentFragment {
         ? `${formatUsd(cost.totalUsd)} \u00b7 ${clampedPct}%`
         : `${formatCompactTokens(rowTokens)} \u00b7 ${clampedPct}%`;
 
+      const sub = row.subagent && row.subagent.requests > 0 ? row.subagent : null;
+      const subRequests = sub ? Math.min(row.requests, Math.max(0, sub.requests)) : 0;
+      const mainRequests = Math.max(0, row.requests - subRequests);
+
       const rowCachePct =
         row.input_tokens > 0
           ? Math.min(100, Math.round((row.cached_tokens / row.input_tokens) * 100))
           : 0;
-      const callsTxt = row.requests === 1 ? "1 call" : `${row.requests} calls`;
+      let callsTxt: string;
+      if (!sub) {
+        callsTxt = fmtCalls(row.requests);
+      } else if (mainRequests === 0) {
+        callsTxt =
+          subRequests === 1 ? "1 sub-agent call" : `${subRequests} sub-agent calls`;
+      } else {
+        const subPart =
+          subRequests === 1 ? "1 sub-agent" : `${subRequests} sub-agents`;
+        callsTxt = `${row.requests} calls (${mainRequests} main \u00b7 ${subPart})`;
+      }
       const metaText = `${callsTxt} \u00b7 ${formatCompactTokens(row.input_tokens)} in (${rowCachePct}% cache) \u00b7 ${formatCompactTokens(row.output_tokens)} out`;
 
       const item = el("div");
@@ -325,9 +359,72 @@ export function buildMonitorView(state: AppState): DocumentFragment {
       top.append(left, el("span", "bk-val num", rightVal));
 
       const bbar = el("div", "bk-bar");
-      const fill = el("div", "bk-bar-fill");
-      fill.style.width = `${clampedPct}%`;
-      bbar.append(fill);
+      if (!sub) {
+        const fill = el("div", "bk-bar-fill");
+        fill.style.width = `${clampedPct}%`;
+        fill.title = cost
+          ? `Main: ${formatUsd(cost.totalUsd)} (${fmtCalls(row.requests)})`
+          : `Main: ${formatCompactTokens(rowTokens)} tokens (${fmtCalls(row.requests)})`;
+        bbar.append(fill);
+      } else {
+        const subTokens = Math.min(
+          rowTokens,
+          Math.max(0, sub.input_tokens) + Math.max(0, sub.output_tokens),
+        );
+        const mainTokens = Math.max(0, rowTokens - subTokens);
+        const subCost = cost
+          ? estimateTokensCost(row.model, {
+              inputTokens: sub.input_tokens,
+              cachedTokens: sub.cached_tokens,
+              outputTokens: sub.output_tokens,
+              reasoningTokens: sub.reasoning_tokens,
+            })
+          : null;
+        const subUsd = cost ? Math.min(cost.totalUsd, Math.max(0, subCost?.totalUsd ?? 0)) : 0;
+        const mainUsd = cost ? Math.max(0, cost.totalUsd - subUsd) : 0;
+
+        if (mainRequests === 0) {
+          const subFill = el("div", "bk-bar-sub");
+          subFill.style.width = `${clampedPct}%`;
+          subFill.title = cost
+            ? `Sub-agents: ${formatUsd(cost.totalUsd)} (${fmtCalls(subRequests)})`
+            : `Sub-agents: ${formatCompactTokens(rowTokens)} tokens (${fmtCalls(subRequests)})`;
+          bbar.append(subFill);
+        } else {
+          let mainPct = 0;
+          let subPct = 0;
+          if (cost && cost.totalUsd > 0) {
+            mainPct = (mainUsd / cost.totalUsd) * clampedPct;
+            subPct = (subUsd / cost.totalUsd) * clampedPct;
+          } else if (rowTokens > 0) {
+            mainPct = (mainTokens / rowTokens) * clampedPct;
+            subPct = (subTokens / rowTokens) * clampedPct;
+          } else if (row.requests > 0) {
+            mainPct = (mainRequests / row.requests) * clampedPct;
+            subPct = (subRequests / row.requests) * clampedPct;
+          }
+
+          if (mainPct > 0) {
+            const mainFill = el("div", "bk-bar-fill");
+            mainFill.style.width = `${mainPct.toFixed(1)}%`;
+            mainFill.title = cost
+              ? `Main: ${formatUsd(mainUsd)} (${fmtCalls(mainRequests)})`
+              : `Main: ${formatCompactTokens(mainTokens)} tokens (${fmtCalls(mainRequests)})`;
+            bbar.append(mainFill);
+          }
+          if (mainPct > 0 && subPct > 0) {
+            bbar.append(el("div", "bk-bar-gap"));
+          }
+          if (subPct > 0) {
+            const subFill = el("div", "bk-bar-sub");
+            subFill.style.width = `${subPct.toFixed(1)}%`;
+            subFill.title = cost
+              ? `Sub-agents: ${formatUsd(subUsd)} (${fmtCalls(subRequests)})`
+              : `Sub-agents: ${formatCompactTokens(subTokens)} tokens (${fmtCalls(subRequests)})`;
+            bbar.append(subFill);
+          }
+        }
+      }
 
       item.append(top, bbar, el("div", "bk-meta num", metaText));
       list.append(item);

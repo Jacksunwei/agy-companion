@@ -813,6 +813,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
                     output_tokens: 600,
                     reasoning_tokens: 120,
                     total_latency_ms: 480,
+                    subagent: None,
                 },
                 ModelSessionStats {
                     provider: "antigravity".to_string(),
@@ -825,6 +826,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
                     output_tokens: 200,
                     reasoning_tokens: 40,
                     total_latency_ms: 320,
+                    subagent: None,
                 },
             ],
         }),

@@ -55,7 +55,7 @@ pub use models::{
 pub use protocol::{
     CloudCodeStatsSnapshot, CloudCodeStatus, HealthResponse, HostPlatform, MAX_RECENT_CALLS,
     MAX_SESSION_MODELS, ModelSessionStats, PROTOCOL_VERSION, ProxyHealthSummary,
-    RecentCallSnapshot, StatsSnapshot, UsageStatsSnapshot,
+    RecentCallSnapshot, StatsSnapshot, SubagentModelStats, UsageStatsSnapshot,
 };
 pub use redaction::{
     RedactedCodexConfig, RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig,

@@ -1207,6 +1207,221 @@ describe("buildMonitorView empty states & active mixed session", () => {
       ["0.0%", "0.0%", "0.0%"],
     );
   });
+
+  it("renders main vs sub-agent two-tone stacked bars, conditional legend, tooltips, and meta copy", () => {
+    const base = loadActiveSnapshot();
+
+    // Case 1: No sub-agents -> header keeps "this session", single solid .bk-bar-fill, unchanged meta
+    const mainOnlyHost = env.document.createElement("div");
+    mainOnlyHost.append(buildMonitorView(makeState({ snapshot: base })) as unknown as FakeElement);
+    const mainOnlyCard = mainOnlyHost.querySelectorAll(".card")[1];
+    assert.equal(mainOnlyCard.querySelector(".sec-count")?.textContent, "this session");
+    assert.equal(mainOnlyCard.querySelector(".bk-legend"), null);
+    assert.equal(mainOnlyCard.querySelectorAll(".bk-bar-fill").length, 2);
+    assert.equal(mainOnlyCard.querySelectorAll(".bk-bar-sub").length, 0);
+    assert.equal(mainOnlyCard.querySelectorAll(".bk-bar-gap").length, 0);
+
+    // Case 2: Sub-agent-only rows (plural & singular) -> conditional legend + lighter .bk-bar-sub + sub-agent meta
+    const subOnlySnap: SettingsSnapshot = {
+      ...base,
+      stats: {
+        ...base.stats!,
+        usage: {
+          requests: 51,
+          prompt_tokens: 11_200_000,
+          cached_tokens: 10_400_000,
+          output_tokens: 41_000,
+          reasoning_tokens: 0,
+          cache_hit_ratio: 0.93,
+        },
+        by_model: [
+          {
+            provider: "antigravity",
+            source: "builtin",
+            model: "gemini-4-hydrogen",
+            requests: 50,
+            input_tokens: 11_100_000,
+            cached_tokens: 10_323_000,
+            output_tokens: 40_000,
+            reasoning_tokens: 0,
+            total_latency_ms: 15_000,
+            subagent: {
+              requests: 50,
+              input_tokens: 11_100_000,
+              cached_tokens: 10_323_000,
+              output_tokens: 40_000,
+              reasoning_tokens: 0,
+            },
+          },
+          {
+            provider: "antigravity",
+            source: "builtin",
+            model: "gemini-4-neon",
+            requests: 1,
+            input_tokens: 100_000,
+            cached_tokens: 77_000,
+            output_tokens: 1_000,
+            reasoning_tokens: 0,
+            total_latency_ms: 400,
+            subagent: {
+              requests: 1,
+              input_tokens: 100_000,
+              cached_tokens: 77_000,
+              output_tokens: 1_000,
+              reasoning_tokens: 0,
+            },
+          },
+        ],
+      },
+    };
+    const subOnlyHost = env.document.createElement("div");
+    subOnlyHost.append(
+      buildMonitorView(makeState({ snapshot: subOnlySnap })) as unknown as FakeElement,
+    );
+    const subOnlyCard = subOnlyHost.querySelectorAll(".card")[1];
+    assert.equal(subOnlyCard.querySelector(".sec-count"), null);
+    const legend = subOnlyCard.querySelector(".bk-legend");
+    assert.ok(legend);
+    assert.ok(legend.querySelector(".bk-legend-dot.is-main"));
+    assert.ok(legend.querySelector(".bk-legend-dot.is-sub"));
+    assert.ok(legend.textContent.includes("Main"));
+    assert.ok(legend.textContent.includes("Sub-agents"));
+
+    const subOnlyBars = subOnlyCard.querySelectorAll(".bk-bar");
+    assert.equal(subOnlyBars.length, 2);
+    assert.equal(subOnlyBars[0].querySelectorAll(".bk-bar-fill").length, 0);
+    assert.equal(subOnlyBars[0].querySelectorAll(".bk-bar-gap").length, 0);
+    const subSeg0 = subOnlyBars[0].querySelector(".bk-bar-sub");
+    assert.ok(subSeg0);
+    assert.ok(subSeg0.title.includes("Sub-agents:"));
+    assert.ok(subSeg0.title.includes("50 calls"));
+
+    const subOnlyMetas = subOnlyCard.querySelectorAll(".bk-meta").map((m) => m.textContent);
+    assert.ok(subOnlyMetas[0].startsWith("50 sub-agent calls \u00b7 "));
+    assert.ok(subOnlyMetas[1].startsWith("1 sub-agent call \u00b7 "));
+
+    // Case 3: Mixed main + sub-agents (priced + unpriced) -> legend + main + gap + sub + mixed meta
+    const mixedSnap: SettingsSnapshot = {
+      ...base,
+      stats: {
+        ...base.stats!,
+        usage: {
+          requests: 70,
+          prompt_tokens: 16_500_000,
+          cached_tokens: 14_650_000,
+          output_tokens: 59_000,
+          reasoning_tokens: 0,
+          cache_hit_ratio: 0.89,
+        },
+        by_model: [
+          {
+            provider: "gemini",
+            source: "proxy",
+            model: "gemini-4-hydrogen",
+            requests: 68,
+            input_tokens: 16_400_000,
+            cached_tokens: 14_596_000,
+            output_tokens: 58_000,
+            reasoning_tokens: 0,
+            total_latency_ms: 20_000,
+            subagent: {
+              requests: 50,
+              input_tokens: 11_100_000,
+              cached_tokens: 10_323_000,
+              output_tokens: 40_000,
+              reasoning_tokens: 0,
+            },
+          },
+          {
+            provider: "openai-codex",
+            source: "proxy",
+            model: "gpt-6.2-sol",
+            requests: 2,
+            input_tokens: 100_000,
+            cached_tokens: 54_000,
+            output_tokens: 1_000,
+            reasoning_tokens: 0,
+            total_latency_ms: 900,
+            subagent: {
+              requests: 1,
+              input_tokens: 50_000,
+              cached_tokens: 27_000,
+              output_tokens: 500,
+              reasoning_tokens: 0,
+            },
+          },
+        ],
+      },
+    };
+    const mixedHost = env.document.createElement("div");
+    mixedHost.append(
+      buildMonitorView(makeState({ snapshot: mixedSnap })) as unknown as FakeElement,
+    );
+    const mixedCard = mixedHost.querySelectorAll(".card")[1];
+    assert.ok(mixedCard.querySelector(".bk-legend"));
+    const mixedBars = mixedCard.querySelectorAll(".bk-bar");
+    assert.equal(mixedBars.length, 2);
+
+    // Priced mixed row (100% of priced session cost): main + gap + sub summing to 100%
+    const mainSeg0 = mixedBars[0].querySelector(".bk-bar-fill");
+    const gapSeg0 = mixedBars[0].querySelector(".bk-bar-gap");
+    const subMixSeg0 = mixedBars[0].querySelector(".bk-bar-sub");
+    assert.ok(mainSeg0 && gapSeg0 && subMixSeg0);
+    const sumPct0 =
+      Number.parseFloat(mainSeg0.style.width) + Number.parseFloat(subMixSeg0.style.width);
+    assert.ok(Math.abs(sumPct0 - 100) <= 0.2, `expected mixed priced bar ~100%, got ${sumPct0}`);
+    assert.ok(mainSeg0.title.includes("Main:"));
+    assert.ok(mainSeg0.title.includes("18 calls"));
+    assert.ok(subMixSeg0.title.includes("Sub-agents:"));
+    assert.ok(subMixSeg0.title.includes("50 calls"));
+
+    const mixedMetas = mixedCard.querySelectorAll(".bk-meta").map((m) => m.textContent);
+    assert.ok(mixedMetas[0].startsWith("68 calls (18 main \u00b7 50 sub-agents) \u00b7 "));
+    assert.ok(mixedMetas[1].startsWith("2 calls (1 main \u00b7 1 sub-agent) \u00b7 "));
+
+    // Unpriced-only mixed session splits by token share (50% / 50% of 100%)
+    const unpricedMixedSnap: SettingsSnapshot = {
+      ...base,
+      stats: {
+        ...base.stats!,
+        usage: {
+          requests: 2,
+          prompt_tokens: 100_000,
+          cached_tokens: 54_000,
+          output_tokens: 1_000,
+          reasoning_tokens: 0,
+          cache_hit_ratio: 0.54,
+        },
+        by_model: [mixedSnap.stats!.by_model[1]],
+      },
+    };
+    const unpricedHost = env.document.createElement("div");
+    unpricedHost.append(
+      buildMonitorView(makeState({ snapshot: unpricedMixedSnap })) as unknown as FakeElement,
+    );
+    const unpricedBar = unpricedHost.querySelectorAll(".card")[1].querySelector(".bk-bar")!;
+    const uMain = unpricedBar.querySelector(".bk-bar-fill");
+    const uGap = unpricedBar.querySelector(".bk-bar-gap");
+    const uSub = unpricedBar.querySelector(".bk-bar-sub");
+    assert.ok(uMain && uGap && uSub);
+    assert.equal(uMain.style.width, "50.0%");
+    assert.equal(uSub.style.width, "50.0%");
+    assert.ok(uMain.title.includes("tokens (1 call)"));
+    assert.ok(uSub.title.includes("tokens (1 call)"));
+
+    // computeMonitorSignature changes when subagent field changes
+    const noSubRow = { ...mixedSnap.stats!.by_model[0], subagent: null };
+    const sigWithSub = computeMonitorSignature(makeState({ snapshot: mixedSnap }));
+    const sigWithoutSub = computeMonitorSignature(
+      makeState({
+        snapshot: {
+          ...mixedSnap,
+          stats: { ...mixedSnap.stats!, by_model: [noSubRow, mixedSnap.stats!.by_model[1]] },
+        },
+      }),
+    );
+    assert.notEqual(sigWithSub, sigWithoutSub);
+  });
 });
 
 describe("buildUsageView filters, states & breakdowns", () => {

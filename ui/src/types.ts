@@ -87,6 +87,14 @@ export interface RecentCallSnapshot {
   cache_break: boolean;
 }
 
+export interface SubagentModelStats {
+  requests: number;
+  input_tokens: number;
+  cached_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+}
+
 export interface ModelSessionStats {
   provider: string;
   source: string;
@@ -98,6 +106,7 @@ export interface ModelSessionStats {
   output_tokens: number;
   reasoning_tokens: number;
   total_latency_ms: number;
+  subagent?: SubagentModelStats | null;
 }
 
 export interface StatsSnapshot {
@@ -701,6 +710,33 @@ function parseRecentCalls(raw: unknown): RecentCallSnapshot[] {
   return calls;
 }
 
+function parseSubagentModelStats(raw: unknown): SubagentModelStats | null {
+  if (!isRecord(raw)) return null;
+  const requests = asNumber(raw.requests);
+  const inputTokens = asNumber(raw.input_tokens);
+  const cachedTokens = asNumber(raw.cached_tokens);
+  const outputTokens = asNumber(raw.output_tokens);
+  const reasoningTokens = asNumber(raw.reasoning_tokens) ?? 0;
+
+  if (
+    requests === null ||
+    requests <= 0 ||
+    inputTokens === null ||
+    cachedTokens === null ||
+    outputTokens === null
+  ) {
+    return null;
+  }
+
+  return {
+    requests,
+    input_tokens: Math.max(0, inputTokens),
+    cached_tokens: Math.max(0, cachedTokens),
+    output_tokens: Math.max(0, outputTokens),
+    reasoning_tokens: Math.max(0, reasoningTokens),
+  };
+}
+
 function parseByModel(raw: unknown): ModelSessionStats[] {
   if (!Array.isArray(raw)) return [];
   const rows: ModelSessionStats[] = [];
@@ -738,6 +774,7 @@ function parseByModel(raw: unknown): ModelSessionStats[] {
       output_tokens: outputTokens,
       reasoning_tokens: reasoningTokens,
       total_latency_ms: totalLatencyMs,
+      subagent: parseSubagentModelStats(item.subagent),
     });
   }
   return rows;
