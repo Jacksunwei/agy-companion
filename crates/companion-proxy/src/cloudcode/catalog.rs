@@ -347,20 +347,17 @@ fn build_injected_variant_details(
             DEFAULT_GEMINI_CONTEXT_WINDOW
         }
     };
-    let max_output_tokens = match details_map
+    // AI Studio `:streamGenerateContent` supports 65,536 output tokens per streaming
+    // request; cap higher upstream long-decode values (e.g., 262,144) so Antigravity
+    // does not reserve unused output headroom and shrink the compaction window.
+    let max_output_tokens = details_map
         .get("maxOutputTokens")
         .and_then(Value::as_u64)
         .filter(|&v| v > 0)
-    {
-        Some(v) => v,
-        None => {
-            details_map.insert(
-                "maxOutputTokens".to_string(),
-                json!(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS),
-            );
-            DEFAULT_GEMINI_MAX_OUTPUT_TOKENS
-        }
-    };
+        .map_or(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS, |v| {
+            v.min(DEFAULT_GEMINI_MAX_OUTPUT_TOKENS)
+        });
+    details_map.insert("maxOutputTokens".to_string(), json!(max_output_tokens));
     if !details_map.contains_key("supportedMimeTypes") {
         details_map.insert(
             "supportedMimeTypes".to_string(),
