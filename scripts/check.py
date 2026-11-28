@@ -605,12 +605,54 @@ class CheckRunner:
         if cur_parsed <= base_parsed:
             if cur_parsed == base_parsed and self._is_github_meta_only_change(git, base_ref):
                 return None
+            if self._is_valid_dev_track_retarget(git, base_parsed, cur_parsed):
+                return None
             return (
                 f"PR version bump required: workspace version {current_ver} is not greater than "
                 f"{base_ref} ({base_ver}); run 'python3 -B scripts/bump_version.py' to bump the dev "
                 "version (or '--release' for a release-prep PR)"
             )
         return None
+
+    def _is_valid_dev_track_retarget(
+        self,
+        git: str,
+        base_parsed: versioning.ParsedVersion,
+        cur_parsed: versioning.ParsedVersion,
+    ) -> bool:
+        """Allow retargeting an unpublished -dev.N track to a different X.Y.Z
+        dev track strictly newer than the latest published vX.Y.Z git tag,
+        while preserving or incrementing the dev counter (dev.N or dev.(N+1)).
+        """
+        if not (base_parsed.is_dev and cur_parsed.is_dev):
+            return False
+        assert base_parsed.dev is not None and cur_parsed.dev is not None
+        if cur_parsed.dev not in (base_parsed.dev, base_parsed.dev + 1):
+            return False
+        if (cur_parsed.major, cur_parsed.minor, cur_parsed.patch) == (
+            base_parsed.major,
+            base_parsed.minor,
+            base_parsed.patch,
+        ):
+            return False
+
+        tags_proc = self.run_capture([git, "tag", "-l", "v*"])
+        if tags_proc.returncode != 0:
+            return False
+        latest_release: versioning.ParsedVersion | None = None
+        for raw_tag in tags_proc.stdout.splitlines():
+            tag = raw_tag.strip()
+            if not tag.startswith("v"):
+                continue
+            try:
+                parsed = versioning.parse_version(tag[1:])
+            except ValueError:
+                continue
+            if parsed.is_final and (latest_release is None or parsed > latest_release):
+                latest_release = parsed
+        if latest_release is not None and cur_parsed <= latest_release:
+            return False
+        return True
 
     def _is_github_meta_only_change(self, git: str, base_ref: str) -> bool:
         """Return True iff every changed/untracked path relative to base_ref is under .github/."""
