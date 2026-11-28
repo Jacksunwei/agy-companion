@@ -296,7 +296,7 @@ class TestCujCodex(E2ETestCase):
         codex_placeholders = {v.get("model") for v in codex_entries.values()}
         self.assertIn("MODEL_PLACEHOLDER_M351", codex_placeholders)
         for entry in codex_entries.values():
-            self.assertIs(entry.get("supportsThoughtCirculation"), False)
+            self.assertIs(entry.get("supportsThoughtCirculation"), True)
 
         # 5. Streaming Gemini -> Codex Responses SSE translation + per-session stats + SQLite usage.
         conv_id = "conv-codex-e2e-42"
