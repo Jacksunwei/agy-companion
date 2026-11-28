@@ -8,8 +8,15 @@ use companion_providers::LoopbackProxyClient;
 use tempfile::TempDir;
 
 use super::bundle::{
-    EMBEDDED_PLUGIN_FILES, PLUGIN_DIR_NAME, STABLE_BIN_NAME, is_companion_plugin_dir,
-    select_fresh_install_port, swap_plugin_dir_two_step, write_staged_plugin_dir,
+    EMBEDDED_PLUGIN_FILES, PLUGIN_DIR_NAME, STABLE_BIN_NAME, files_have_identical_bytes,
+    is_companion_plugin_dir, select_fresh_install_port, swap_plugin_dir_two_step,
+    write_staged_plugin_dir,
+};
+#[cfg(unix)]
+use super::proxy::verify_same_version_replacement_owner;
+use super::proxy::{
+    InstallProxyContext, ProxyReplaceReason, classify_proxy_replacement,
+    ensure_installed_proxy_running,
 };
 #[cfg(unix)]
 use super::safety::inspect_non_symlink_rel_chain;
@@ -951,4 +958,323 @@ fn dir_safety_helpers_reject_symlinks_non_dirs_and_match_normalized_usage_dir_an
                 .contains("refusing to traverse symlinked/non-directory sidecar data directory")
         );
     }
+}
+
+#[test]
+fn files_have_identical_bytes_distinguishes_matching_differing_missing_symlink_and_fifo() {
+    let tmp = TempDir::new().expect("tempdir");
+    let file_a = tmp.path().join("bin_a");
+    let file_b = tmp.path().join("bin_b");
+    let file_c = tmp.path().join("bin_c");
+    let missing = tmp.path().join("missing");
+
+    // Multi-chunk (> 64 KiB) identical content
+    let mut payload = vec![0x5Au8; 160 * 1024];
+    payload[0] = 0x01;
+    payload[160 * 1024 - 1] = 0xFE;
+    fs::write(&file_a, &payload).expect("write a");
+    fs::write(&file_b, &payload).expect("write b");
+    assert!(files_have_identical_bytes(&file_a, &file_b));
+    assert!(files_have_identical_bytes(&file_a, &file_a));
+
+    // Same length, last byte differs (forces reading final chunk)
+    let mut modified = payload.clone();
+    modified[160 * 1024 - 1] = 0xFF;
+    fs::write(&file_c, &modified).expect("write c");
+    assert!(!files_have_identical_bytes(&file_a, &file_c));
+
+    // Different length
+    fs::write(&file_c, b"short").expect("write short");
+    assert!(!files_have_identical_bytes(&file_a, &file_c));
+
+    // Missing file
+    assert!(!files_have_identical_bytes(&file_a, &missing));
+    assert!(!files_have_identical_bytes(&missing, &file_a));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        // Symlinked destination pointing directly to `file_a` must return false (never followed).
+        let link_to_a = tmp.path().join("link_to_a");
+        symlink(&file_a, &link_to_a).expect("symlink to a");
+        assert!(!files_have_identical_bytes(&file_a, &link_to_a));
+
+        // Named pipe (FIFO) at either operand must return false immediately without blocking.
+        let fifo_path = tmp.path().join("bin_fifo");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo_path)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        assert!(!files_have_identical_bytes(&file_a, &fifo_path));
+        assert!(!files_have_identical_bytes(&fifo_path, &file_a));
+    }
+}
+
+#[test]
+fn classify_proxy_replacement_and_owner_verification_cover_same_version_paths() {
+    let tmp = TempDir::new().expect("tempdir");
+    let stable_bin = tmp.path().join("stable_bin");
+    let other_bin = tmp.path().join("other_bin");
+    fs::write(&stable_bin, b"bin").expect("write stable_bin");
+    fs::write(&other_bin, b"other").expect("write other_bin");
+
+    let pid_path = tmp.path().join(PROXY_PID_FILENAME);
+    let pid_candidates = vec![pid_path.clone()];
+    let port = 45_123;
+
+    // 1. Version mismatch always triggers replacement.
+    assert_eq!(
+        classify_proxy_replacement("0.1.0", "0.1.1", false, &stable_bin, port, &pid_candidates),
+        Some(ProxyReplaceReason::VersionMismatch)
+    );
+
+    // 2. Binary bytes changed triggers replacement at same version.
+    assert_eq!(
+        classify_proxy_replacement("0.1.1", "0.1.1", true, &stable_bin, port, &pid_candidates),
+        Some(ProxyReplaceReason::BinaryUpdated)
+    );
+
+    // 3. No proxy.pid at same version without binary_changed -> keep running.
+    assert_eq!(
+        classify_proxy_replacement("0.1.1", "0.1.1", false, &stable_bin, port, &pid_candidates),
+        None
+    );
+
+    let write_pid_json = |info: &ProxyPidInfo| {
+        fs::write(&pid_path, serde_json::to_vec(info).expect("serialize pid"))
+            .expect("write pid file");
+    };
+
+    // 4. Matching binary_path + fresh started_at_ms -> keep running.
+    let fresh_pid = ProxyPidInfo {
+        pid: std::process::id(),
+        port,
+        version: "0.1.1".to_string(),
+        started_at_ms: u64::MAX,
+        binary_path: stable_bin.display().to_string(),
+    };
+    write_pid_json(&fresh_pid);
+    assert_eq!(
+        classify_proxy_replacement("0.1.1", "0.1.1", false, &stable_bin, port, &pid_candidates),
+        None
+    );
+
+    // 5. Legacy/relocated binary_path in proxy.pid triggers replacement.
+    let relocated_pid = ProxyPidInfo {
+        binary_path: other_bin.display().to_string(),
+        ..fresh_pid.clone()
+    };
+    write_pid_json(&relocated_pid);
+    assert_eq!(
+        classify_proxy_replacement("0.1.1", "0.1.1", false, &stable_bin, port, &pid_candidates),
+        Some(ProxyReplaceReason::BinaryPathChanged)
+    );
+
+    // 6. Proxy started strictly before stable_bin mtime triggers replacement (e.g. after --no-start-proxy).
+    let older_pid = ProxyPidInfo {
+        started_at_ms: 1,
+        ..fresh_pid.clone()
+    };
+    write_pid_json(&older_pid);
+    assert_eq!(
+        classify_proxy_replacement("0.1.1", "0.1.1", false, &stable_bin, port, &pid_candidates),
+        Some(ProxyReplaceReason::BinaryNewerThanProxy)
+    );
+
+    // 7. Missing/zero started_at_ms (legacy PID format) does NOT falsely trigger mtime restart.
+    let zero_ts_pid = ProxyPidInfo {
+        started_at_ms: 0,
+        ..fresh_pid
+    };
+    write_pid_json(&zero_ts_pid);
+    assert_eq!(
+        classify_proxy_replacement("0.1.1", "0.1.1", false, &stable_bin, port, &pid_candidates),
+        None
+    );
+
+    // 8. Same-version replacement owner verification rejects port-hijacking PID or exited child.
+    #[cfg(unix)]
+    {
+        use std::process::{Child, Command};
+
+        struct KillOnDrop(Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut child = KillOnDrop(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let child_pid = child.0.id();
+
+        let hijacked = ProxyPidInfo {
+            pid: child_pid.saturating_add(1),
+            port,
+            version: "0.1.1".to_string(),
+            started_at_ms: u64::MAX,
+            binary_path: stable_bin.display().to_string(),
+        };
+        write_pid_json(&hijacked);
+        assert!(
+            !verify_same_version_replacement_owner(&mut child.0, &pid_path, port),
+            "different PID in proxy.pid must fail ownership check"
+        );
+
+        let owned = ProxyPidInfo {
+            pid: child_pid,
+            ..hijacked
+        };
+        write_pid_json(&owned);
+        assert!(
+            verify_same_version_replacement_owner(&mut child.0, &pid_path, port),
+            "live child matching proxy.pid must pass ownership check"
+        );
+
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+        assert!(
+            !verify_same_version_replacement_owner(&mut child.0, &pid_path, port),
+            "exited child must fail ownership check"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_installed_proxy_running_skips_up_to_date_and_warns_accurately_on_same_version_restart()
+ {
+    use axum::Router;
+    use axum::routing::get;
+    use companion_proxy::HealthResponse;
+
+    let version = env!("CARGO_PKG_VERSION");
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind mock health server");
+    let port = listener.local_addr().expect("local addr").port();
+    let app = Router::new().route(
+        "/health",
+        get(move || async move { axum::Json(HealthResponse::ok(version).with_role("bootstrap")) }),
+    );
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::task::yield_now().await;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let stable_bin = tmp.path().join(STABLE_BIN_NAME);
+    let legacy_bin = tmp.path().join("legacy_bin");
+    let cfg_path = tmp.path().join("config.json");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).expect("mkdir data");
+    fs::write(&stable_bin, b"bin").expect("write stable_bin");
+    fs::write(&legacy_bin, b"legacy").expect("write legacy_bin");
+    let pid_path = data_dir.join(PROXY_PID_FILENAME);
+
+    let probe = LoopbackProxyClient::new(
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("probe client");
+
+    let write_pid_json = |info: &ProxyPidInfo| {
+        fs::write(&pid_path, serde_json::to_vec(info).expect("serialize pid"))
+            .expect("write pid file");
+    };
+
+    // (a) Up-to-date binary_path + fresh started_at_ms -> skips restart cleanly.
+    write_pid_json(&ProxyPidInfo {
+        pid: u32::MAX,
+        port,
+        version: version.to_string(),
+        started_at_ms: u64::MAX,
+        binary_path: stable_bin.display().to_string(),
+    });
+    let mut warnings = Vec::new();
+    let outcome = ensure_installed_proxy_running(
+        &InstallProxyContext {
+            probe: &probe,
+            stable_bin: &stable_bin,
+            config_path: &cfg_path,
+            data_dir: &data_dir,
+            runtime_data_dir: &data_dir,
+            listen_port: port,
+            version,
+            binary_changed: false,
+        },
+        &mut warnings,
+    )
+    .await
+    .expect("ensure running up-to-date");
+    assert!(!outcome.started && !outcome.replaced);
+    assert_eq!(outcome.version.as_deref(), Some(version));
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+    // (b) binary_changed == true with unverified PID -> enters stop path and emits accurate same-version warning.
+    let mut warnings_updated = Vec::new();
+    let outcome_updated = ensure_installed_proxy_running(
+        &InstallProxyContext {
+            probe: &probe,
+            stable_bin: &stable_bin,
+            config_path: &cfg_path,
+            data_dir: &data_dir,
+            runtime_data_dir: &data_dir,
+            listen_port: port,
+            version,
+            binary_changed: true,
+        },
+        &mut warnings_updated,
+    )
+    .await
+    .expect("ensure running updated");
+    assert!(!outcome_updated.started && !outcome_updated.replaced);
+    assert!(
+        warnings_updated
+            .iter()
+            .any(|w| w.contains("updated binary at version") && !w.contains("has version")),
+        "expected accurate updated-binary warning, got {warnings_updated:?}"
+    );
+
+    // (c) Relocated binary_path in proxy.pid (binary_changed == false) -> enters stop path with relocated warning.
+    write_pid_json(&ProxyPidInfo {
+        pid: u32::MAX,
+        port,
+        version: version.to_string(),
+        started_at_ms: u64::MAX,
+        binary_path: legacy_bin.display().to_string(),
+    });
+    let mut warnings_relocated = Vec::new();
+    let _ = ensure_installed_proxy_running(
+        &InstallProxyContext {
+            probe: &probe,
+            stable_bin: &stable_bin,
+            config_path: &cfg_path,
+            data_dir: &data_dir,
+            runtime_data_dir: &data_dir,
+            listen_port: port,
+            version,
+            binary_changed: false,
+        },
+        &mut warnings_relocated,
+    )
+    .await
+    .expect("ensure running relocated");
+    assert!(
+        warnings_relocated
+            .iter()
+            .any(|w| w.contains("relocated binary path at version") && !w.contains("has version")),
+        "expected accurate relocated-binary warning, got {warnings_relocated:?}"
+    );
+
+    server.abort();
 }

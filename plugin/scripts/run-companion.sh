@@ -574,6 +574,12 @@ resolve_xdg_cache_bin_dir() {
 resolve_cache_bin_dir() {
   local cache_root=""
   if [[ -n "${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-}" ]]; then
+    case "/${ANTIGRAVITY_EXECUTABLE_DATA_DIR}/" in
+      */../*)
+        log_err "ANTIGRAVITY_EXECUTABLE_DATA_DIR must not contain '..' traversal: ${ANTIGRAVITY_EXECUTABLE_DATA_DIR}"
+        return 1
+        ;;
+    esac
     cache_root="${ANTIGRAVITY_EXECUTABLE_DATA_DIR%/}"
     case "${cache_root}" in
       -*) cache_root="./${cache_root}" ;;
@@ -674,12 +680,13 @@ main() {
     exec_clean "${release_bin}" ${1+"$@"}
   fi
 
-  # Step 3: Version-matched cached binary (checked BEFORE unversioned $PATH).
+  # Step 3: Version-matched installed/cached binary (checked BEFORE unversioned $PATH).
+  # Prefer the explicit XDG install dir over ANTIGRAVITY_EXECUTABLE_DATA_DIR auto-download cache
+  # when both match plugin.json version; keep cache_bin_dir as the Step 5 download target.
   local cache_bin_dir cache_bin
   cache_bin_dir="$(resolve_cache_bin_dir)" || exit 1
   cache_bin="${cache_bin_dir}/${BINARY_NAME}"
 
-  try_exec_cached_bin "${cache_bin_dir}" "${plugin_dir}" "${script_path}" ${1+"$@"} || true
   if [[ -n "${ANTIGRAVITY_EXECUTABLE_DATA_DIR:-}" ]]; then
     local xdg_bin_dir=""
     xdg_bin_dir="$(resolve_xdg_cache_bin_dir 2>/dev/null || true)"
@@ -687,6 +694,7 @@ main() {
       try_exec_cached_bin "${xdg_bin_dir}" "${plugin_dir}" "${script_path}" ${1+"$@"} || true
     fi
   fi
+  try_exec_cached_bin "${cache_bin_dir}" "${plugin_dir}" "${script_path}" ${1+"$@"} || true
 
   # Step 4: Installed binary on $PATH (with self-exec guard).
   local path_bin=""

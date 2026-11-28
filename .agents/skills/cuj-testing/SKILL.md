@@ -1,6 +1,6 @@
 ---
 name: cuj-testing
-description: Design, write, review, refactor, or prune automated tests in agy-companion using the CUJ-first Testing Trophy and Single-Owner layer rules. Use whenever adding tests for a new feature or bug fix (Rust crates, Sidecar API endpoints, proxy routes, CLI, UI state/protocol, or Python E2E), refactoring tests, reviewing test quality/coverage in a PR, fixing flaky tests, or auditing test bloat/duplication — even if the user just asks to "add tests" or "verify this change". Do NOT use for local plugin linking, AGY_COMPANION_UI_HTML live reload, sidecar log debugging, or manual live agy CLI runs (use local-dev instead).
+description: Design, write, review, refactor, or prune automated tests in agy-companion using the CUJ-first Testing Trophy and Single-Owner layer rules. Use whenever adding tests for a new feature or bug fix (Rust crates, Sidecar API endpoints, proxy routes, CLI, UI state/protocol, or Python E2E), refactoring tests, reviewing test quality/coverage in a PR, fixing flaky tests, or auditing test bloat/duplication — even if the user just asks to "add tests" or "verify this change". Do NOT use for local plugin deploys, AGY_COMPANION_UI_HTML live reload, sidecar log debugging, or manual live agy CLI runs (use local-dev instead).
 ---
 
 # CUJ-First Testing & Anti-Slop Skill (`agy-companion`)

@@ -7,6 +7,8 @@ use companion_core::AuthStore;
 use serde_json::Value;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use crate::common::{DetachedPidFileGuard, loopback_http_client, run_with_captured_files};
 use crate::common::{config_with_port, free_loopback_port, isolated_cli_command};
 
 #[cfg(unix)]
@@ -782,5 +784,158 @@ fn install_persists_launcher_auto_start_and_uninstall_purge_removes_integration_
     assert!(
         !xdg_data.join("agy-companion").exists(),
         "empty data_dir must be removed cleanly after integration.lock is purged"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_same_version_replaces_proxy_on_binary_change_or_relocated_pid_and_keeps_up_to_date()
+ {
+    use std::os::unix::fs::MetadataExt;
+
+    use companion_cli::daemon::{PROXY_PID_FILENAME, ProxyPidInfo, read_proxy_pid};
+
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_config = temp.path().join("xdg_config");
+    let xdg_data = temp.path().join("xdg_data");
+    let plugins_dir = temp.path().join("plugins");
+    let capture_dir = temp.path().join("capture");
+    fs::create_dir_all(&home).expect("mkdir home");
+    fs::create_dir_all(&plugins_dir).expect("mkdir plugins");
+    fs::create_dir_all(&capture_dir).expect("mkdir capture");
+
+    let port = free_loopback_port();
+    let cfg_path = xdg_config.join("agy-companion").join("config.json");
+    let mut cfg = config_with_port(port);
+    let data_dir = xdg_data.join("agy-companion");
+    cfg.usage_dir = Some(data_dir.join("usage"));
+    cfg.save_secure(&cfg_path).expect("save config");
+
+    let pid_path = data_dir.join(PROXY_PID_FILENAME);
+    let _pid_guard = DetachedPidFileGuard::new(pid_path.clone());
+    let stable_bin = data_dir.join("bin").join("agy-companion");
+
+    let run_install = |label: &str, extra_args: &[&str]| -> Value {
+        let mut cmd = isolated_cli_command(&home);
+        cmd.env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_DATA_HOME", &xdg_data)
+            .env("ZDOTDIR", &home)
+            .args([
+                "install",
+                "--config",
+                cfg_path.to_str().expect("utf8 cfg"),
+                "--plugins-dir",
+                plugins_dir.to_str().expect("utf8 plugins"),
+                "--no-launcher-hook",
+                "--json",
+            ])
+            .args(extra_args);
+        let out = run_with_captured_files(&mut cmd, &capture_dir, label).expect("run install");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label} failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("parse install json")
+    };
+
+    // 1. Fresh install starts the background proxy daemon from stable_bin.
+    let rep1 = run_install("install_fresh", &[]);
+    assert_eq!(rep1["ok"], true);
+    assert_eq!(rep1["proxy_started"], true);
+    assert_eq!(rep1["proxy_replaced"], false);
+    assert_eq!(rep1["listen_port"], port);
+    let pid1 = read_proxy_pid(&pid_path)
+        .expect("read pid1")
+        .expect("pid1 present");
+    assert_eq!(pid1.port, port);
+    let stable_meta_before = fs::metadata(&stable_bin).expect("stable_bin metadata");
+
+    // 2. Identical --no-start-proxy preserves stable_bin (no mtime/inode bump) and a
+    //    subsequent identical install keeps the up-to-date proxy running untouched.
+    let rep_nostart = run_install("install_identical_no_start", &["--no-start-proxy"]);
+    assert_eq!(rep_nostart["ok"], true);
+    assert_eq!(rep_nostart["proxy_started"], false, "rep={rep_nostart}");
+    assert_eq!(rep_nostart["proxy_replaced"], false, "rep={rep_nostart}");
+    let stable_meta_after = fs::metadata(&stable_bin).expect("stable_bin metadata after");
+    assert_eq!(
+        stable_meta_after.ino(),
+        stable_meta_before.ino(),
+        "identical --no-start-proxy must not rewrite stable_bin"
+    );
+    assert_eq!(
+        stable_meta_after.modified().ok(),
+        stable_meta_before.modified().ok(),
+        "identical --no-start-proxy must preserve stable_bin mtime"
+    );
+
+    let rep2 = run_install("install_identical", &[]);
+    assert_eq!(rep2["ok"], true);
+    assert_eq!(rep2["proxy_started"], false, "rep2={rep2}");
+    assert_eq!(rep2["proxy_replaced"], false, "rep2={rep2}");
+    let pid2 = read_proxy_pid(&pid_path)
+        .expect("read pid2")
+        .expect("pid2 present");
+    assert_eq!(
+        pid2.pid, pid1.pid,
+        "identical re-install must not restart up-to-date proxy"
+    );
+
+    // 3. Atomically mutating stable_bin bytes on disk triggers same-version proxy replacement.
+    let mutated_tmp = data_dir.join("bin").join(".agy-companion.mutated");
+    fs::write(&mutated_tmp, b"mutated-stale-binary-bytes").expect("write mutated tmp");
+    fs::rename(&mutated_tmp, &stable_bin).expect("atomic mutate stable_bin");
+    let rep3 = run_install("install_bytes_changed", &[]);
+    assert_eq!(rep3["ok"], true);
+    assert_eq!(rep3["proxy_started"], true, "rep3={rep3}");
+    assert_eq!(rep3["proxy_replaced"], true, "rep3={rep3}");
+    let pid3 = read_proxy_pid(&pid_path)
+        .expect("read pid3")
+        .expect("pid3 present");
+    assert_ne!(
+        pid3.pid, pid1.pid,
+        "changed binary bytes must replace running same-version proxy"
+    );
+    assert_eq!(pid3.port, port);
+
+    let health_resp = loopback_http_client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .expect("probe replaced proxy health");
+    assert!(health_resp.status().is_success());
+    let health_json: Value = health_resp.json().await.expect("parse health json");
+    assert_eq!(health_json["version"], env!("CARGO_PKG_VERSION"));
+
+    // 4. Unchanged stable_bin bytes + relocated proxy.pid.binary_path triggers replacement.
+    let legacy_bin = temp.path().join("legacy_target_bin");
+    fs::write(&legacy_bin, b"legacy").expect("write legacy bin");
+    let relocated_pid = ProxyPidInfo {
+        binary_path: legacy_bin.display().to_string(),
+        started_at_ms: u64::MAX,
+        ..pid3.clone()
+    };
+    companion_core::write_atomic_secure(
+        &pid_path,
+        &serde_json::to_vec(&relocated_pid).expect("serialize relocated pid"),
+    )
+    .expect("rewrite relocated proxy.pid");
+    let rep4 = run_install("install_relocated_pid", &[]);
+    assert_eq!(rep4["ok"], true);
+    assert_eq!(rep4["proxy_started"], true, "rep4={rep4}");
+    assert_eq!(rep4["proxy_replaced"], true, "rep4={rep4}");
+    let pid4 = read_proxy_pid(&pid_path)
+        .expect("read pid4")
+        .expect("pid4 present");
+    assert_ne!(
+        pid4.pid, pid3.pid,
+        "relocated proxy.pid.binary_path must replace running same-version proxy"
+    );
+    assert_eq!(
+        fs::canonicalize(&pid4.binary_path).expect("canon pid4"),
+        fs::canonicalize(&stable_bin).expect("canon stable_bin")
     );
 }

@@ -24,7 +24,7 @@ Unified `agy-companion` binary wiring together the loopback proxy, Sidecar Web U
 | `src/install/uninstall.rs` | `run_uninstall` lifecycle (RC stripping, `env.sh`, plugin-before-proxy removal, `--dry-run`, `--purge`) |
 | `src/install/bundle.rs` | `EMBEDDED_PLUGIN_FILES` (`include_str!` byte-for-byte `plugin/` bundle), staging, `~/.local/bin` symlink management, fresh-install port fallback, and two-step atomic swaps with `companion-core::fs_safe` Windows rename retry |
 | `src/install/safety.rs` | Directory-chain symlink checks (delegating to `companion-core::fs_safe`), safe removal guards, and path normalization helpers |
-| `src/install/proxy.rs` | Install-time proxy startup and version-skew replacement via `daemon::wait_for_daemon_healthy` |
+| `src/install/proxy.rs` | Install-time proxy startup, same-version binary-change/path/mtime replacement with child-PID verification, and version-skew replacement via `daemon::wait_for_daemon_healthy` |
 | `src/install/windows.rs` | Windows manifest derivation (parsing & patching embedded `plugin/sidecars/proxy/sidecar.json` without drift) and Start Menu `.lnk` shortcut management |
 | `src/install/format.rs` | Human-readable and JSON formatting for install/uninstall reports |
 | `src/install/tests.rs` | Unit tests for embedded bundle parity, Windows manifest derivation, PID safety, two-step swap rollback, and directory-chain guards |

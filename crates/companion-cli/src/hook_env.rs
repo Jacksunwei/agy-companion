@@ -59,7 +59,7 @@ async fn try_hook_env(opts: &HookEnvOptions) -> Result<Option<u16>, String> {
     };
 
     let plugin_json = plugins_dir.join("agy-companion").join("plugin.json");
-    // Use fs::metadata so dev-install directory symlinks (`~/.gemini/config/plugins/agy-companion -> ./plugin`)
+    // Use fs::metadata so legacy/manual plugin directory symlinks (`~/.gemini/config/plugins/agy-companion -> ./plugin`)
     // work transparently while missing/dangling symlinks, dirs, and FIFOs return false without blocking.
     if !fs::metadata(&plugin_json).is_ok_and(|meta| meta.is_file()) {
         return Err(format!(

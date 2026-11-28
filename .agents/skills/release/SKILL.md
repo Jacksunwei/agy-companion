@@ -1,6 +1,6 @@
 ---
 name: release
-description: Manage agy-companion SemVer dev/release versioning (X.Y.Z-dev.N vs final X.Y.Z), cut and tag public releases across GitHub Releases, PyPI, and npm, verify OIDC Trusted Publishing and GitHub Environments, monitor release.yml runs, and run post-release live verification. Use when preparing a release PR, curating CHANGELOG.md, promoting -dev.N to X.Y.Z, running dry-run release builds, tagging vX.Y.Z, troubleshooting release.yml failures, or verifying published artifacts. Do NOT use for local plugin linking or Sidecar UI dev (use local-dev) or writing automated tests (use cuj-testing).
+description: Manage agy-companion SemVer dev/release versioning (X.Y.Z-dev.N vs final X.Y.Z), cut and tag public releases across GitHub Releases, PyPI, and npm, verify OIDC Trusted Publishing and GitHub Environments, monitor release.yml runs, and run post-release live verification. Use when preparing a release PR, curating CHANGELOG.md, promoting -dev.N to X.Y.Z, running dry-run release builds, tagging vX.Y.Z, troubleshooting release.yml failures, or verifying published artifacts. Do NOT use for local dev deploys or Sidecar UI dev (use local-dev) or writing automated tests (use cuj-testing).
 ---
 
 # Release Lifecycle & Publishing Runbook

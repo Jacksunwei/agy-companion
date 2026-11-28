@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use companion_core::fs_safe::{DirChainStatus, ensure_dir_no_symlink, inspect_dir_chain};
 use companion_core::fs_safe::{
     FsError, PathLeafKind, SymlinkPolicy, TempPathGuard, inspect_leaf_kind,
-    read_regular_file_bounded, rename_with_retry, unique_temp_suffix, unlink_symlink,
+    inspect_regular_file_if_exists, read_regular_file_bounded, rename_with_retry,
+    unique_temp_suffix, unlink_symlink,
 };
 use companion_providers::LoopbackProxyClient;
 
@@ -123,6 +124,96 @@ pub(crate) async fn select_fresh_install_port(
     Err(CliError::Install(format!(
         "no free loopback port available in {start_port}..={end_port}; free a port or preconfigure listen_port in config.json"
     )))
+}
+
+/// Returns `true` when `b` exists as a regular non-symlink file whose contents are
+/// byte-for-byte identical to regular file `a`.
+///
+/// Pre-validates `b` via `inspect_regular_file_if_exists` before opening so a FIFO never
+/// blocks and a symlinked `b` always returns `false`.
+pub(crate) fn files_have_identical_bytes(a: &Path, b: &Path) -> bool {
+    fn read_full_chunk(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut total = 0;
+        while total < buf.len() {
+            match std::io::Read::read(file, &mut buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(total)
+    }
+
+    let Ok(Some(pre_meta_b)) = inspect_regular_file_if_exists(b, None) else {
+        return false;
+    };
+    if is_same_file_path(a, b) {
+        return true;
+    }
+
+    let Ok(pre_meta_a) = fs::metadata(a) else {
+        return false;
+    };
+    if !pre_meta_a.is_file() || pre_meta_a.len() != pre_meta_b.len() {
+        return false;
+    }
+
+    let (Ok(mut file_a), Ok(mut file_b)) = (File::open(a), File::open(b)) else {
+        return false;
+    };
+    let (Ok(meta_a), Ok(meta_b)) = (file_a.metadata(), file_b.metadata()) else {
+        return false;
+    };
+    if !meta_a.is_file()
+        || !meta_b.is_file()
+        || meta_a.len() != meta_b.len()
+        || meta_b.len() != pre_meta_b.len()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta_b.dev() != pre_meta_b.dev() || meta_b.ino() != pre_meta_b.ino() {
+            return false;
+        }
+    }
+
+    let mut buf_a = vec![0u8; 64 * 1024];
+    let mut buf_b = vec![0u8; 64 * 1024];
+    loop {
+        let (Ok(na), Ok(nb)) = (
+            read_full_chunk(&mut file_a, &mut buf_a),
+            read_full_chunk(&mut file_b, &mut buf_b),
+        ) else {
+            return false;
+        };
+        if na != nb || buf_a[..na] != buf_b[..nb] {
+            return false;
+        }
+        if na == 0 {
+            return true;
+        }
+    }
+}
+
+/// Returns `true` when `stable_bin` already exists as a regular non-symlink executable
+/// file with standard `0755` permissions (Unix) so an identical install can preserve its
+/// inode and modification timestamp.
+pub(crate) fn is_stable_bin_ready_exact(stable_bin: &Path) -> bool {
+    let Ok(Some(meta)) = inspect_regular_file_if_exists(stable_bin, None) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o777) == 0o755
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
 }
 
 pub(crate) fn stage_binary_copy(
