@@ -474,6 +474,88 @@ describe("parseSettingsSnapshot defensive invariants", () => {
     assert.equal(parsed.stats.by_model[0].reasoning_tokens, 0);
     assert.equal(parsed.stats.by_model[0].total_latency_ms, 0);
     assert.equal(parsed.stats.by_model[0].model_display_name, null);
+    assert.equal(parsed.stats.by_model[0].subagent, null);
+
+    const withSubagent = cloneJson(activeBase) as { stats: { by_model: unknown[] } };
+    withSubagent.stats.by_model = [
+      {
+        provider: "gemini",
+        source: "proxy",
+        model: "gemini-4-hydrogen",
+        requests: 68,
+        input_tokens: 16_400_000,
+        cached_tokens: 14_596_000,
+        output_tokens: 58_000,
+        reasoning_tokens: 2_000,
+        total_latency_ms: 12_000,
+        subagent: {
+          requests: 50,
+          input_tokens: 11_100_000,
+          cached_tokens: 10_323_000,
+          output_tokens: 40_000,
+          reasoning_tokens: 1_500,
+        },
+      },
+      {
+        provider: "antigravity",
+        source: "builtin",
+        model: "gemini-4-neon",
+        requests: 5,
+        input_tokens: 500_000,
+        cached_tokens: 400_000,
+        output_tokens: 2_000,
+        subagent: {
+          requests: 2,
+          input_tokens: 200_000,
+          cached_tokens: 150_000,
+          output_tokens: 800,
+        },
+      },
+      {
+        provider: "antigravity",
+        source: "builtin",
+        model: "gemini-4-carbon",
+        requests: 3,
+        input_tokens: 100_000,
+        cached_tokens: 50_000,
+        output_tokens: 500,
+        subagent: {
+          requests: 0,
+          input_tokens: 0,
+          cached_tokens: 0,
+          output_tokens: 0,
+        },
+      },
+      {
+        provider: "antigravity",
+        source: "builtin",
+        model: "gemini-3.8-flash",
+        requests: 1,
+        input_tokens: 10_000,
+        cached_tokens: 0,
+        output_tokens: 100,
+        subagent: { requests: "bad", input_tokens: 100 },
+      },
+    ];
+    const parsedSub = parseSettingsSnapshot(withSubagent);
+    assert.ok(parsedSub?.stats);
+    assert.equal(parsedSub.stats.by_model.length, 4);
+    assert.deepEqual(parsedSub.stats.by_model[0].subagent, {
+      requests: 50,
+      input_tokens: 11_100_000,
+      cached_tokens: 10_323_000,
+      output_tokens: 40_000,
+      reasoning_tokens: 1_500,
+    });
+    assert.deepEqual(parsedSub.stats.by_model[1].subagent, {
+      requests: 2,
+      input_tokens: 200_000,
+      cached_tokens: 150_000,
+      output_tokens: 800,
+      reasoning_tokens: 0,
+    });
+    assert.equal(parsedSub.stats.by_model[2].subagent, null);
+    assert.equal(parsedSub.stats.by_model[3].subagent, null);
 
     const withDisplay = cloneJson(activeBase) as { stats: { by_model: unknown[] } };
     withDisplay.stats.by_model = [

@@ -77,6 +77,15 @@ pub struct RecentCallSnapshot {
     pub cache_break: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentModelStats {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSessionStats {
     pub provider: String,
@@ -90,6 +99,8 @@ pub struct ModelSessionStats {
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentModelStats>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -326,6 +337,7 @@ mod tests {
                 output_tokens: 250,
                 reasoning_tokens: 80,
                 total_latency_ms: 2100,
+                subagent: None,
             }],
         };
 
@@ -432,6 +444,13 @@ mod tests {
                     output_tokens: u64::MAX,
                     reasoning_tokens: u64::MAX,
                     total_latency_ms: u64::MAX,
+                    subagent: Some(SubagentModelStats {
+                        requests: u64::MAX,
+                        input_tokens: u64::MAX,
+                        cached_tokens: u64::MAX,
+                        output_tokens: u64::MAX,
+                        reasoning_tokens: u64::MAX,
+                    }),
                 })
                 .collect(),
         };
@@ -602,5 +621,56 @@ mod tests {
             ser_with.get("model_display_name").and_then(|v| v.as_str()),
             Some("Gemini 5 Nova (High)")
         );
+    }
+
+    #[test]
+    fn model_session_stats_subagent_serde_roundtrip_and_omission() {
+        let legacy_json = r#"{
+            "provider": "antigravity",
+            "source": "builtin",
+            "model": "gemini-4-hydrogen",
+            "requests": 10,
+            "input_tokens": 5000,
+            "cached_tokens": 4000,
+            "output_tokens": 300,
+            "reasoning_tokens": 50,
+            "total_latency_ms": 1200
+        }"#;
+        let without_sub: ModelSessionStats =
+            serde_json::from_str(legacy_json).expect("deserialize without subagent");
+        assert_eq!(without_sub.subagent, None);
+        let serialized_none = serde_json::to_value(&without_sub).expect("serialize none");
+        assert!(
+            serialized_none.get("subagent").is_none(),
+            "subagent must be omitted from JSON when None"
+        );
+
+        let sub = SubagentModelStats {
+            requests: 4,
+            input_tokens: 2000,
+            cached_tokens: 1500,
+            output_tokens: 120,
+            reasoning_tokens: 20,
+        };
+        let with_sub = ModelSessionStats {
+            subagent: Some(sub.clone()),
+            ..without_sub
+        };
+        let serialized_some = serde_json::to_value(&with_sub).expect("serialize some");
+        let sub_obj = serialized_some
+            .get("subagent")
+            .and_then(|v| v.as_object())
+            .expect("subagent object present");
+        assert_eq!(sub_obj.len(), 5);
+        assert_eq!(sub_obj["requests"], 4);
+        assert_eq!(sub_obj["input_tokens"], 2000);
+        assert_eq!(sub_obj["cached_tokens"], 1500);
+        assert_eq!(sub_obj["output_tokens"], 120);
+        assert_eq!(sub_obj["reasoning_tokens"], 20);
+
+        let roundtrip: ModelSessionStats =
+            serde_json::from_value(serialized_some).expect("roundtrip with subagent");
+        assert_eq!(roundtrip, with_sub);
+        assert_eq!(roundtrip.subagent, Some(sub));
     }
 }

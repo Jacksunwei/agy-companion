@@ -8,10 +8,11 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use companion_core::fs_safe::{self, OpenRegularMode};
 use companion_core::{
     LsSyncWatermark, MAX_RECENT_CALLS, MAX_SESSION_MODELS, ModelSessionStats, ObservedModel,
-    RecentCallSnapshot, SqliteUsageSink, StaticPlaceholderMapping, StatsSnapshot, TelemetrySource,
-    UpstreamModelCatalog, UsageEvent, UsageStatsSnapshot, lookup_static_placeholder,
-    normalize_placeholder_enum_key, normalize_utc_timestamp, placeholder_numeric_alias,
-    sanitize_conversation_id, sanitize_model_display_name, sanitize_response_id,
+    RecentCallSnapshot, SqliteUsageSink, StaticPlaceholderMapping, StatsSnapshot,
+    SubagentModelStats, TelemetrySource, UpstreamModelCatalog, UsageEvent, UsageStatsSnapshot,
+    lookup_static_placeholder, normalize_placeholder_enum_key, normalize_utc_timestamp,
+    placeholder_numeric_alias, sanitize_conversation_id, sanitize_model_display_name,
+    sanitize_response_id,
 };
 use companion_providers::{
     LsClient, LsError, LsGeneratorMetadata, LsModelConfig, LsModelUsage, LsStepMetadata,
@@ -1233,6 +1234,7 @@ impl CascadeFoldState {
             cache_break,
         });
 
+        let is_subagent = ev.parent_conversation_id.is_some();
         let model_key = (ev.provider.clone(), ev.source.clone(), ev.model.clone());
         if let Some(entry) = self.by_model.get_mut(&model_key) {
             entry.requests = entry.requests.saturating_add(1);
@@ -1244,7 +1246,28 @@ impl CascadeFoldState {
             if entry.model_display_name.is_none() {
                 entry.model_display_name = ev.model_display_name.clone();
             }
+            if is_subagent {
+                let sub = entry
+                    .subagent
+                    .get_or_insert_with(SubagentModelStats::default);
+                sub.requests = sub.requests.saturating_add(1);
+                sub.input_tokens = sub.input_tokens.saturating_add(ev.input_tokens);
+                sub.cached_tokens = sub.cached_tokens.saturating_add(ev.cached_tokens);
+                sub.output_tokens = sub.output_tokens.saturating_add(ev.output_tokens);
+                sub.reasoning_tokens = sub.reasoning_tokens.saturating_add(ev.reasoning_tokens);
+            }
         } else {
+            let subagent = if is_subagent {
+                Some(SubagentModelStats {
+                    requests: 1,
+                    input_tokens: ev.input_tokens,
+                    cached_tokens: ev.cached_tokens,
+                    output_tokens: ev.output_tokens,
+                    reasoning_tokens: ev.reasoning_tokens,
+                })
+            } else {
+                None
+            };
             self.by_model.insert(
                 model_key,
                 ModelSessionStats {
@@ -1258,6 +1281,7 @@ impl CascadeFoldState {
                     output_tokens: ev.output_tokens,
                     reasoning_tokens: ev.reasoning_tokens,
                     total_latency_ms: ev.latency_ms,
+                    subagent,
                 },
             );
         }
@@ -1344,8 +1368,20 @@ pub fn merge_cascade_folds(folds: &[&CascadeFoldState]) -> StatsSnapshot {
                 if acc.model_display_name.is_none() {
                     acc.model_display_name = stats.model_display_name.clone();
                 }
+                if let Some(sub) = stats.subagent.as_ref().filter(|s| s.requests > 0) {
+                    let acc_sub = acc.subagent.get_or_insert_with(SubagentModelStats::default);
+                    acc_sub.requests = acc_sub.requests.saturating_add(sub.requests);
+                    acc_sub.input_tokens = acc_sub.input_tokens.saturating_add(sub.input_tokens);
+                    acc_sub.cached_tokens = acc_sub.cached_tokens.saturating_add(sub.cached_tokens);
+                    acc_sub.output_tokens = acc_sub.output_tokens.saturating_add(sub.output_tokens);
+                    acc_sub.reasoning_tokens = acc_sub
+                        .reasoning_tokens
+                        .saturating_add(sub.reasoning_tokens);
+                }
             } else {
-                by_model_map.insert(key.clone(), stats.clone());
+                let mut cloned = stats.clone();
+                cloned.subagent = cloned.subagent.filter(|s| s.requests > 0);
+                by_model_map.insert(key.clone(), cloned);
             }
         }
 
@@ -3778,6 +3814,251 @@ mod tests {
             .find(|m| m.model == "gemini-4-hydrogen")
             .expect("hydrogen rollup");
         assert_eq!(hydrogen.requests, 5);
+        assert_eq!(
+            hydrogen.subagent,
+            Some(SubagentModelStats {
+                requests: 1,
+                input_tokens: 600,
+                cached_tokens: 0,
+                output_tokens: 70,
+                reasoning_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn merge_cascade_folds_tracks_root_only_subagent_only_and_mixed_subagent_stats() {
+        let mut catalog = ModelCatalog::default();
+        catalog.update(
+            vec![
+                LsModelConfig {
+                    label: Some("Gemini 4 Hydrogen".to_string()),
+                    model_id: Some("gemini-4-hydrogen".to_string()),
+                    provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                    model_or_alias: Some(LsModelOrAlias {
+                        model: Some("MODEL_PLACEHOLDER_M335".to_string()),
+                        alias: None,
+                    }),
+                    model_url: None,
+                    context_window_options: Vec::new(),
+                },
+                LsModelConfig {
+                    label: Some("Gemini 4 Neon".to_string()),
+                    model_id: Some("gemini-4-neon".to_string()),
+                    provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                    model_or_alias: Some(LsModelOrAlias {
+                        model: Some("MODEL_PLACEHOLDER_M338".to_string()),
+                        alias: None,
+                    }),
+                    model_url: None,
+                    context_window_options: Vec::new(),
+                },
+                LsModelConfig {
+                    label: Some("Gemini 4 Carbon".to_string()),
+                    model_id: Some("gemini-4-carbon".to_string()),
+                    provider: Some("MODEL_PROVIDER_GOOGLE".to_string()),
+                    model_or_alias: Some(LsModelOrAlias {
+                        model: Some("MODEL_PLACEHOLDER_M339".to_string()),
+                        alias: None,
+                    }),
+                    model_url: None,
+                    context_window_options: Vec::new(),
+                },
+            ],
+            Instant::now(),
+        );
+
+        let mk_usage = |total_input: u64, cache: u64, total_output: u64, reasoning: u64| {
+            Some(LsModelUsage {
+                input_tokens: total_input.saturating_sub(cache),
+                output_tokens: total_output,
+                response_output_tokens: total_output.saturating_sub(reasoning),
+                thinking_output_tokens: reasoning,
+                cache_read_tokens: cache,
+                api_provider: Some("API_PROVIDER_GOOGLE_VERTEX".to_string()),
+                ..Default::default()
+            })
+        };
+
+        // Root cascade uses Hydrogen (mixed) and Neon (root-only).
+        let root_steps = vec![
+            make_planner_step(
+                "CORTEX_STEP_STATUS_DONE",
+                "MODEL_PLACEHOLDER_M335",
+                mk_usage(1000, 400, 120, 20),
+                Vec::new(),
+                "2026-11-26T10:00:00Z",
+                None,
+                Some("2026-11-26T10:00:01Z"),
+                None,
+            ),
+            make_planner_step(
+                "CORTEX_STEP_STATUS_DONE",
+                "MODEL_PLACEHOLDER_M338",
+                mk_usage(500, 100, 50, 0),
+                Vec::new(),
+                "2026-11-26T10:00:02Z",
+                None,
+                Some("2026-11-26T10:00:03Z"),
+                None,
+            ),
+        ];
+        let root_batch = process_steps_slice(
+            "conv-root-split",
+            None,
+            0,
+            &root_steps,
+            &catalog,
+            None,
+            Utc::now(),
+        );
+        let mut root_fold = CascadeFoldState::new("traj-root-split".to_string(), 0);
+        root_fold.apply_batch(&root_batch);
+
+        // Root-only snapshot: subagent must be None on all rows.
+        let root_only = merge_cascade_folds(&[&root_fold]);
+        assert_eq!(root_only.by_model.len(), 2);
+        for row in &root_only.by_model {
+            assert_eq!(row.subagent, None, "root-only row must have subagent=None");
+        }
+
+        // Subagent 1 uses Hydrogen (mixed) and Carbon (subagent-only).
+        let sub_summary_1 = LsTrajectorySummary {
+            trajectory_metadata: Some(LsTrajectoryMetadata {
+                parent_conversation_id: Some("conv-root-split".to_string()),
+                root_conversation_id: Some("conv-root-split".to_string()),
+                nesting_depth: 1,
+            }),
+            ..Default::default()
+        };
+        let sub_steps_1 = vec![
+            make_planner_step(
+                "CORTEX_STEP_STATUS_DONE",
+                "MODEL_PLACEHOLDER_M335",
+                mk_usage(2000, 1500, 200, 50),
+                Vec::new(),
+                "2026-11-26T10:00:04Z",
+                None,
+                Some("2026-11-26T10:00:05Z"),
+                None,
+            ),
+            make_planner_step(
+                "CORTEX_STEP_STATUS_DONE",
+                "MODEL_PLACEHOLDER_M339",
+                mk_usage(800, 600, 90, 10),
+                Vec::new(),
+                "2026-11-26T10:00:06Z",
+                None,
+                Some("2026-11-26T10:00:07Z"),
+                None,
+            ),
+        ];
+        let sub_batch_1 = process_steps_slice(
+            "conv-sub-split-1",
+            Some(&sub_summary_1),
+            0,
+            &sub_steps_1,
+            &catalog,
+            None,
+            Utc::now(),
+        );
+        let mut sub_fold_1 = CascadeFoldState::new("traj-sub-split-1".to_string(), 0);
+        sub_fold_1.apply_batch(&sub_batch_1);
+
+        // Subagent-only snapshot: subagent equals top-level totals.
+        let sub_only = merge_cascade_folds(&[&sub_fold_1]);
+        let sub_only_carbon = sub_only
+            .by_model
+            .iter()
+            .find(|m| m.model == "gemini-4-carbon")
+            .expect("carbon row");
+        assert_eq!(sub_only_carbon.requests, 1);
+        assert_eq!(
+            sub_only_carbon.subagent,
+            Some(SubagentModelStats {
+                requests: 1,
+                input_tokens: 800,
+                cached_tokens: 600,
+                output_tokens: 80,
+                reasoning_tokens: 10,
+            })
+        );
+
+        // Subagent 2 also uses Hydrogen so we test multi-subagent accumulation.
+        let sub_steps_2 = vec![make_planner_step(
+            "CORTEX_STEP_STATUS_DONE",
+            "MODEL_PLACEHOLDER_M335",
+            mk_usage(3000, 2500, 300, 40),
+            Vec::new(),
+            "2026-11-26T10:00:08Z",
+            None,
+            Some("2026-11-26T10:00:09Z"),
+            None,
+        )];
+        let sub_batch_2 = process_steps_slice(
+            "conv-sub-split-2",
+            Some(&sub_summary_1),
+            0,
+            &sub_steps_2,
+            &catalog,
+            None,
+            Utc::now(),
+        );
+        let mut sub_fold_2 = CascadeFoldState::new("traj-sub-split-2".to_string(), 0);
+        sub_fold_2.apply_batch(&sub_batch_2);
+
+        // Mixed merge: root + sub1 + sub2.
+        let merged = merge_cascade_folds(&[&root_fold, &sub_fold_1, &sub_fold_2]);
+        assert_eq!(merged.by_model.len(), 3);
+
+        // 1. Mixed same-model row (Hydrogen): total = root + sub1 + sub2, subagent = sub1 + sub2.
+        let hydrogen = merged
+            .by_model
+            .iter()
+            .find(|m| m.model == "gemini-4-hydrogen")
+            .expect("hydrogen row");
+        assert_eq!(hydrogen.requests, 3);
+        assert_eq!(hydrogen.input_tokens, 6000);
+        assert_eq!(hydrogen.cached_tokens, 4400);
+        assert_eq!(hydrogen.output_tokens, 510);
+        assert_eq!(hydrogen.reasoning_tokens, 110);
+        assert_eq!(
+            hydrogen.subagent,
+            Some(SubagentModelStats {
+                requests: 2,
+                input_tokens: 5000,
+                cached_tokens: 4000,
+                output_tokens: 410,
+                reasoning_tokens: 90,
+            })
+        );
+
+        // 2. Root-only row (Neon): subagent remains None.
+        let neon = merged
+            .by_model
+            .iter()
+            .find(|m| m.model == "gemini-4-neon")
+            .expect("neon row");
+        assert_eq!(neon.requests, 1);
+        assert_eq!(neon.subagent, None);
+
+        // 3. Subagent-only row (Carbon): subagent equals total.
+        let carbon = merged
+            .by_model
+            .iter()
+            .find(|m| m.model == "gemini-4-carbon")
+            .expect("carbon row");
+        assert_eq!(carbon.requests, 1);
+        assert_eq!(
+            carbon.subagent,
+            Some(SubagentModelStats {
+                requests: 1,
+                input_tokens: 800,
+                cached_tokens: 600,
+                output_tokens: 80,
+                reasoning_tokens: 10,
+            })
+        );
     }
 
     #[test]

@@ -134,6 +134,7 @@ impl StatsBucket {
                     output_tokens: usage.candidates_token_count,
                     reasoning_tokens: usage.thoughts_token_count,
                     total_latency_ms: latency_ms,
+                    subagent: None,
                 },
             );
         }
