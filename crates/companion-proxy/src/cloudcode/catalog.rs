@@ -28,7 +28,27 @@ fn override_checkpointer_value(existing: Option<&Value>, compaction_window: u64)
         .and_then(Value::as_str)
         && let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(raw)
     {
-        obj.insert("maxTokenLimit".to_string(), json!(compaction_window));
+        // ProtoJSON rejects objects that contain both snake_case (`max_token_limit`) and
+        // camelCase (`maxTokenLimit`) for the same protobuf field. Preserve upstream's key
+        // naming (and string-encoded int64 style) while removing the alias to avoid
+        // duplicate-field unmarshal failures in Antigravity's language server.
+        if let Some(prev_snake) = obj.remove("max_token_limit") {
+            obj.remove("maxTokenLimit");
+            let updated = if prev_snake.is_string() {
+                json!(compaction_window.to_string())
+            } else {
+                json!(compaction_window)
+            };
+            obj.insert("max_token_limit".to_string(), updated);
+        } else {
+            let prev_camel = obj.remove("maxTokenLimit");
+            let updated = if prev_camel.as_ref().is_some_and(Value::is_string) {
+                json!(compaction_window.to_string())
+            } else {
+                json!(compaction_window)
+            };
+            obj.insert("maxTokenLimit".to_string(), updated);
+        }
         return json!({ "stringValue": Value::Object(obj).to_string() });
     }
     json!({ "stringValue": json!({ "maxTokenLimit": compaction_window }).to_string() })

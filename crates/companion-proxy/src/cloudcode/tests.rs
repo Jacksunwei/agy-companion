@@ -2969,3 +2969,54 @@ fn merge_available_models_overrides_gemini_checkpointer_across_shared_variants_a
     .expect("valid empty upstream checkpointer JSON");
     assert_eq!(empty_ckpt["maxTokenLimit"], 835_584);
 }
+
+#[test]
+fn merge_available_models_overrides_snake_case_protojson_max_token_limit_without_duplicate_keys() {
+    // Regression test: upstream CloudCode checkpointer JSON uses snake_case string-encoded int64
+    // (`"max_token_limit": "512000"`). Inserting `"maxTokenLimit"` alongside `"max_token_limit"`
+    // causes Go's `protojson.Unmarshal` to fail on duplicate field and fall back to 256K.
+    let upstream = json!({
+        "models": {
+            "gemini-4-neon-medium": {
+                "model": "MODEL_PLACEHOLDER_M467",
+                "displayName": "Gemini 4 Neon (Medium)",
+                "maxTokens": 1048576,
+                "maxOutputTokens": 262144,
+                "modelExperimentIds": ["sonar"],
+                "modelExperiments": {
+                    "experiments": {
+                        "CASCADE_USE_EXPERIMENT_CHECKPOINTER": {
+                            "stringValue": "{\"strategy\":\"CHECKPOINT_STRATEGY_SAME_MODEL\",\"max_token_limit\":\"512000\",\"max_overhead_ratio\":\"0.15\",\"enabled\":true}"
+                        }
+                    }
+                }
+            }
+        },
+        "agentModelSorts": [{
+            "displayName": "Recommended",
+            "groups": [{ "modelIds": ["gemini-4-neon-medium"] }]
+        }]
+    });
+
+    let merged_bytes = merge_available_models(
+        &serde_json::to_vec(&upstream).unwrap(),
+        &["gemini-4-neon".to_string()],
+        "gemini-4-neon",
+    )
+    .expect("snake_case gemini merge succeeds");
+    let merged: Value = serde_json::from_slice(&merged_bytes).unwrap();
+    let neon = &merged["models"]["companion/gemini-4-neon-medium"];
+    let ckpt_raw = neon["modelExperiments"]["experiments"]["CASCADE_USE_EXPERIMENT_CHECKPOINTER"]
+        ["stringValue"]
+        .as_str()
+        .expect("checkpointer stringValue");
+    let ckpt: Value = serde_json::from_str(ckpt_raw).expect("valid checkpointer JSON");
+    // (1_048_576 - 262_144) * 85 / 100 = 668_467, preserved as snake_case string with zero duplicate camelCase key.
+    assert_eq!(ckpt["max_token_limit"], "668467");
+    assert!(
+        ckpt.get("maxTokenLimit").is_none(),
+        "must not emit duplicate camelCase maxTokenLimit alongside max_token_limit"
+    );
+    assert_eq!(ckpt["strategy"], "CHECKPOINT_STRATEGY_SAME_MODEL");
+    assert_eq!(ckpt["enabled"], true);
+}
