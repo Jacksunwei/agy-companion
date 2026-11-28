@@ -943,3 +943,90 @@ async fn spawn_serve_rejects_foreign_health_and_retries_fresh_port() {
         assert!(!pid_path.exists());
     }
 }
+
+#[test]
+fn doctor_offline_update_status_reports_channel_and_cached_update() {
+    use companion_core::{InstallChannel, UpdateState, save_update_state, update_state_path};
+
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_data = temp.path().join("xdg_data");
+    fs::create_dir_all(&home).expect("mkdir home");
+    let cfg_path = temp.path().join("config.json");
+    let cfg = config_with_port(free_loopback_port());
+    cfg.save_secure(&cfg_path).expect("save config");
+
+    let run_doctor_json = || {
+        let out = isolated_cli_command(&home)
+            .env("XDG_DATA_HOME", &xdg_data)
+            .args(["doctor", "--config"])
+            .arg(&cfg_path)
+            .arg("--json")
+            .output()
+            .expect("run doctor");
+        let report: Value = serde_json::from_slice(&out.stdout).expect("parse doctor json");
+        report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["name"] == "update_status")
+            .cloned()
+            .expect("update_status check present")
+    };
+
+    // 1. Missing update-state.json -> non-critical Info mentioning default npx channel.
+    let c_missing = run_doctor_json();
+    assert_eq!(c_missing["status"], "info");
+    assert_eq!(c_missing["critical"], false);
+    assert!(
+        c_missing["message"].as_str().unwrap().contains("npx"),
+        "{c_missing}"
+    );
+
+    // 2. Cached newer stable version on uvx -> reports update available + uvx fallback command.
+    let state_path = update_state_path(&xdg_data.join("agy-companion"));
+    save_update_state(
+        &state_path,
+        &UpdateState {
+            schema_version: 1,
+            install_channel: InstallChannel::Uvx,
+            checked_at_ms: Some(1_760_000_000_000),
+            latest_version: Some("99.0.0".to_string()),
+            last_upgrade: None,
+        },
+    )
+    .expect("save state");
+    let c_avail = run_doctor_json();
+    assert_eq!(c_avail["status"], "info");
+    assert_eq!(c_avail["critical"], false);
+    let msg_avail = c_avail["message"].as_str().unwrap();
+    assert!(msg_avail.contains("uvx"), "{msg_avail}");
+    assert!(msg_avail.contains("99.0.0"), "{msg_avail}");
+    assert!(
+        msg_avail.contains("uvx --refresh agy-companion install"),
+        "{msg_avail}"
+    );
+
+    // 3. Cached prerelease (even higher major) is not treated as an available stable update.
+    save_update_state(
+        &state_path,
+        &UpdateState {
+            schema_version: 1,
+            install_channel: InstallChannel::Npx,
+            checked_at_ms: Some(1_760_000_000_000),
+            latest_version: Some("99.0.0-dev.0".to_string()),
+            last_upgrade: None,
+        },
+    )
+    .expect("save prerelease state");
+    let c_pre = run_doctor_json();
+    assert_eq!(c_pre["status"], "info");
+    assert_eq!(c_pre["critical"], false);
+    assert!(
+        !c_pre["message"]
+            .as_str()
+            .unwrap()
+            .contains("update available"),
+        "{c_pre}"
+    );
+}

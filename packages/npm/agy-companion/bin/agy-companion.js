@@ -89,6 +89,23 @@ function resolveBinaryPath({
   return binaryPath;
 }
 
+function isNpxInvocation(env = process.env, dir = __dirname) {
+  if (env && env.npm_command === 'exec') {
+    return true;
+  }
+  if (typeof dir === 'string' && dir.split(/[\\/]+/).includes('_npx')) {
+    return true;
+  }
+  return false;
+}
+
+function buildChildEnv(env = process.env, dir = __dirname) {
+  if (env && !env.AGY_COMPANION_INSTALL_CHANNEL && isNpxInvocation(env, dir)) {
+    return { ...env, AGY_COMPANION_INSTALL_CHANNEL: 'npx' };
+  }
+  return env;
+}
+
 function run(argv = process.argv.slice(2)) {
   let binaryPath;
   try {
@@ -102,6 +119,7 @@ function run(argv = process.argv.slice(2)) {
     execFileSync(binaryPath, argv, {
       stdio: 'inherit',
       shell: false,
+      env: buildChildEnv(),
     });
   } catch (err) {
     if (err && typeof err.status === 'number') {
@@ -131,5 +149,7 @@ module.exports = {
   SUPPORTED_TARGETS,
   resolveTarget,
   resolveBinaryPath,
+  isNpxInvocation,
+  buildChildEnv,
   run,
 };

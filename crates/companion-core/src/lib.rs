@@ -7,6 +7,7 @@ pub mod integration;
 pub mod models;
 pub mod protocol;
 pub mod redaction;
+pub mod update;
 pub mod usage;
 pub mod validation;
 
@@ -62,6 +63,11 @@ pub use protocol::{
 pub use redaction::{
     RedactedCodexConfig, RedactedConfig, RedactedGeminiConfig, RedactedProvidersConfig,
     api_key_hint, mask_account_id, mask_api_key,
+};
+pub use update::{
+    INSTALL_CHANNEL_ENV_VAR, InstallChannel, LastUpgradeRecord, MAX_UPDATE_STATE_BYTES,
+    PrereleaseIdent, SemVer, UPDATE_STATE_FILENAME, UPDATE_STATE_SCHEMA_VERSION, UpdateState,
+    UpgradeOutcome, load_update_state, save_update_state, update_state_path,
 };
 pub use usage::{
     GeminiUsageMetadata, LsSyncWatermark, MAX_CONVERSATION_ID_LEN, MAX_MODEL_DISPLAY_NAME_LEN,

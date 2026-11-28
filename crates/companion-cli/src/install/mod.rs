@@ -9,12 +9,15 @@ mod windows;
 mod tests;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use companion_core::DEFAULT_LISTEN_PORT;
 use companion_core::fs_safe::{self, FsError, PathLeafKind, inspect_leaf_kind};
 use companion_core::integration::{IntegrationOptions, IntegrationStatus};
+use companion_core::{
+    CoreError, DEFAULT_LISTEN_PORT, INSTALL_CHANNEL_ENV_VAR, InstallChannel, UpdateState,
+    load_update_state, save_update_state, update_state_path,
+};
 use companion_providers::LoopbackProxyClient;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +58,7 @@ pub struct InstallOptions {
     pub no_launcher_hook: bool,
     pub no_start_proxy: bool,
     pub force: bool,
+    pub channel: Option<InstallChannel>,
     pub json: bool,
 }
 
@@ -71,6 +75,7 @@ pub struct UninstallOptions {
 pub struct InstallReport {
     pub ok: bool,
     pub version: String,
+    pub install_channel: InstallChannel,
     pub binary_path: PathBuf,
     pub local_bin_symlink: Option<PathBuf>,
     pub plugin_dir: PathBuf,
@@ -104,6 +109,56 @@ pub struct UninstallReport {
     pub purged_paths: Vec<PathBuf>,
     pub preserved_paths: Vec<PathBuf>,
     pub warnings: Vec<String>,
+}
+
+fn has_uvx_archive_hint(raw: &str) -> bool {
+    let normalized = raw.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("uv/archive-v") || normalized.contains("uv/cache/archive-v")
+}
+
+pub(crate) fn resolve_install_channel(
+    cli_channel: Option<InstallChannel>,
+    env_channel: Option<&str>,
+    current_exe: Option<&Path>,
+    virtual_env: Option<&str>,
+    existing_state: Option<&UpdateState>,
+) -> InstallChannel {
+    if let Some(ch) = cli_channel {
+        return ch;
+    }
+    if let Some(raw) = env_channel
+        && let Ok(ch) = raw.parse::<InstallChannel>()
+    {
+        return ch;
+    }
+    if current_exe
+        .and_then(|p| p.to_str())
+        .is_some_and(has_uvx_archive_hint)
+        || virtual_env.is_some_and(has_uvx_archive_hint)
+    {
+        return InstallChannel::Uvx;
+    }
+    if let Some(state) = existing_state {
+        return state.install_channel;
+    }
+    InstallChannel::Npx
+}
+
+pub(crate) fn next_update_state(
+    existing: Option<UpdateState>,
+    resolved_channel: InstallChannel,
+) -> UpdateState {
+    match existing {
+        Some(mut state) => {
+            if state.install_channel != resolved_channel {
+                state.install_channel = resolved_channel;
+                state.checked_at_ms = None;
+                state.latest_version = None;
+            }
+            state
+        }
+        None => UpdateState::new(resolved_channel),
+    }
 }
 
 pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<(), CliError> {
@@ -283,6 +338,16 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     }
     let listen_port = config.proxy.port.get();
     let runtime_data_dir = resolve_runtime_data_dir(&config)?;
+    let update_state_file = update_state_path(&runtime_data_dir);
+    let existing_update_state = match load_update_state(&update_state_file) {
+        Ok(state) => state,
+        Err(
+            err @ CoreError::Fs(FsError::SymlinkRejected { .. } | FsError::NotRegularFile { .. }),
+        ) => {
+            return Err(CliError::from(err));
+        }
+        Err(_) => None,
+    };
 
     // 2. Stage binary, .version, and 6-file plugin directory BEFORE swapping anything.
     ensure_non_symlink_dir(&plugins_root, 0o755)?;
@@ -293,6 +358,15 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let version_file = bin_dir.join(".version");
 
     let current_exe = std::env::current_exe()?;
+    let env_channel = std::env::var(INSTALL_CHANNEL_ENV_VAR).ok();
+    let virtual_env = std::env::var("VIRTUAL_ENV").ok();
+    let install_channel = resolve_install_channel(
+        opts.channel,
+        env_channel.as_deref(),
+        Some(&current_exe),
+        virtual_env.as_deref(),
+        existing_update_state.as_ref(),
+    );
     let binary_changed = !files_have_identical_bytes(&current_exe, &stable_bin);
     let skip_binary_rewrite = (cfg!(windows) && is_same_file_path(&current_exe, &stable_bin))
         || (!binary_changed && is_stable_bin_ready_exact(&stable_bin));
@@ -327,6 +401,8 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     if port_auto_selected {
         config.save_secure(&config_path)?;
     }
+    let next_state = next_update_state(existing_update_state, install_channel);
+    save_update_state(&update_state_file, &next_state)?;
 
     // 4. Proxy startup or version-skew replacement (unless --no-start-proxy).
     let proxy_outcome = if opts.no_start_proxy {
@@ -404,6 +480,7 @@ pub async fn run_install<W: Write>(opts: InstallOptions, out: &mut W) -> Result<
     let report = InstallReport {
         ok: true,
         version,
+        install_channel,
         binary_path: stable_bin,
         local_bin_symlink,
         plugin_dir: plugin_target,

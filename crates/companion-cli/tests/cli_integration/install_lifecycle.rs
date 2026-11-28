@@ -939,3 +939,154 @@ async fn install_same_version_replaces_proxy_on_binary_change_or_relocated_pid_a
         fs::canonicalize(&stable_bin).expect("canon stable_bin")
     );
 }
+
+#[test]
+fn install_channel_precedence_persistence_and_output_contract() {
+    use companion_core::{
+        InstallChannel, LastUpgradeRecord, UpdateState, UpgradeOutcome, load_update_state,
+        save_update_state, update_state_path,
+    };
+
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_config = temp.path().join("xdg_config");
+    let xdg_data = temp.path().join("xdg_data");
+    let plugins_dir = temp.path().join("plugins");
+    fs::create_dir_all(&home).expect("mkdir home");
+    fs::create_dir_all(&plugins_dir).expect("mkdir plugins");
+
+    let cfg_path = xdg_config.join("agy-companion").join("config.json");
+    let cfg = config_with_port(free_loopback_port());
+    cfg.save_secure(&cfg_path).expect("save config");
+    let state_path = update_state_path(&xdg_data.join("agy-companion"));
+
+    // 1. Default fallback to npx (human output prints `  Channel:  npx` and persists update-state.json).
+    let out_default = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env_remove("AGY_COMPANION_INSTALL_CHANNEL")
+        .env_remove("VIRTUAL_ENV")
+        .args([
+            "install",
+            "--plugins-dir",
+            plugins_dir.to_str().unwrap(),
+            "--no-launcher-hook",
+            "--no-start-proxy",
+        ])
+        .output()
+        .expect("run default install");
+    assert_eq!(
+        out_default.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out_default.stderr)
+    );
+    let stdout_default = String::from_utf8_lossy(&out_default.stdout);
+    assert!(
+        stdout_default.contains("  Channel:  npx"),
+        "expected human channel line, got:\n{stdout_default}"
+    );
+    let saved_default = load_update_state(&state_path)
+        .expect("load state")
+        .expect("state exists");
+    assert_eq!(saved_default.install_channel, InstallChannel::Npx);
+
+    // 2. Explicit --channel uvx overrides env var and persists uvx in JSON report + update-state.json.
+    let out_flag = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("AGY_COMPANION_INSTALL_CHANNEL", "npx")
+        .env_remove("VIRTUAL_ENV")
+        .args([
+            "install",
+            "--plugins-dir",
+            plugins_dir.to_str().unwrap(),
+            "--no-launcher-hook",
+            "--no-start-proxy",
+            "--channel",
+            "uvx",
+            "--json",
+        ])
+        .output()
+        .expect("run --channel uvx install");
+    assert_eq!(
+        out_flag.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out_flag.stderr)
+    );
+    let json_flag: Value = serde_json::from_slice(&out_flag.stdout).expect("parse json");
+    assert_eq!(json_flag["ok"], true);
+    assert_eq!(json_flag["install_channel"], "uvx");
+    let saved_uvx = load_update_state(&state_path)
+        .expect("load state")
+        .expect("state exists");
+    assert_eq!(saved_uvx.install_channel, InstallChannel::Uvx);
+
+    // Seed cached check + last_upgrade on uvx channel, then re-run without flags/env -> preserves uvx + cache.
+    let seeded = UpdateState {
+        schema_version: 1,
+        install_channel: InstallChannel::Uvx,
+        checked_at_ms: Some(1_760_000_000_000),
+        latest_version: Some("9.9.9".to_string()),
+        last_upgrade: Some(LastUpgradeRecord {
+            target_version: "0.1.2".to_string(),
+            started_at_ms: 1_759_000_000_000,
+            finished_at_ms: Some(1_759_000_005_000),
+            outcome: UpgradeOutcome::Succeeded,
+            error: None,
+        }),
+    };
+    save_update_state(&state_path, &seeded).expect("seed state");
+
+    // 3. Re-run with invalid env value -> ignored, preserves previously persisted uvx + cached check fields.
+    let out_preserve = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("AGY_COMPANION_INSTALL_CHANNEL", "invalid-channel")
+        .env_remove("VIRTUAL_ENV")
+        .args([
+            "install",
+            "--plugins-dir",
+            plugins_dir.to_str().unwrap(),
+            "--no-launcher-hook",
+            "--no-start-proxy",
+            "--json",
+        ])
+        .output()
+        .expect("run preserve install");
+    assert_eq!(out_preserve.status.code(), Some(0));
+    let json_preserve: Value = serde_json::from_slice(&out_preserve.stdout).expect("parse json");
+    assert_eq!(json_preserve["install_channel"], "uvx");
+    let after_preserve = load_update_state(&state_path)
+        .expect("load state")
+        .expect("state exists");
+    assert_eq!(after_preserve, seeded);
+
+    // 4. Switching channel via AGY_COMPANION_INSTALL_CHANNEL=NPX clears checked_at_ms/latest_version but keeps last_upgrade.
+    let out_env_switch = isolated_cli_command(&home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("AGY_COMPANION_INSTALL_CHANNEL", "NPX")
+        .env_remove("VIRTUAL_ENV")
+        .args([
+            "install",
+            "--plugins-dir",
+            plugins_dir.to_str().unwrap(),
+            "--no-launcher-hook",
+            "--no-start-proxy",
+            "--json",
+        ])
+        .output()
+        .expect("run env switch install");
+    assert_eq!(out_env_switch.status.code(), Some(0));
+    let json_switch: Value = serde_json::from_slice(&out_env_switch.stdout).expect("parse json");
+    assert_eq!(json_switch["install_channel"], "npx");
+    let after_switch = load_update_state(&state_path)
+        .expect("load state")
+        .expect("state exists");
+    assert_eq!(after_switch.install_channel, InstallChannel::Npx);
+    assert_eq!(after_switch.checked_at_ms, None);
+    assert_eq!(after_switch.latest_version, None);
+    assert_eq!(after_switch.last_upgrade, seeded.last_upgrade);
+}

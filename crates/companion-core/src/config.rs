@@ -304,6 +304,8 @@ pub struct Config {
     pub usage_dir: Option<PathBuf>,
     #[serde(default)]
     pub launcher_auto_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_for_updates: Option<bool>,
 }
 
 impl Default for Config {
@@ -315,6 +317,7 @@ impl Default for Config {
             providers: ProvidersConfig::default(),
             usage_dir: None,
             launcher_auto_start: None,
+            check_for_updates: None,
         }
     }
 }
@@ -377,6 +380,7 @@ pub struct ConfigPatch {
     pub cloudcode: Option<CloudCodeConfigPatch>,
     pub providers: Option<ProvidersConfigPatch>,
     pub launcher_auto_start: Option<Option<bool>>,
+    pub check_for_updates: Option<Option<bool>>,
 }
 
 #[derive(Deserialize)]
@@ -465,6 +469,7 @@ struct RawConfig {
     providers: RawProvidersConfig,
     usage_dir: Option<PathBuf>,
     launcher_auto_start: Option<bool>,
+    check_for_updates: Option<bool>,
 }
 
 impl Default for RawConfig {
@@ -476,6 +481,7 @@ impl Default for RawConfig {
             providers: RawProvidersConfig::default(),
             usage_dir: None,
             launcher_auto_start: None,
+            check_for_updates: None,
         }
     }
 }
@@ -835,6 +841,10 @@ impl Config {
         }
     }
 
+    pub fn updates_enabled(&self) -> bool {
+        self.check_for_updates.unwrap_or(true)
+    }
+
     pub fn redacted_with_auth(
         &self,
         gemini_creds: Option<&GeminiCredentials>,
@@ -876,6 +886,7 @@ impl Config {
                 },
             },
             launcher_auto_start: self.launcher_auto_start,
+            check_for_updates: self.check_for_updates,
         }
     }
 
@@ -925,6 +936,7 @@ impl Config {
             },
             usage_dir: raw_cfg.usage_dir,
             launcher_auto_start: raw_cfg.launcher_auto_start,
+            check_for_updates: raw_cfg.check_for_updates,
         };
         config.validate()?;
         Ok(config)
@@ -1047,6 +1059,9 @@ impl Config {
         if let Some(auto_start) = patch.launcher_auto_start {
             next.launcher_auto_start = auto_start;
         }
+        if let Some(check_for_updates) = patch.check_for_updates {
+            next.check_for_updates = check_for_updates;
+        }
 
         next.validate()?;
         *self = next;
@@ -1081,6 +1096,42 @@ mod tests {
 
         let from_empty: Config = serde_json::from_str("{}").expect("empty object deserializes");
         assert_eq!(from_empty, cfg);
+    }
+
+    #[test]
+    fn check_for_updates_defaults_none_omits_from_json_and_round_trips() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.check_for_updates, None);
+        assert!(cfg.updates_enabled());
+
+        // When None, field is omitted from both Config and RedactedConfig JSON.
+        let cfg_json = serde_json::to_string(&cfg).expect("serialize default config");
+        assert!(!cfg_json.contains("check_for_updates"), "{cfg_json}");
+        let redacted_json =
+            serde_json::to_string(&cfg.redacted_with_auth(None, None)).expect("serialize redacted");
+        assert!(
+            !redacted_json.contains("check_for_updates"),
+            "{redacted_json}"
+        );
+
+        // Patch to Some(false) and verify round-trip through from_json_str and redacted_with_auth.
+        cfg.apply_patch(ConfigPatch {
+            check_for_updates: Some(Some(false)),
+            ..Default::default()
+        })
+        .expect("patch check_for_updates");
+        assert_eq!(cfg.check_for_updates, Some(false));
+        assert!(!cfg.updates_enabled());
+
+        let saved = serde_json::to_string(&cfg).expect("serialize disabled config");
+        assert!(saved.contains("\"check_for_updates\":false"), "{saved}");
+        let parsed =
+            Config::from_json_str(&saved, Path::new("config.json")).expect("parse saved config");
+        assert_eq!(parsed.check_for_updates, Some(false));
+        assert_eq!(
+            parsed.redacted_with_auth(None, None).check_for_updates,
+            Some(false)
+        );
     }
 
     #[test]
@@ -1359,6 +1410,7 @@ mod tests {
                 codex: None,
             }),
             launcher_auto_start: None,
+            check_for_updates: None,
         })
         .expect("valid patch succeeds");
 
@@ -1388,6 +1440,7 @@ mod tests {
                     codex: None,
                 }),
                 launcher_auto_start: None,
+                check_for_updates: None,
             })
             .expect_err("zero timeout must fail");
         assert!(matches!(err, CoreError::InvalidTimeout));

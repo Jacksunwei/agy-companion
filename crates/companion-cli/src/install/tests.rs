@@ -1278,3 +1278,116 @@ async fn ensure_installed_proxy_running_skips_up_to_date_and_warns_accurately_on
 
     server.abort();
 }
+
+#[test]
+fn resolve_install_channel_follows_five_level_precedence_including_windows_uvx_paths() {
+    use companion_core::{InstallChannel, LastUpgradeRecord, UpdateState, UpgradeOutcome};
+
+    use super::{next_update_state, resolve_install_channel};
+
+    let persisted_uvx = UpdateState::new(InstallChannel::Uvx);
+
+    // 1. Explicit CLI flag wins over everything.
+    assert_eq!(
+        resolve_install_channel(
+            Some(InstallChannel::Npx),
+            Some("uvx"),
+            Some(Path::new(
+                "/home/u/.cache/uv/archive-v0/abc/bin/agy-companion"
+            )),
+            Some("/home/u/.cache/uv/cache/archive-v0/abc"),
+            Some(&persisted_uvx),
+        ),
+        InstallChannel::Npx
+    );
+
+    // 2. Valid env var (case-insensitive) wins over uvx path detection and persisted state.
+    assert_eq!(
+        resolve_install_channel(
+            None,
+            Some("NPX"),
+            Some(Path::new(
+                r"C:\Users\u\AppData\Local\uv\cache\archive-v0\abc\agy-companion.exe"
+            )),
+            None,
+            Some(&persisted_uvx),
+        ),
+        InstallChannel::Npx
+    );
+    assert_eq!(
+        resolve_install_channel(None, Some("UvX"), None, None, None),
+        InstallChannel::Uvx
+    );
+
+    // Invalid/empty env var is ignored and falls through to uvx path detection.
+    assert_eq!(
+        resolve_install_channel(
+            None,
+            Some("invalid"),
+            Some(Path::new(
+                "/Users/u/.cache/uv/archive-v0/xyz/bin/agy-companion"
+            )),
+            None,
+            None,
+        ),
+        InstallChannel::Uvx
+    );
+    assert_eq!(
+        resolve_install_channel(
+            None,
+            Some("  "),
+            None,
+            Some(r"C:\Users\u\AppData\Local\uv\cache\archive-v0\xyz"),
+            None,
+        ),
+        InstallChannel::Uvx
+    );
+
+    // 4. Persisted state wins over fallback.
+    assert_eq!(
+        resolve_install_channel(
+            None,
+            None,
+            Some(Path::new("/usr/local/bin/agy-companion")),
+            None,
+            Some(&persisted_uvx),
+        ),
+        InstallChannel::Uvx
+    );
+
+    // 5. Fallback is Npx.
+    assert_eq!(
+        resolve_install_channel(
+            None,
+            None,
+            Some(Path::new("/usr/local/bin/agy-companion")),
+            None,
+            None,
+        ),
+        InstallChannel::Npx
+    );
+
+    // next_update_state preserves cache on same channel, clears cache (keeping last_upgrade) on channel switch.
+    let seeded = UpdateState {
+        schema_version: 1,
+        install_channel: InstallChannel::Uvx,
+        checked_at_ms: Some(12345),
+        latest_version: Some("0.2.0".to_string()),
+        last_upgrade: Some(LastUpgradeRecord {
+            target_version: "0.1.2".to_string(),
+            started_at_ms: 100,
+            finished_at_ms: Some(200),
+            outcome: UpgradeOutcome::Succeeded,
+            error: None,
+        }),
+    };
+    assert_eq!(
+        next_update_state(Some(seeded.clone()), InstallChannel::Uvx),
+        seeded
+    );
+    let switched = next_update_state(Some(seeded.clone()), InstallChannel::Npx);
+    assert_eq!(switched.install_channel, InstallChannel::Npx);
+    assert_eq!(switched.checked_at_ms, None);
+    assert_eq!(switched.latest_version, None);
+    assert_eq!(switched.last_upgrade, seeded.last_upgrade);
+}

@@ -6,12 +6,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use companion_core::fs_safe::{self, FsError};
 use companion_core::{
     AuthStore, CODEX_AUTH_FILENAME, CODEX_REFRESH_LOCK_FILENAME, Config, DEFAULT_LISTEN_PORT,
-    FileAuthStore, GEMINI_AUTH_FILENAME, MAX_AUTH_FILE_BYTES, PROTOCOL_VERSION, ProxyHealthSummary,
-    auth_dir_for_config_path, is_placeholder_api_key, sanitize_base_url,
+    FileAuthStore, GEMINI_AUTH_FILENAME, InstallChannel, MAX_AUTH_FILE_BYTES, PROTOCOL_VERSION,
+    ProxyHealthSummary, SemVer, auth_dir_for_config_path, is_placeholder_api_key,
+    load_update_state, sanitize_base_url, update_state_path,
 };
 use companion_providers::LoopbackProxyClient;
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::resolve_runtime_data_dir;
 use crate::{CliError, MAX_CONFIG_FILE_BYTES, resolve_cli_config_path};
 
 pub use companion_providers::{
@@ -978,6 +980,60 @@ pub async fn run_doctor(options: DoctorOptions, env: DoctorEnv) -> Result<Doctor
         status: base_url_status,
         critical: false,
         message: base_url_message,
+    });
+
+    let update_status_message = {
+        let default_cfg = Config::default();
+        let cfg_ref = loaded_config.as_ref().unwrap_or(&default_cfg);
+        match resolve_runtime_data_dir(cfg_ref) {
+            Ok(data_dir) => {
+                let state_path = update_state_path(&data_dir);
+                match load_update_state(&state_path) {
+                    Ok(Some(state)) => {
+                        let channel = state.install_channel;
+                        match state.latest_version.as_deref() {
+                            Some(latest_raw) => match (
+                                SemVer::parse(latest_raw),
+                                SemVer::parse(&options.binary_version),
+                            ) {
+                                (Ok(latest), Ok(current))
+                                    if !latest.is_prerelease() && latest > current =>
+                                {
+                                    format!(
+                                        "channel: {channel}; update available: v{latest} (current v{}) — run `{}`",
+                                        options.binary_version,
+                                        channel.fallback_command()
+                                    )
+                                }
+                                (Ok(latest), _) => {
+                                    format!(
+                                        "channel: {channel}; up to date (cached latest v{latest})"
+                                    )
+                                }
+                                (Err(_), _) => {
+                                    format!(
+                                        "channel: {channel}; cached latest version '{latest_raw}' is not valid SemVer"
+                                    )
+                                }
+                            },
+                            None => format!("channel: {channel}; no cached update check yet"),
+                        }
+                    }
+                    Ok(None) => format!(
+                        "channel: {} (default); no cached update check yet",
+                        InstallChannel::default()
+                    ),
+                    Err(err) => format!("cached update state unreadable: {err}"),
+                }
+            }
+            Err(err) => format!("unable to resolve update state directory: {err}"),
+        }
+    };
+    checks.push(DoctorCheck {
+        name: "update_status".to_string(),
+        status: CheckStatus::Info,
+        critical: false,
+        message: update_status_message,
     });
 
     let ok = !checks

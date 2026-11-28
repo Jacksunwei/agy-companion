@@ -428,6 +428,7 @@ impl TryFrom<SaveSettingsArgs> for ConfigPatch {
             cloudcode,
             providers: args.providers.map(Into::into),
             launcher_auto_start: None,
+            check_for_updates: None,
         })
     }
 }

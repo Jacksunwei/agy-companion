@@ -60,6 +60,8 @@ pub struct RedactedConfig {
     pub providers: RedactedProvidersConfig,
     #[serde(default)]
     pub launcher_auto_start: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_for_updates: Option<bool>,
 }
 
 pub fn mask_api_key(key: &str) -> String {

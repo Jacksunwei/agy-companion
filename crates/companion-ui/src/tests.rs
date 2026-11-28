@@ -746,6 +746,7 @@ fn golden_wire_fixtures_match_rust_serialization_verbatim() {
                 codex: RedactedCodexConfig::default(),
             },
             launcher_auto_start: Some(true),
+            check_for_updates: None,
         },
         binary_version: "0.1.0".to_string(),
         proxy: ProxyHealthSummary {

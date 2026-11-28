@@ -125,6 +125,9 @@ pub enum Commands {
         /// Overwrite an existing symlinked plugin directory (e.g. a legacy dev symlink).
         #[arg(long)]
         force: bool,
+        /// Installation channel used for update checks and upgrades (npx or uvx).
+        #[arg(long, value_enum)]
+        channel: Option<CliInstallChannel>,
         /// Emit machine-readable JSON install report to stdout.
         #[arg(long)]
         json: bool,
@@ -147,6 +150,21 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliInstallChannel {
+    Npx,
+    Uvx,
+}
+
+impl From<CliInstallChannel> for companion_core::InstallChannel {
+    fn from(value: CliInstallChannel) -> Self {
+        match value {
+            CliInstallChannel::Npx => Self::Npx,
+            CliInstallChannel::Uvx => Self::Uvx,
+        }
+    }
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +275,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use companion_core::integration::ShellKind;
 
-    use super::{Cli, CliShell, Commands, IntegrationCommands};
+    use super::{Cli, CliInstallChannel, CliShell, Commands, IntegrationCommands};
 
     #[test]
     fn cli_rejects_forbidden_host_zero_ports_and_invalid_arguments() {
@@ -319,6 +337,10 @@ mod tests {
             Cli::try_parse_from(["agy-companion", "integration", "enable", "--shell", "tcsh"])
                 .is_err(),
             "unsupported --shell must fail"
+        );
+        assert!(
+            Cli::try_parse_from(["agy-companion", "install", "--channel", "brew"]).is_err(),
+            "unsupported --channel must fail"
         );
     }
 
@@ -425,6 +447,7 @@ mod tests {
                 "--no-launcher-hook",
                 "--no-start-proxy",
                 "--force",
+                "--channel=uvx",
                 "--json",
             ])
             .expect("install equals form")
@@ -435,8 +458,17 @@ mod tests {
                 no_launcher_hook: true,
                 no_start_proxy: true,
                 force: true,
+                channel: Some(CliInstallChannel::Uvx),
                 json: true,
             }
+        );
+        assert_eq!(
+            companion_core::InstallChannel::from(CliInstallChannel::Npx),
+            companion_core::InstallChannel::Npx
+        );
+        assert_eq!(
+            companion_core::InstallChannel::from(CliInstallChannel::Uvx),
+            companion_core::InstallChannel::Uvx
         );
 
         assert_eq!(
