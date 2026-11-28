@@ -8,18 +8,20 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::Response;
 use axum::routing::{get, post};
-use companion_core::{AuthStore, UsageRange};
+use companion_core::{AuthStore, Config, InstallChannel, UsageRange};
 use companion_providers::CodexAuthManager;
 use companion_ui::{
     CompanionUiServer, GetUsageArgs, SaveSettingsArgs, SettingsSnapshot, TestConnectionArgs,
-    UiServerOptions,
+    UiServerOptions, UpdateLifecycleState, UpdateStatusSnapshot,
 };
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
 use crate::CliError;
+use crate::daemon::resolve_runtime_data_dir;
 use crate::ls_collector::LsCollectorHandle;
+use crate::update_manager::{UpdateManager, UpdateManagerOptions};
 
 pub const SIDECAR_WEB_PORT_ENV: &str = "ANTIGRAVITY_SIDECAR_WEB_PORT";
 pub const SIDECAR_UI_TOKEN_ENV: &str = "ANTIGRAVITY_SIDECAR_UI_TOKEN";
@@ -50,6 +52,21 @@ struct SidecarUiState {
     ui: Arc<CompanionUiServer>,
     token: Option<Arc<String>>,
     ls_collector: Option<LsCollectorHandle>,
+    update_manager: Option<Arc<UpdateManager>>,
+}
+
+fn disabled_update_snapshot() -> UpdateStatusSnapshot {
+    let channel = InstallChannel::default();
+    UpdateStatusSnapshot {
+        state: UpdateLifecycleState::Disabled,
+        channel,
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        latest_version: None,
+        can_one_click_upgrade: false,
+        fallback_command: channel.fallback_command().to_string(),
+        checked_at_ms: None,
+        error: None,
+    }
 }
 
 async fn apply_ls_telemetry_overlay(
@@ -455,8 +472,68 @@ async fn set_launcher_integration_handler(
     }
 }
 
+async fn get_update_status_handler(
+    State(state): State<SidecarUiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = reject_invalid_api_request(&state, &headers) {
+        return resp;
+    }
+    if !body.is_empty()
+        && let Err(err) = serde_json::from_slice::<EmptyHttpArgs>(&body)
+    {
+        return api_error(StatusCode::BAD_REQUEST, format!("invalid request: {err}"));
+    }
+    let snapshot = match state.update_manager.as_ref() {
+        Some(manager) => manager.get_status(),
+        None => disabled_update_snapshot(),
+    };
+    api_ok(&snapshot)
+}
+
+async fn check_update_handler(
+    State(state): State<SidecarUiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = reject_invalid_api_request(&state, &headers) {
+        return resp;
+    }
+    if !body.is_empty()
+        && let Err(err) = serde_json::from_slice::<EmptyHttpArgs>(&body)
+    {
+        return api_error(StatusCode::BAD_REQUEST, format!("invalid request: {err}"));
+    }
+    let snapshot = match state.update_manager.as_ref() {
+        Some(manager) => manager.check_update_manual().await,
+        None => disabled_update_snapshot(),
+    };
+    api_ok(&snapshot)
+}
+
+async fn start_upgrade_handler(
+    State(state): State<SidecarUiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = reject_invalid_api_request(&state, &headers) {
+        return resp;
+    }
+    if !body.is_empty()
+        && let Err(err) = serde_json::from_slice::<EmptyHttpArgs>(&body)
+    {
+        return api_error(StatusCode::BAD_REQUEST, format!("invalid request: {err}"));
+    }
+    let snapshot = match state.update_manager.as_ref() {
+        Some(manager) => manager.start_upgrade().await,
+        None => disabled_update_snapshot(),
+    };
+    api_ok(&snapshot)
+}
+
 pub fn build_sidecar_ui_router(ui: Arc<CompanionUiServer>, token: Option<String>) -> Router {
-    build_sidecar_ui_router_with_ls(ui, token, None)
+    build_sidecar_ui_router_with_ls_and_update(ui, token, None, None)
 }
 
 pub fn build_sidecar_ui_router_with_ls(
@@ -464,10 +541,20 @@ pub fn build_sidecar_ui_router_with_ls(
     token: Option<String>,
     ls_collector: Option<LsCollectorHandle>,
 ) -> Router {
+    build_sidecar_ui_router_with_ls_and_update(ui, token, ls_collector, None)
+}
+
+pub fn build_sidecar_ui_router_with_ls_and_update(
+    ui: Arc<CompanionUiServer>,
+    token: Option<String>,
+    ls_collector: Option<LsCollectorHandle>,
+    update_manager: Option<Arc<UpdateManager>>,
+) -> Router {
     let state = SidecarUiState {
         ui,
         token: token.map(Arc::new),
         ls_collector,
+        update_manager,
     };
     Router::new()
         .route("/", get(index_handler))
@@ -486,6 +573,9 @@ pub fn build_sidecar_ui_router_with_ls(
             post(complete_codex_login_handler),
         )
         .route("/_api/disconnect_codex", post(disconnect_codex_handler))
+        .route("/_api/get_update_status", post(get_update_status_handler))
+        .route("/_api/check_update", post(check_update_handler))
+        .route("/_api/start_upgrade", post(start_upgrade_handler))
         .layer(DefaultBodyLimit::max(MAX_SIDECAR_API_BODY_BYTES))
         .with_state(state)
 }
@@ -533,12 +623,38 @@ pub async fn bind_and_spawn_sidecar_ui_with_auth_and_ls<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let update_manager = {
+        let cfg = Config::load_or_default(&config_path).unwrap_or_default();
+        match resolve_runtime_data_dir(&cfg) {
+            Ok(runtime_data_dir) => {
+                let opts = UpdateManagerOptions::for_paths(config_path.clone(), runtime_data_dir);
+                match UpdateManager::new(opts) {
+                    Ok(mgr) => Some(Arc::new(mgr)),
+                    Err(err) => {
+                        tracing::debug!(error = %err, "failed to initialize UpdateManager");
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "failed to resolve runtime data dir for UpdateManager");
+                None
+            }
+        }
+    };
+
     let mut ui_options = UiServerOptions::default();
     if let Some(store) = auth_store {
         ui_options = ui_options.with_auth_store_override(store);
     }
     if let Some(manager) = codex_auth {
         ui_options = ui_options.with_codex_auth_override(manager);
+    }
+    if let Some(ref upd) = update_manager {
+        let upd_for_snapshot = Arc::clone(upd);
+        ui_options = ui_options.with_update_status_provider(Arc::new(move |cfg| {
+            Some(upd_for_snapshot.snapshot_for_config(cfg))
+        }));
     }
     let ui = Arc::new(CompanionUiServer::with_options(config_path, ui_options)?);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), sidecar_cfg.port);
@@ -550,17 +666,34 @@ where
             "sidecar UI listener must bind to 127.0.0.1",
         )));
     }
-    let router = build_sidecar_ui_router_with_ls(ui, sidecar_cfg.token, ls_collector);
+    let (update_shutdown_tx, update_shutdown_rx) = tokio::sync::watch::channel(false);
+    let update_loop_handle = update_manager
+        .as_ref()
+        .map(|mgr| mgr.spawn_background_loop(update_shutdown_rx));
+
+    let router = build_sidecar_ui_router_with_ls_and_update(
+        ui,
+        sidecar_cfg.token,
+        ls_collector,
+        update_manager,
+    );
     tracing::info!(
         addr = %bound_addr,
         "agy-companion sidecar Web UI listening"
     );
     let handle = tokio::spawn(async move {
+        let shutdown_with_notify = async move {
+            shutdown.await;
+            let _ = update_shutdown_tx.send(true);
+        };
         if let Err(err) = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
+            .with_graceful_shutdown(shutdown_with_notify)
             .await
         {
             tracing::warn!(error = %err, "sidecar Web UI server exited with error");
+        }
+        if let Some(bg) = update_loop_handle {
+            bg.abort();
         }
     });
     Ok((bound_addr, handle))
@@ -1263,5 +1396,220 @@ mod tests {
 
         server.abort();
         mock_server.abort();
+    }
+
+    #[tokio::test]
+    async fn sidecar_ui_update_endpoints_enforce_auth_ct_deny_unknown_and_drive_lifecycle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let tmp = TempDir::new().expect("tmp");
+        let cfg_path = tmp.path().join("config.json");
+        let data_dir = tmp.path().join("data");
+
+        let npm_hits = Arc::new(AtomicUsize::new(0));
+        let npm_hits_srv = Arc::clone(&npm_hits);
+        let mock_registry = Router::new().route(
+            "/latest",
+            get(move || {
+                let hits = Arc::clone(&npm_hits_srv);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    r#"{"version":"0.9.0"}"#
+                }
+            }),
+        );
+        let reg_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind reg");
+        let reg_addr = reg_listener.local_addr().expect("reg addr");
+        let reg_server = tokio::spawn(async move {
+            let _ = axum::serve(reg_listener, mock_registry).await;
+        });
+
+        #[cfg(unix)]
+        let fake_exe = {
+            use std::os::unix::fs::PermissionsExt;
+            let p = tmp.path().join("fake-npx");
+            std::fs::write(&p, "#!/bin/sh\nsleep 0.1\nexit 0\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Some(p)
+        };
+        #[cfg(not(unix))]
+        let fake_exe: Option<PathBuf> = None;
+
+        let mut upd_opts = UpdateManagerOptions::for_paths(cfg_path.clone(), data_dir);
+        upd_opts.current_version = "0.1.0".to_string();
+        upd_opts.npm_registry_url = format!("http://{reg_addr}/latest");
+        upd_opts.disabled_by_env = Some(false);
+        upd_opts.manual_cooldown = Duration::from_secs(60);
+        upd_opts.executable_override = Some(fake_exe.clone());
+        let upd_mgr = Arc::new(UpdateManager::new(upd_opts).expect("update manager"));
+
+        let upd_for_snap = Arc::clone(&upd_mgr);
+        let ui_opts = UiServerOptions {
+            ui_html_source: UiHtmlSource::Fixed(None),
+            env_api_key_fallback: false,
+            integration_options_override: Some(IntegrationOptions {
+                shell: None,
+                rc_file: Some(tmp.path().join(".zlogin")),
+                binary_path: Some(tmp.path().join("agy-companion")),
+                data_dir: Some(tmp.path().join("int-data")),
+                follow_rc_symlink: false,
+            }),
+            hybrid_active_override: Some(true),
+            update_status_provider: Some(Arc::new(move |cfg| {
+                Some(upd_for_snap.snapshot_for_config(cfg))
+            })),
+            ..UiServerOptions::default()
+        };
+        let ui = Arc::new(CompanionUiServer::with_options(cfg_path, ui_opts).expect("ui"));
+
+        let token = "update-secret-tok";
+        let router = build_sidecar_ui_router_with_ls_and_update(
+            ui,
+            Some(token.to_string()),
+            None,
+            Some(upd_mgr),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ui");
+        let addr = listener.local_addr().expect("ui addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+
+        // All 3 endpoints enforce 401 without token, 415 without JSON CT, 400 on unknown fields, 405 on GET.
+        for endpoint in [
+            "/_api/get_update_status",
+            "/_api/check_update",
+            "/_api/start_upgrade",
+        ] {
+            let get_resp = client
+                .get(format!("http://{addr}{endpoint}"))
+                .send()
+                .await
+                .expect("get");
+            assert_eq!(get_resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+            let unauth = client
+                .post(format!("http://{addr}{endpoint}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body("{}")
+                .send()
+                .await
+                .expect("unauth");
+            assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+            let bad_ct = client
+                .post(format!("http://{addr}{endpoint}"))
+                .header(SIDECAR_TOKEN_HEADER, token)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body("{}")
+                .send()
+                .await
+                .expect("bad ct");
+            assert_eq!(bad_ct.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+            let bad_body = client
+                .post(format!("http://{addr}{endpoint}"))
+                .header(SIDECAR_TOKEN_HEADER, token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(r#"{"unknown_field":1}"#)
+                .send()
+                .await
+                .expect("bad body");
+            assert_eq!(bad_body.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // 1. Initial get_update_status returns up_to_date + security headers.
+        let init = client
+            .post(format!("http://{addr}/_api/get_update_status"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("init status");
+        assert_eq!(init.status(), StatusCode::OK);
+        assert_eq!(
+            init.headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            init.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let init_json: serde_json::Value = init.json().await.expect("init json");
+        assert_eq!(init_json["state"], "up_to_date");
+
+        // 2. check_update hits mock registry -> available; immediate second call hits 60s cooldown.
+        let checked = client
+            .post(format!("http://{addr}/_api/check_update"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("check");
+        assert_eq!(checked.status(), StatusCode::OK);
+        let checked_json: serde_json::Value = checked.json().await.expect("checked json");
+        assert_eq!(checked_json["state"], "available");
+        assert_eq!(checked_json["latest_version"], "0.9.0");
+        assert_eq!(npm_hits.load(Ordering::SeqCst), 1);
+
+        let cooldown = client
+            .post(format!("http://{addr}/_api/check_update"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("cooldown");
+        assert_eq!(cooldown.status(), StatusCode::OK);
+        assert_eq!(
+            npm_hits.load(Ordering::SeqCst),
+            1,
+            "60s cooldown must suppress duplicate check"
+        );
+
+        // 3. get_settings includes populated `update` snapshot.
+        let settings = client
+            .post(format!("http://{addr}/_api/get_settings"))
+            .header(SIDECAR_TOKEN_HEADER, token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("settings");
+        assert_eq!(settings.status(), StatusCode::OK);
+        let settings_json: serde_json::Value = settings.json().await.expect("settings json");
+        assert_eq!(settings_json["update"]["state"], "available");
+        assert_eq!(settings_json["update"]["latest_version"], "0.9.0");
+
+        // 4. start_upgrade transitions to upgrading -> upgraded on Unix with fake exe.
+        #[cfg(unix)]
+        {
+            let started = client
+                .post(format!("http://{addr}/_api/start_upgrade"))
+                .header(SIDECAR_TOKEN_HEADER, token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body("{}")
+                .send()
+                .await
+                .expect("start upgrade");
+            assert_eq!(started.status(), StatusCode::OK);
+            let started_json: serde_json::Value = started.json().await.expect("started json");
+            assert_eq!(started_json["state"], "upgrading");
+        }
+
+        server.abort();
+        reg_server.abort();
     }
 }

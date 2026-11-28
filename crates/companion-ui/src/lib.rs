@@ -17,6 +17,7 @@ pub use types::{
     CodexSettingsPatch, CompleteCodexLoginArgs, GeminiSettingsPatch, GetUsageArgs,
     ProvidersSettingsPatch, ProxySettingsPatch, ResolvedAccountPlan, SaveSettingsArgs,
     SettingsSnapshot, StartCodexLoginPayload, TestConnectionArgs, TestConnectionPayload,
-    TestConnectionProvider, UiError, UiHtmlSource, UiServerOptions, UsageRangeArg,
+    TestConnectionProvider, UiError, UiHtmlSource, UiServerOptions, UpdateLifecycleState,
+    UpdateStatusProvider, UpdateStatusSnapshot, UsageRangeArg,
 };
 pub use ui_resource::{EMBEDDED_UI_HTML, MAX_UI_HTML_BYTES, UI_HTML_ENV_VAR};
